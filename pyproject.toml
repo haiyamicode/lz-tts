@@ -5,25 +5,28 @@ description = "Minimal Piper TTS inference pipeline"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.19.0,<2",
+    "numpy>=1.26.0,<1.27",
     "torch==1.13.1",
     "pytorch-lightning==1.7.7",
     "torchmetrics==0.11.4",
     "piper-phonemize==1.1.0",
-    "transformers>=4.30.0,<4.40.0",
-    "sentencepiece>=0.1.99",
+    "transformers>=4.39.0,<4.40",
+    "sentencepiece>=0.2.0,<0.3",
     # piper_train dependencies for inference
-    "pycld2>=0.41",
-    "wordfreq>=3.0.0",
-    "six>=1.15.0",
-    "librosa>=0.10.0",
-    "unicodedataplus>=16.0.0",
-    "regex>=2023.0",
+    "pycld2==0.41",
+    "wordfreq>=3.1.0,<3.2",
+    "six>=1.17.0,<1.18",
+    "librosa>=0.11.0,<0.12",
+    "unicodedataplus>=16.0.0,<16.1",
+    "regex>=2026.1,<2027",
     # CJK tokenization for multilingual_splitter
-    "mecab-python3>=1.0.0",
-    "mecab-ko-dic>=1.0.0",
-    "ipadic>=1.0.0",
-    "jieba>=0.42.1",
+    "mecab-python3>=1.0.0,<1.1",
+    # Japanese text normalization for preprocess.py
+    "fugashi>=1.5.0,<1.6",
+    "pykakasi>=2.3.0,<2.4",
+    "mecab-ko-dic>=1.0.0,<1.1",
+    "ipadic>=1.0.0,<1.1",
+    "jieba>=0.42.0,<0.43",
 ]
 
 [project.scripts]
