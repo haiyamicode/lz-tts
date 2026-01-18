@@ -2,8 +2,9 @@
 
 Supports a subset of SSML similar to Google's Text-to-Speech API.
 Currently supported elements:
-- <speak>: Root element (optional)
+- <speak>: Root element (required)
 - <break>: Insert pause with time="Xms" or time="Xs"
+- <voice name="speaker">: Set speaker for enclosed text (overrides auto-detection)
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ class TextSegment:
     """A segment of text to synthesize."""
 
     text: str
+    speaker: str | None = None  # None = auto-detect language
 
 
 @dataclass
@@ -46,7 +48,7 @@ def _parse_time(time_str: str) -> int:
         return int(float(time_str))
 
 
-def _extract_segments(element: ET.Element) -> list[Segment]:
+def _extract_segments(element: ET.Element, speaker: str | None = None) -> list[Segment]:
     """Recursively extract text and break segments from an element."""
     segments: list[Segment] = []
 
@@ -54,7 +56,7 @@ def _extract_segments(element: ET.Element) -> list[Segment]:
     if element.text:
         text = element.text.strip()
         if text:
-            segments.append(TextSegment(text=text))
+            segments.append(TextSegment(text=text, speaker=speaker))
 
     # Process children
     for child in element:
@@ -62,28 +64,37 @@ def _extract_segments(element: ET.Element) -> list[Segment]:
             time_attr = child.get("time", "250ms")
             duration_ms = _parse_time(time_attr)
             segments.append(BreakSegment(duration_ms=duration_ms))
+        elif child.tag == "voice":
+            # <voice name="speaker_name"> sets speaker for children
+            child_speaker = child.get("name") or speaker
+            segments.extend(_extract_segments(child, speaker=child_speaker))
         else:
             # Recursively process other elements
-            segments.extend(_extract_segments(child))
+            segments.extend(_extract_segments(child, speaker=speaker))
 
-        # Add tail text after this child
+        # Add tail text after this child (inherits parent speaker, not child's)
         if child.tail:
             text = child.tail.strip()
             if text:
-                segments.append(TextSegment(text=text))
+                segments.append(TextSegment(text=text, speaker=speaker))
 
     return segments
 
 
 def _merge_adjacent_text(segments: list[Segment]) -> list[Segment]:
-    """Merge adjacent TextSegments into single segments."""
+    """Merge adjacent TextSegments with the same speaker."""
     if not segments:
         return []
 
     merged: list[Segment] = []
     for seg in segments:
-        if isinstance(seg, TextSegment) and merged and isinstance(merged[-1], TextSegment):
-            merged[-1] = TextSegment(text=merged[-1].text + " " + seg.text)
+        if (
+            isinstance(seg, TextSegment)
+            and merged
+            and isinstance(merged[-1], TextSegment)
+            and merged[-1].speaker == seg.speaker
+        ):
+            merged[-1] = TextSegment(text=merged[-1].text + " " + seg.text, speaker=seg.speaker)
         else:
             merged.append(seg)
     return merged

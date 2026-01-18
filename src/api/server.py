@@ -186,6 +186,39 @@ def _resolve_model_for_speaker(speaker: str | None) -> tuple[str, str | None]:
     return _server_config.default_model, speaker
 
 
+def _resolve_lang_to_speaker(lang: str) -> str:
+    """Resolve a language code to a speaker label.
+
+    Uses lang_speaker_map for explicit mappings, then falls back to
+    checking speaker_routes for the language code itself.
+    """
+    lang_canonical = _normalize_locale(lang)
+
+    # Check explicit mapping first
+    if lang_canonical in _lang_speaker_map:
+        return _lang_speaker_map[lang_canonical]
+
+    # Build fallback chain
+    parts = lang_canonical.split("-")
+    base_lang = parts[0]
+    if len(parts) == 2:
+        if parts[0] == parts[1].lower():
+            # "fr-FR" -> just "fr"
+            candidates = [base_lang]
+        else:
+            # "en-GB" -> try "en-GB" first, then "en"
+            candidates = [lang_canonical, base_lang]
+    else:
+        candidates = [base_lang]
+
+    # Find first speaker that exists in routes
+    for cand in candidates:
+        if cand in _speaker_routes:
+            return cand
+
+    return candidates[0]
+
+
 def _synthesize_multilingual(
     text: str,
     noise_scale: Optional[float] = None,
@@ -219,35 +252,8 @@ def _synthesize_multilingual(
         if not seg_text:
             continue
 
-        # Determine language -> speaker
         lang = (seg.language if seg.language and seg.language != "und" else main_lang) or "en"
-        lang_canonical = _normalize_locale(lang)
-
-        # Check explicit mapping first
-        if lang_canonical in _lang_speaker_map:
-            speaker = _lang_speaker_map[lang_canonical]
-        else:
-            # Build fallback chain
-            parts = lang_canonical.split("-")
-            base_lang = parts[0]
-            if len(parts) == 2:
-                if parts[0] == parts[1].lower():
-                    # "fr-FR" -> just "fr"
-                    candidates = [base_lang]
-                else:
-                    # "en-GB" -> try "en-GB" first, then "en"
-                    candidates = [lang_canonical, base_lang]
-            else:
-                candidates = [base_lang]
-
-            # Find first speaker that exists in routes
-            speaker = candidates[0]
-            for cand in candidates:
-                if cand in _speaker_routes:
-                    speaker = cand
-                    break
-
-        # Route to model
+        speaker = _resolve_lang_to_speaker(lang)
         model_name, _ = _resolve_model_for_speaker(speaker)
 
         routing_plan.append({
@@ -293,22 +299,24 @@ def _synthesize_multilingual(
 
 def _synthesize_ssml(
     ssml_text: str,
-    model: Optional[str] = None,
-    speaker: Optional[str] = None,
+    global_speaker: Optional[str] = None,
     noise_scale: Optional[float] = None,
     length_scale: Optional[float] = None,
     noise_w: Optional[float] = None,
 ) -> tuple[np.ndarray, int]:
-    """Synthesize SSML text with break support.
+    """Synthesize SSML text with break and multilingual support.
+
+    Args:
+        ssml_text: SSML string to synthesize.
+        global_speaker: If set, overrides all segment speakers.
 
     Returns (audio, sample_rate).
     """
-    segments = parse_ssml(ssml_text)
+    global _splitter
+    if _splitter is None:
+        _splitter = MultilingualSplitter()
 
-    if model is None:
-        model, _ = _resolve_model_for_speaker(speaker)
-    inference = _get_inference(model)
-    sample_rate = inference.sample_rate
+    segments = parse_ssml(ssml_text)
 
     synth_kwargs = {}
     if noise_scale is not None:
@@ -318,20 +326,91 @@ def _synthesize_ssml(
     if noise_w is not None:
         synth_kwargs["noise_w"] = noise_w
 
-    audio_parts: list[np.ndarray] = []
+    # Build routing plan
+    routing_plan: list[dict] = []
 
     for seg in segments:
-        if isinstance(seg, TextSegment):
-            if seg.text.strip():
-                audio = inference.synthesize(
-                    text=seg.text,
-                    speaker=speaker,
-                    **synth_kwargs,
-                )
-                audio_parts.append(audio)
-        elif isinstance(seg, BreakSegment):
-            silence = generate_silence(seg.duration_ms, sample_rate)
+        if isinstance(seg, BreakSegment):
+            routing_plan.append({"type": "break", "duration_ms": seg.duration_ms})
+        elif isinstance(seg, TextSegment):
+            seg_text = seg.text.strip()
+            if not seg_text:
+                continue
+
+            # Determine speaker: global override > segment speaker > auto-detect
+            if global_speaker is not None:
+                # Global override
+                model_name, _ = _resolve_model_for_speaker(global_speaker)
+                routing_plan.append({
+                    "type": "text",
+                    "speaker": global_speaker,
+                    "model": model_name,
+                    "text": seg_text,
+                })
+            elif seg.speaker is not None:
+                # Segment-level speaker from <voice name="...">
+                model_name, _ = _resolve_model_for_speaker(seg.speaker)
+                routing_plan.append({
+                    "type": "text",
+                    "speaker": seg.speaker,
+                    "model": model_name,
+                    "text": seg_text,
+                })
+            else:
+                # Auto-detect: run through multilingual splitter
+                result = _splitter.split(seg_text)
+                main_lang = result.main_language or "en"
+
+                for lang_seg in result.segments:
+                    lang_text = lang_seg.text.strip()
+                    if not lang_text:
+                        continue
+
+                    lang = (lang_seg.language if lang_seg.language and lang_seg.language != "und" else main_lang) or "en"
+                    speaker = _resolve_lang_to_speaker(lang)
+                    model_name, _ = _resolve_model_for_speaker(speaker)
+
+                    routing_plan.append({
+                        "type": "text",
+                        "lang": lang,
+                        "speaker": speaker,
+                        "model": model_name,
+                        "text": lang_text,
+                    })
+
+    # Log routing plan (text segments only, truncated)
+    log_plan = []
+    for p in routing_plan:
+        if p["type"] == "text":
+            log_plan.append({
+                **{k: v for k, v in p.items() if k != "text"},
+                "text": p["text"][:50] + ("..." if len(p["text"]) > 50 else ""),
+            })
+        else:
+            log_plan.append(p)
+    _LOGGER.info("SSML routing: %s", json.dumps(log_plan, ensure_ascii=False))
+
+    # Synthesize
+    audio_parts: list[np.ndarray] = []
+    sample_rate = 22050
+
+    for plan in routing_plan:
+        if plan["type"] == "break":
+            silence = generate_silence(plan["duration_ms"], sample_rate)
             audio_parts.append(silence)
+        elif plan["type"] == "text":
+            speaker = plan["speaker"]
+            model_name = plan["model"]
+
+            inference = _get_inference(model_name)
+            sample_rate = inference.sample_rate
+
+            if speaker not in inference.speakers:
+                _LOGGER.warning("Speaker '%s' not in model '%s', using first available", speaker, model_name)
+                speaker = next(iter(inference.speakers.keys()))
+
+            audio = inference.synthesize_span(plan["text"], speaker=speaker, **synth_kwargs)
+            audio_parts.append(audio)
 
     if not audio_parts:
         return np.array([], dtype=np.int16), sample_rate
@@ -474,11 +553,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             synth_kwargs["noise_w"] = request.noise_w
 
         if request.ssml:
-            # SSML synthesis
+            # SSML synthesis (speaker param overrides all, otherwise auto-detect)
             audio, sample_rate = _synthesize_ssml(
                 request.ssml,
-                model=model,
-                speaker=request.speaker,
+                global_speaker=request.speaker,
                 **synth_kwargs,
             )
         elif request.speaker is None and model is None:
@@ -532,11 +610,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             synth_kwargs["noise_w"] = noise_w
 
         if ssml:
-            # SSML synthesis
+            # SSML synthesis (speaker param overrides all, otherwise auto-detect)
             audio, sample_rate = _synthesize_ssml(
                 ssml,
-                model=model,
-                speaker=speaker,
+                global_speaker=speaker,
                 **synth_kwargs,
             )
         elif speaker is None and model is None:
