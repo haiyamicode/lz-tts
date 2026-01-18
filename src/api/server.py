@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from ..multilingual_splitter import MultilingualSplitter
 from ..piper import PiperInference
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
 _LOGGER = logging.getLogger(__name__)
 
 # Default paths
@@ -49,15 +50,6 @@ class SpeakerInfo(BaseModel):
 
     label: str
     id: int
-
-
-class SpeakerRouteInfo(BaseModel):
-    """Speaker routing information."""
-
-    locale: str
-    speaker: str
-    model: str
-    speaker_id: int
 
 
 class ModelInfo(BaseModel):
@@ -327,6 +319,45 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             _speaker_routes = _build_speaker_routes(_server_config.model_priority)
             _LOGGER.info("Built speaker routes for %d speakers", len(_speaker_routes))
 
+        _LOGGER.info("Server ready")
+
+    @app.get("/")
+    async def health():
+        """Health check and server info."""
+        # Build speaker list with locale mappings
+        speakers = []
+        seen_locales: set[str] = set()
+
+        for locale, speaker in _lang_speaker_map.items():
+            if speaker in _speaker_routes:
+                model, sid = _speaker_routes[speaker]
+                speakers.append({
+                    "locale": locale,
+                    "speaker": speaker,
+                    "model": model,
+                    "speaker_id": sid,
+                })
+                seen_locales.add(locale)
+
+        for speaker, (model, sid) in _speaker_routes.items():
+            if speaker not in seen_locales:
+                speakers.append({
+                    "locale": speaker,
+                    "speaker": speaker,
+                    "model": model,
+                    "speaker_id": sid,
+                })
+
+        speakers.sort(key=lambda x: x["locale"])
+
+        return {
+            "status": "ok",
+            "version": "0.1.0",
+            "models_loaded": list(_inference_cache.keys()),
+            "default_model": _server_config.default_model,
+            "speakers": speakers,
+        }
+
     @app.get("/models", response_model=list[str])
     async def list_models():
         """List available models."""
@@ -347,36 +378,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         """List speakers for a specific model."""
         inference = _get_inference(model)
         return [SpeakerInfo(label=label, id=sid) for label, sid in inference.speakers.items()]
-
-    @app.get("/speakers", response_model=list[SpeakerRouteInfo])
-    async def list_speakers():
-        """List all locale codes and how they resolve to speakers/models."""
-        results = []
-        seen_locales: set[str] = set()
-
-        # First, add explicit mappings from lang_speaker_map
-        for locale, speaker in _lang_speaker_map.items():
-            if speaker in _speaker_routes:
-                model, sid = _speaker_routes[speaker]
-                results.append(SpeakerRouteInfo(
-                    locale=locale,
-                    speaker=speaker,
-                    model=model,
-                    speaker_id=sid,
-                ))
-                seen_locales.add(locale)
-
-        # Then, add all speakers that aren't covered by mappings
-        for speaker, (model, sid) in _speaker_routes.items():
-            if speaker not in seen_locales:
-                results.append(SpeakerRouteInfo(
-                    locale=speaker,
-                    speaker=speaker,
-                    model=model,
-                    speaker_id=sid,
-                ))
-
-        return sorted(results, key=lambda x: x.locale)
 
     @app.post("/synthesize")
     async def synthesize(
@@ -473,8 +474,7 @@ def run():
 
     import uvicorn
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
-
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
+    _LOGGER.info("Starting server at http://%s:%d", host, port)
     uvicorn.run("src.api.server:app", host=host, port=port, reload=False)
