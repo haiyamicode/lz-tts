@@ -6,12 +6,16 @@ Provides a minimal interface for running TTS inference using a Piper/VITS model 
 from __future__ import annotations
 
 import json
+import logging
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import torch
+
+_LOGGER = logging.getLogger(__name__)
 
 from .vits.lightning import VitsModel
 from .vits.utils import audio_float_to_int16
@@ -71,14 +75,16 @@ class PiperInference:
             self.device = torch.device(device)
 
         # Load model
+        _LOGGER.info("Loading model: %s", self.checkpoint_path.name)
         self.model = VitsModel.load_from_checkpoint(
             str(self.checkpoint_path), dataset=None
         )
         self.model.eval()
         self.model.to(self.device)
 
-        # Remove weight norm for inference
-        with torch.no_grad():
+        # Remove weight norm for inference (suppress warnings)
+        with torch.no_grad(), warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*Removing weight norm.*")
             self.model.model_g.dec.remove_weight_norm()
 
         # Setup BERT semantic tokenizer if model was trained with it
@@ -93,8 +99,17 @@ class PiperInference:
             )
 
             bert_model_name = getattr(self.model.hparams, "bert_model_name", None)
+            _LOGGER.info("Loading BERT tokenizer: %s", bert_model_name or "default")
             self.semantic_tokenizer = SemanticTokenizer(model_name=bert_model_name)
             self._build_bert_input = build_bert_input
+
+        _LOGGER.info(
+            "Model ready: %s (device=%s, speakers=%d, bert=%s)",
+            self.checkpoint_path.name,
+            self.device,
+            len(self.speakers),
+            self.use_bert,
+        )
 
     def phonemize(
         self,
@@ -126,6 +141,66 @@ class PiperInference:
             return phonemize_spans_with_speakers(
                 text, self.config_path, espeak_data_path
             )
+
+    def synthesize_span(
+        self,
+        text: str,
+        speaker: str,
+        noise_scale: Optional[float] = None,
+        length_scale: Optional[float] = None,
+        noise_w: Optional[float] = None,
+    ) -> np.ndarray:
+        """Synthesize a single text span with a specific speaker.
+
+        This is a lower-level method for multi-model synthesis where the caller
+        handles language detection and model routing.
+
+        Args:
+            text: Input text to synthesize.
+            speaker: Speaker label to use (must exist in this model).
+            noise_scale: Override for prosody randomness (default from config).
+            length_scale: Override for speech rate (default from config).
+            noise_w: Override for duration predictor noise (default from config).
+
+        Returns:
+            Audio waveform as int16 numpy array.
+        """
+        from .preprocess import phonemize_text_for_speaker
+
+        scales = [
+            noise_scale if noise_scale is not None else self.inference_config.noise_scale,
+            length_scale if length_scale is not None else self.inference_config.length_scale,
+            noise_w if noise_w is not None else self.inference_config.noise_w,
+        ]
+
+        span = phonemize_text_for_speaker(text, self.config_path, speaker, None)
+        phoneme_ids = span["phoneme_ids"]
+        speaker_id = span.get("speaker_id", 0)
+
+        with torch.no_grad():
+            text_tensor = torch.LongTensor(phoneme_ids).unsqueeze(0).to(self.device)
+            text_lengths = torch.LongTensor([len(phoneme_ids)]).to(self.device)
+            sid = torch.LongTensor([speaker_id]).to(self.device)
+
+            bert_input = None
+            if self.use_bert and self.semantic_tokenizer and text:
+                bert_dict = self._build_bert_input([text], self.semantic_tokenizer)
+                if bert_dict is not None:
+                    bert_input = {
+                        "input_ids": bert_dict["input_ids"].to(self.device),
+                        "attention_mask": bert_dict["attention_mask"].to(self.device),
+                    }
+
+            audio = self.model(
+                text_tensor, text_lengths, scales, sid=sid, bert_input=bert_input
+            )
+            audio = audio.detach().cpu().numpy()
+            audio = audio_float_to_int16(audio)
+
+            if audio.ndim > 1:
+                audio = audio.reshape(-1)
+
+        return audio
 
     def synthesize(
         self,

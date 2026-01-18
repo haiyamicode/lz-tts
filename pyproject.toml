@@ -27,7 +27,11 @@ dependencies = [
     "mecab-ko-dic>=1.0.0,<1.1",
     "ipadic>=1.0.0,<1.1",
     "jieba>=0.42.0,<0.43",
+    # API server
+    "fastapi>=0.115.0,<0.116",
+    "uvicorn>=0.34.0,<0.35",
 ]
 
 [project.scripts]
 lz-tts = "main:main"
+lz-tts-server = "src.api.server:run"
