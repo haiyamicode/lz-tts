@@ -162,10 +162,11 @@ def _normalize_text_for_voice(text: str, voice: str) -> str:
     v = (voice or "").lower()
 
     if v.startswith("ja"):
-        from fugashi import Tagger
+        import ipadic
+        from fugashi import GenericTagger
         from pykakasi import kakasi
 
-        tagger = Tagger()
+        tagger = GenericTagger(ipadic.MECAB_ARGS)
         parts = []
         for token in tagger(norm_text):
             surf = token.surface

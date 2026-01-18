@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from ..multilingual_splitter import MultilingualSplitter
 from ..piper import PiperInference
+from ..ssml import BreakSegment, TextSegment, generate_silence, parse_ssml
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
 _LOGGER = logging.getLogger(__name__)
@@ -37,12 +38,12 @@ class ServerConfig(BaseModel):
 class SynthesizeRequest(BaseModel):
     """Request body for text synthesis."""
 
-    text: str = Field(..., description="Text to synthesize")
-    speaker: Optional[str] = Field(None, description="Speaker label (uses auto-detection if not specified)")
+    text: Optional[str] = Field(None, description="Plain text to synthesize (mutually exclusive with ssml)")
+    ssml: Optional[str] = Field(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)")
+    speaker: Optional[str] = Field(None, description="Speaker label (overrides auto language detection)")
     noise_scale: Optional[float] = Field(None, description="Prosody randomness")
     length_scale: Optional[float] = Field(None, description="Speech rate multiplier (>1 = slower)")
     noise_w: Optional[float] = Field(None, description="Duration predictor noise")
-    multilingual: bool = Field(False, description="Enable multi-model routing for mixed-language text")
 
 
 class SpeakerInfo(BaseModel):
@@ -203,11 +204,6 @@ def _synthesize_multilingual(
     segments = result.segments
     main_lang = result.main_language or "en"
 
-    _LOGGER.debug("Multilingual split: %d segments, main_lang=%s", len(segments), main_lang)
-
-    audio_parts: list[np.ndarray] = []
-    sample_rate = 22050  # Will be set from first model
-
     synth_kwargs = {}
     if noise_scale is not None:
         synth_kwargs["noise_scale"] = noise_scale
@@ -216,6 +212,8 @@ def _synthesize_multilingual(
     if noise_w is not None:
         synth_kwargs["noise_w"] = noise_w
 
+    # First pass: compute routing plan
+    routing_plan: list[dict] = []
     for seg in segments:
         seg_text = seg.text.strip()
         if not seg_text:
@@ -251,19 +249,89 @@ def _synthesize_multilingual(
 
         # Route to model
         model_name, _ = _resolve_model_for_speaker(speaker)
+
+        routing_plan.append({
+            "lang": lang,
+            "speaker": speaker,
+            "model": model_name,
+            "text": seg_text,
+        })
+
+    _LOGGER.info("Multilingual routing: %s", json.dumps([
+        {**p, "text": p["text"][:50] + ("..." if len(p["text"]) > 50 else "")}
+        for p in routing_plan
+    ], ensure_ascii=False))
+
+    # Second pass: synthesize
+    audio_parts: list[np.ndarray] = []
+    sample_rate = 22050
+
+    for plan in routing_plan:
+        seg_text = plan["text"]
+        speaker = plan["speaker"]
+        model_name = plan["model"]
+
         inference = _get_inference(model_name)
         sample_rate = inference.sample_rate
-
-        _LOGGER.debug("Segment: lang=%s speaker=%s model=%s text='%s'", lang, speaker, model_name, seg_text[:50])
 
         # Check if speaker exists in this model
         if speaker not in inference.speakers:
             _LOGGER.warning("Speaker '%s' not in model '%s', using first available", speaker, model_name)
             speaker = next(iter(inference.speakers.keys()))
 
-        # Synthesize this segment
         audio = inference.synthesize_span(seg_text, speaker=speaker, **synth_kwargs)
         audio_parts.append(audio)
+
+    if not audio_parts:
+        return np.array([], dtype=np.int16), sample_rate
+
+    if len(audio_parts) == 1:
+        return audio_parts[0], sample_rate
+
+    return np.concatenate(audio_parts, axis=0), sample_rate
+
+
+def _synthesize_ssml(
+    ssml_text: str,
+    model: Optional[str] = None,
+    speaker: Optional[str] = None,
+    noise_scale: Optional[float] = None,
+    length_scale: Optional[float] = None,
+    noise_w: Optional[float] = None,
+) -> tuple[np.ndarray, int]:
+    """Synthesize SSML text with break support.
+
+    Returns (audio, sample_rate).
+    """
+    segments = parse_ssml(ssml_text)
+
+    if model is None:
+        model, _ = _resolve_model_for_speaker(speaker)
+    inference = _get_inference(model)
+    sample_rate = inference.sample_rate
+
+    synth_kwargs = {}
+    if noise_scale is not None:
+        synth_kwargs["noise_scale"] = noise_scale
+    if length_scale is not None:
+        synth_kwargs["length_scale"] = length_scale
+    if noise_w is not None:
+        synth_kwargs["noise_w"] = noise_w
+
+    audio_parts: list[np.ndarray] = []
+
+    for seg in segments:
+        if isinstance(seg, TextSegment):
+            if seg.text.strip():
+                audio = inference.synthesize(
+                    text=seg.text,
+                    speaker=speaker,
+                    **synth_kwargs,
+                )
+                audio_parts.append(audio)
+        elif isinstance(seg, BreakSegment):
+            silence = generate_silence(seg.duration_ms, sample_rate)
+            audio_parts.append(silence)
 
     if not audio_parts:
         return np.array([], dtype=np.int16), sample_rate
@@ -382,15 +450,21 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     @app.post("/synthesize")
     async def synthesize(
         request: SynthesizeRequest,
-        model: str = Query(None, description="Model to use (overrides speaker routing)"),
+        model: str = Query(None, description="Model to use (overrides auto routing)"),
     ):
-        """Synthesize text to speech.
+        """Synthesize text or SSML to speech.
 
-        If multilingual=true, splits text by language and routes each segment
-        to the appropriate model based on detected language.
+        Provide either `text` (plain text) or `ssml` (SSML with <speak> wrapper), not both.
 
-        If model is not specified, routes based on speaker label using model_priority config.
+        By default, text is split by language and routed to appropriate speakers automatically.
+        Specify `speaker` to override and use a single speaker for the entire text.
         """
+        # Validate exactly one of text or ssml is provided
+        if request.text and request.ssml:
+            raise HTTPException(status_code=400, detail="Provide either 'text' or 'ssml', not both")
+        if not request.text and not request.ssml:
+            raise HTTPException(status_code=400, detail="Must provide either 'text' or 'ssml'")
+
         synth_kwargs = {}
         if request.noise_scale is not None:
             synth_kwargs["noise_scale"] = request.noise_scale
@@ -399,8 +473,16 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if request.noise_w is not None:
             synth_kwargs["noise_w"] = request.noise_w
 
-        if request.multilingual and model is None and request.speaker is None:
-            # Multi-model synthesis
+        if request.ssml:
+            # SSML synthesis
+            audio, sample_rate = _synthesize_ssml(
+                request.ssml,
+                model=model,
+                speaker=request.speaker,
+                **synth_kwargs,
+            )
+        elif request.speaker is None and model is None:
+            # Auto multilingual synthesis (default)
             audio, sample_rate = _synthesize_multilingual(request.text, **synth_kwargs)
         else:
             # Single-model synthesis
@@ -420,21 +502,27 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     @app.get("/synthesize")
     async def synthesize_get(
-        text: str = Query(..., description="Text to synthesize"),
-        model: str = Query(None, description="Model to use (overrides speaker routing)"),
-        speaker: Optional[str] = Query(None, description="Speaker label"),
-        multilingual: bool = Query(False, description="Enable multi-model routing for mixed-language text"),
+        text: Optional[str] = Query(None, description="Plain text to synthesize (mutually exclusive with ssml)"),
+        ssml: Optional[str] = Query(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)"),
+        model: str = Query(None, description="Model to use (overrides auto routing)"),
+        speaker: Optional[str] = Query(None, description="Speaker label (overrides auto language detection)"),
         noise_scale: Optional[float] = Query(None, description="Prosody randomness"),
         length_scale: Optional[float] = Query(None, description="Speech rate multiplier"),
         noise_w: Optional[float] = Query(None, description="Duration predictor noise"),
     ):
-        """Synthesize text to speech (GET endpoint for easy testing).
+        """Synthesize text or SSML to speech (GET endpoint for easy testing).
 
-        If multilingual=true, splits text by language and routes each segment
-        to the appropriate model based on detected language.
+        Provide either `text` (plain text) or `ssml` (SSML with <speak> wrapper), not both.
 
-        If model is not specified, routes based on speaker label using model_priority config.
+        By default, text is split by language and routed to appropriate speakers automatically.
+        Specify `speaker` to override and use a single speaker for the entire text.
         """
+        # Validate exactly one of text or ssml is provided
+        if text and ssml:
+            raise HTTPException(status_code=400, detail="Provide either 'text' or 'ssml', not both")
+        if not text and not ssml:
+            raise HTTPException(status_code=400, detail="Must provide either 'text' or 'ssml'")
+
         synth_kwargs = {}
         if noise_scale is not None:
             synth_kwargs["noise_scale"] = noise_scale
@@ -443,11 +531,19 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if noise_w is not None:
             synth_kwargs["noise_w"] = noise_w
 
-        if multilingual and model is None and speaker is None:
-            # Multi-model synthesis
+        if ssml:
+            # SSML synthesis
+            audio, sample_rate = _synthesize_ssml(
+                ssml,
+                model=model,
+                speaker=speaker,
+                **synth_kwargs,
+            )
+        elif speaker is None and model is None:
+            # Auto multilingual synthesis (default)
             audio, sample_rate = _synthesize_multilingual(text, **synth_kwargs)
         else:
-            # Single-model synthesis
+            # Single-speaker synthesis
             if model is None:
                 model, _ = _resolve_model_for_speaker(speaker)
             inference = _get_inference(model)
