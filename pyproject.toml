@@ -31,6 +31,8 @@ dependencies = [
     "fastapi>=0.115.0,<0.116",
     "uvicorn>=0.34.0,<0.35",
     "pydub>=0.25.1",
+    "boto3>=1.42.30",
+    "python-dotenv>=1.2.1",
 ]
 
 [project.scripts]
