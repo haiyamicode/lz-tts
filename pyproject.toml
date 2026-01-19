@@ -3,7 +3,7 @@ name = "lz-tts"
 version = "0.1.0"
 description = "Minimal Piper TTS inference pipeline"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.10.12"
 dependencies = [
     "numpy>=1.26.0,<1.27",
     "torch==1.13.1",
@@ -30,6 +30,7 @@ dependencies = [
     # API server
     "fastapi>=0.115.0,<0.116",
     "uvicorn>=0.34.0,<0.35",
+    "pydub>=0.25.1",
 ]
 
 [project.scripts]

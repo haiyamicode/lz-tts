@@ -7,12 +7,13 @@ import json
 import logging
 import wave
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from pydub import AudioSegment
 
 from ..multilingual_splitter import MultilingualSplitter
 from ..piper import PiperInference
@@ -41,6 +42,7 @@ class SynthesizeRequest(BaseModel):
     text: Optional[str] = Field(None, description="Plain text to synthesize (mutually exclusive with ssml)")
     ssml: Optional[str] = Field(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)")
     speaker: Optional[str] = Field(None, description="Speaker label (overrides auto language detection)")
+    format: Literal["wav", "mp3"] = Field("wav", description="Output audio format (wav or mp3)")
     noise_scale: Optional[float] = Field(None, description="Prosody randomness")
     length_scale: Optional[float] = Field(None, description="Speech rate multiplier (>1 = slower)")
     noise_w: Optional[float] = Field(None, description="Duration predictor noise")
@@ -432,6 +434,30 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     return buffer.getvalue()
 
 
+def _audio_to_mp3_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
+    """Convert audio array to MP3 bytes with highest quality settings."""
+    # First convert to WAV in memory
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)  # 16-bit
+        wav.setframerate(sample_rate)
+        wav.writeframes(audio.tobytes())
+    wav_buffer.seek(0)
+
+    # Convert WAV to MP3 using pydub with highest quality
+    # Use 320kbps CBR (constant bitrate) for maximum quality
+    audio_segment = AudioSegment.from_wav(wav_buffer)
+    mp3_buffer = io.BytesIO()
+    audio_segment.export(
+        mp3_buffer,
+        format="mp3",
+        bitrate="320k",
+        parameters=["-q:a", "0"]  # Highest quality VBR setting
+    )
+    return mp3_buffer.getvalue()
+
+
 def create_app(config: ServerConfig | None = None) -> FastAPI:
     """Create the FastAPI application."""
     global _server_config, _speaker_routes
@@ -575,8 +601,15 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             )
             sample_rate = inference.sample_rate
 
-        wav_bytes = _audio_to_wav_bytes(audio, sample_rate)
-        return Response(content=wav_bytes, media_type="audio/wav")
+        # Convert to requested format
+        if request.format == "mp3":
+            audio_bytes = _audio_to_mp3_bytes(audio, sample_rate)
+            media_type = "audio/mpeg"
+        else:
+            audio_bytes = _audio_to_wav_bytes(audio, sample_rate)
+            media_type = "audio/wav"
+
+        return Response(content=audio_bytes, media_type=media_type)
 
     @app.get("/synthesize")
     async def synthesize_get(
@@ -584,6 +617,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         ssml: Optional[str] = Query(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)"),
         model: str = Query(None, description="Model to use (overrides auto routing)"),
         speaker: Optional[str] = Query(None, description="Speaker label (overrides auto language detection)"),
+        format: Literal["wav", "mp3"] = Query("wav", description="Output audio format (wav or mp3)"),
         noise_scale: Optional[float] = Query(None, description="Prosody randomness"),
         length_scale: Optional[float] = Query(None, description="Speech rate multiplier"),
         noise_w: Optional[float] = Query(None, description="Duration predictor noise"),
@@ -632,8 +666,15 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             )
             sample_rate = inference.sample_rate
 
-        wav_bytes = _audio_to_wav_bytes(audio, sample_rate)
-        return Response(content=wav_bytes, media_type="audio/wav")
+        # Convert to requested format
+        if format == "mp3":
+            audio_bytes = _audio_to_mp3_bytes(audio, sample_rate)
+            media_type = "audio/mpeg"
+        else:
+            audio_bytes = _audio_to_wav_bytes(audio, sample_rate)
+            media_type = "audio/wav"
+
+        return Response(content=audio_bytes, media_type=media_type)
 
     return app
 
