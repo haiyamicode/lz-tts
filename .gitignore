@@ -13,3 +13,8 @@ wheels/
 local
 output
 data
+
+# IDE files
+.claude
+.vscode
+.idea
