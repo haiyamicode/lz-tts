@@ -531,6 +531,107 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "speakers": speakers,
         }
 
+    @app.get("/llms.txt", response_class=Response)
+    async def llms_txt():
+        """LLM-readable API documentation."""
+        content = """# LZ-TTS API Documentation for LLMs
+
+This is a text-to-speech API that converts text to audio using Piper TTS models.
+
+## Base URL
+http://localhost:8000 (or your deployed URL)
+
+## Main Endpoint: /synthesize
+
+### POST /synthesize
+Synthesize text or SSML to speech audio.
+
+Request Body (JSON):
+{
+  "text": "Text to synthesize",           // Plain text (mutually exclusive with ssml)
+  "ssml": "<speak>SSML content</speak>", // SSML format (mutually exclusive with text)
+  "speaker": "en-US",                    // Optional: speaker/language code
+  "format": "mp3",                       // Optional: "wav" (default) or "mp3"
+  "noise_scale": 0.667,                  // Optional: prosody randomness (default: 0.667)
+  "length_scale": 1.0,                   // Optional: speech rate (>1 = slower, default: 1.0)
+  "noise_w": 0.8                         // Optional: duration predictor noise (default: 0.8)
+}
+
+Response: Binary audio data (audio/wav or audio/mpeg)
+
+### GET /synthesize
+Same as POST but with query parameters for easy testing.
+
+Query Parameters:
+- text: Plain text to synthesize (mutually exclusive with ssml)
+- ssml: SSML to synthesize (mutually exclusive with text)
+- speaker: Speaker/language code (optional)
+- format: "wav" or "mp3" (optional, default: "wav")
+- noise_scale: Prosody randomness (optional)
+- length_scale: Speech rate multiplier (optional)
+- noise_w: Duration predictor noise (optional)
+- model: Specific model to use (optional, overrides auto routing)
+
+## Audio Format Support
+- WAV: Lossless, default format
+- MP3: 320kbps CBR with highest quality settings (-q:a 0)
+
+## Multilingual Support
+The API automatically detects languages and routes to appropriate speakers.
+You can override this by specifying a speaker parameter.
+
+## SSML Support
+Use SSML for advanced control:
+- <speak>: Root element (required)
+- <voice name="speaker">: Change speaker
+- <break time="500ms"/>: Insert pauses
+
+Example SSML:
+<speak>
+  <voice name="en-US">Hello</voice>
+  <break time="500ms"/>
+  <voice name="ja">こんにちは</voice>
+</speak>
+
+## Other Endpoints
+
+GET /: Health check and server info
+GET /models: List available models
+GET /models/{model}: Get model information
+GET /models/{model}/speakers: List speakers for a model
+
+## Example Usage
+
+# Simple text to MP3
+curl -X POST "http://localhost:8000/synthesize" \\
+  -H "Content-Type: application/json" \\
+  -d '{"text": "Hello world", "format": "mp3"}' \\
+  -o output.mp3
+
+# GET request with text
+curl "http://localhost:8000/synthesize?text=Hello+world&format=mp3" -o output.mp3
+
+# Multilingual SSML
+curl -X POST "http://localhost:8000/synthesize" \\
+  -H "Content-Type: application/json" \\
+  -d '{"ssml": "<speak>Hello <break time=\\"500ms\\"/> こんにちは</speak>", "format": "mp3"}' \\
+  -o output.mp3
+
+# Custom speech parameters
+curl -X POST "http://localhost:8000/synthesize" \\
+  -H "Content-Type: application/json" \\
+  -d '{"text": "Slower speech", "length_scale": 1.5, "format": "mp3"}' \\
+  -o output.mp3
+
+## Notes
+- Provide either 'text' OR 'ssml', not both
+- Default format is WAV (lossless)
+- MP3 format requires ffmpeg to be installed on the server
+- Automatic language detection and speaker routing when speaker is not specified
+- Speaker parameter overrides automatic language detection
+"""
+        return Response(content=content, media_type="text/plain")
+
     @app.get("/models", response_model=list[str])
     async def list_models():
         """List available models."""
