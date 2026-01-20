@@ -77,7 +77,7 @@ class PiperInference:
         # Load model
         _LOGGER.info("Loading model: %s", self.checkpoint_path.name)
         self.model = VitsModel.load_from_checkpoint(
-            str(self.checkpoint_path), dataset=None
+            str(self.checkpoint_path), dataset=None, weights_only=False
         )
         self.model.eval()
         self.model.to(self.device)

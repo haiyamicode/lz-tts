@@ -157,6 +157,9 @@ class VitsModel(pl.LightningModule):
         # Lazily-initialized semantic tokenizer (only when use_bert=True)
         self._semantic_tokenizer = None
 
+        # Enable manual optimization for multiple optimizers (Lightning 2.0+)
+        self.automatic_optimization = False
+
         if use_bert:
             _LOGGER.info(
                 "Semantic encoder enabled: model=%s fusion_weight=%s",
@@ -233,12 +236,25 @@ class VitsModel(pl.LightningModule):
             batch_size=self.hparams.batch_size,
         )
 
-    def training_step(self, batch: Batch, batch_idx: int, optimizer_idx: int):
-        if optimizer_idx == 0:
-            return self.training_step_g(batch)
+    def training_step(self, batch: Batch, batch_idx: int):
+        # Manual optimization for multiple optimizers (Lightning 2.0+)
+        g_opt, d_opt = self.optimizers()
 
-        if optimizer_idx == 1:
-            return self.training_step_d(batch)
+        # Generator step
+        loss_gen_all = self.training_step_g(batch)
+        g_opt.zero_grad()
+        self.manual_backward(loss_gen_all)
+        if self.hparams.grad_clip:
+            self.clip_gradients(g_opt, gradient_clip_val=self.hparams.grad_clip)
+        g_opt.step()
+
+        # Discriminator step
+        loss_disc_all = self.training_step_d(batch)
+        d_opt.zero_grad()
+        self.manual_backward(loss_disc_all)
+        if self.hparams.grad_clip:
+            self.clip_gradients(d_opt, gradient_clip_val=self.hparams.grad_clip)
+        d_opt.step()
 
     def training_step_g(self, batch: Batch):
         x, x_lengths, y, _, spec, spec_lengths, speaker_ids = (
@@ -399,30 +415,34 @@ class VitsModel(pl.LightningModule):
         return val_loss
 
     def configure_optimizers(self):
-        optimizers = [
-            torch.optim.AdamW(
-                self.model_g.parameters(),
-                lr=self.hparams.learning_rate,
-                betas=self.hparams.betas,
-                eps=self.hparams.eps,
-            ),
-            torch.optim.AdamW(
-                self.model_d.parameters(),
-                lr=self.hparams.learning_rate,
-                betas=self.hparams.betas,
-                eps=self.hparams.eps,
-            ),
-        ]
-        schedulers = [
-            torch.optim.lr_scheduler.ExponentialLR(
-                optimizers[0], gamma=self.hparams.lr_decay
-            ),
-            torch.optim.lr_scheduler.ExponentialLR(
-                optimizers[1], gamma=self.hparams.lr_decay
-            ),
-        ]
+        g_opt = torch.optim.AdamW(
+            self.model_g.parameters(),
+            lr=self.hparams.learning_rate,
+            betas=self.hparams.betas,
+            eps=self.hparams.eps,
+        )
+        d_opt = torch.optim.AdamW(
+            self.model_d.parameters(),
+            lr=self.hparams.learning_rate,
+            betas=self.hparams.betas,
+            eps=self.hparams.eps,
+        )
 
-        return optimizers, schedulers
+        g_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            g_opt, gamma=self.hparams.lr_decay
+        )
+        d_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            d_opt, gamma=self.hparams.lr_decay
+        )
+
+        return [g_opt, d_opt], [g_scheduler, d_scheduler]
+
+    def on_train_epoch_end(self):
+        # Manually step schedulers with manual optimization
+        schedulers = self.lr_schedulers()
+        if schedulers:
+            for scheduler in schedulers:
+                scheduler.step()
 
     @staticmethod
     def add_model_specific_args(parent_parser):
