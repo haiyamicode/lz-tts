@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Upload model data files to Wasabi S3
+Upload data files to Wasabi S3
+
+Uploads model data and server configuration (local/server.json) to S3.
 
 Usage:
-    uv run python scripts/upload_models.py
-    uv run python scripts/upload_models.py --model lzspeech-enzhja-1000-bert
-    uv run python scripts/upload_models.py --data-dir ./data
+    uv run python scripts/upload_data.py
+    uv run python scripts/upload_data.py --model lzspeech-enzhja-1000-bert
+    uv run python scripts/upload_data.py --data-dir ./data
 """
 import argparse
 import os
@@ -32,7 +34,7 @@ def get_s3_client():
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Upload LZ-TTS model data to Wasabi S3"
+        description="Upload LZ-TTS data (models and server config) to Wasabi S3"
     )
     parser.add_argument(
         "--data-dir",
@@ -144,6 +146,21 @@ def upload_data_to_s3(
                 skipped += 1
             elif result == "failed":
                 failed += 1
+
+    # Upload server.json configuration file
+    print("\n=== Uploading server configuration ===")
+    local_server_config = Path("local/server.json")
+    if local_server_config.exists():
+        server_config_s3_key = f"{s3_data_path}/server.json"
+        result = upload_file(s3_client, local_server_config, bucket, server_config_s3_key, "server.json", force)
+        if result == "uploaded":
+            uploaded += 1
+        elif result == "skipped":
+            skipped += 1
+        elif result == "failed":
+            failed += 1
+    else:
+        print("local/server.json not found (skipping)")
 
     print()
     print(f"Upload complete: {uploaded} uploaded, {skipped} skipped, {failed} failed")

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Download (sync) model data files from Wasabi S3
+Download (sync) data files from Wasabi S3
+
+Downloads model data and server configuration (local/server.json) from S3.
 
 Usage:
-    uv run python scripts/download_models.py
-    uv run python scripts/download_models.py --filter lzspeech
-    uv run python scripts/download_models.py --data-dir ./data
+    uv run python scripts/download_data.py
+    uv run python scripts/download_data.py --filter lzspeech
+    uv run python scripts/download_data.py --data-dir ./data
 """
 import argparse
 import os
@@ -33,7 +35,7 @@ def get_s3_client():
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Download LZ-TTS model data from Wasabi S3."
+        description="Download LZ-TTS data (models and server config) from Wasabi S3."
     )
     parser.add_argument(
         "--data-dir",
@@ -162,6 +164,26 @@ def sync_data_from_s3(
 
         print()
         print(f"Download complete: {downloaded} downloaded, {skipped} skipped, {failed} failed")
+
+        # Download server.json configuration file
+        print("\n=== Downloading server configuration ===")
+        server_config_s3_key = f"{s3_data_path}/server.json"
+        local_server_config = Path("local/server.json")
+        local_server_config.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Check if server.json exists in S3
+            s3_client.head_object(Bucket=bucket, Key=server_config_s3_key)
+            print(f"Downloading server.json...", end=" ", flush=True)
+            if download_file(s3_client, bucket, server_config_s3_key, local_server_config):
+                print("done")
+            else:
+                print("FAILED (non-fatal)")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                print("server.json not found in S3 (skipping)")
+            else:
+                print(f"Error checking server.json: {e}")
 
         return 0 if failed == 0 else 1
 

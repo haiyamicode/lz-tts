@@ -175,50 +175,29 @@ def _build_speaker_routes(model_priority: list[str]) -> dict[str, tuple[str, int
     return routes
 
 
-def _resolve_model_for_speaker(speaker: str | None) -> tuple[str, str | None]:
-    """Resolve which model to use for a given speaker.
+def _resolve_speaker_and_model(input_speaker: str | None) -> tuple[str | None, str]:
+    """Resolve speaker to actual speaker label and model name.
 
-    Returns (model_name, speaker_label). If speaker is None or not found in routes,
-    falls back to default model.
+    Simple two-step lookup:
+    1. Check lang_speaker_map for alias resolution (e.g., "en-US" → "en")
+    2. Check speaker_routes for model selection
+
+    Returns (speaker, model_name).
     """
-    if speaker and speaker in _speaker_routes:
+    if input_speaker is None:
+        return None, _server_config.default_model
+
+    # Step 1: Resolve alias through lang_speaker_map
+    normalized = _normalize_locale(input_speaker)
+    speaker = _lang_speaker_map.get(normalized, normalized)
+
+    # Step 2: Find model in speaker_routes
+    if speaker in _speaker_routes:
         model_name, _ = _speaker_routes[speaker]
-        return model_name, speaker
+        return speaker, model_name
 
-    return _server_config.default_model, speaker
-
-
-def _resolve_lang_to_speaker(lang: str) -> str:
-    """Resolve a language code to a speaker label.
-
-    Uses lang_speaker_map for explicit mappings, then falls back to
-    checking speaker_routes for the language code itself.
-    """
-    lang_canonical = _normalize_locale(lang)
-
-    # Check explicit mapping first
-    if lang_canonical in _lang_speaker_map:
-        return _lang_speaker_map[lang_canonical]
-
-    # Build fallback chain
-    parts = lang_canonical.split("-")
-    base_lang = parts[0]
-    if len(parts) == 2:
-        if parts[0] == parts[1].lower():
-            # "fr-FR" -> just "fr"
-            candidates = [base_lang]
-        else:
-            # "en-GB" -> try "en-GB" first, then "en"
-            candidates = [lang_canonical, base_lang]
-    else:
-        candidates = [base_lang]
-
-    # Find first speaker that exists in routes
-    for cand in candidates:
-        if cand in _speaker_routes:
-            return cand
-
-    return candidates[0]
+    # Fallback to default model
+    return speaker, _server_config.default_model
 
 
 def _synthesize_multilingual(
@@ -255,8 +234,7 @@ def _synthesize_multilingual(
             continue
 
         lang = (seg.language if seg.language and seg.language != "und" else main_lang) or "en"
-        speaker = _resolve_lang_to_speaker(lang)
-        model_name, _ = _resolve_model_for_speaker(speaker)
+        speaker, model_name = _resolve_speaker_and_model(lang)
 
         routing_plan.append({
             "lang": lang,
@@ -342,7 +320,7 @@ def _synthesize_ssml(
             # Determine speaker: global override > segment speaker > auto-detect
             if global_speaker is not None:
                 # Global override
-                model_name, _ = _resolve_model_for_speaker(global_speaker)
+                global_speaker, model_name = _resolve_speaker_and_model(global_speaker)
                 routing_plan.append({
                     "type": "text",
                     "speaker": global_speaker,
@@ -351,10 +329,10 @@ def _synthesize_ssml(
                 })
             elif seg.speaker is not None:
                 # Segment-level speaker from <voice name="...">
-                model_name, _ = _resolve_model_for_speaker(seg.speaker)
+                resolved_speaker, model_name = _resolve_speaker_and_model(seg.speaker)
                 routing_plan.append({
                     "type": "text",
-                    "speaker": seg.speaker,
+                    "speaker": resolved_speaker,
                     "model": model_name,
                     "text": seg_text,
                 })
@@ -692,7 +670,9 @@ curl -X POST "http://localhost:8000/synthesize" \\
         else:
             # Single-model synthesis
             if model is None:
-                model, _ = _resolve_model_for_speaker(request.speaker)
+                request_speaker, model = _resolve_speaker_and_model(request.speaker)
+                # Use the resolved speaker instead of the original input
+                request.speaker = request_speaker
             inference = _get_inference(model)
 
             audio = inference.synthesize(
@@ -757,7 +737,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
         else:
             # Single-speaker synthesis
             if model is None:
-                model, _ = _resolve_model_for_speaker(speaker)
+                speaker, model = _resolve_speaker_and_model(speaker)
             inference = _get_inference(model)
 
             audio = inference.synthesize(
