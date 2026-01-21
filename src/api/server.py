@@ -347,8 +347,7 @@ def _synthesize_ssml(
                         continue
 
                     lang = (lang_seg.language if lang_seg.language and lang_seg.language != "und" else main_lang) or "en"
-                    speaker = _resolve_lang_to_speaker(lang)
-                    model_name, _ = _resolve_model_for_speaker(speaker)
+                    speaker, model_name = _resolve_speaker_and_model(lang)
 
                     routing_plan.append({
                         "type": "text",
