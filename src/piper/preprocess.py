@@ -7,9 +7,23 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from piper_phonemize import phonemize_espeak, phoneme_ids_espeak, tashkeel_run
+from piper_phonemize import phonemize_espeak as _phonemize_espeak_raw, phoneme_ids_espeak, tashkeel_run
 
 from ..multilingual_splitter import MultilingualSplitter
+
+
+def _phonemize_espeak_with_reset(text: str, voice: str, data_path) -> list:
+    """Wrapper around phonemize_espeak that resets espeak state after each call.
+
+    espeak-ng has a bug where processing text with consecutive periods (..)
+    corrupts internal state, causing "dot" to be prepended to the NEXT call's output.
+    Switching voices resets this state.
+    """
+    result = _phonemize_espeak_raw(text, voice, data_path)
+    # Reset espeak state by switching to a different voice
+    # This prevents the ".." bug from affecting subsequent calls
+    _phonemize_espeak_raw("", "de", data_path)
+    return result
 
 _DEBUG = os.environ.get("PREPROCESS_DEBUG", "").lower() in ("1", "true", "yes")
 if _DEBUG:
@@ -230,7 +244,7 @@ def _phonemize_multilingual(
 
         _LOGGER.debug("span[%s]: lang=%s voice=%s text='%s'", idx, lang, voice, _short_text(span_text, 80))
 
-        span_phoneme_sents = phonemize_espeak(casing_fn(span_text), voice, espeak_data)
+        span_phoneme_sents = _phonemize_espeak_with_reset(casing_fn(span_text), voice, espeak_data)
         span_phonemes = [p for sp in span_phoneme_sents for p in sp]
 
         _LOGGER.debug("span[%s] phonemes=%s", idx, _short_list(span_phonemes, 32))
@@ -272,7 +286,7 @@ def phonemize_text_for_infer(
         voice = _map_cld2_to_espeak(voice, primary)
         norm_text = _normalize_text_for_voice(text, voice)
         _LOGGER.debug("infer: voice=%s text='%s'", voice, _short_text(norm_text, 120))
-        sent_ph = phonemize_espeak(casing(norm_text), voice, espeak_data)
+        sent_ph = _phonemize_espeak_with_reset(casing(norm_text), voice, espeak_data)
         phonemes = [p for sent in sent_ph for p in sent]
 
     _LOGGER.debug("infer: phonemes=%s", _short_list(phonemes, 48))
@@ -355,7 +369,7 @@ def phonemize_spans_with_speakers(
 
         _LOGGER.debug("infer-multispan: lang=%s voice=%s spk_label=%s spk_id=%s", lang, voice, spk_label, spk_id)
 
-        ph_sent = phonemize_espeak(casing(span_text), voice, espeak_data)
+        ph_sent = _phonemize_espeak_with_reset(casing(span_text), voice, espeak_data)
         ph = [p for s in ph_sent for p in s]
 
         _LOGGER.debug("infer-multispan: phonemes=%s", _short_list(ph, 40))
@@ -397,7 +411,7 @@ def phonemize_text_for_speaker(
 
     _LOGGER.debug("infer-forced: text='%s'", _short_text(norm_text, 120))
 
-    ph_sents = phonemize_espeak(casing(norm_text), voice, espeak_data)
+    ph_sents = _phonemize_espeak_with_reset(casing(norm_text), voice, espeak_data)
     phonemes = [p for s in ph_sents for p in s]
 
     _LOGGER.debug("infer-forced: phonemes=%s", _short_list(phonemes, 48))

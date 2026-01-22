@@ -284,6 +284,7 @@ def _synthesize_ssml(
     length_scale: Optional[float] = None,
     noise_w: Optional[float] = None,
 ) -> tuple[np.ndarray, int]:
+    print("_synthesize_ssml called with ssml_text:", ssml_text)
     """Synthesize SSML text with break and multilingual support.
 
     Args:
@@ -388,6 +389,7 @@ def _synthesize_ssml(
                 _LOGGER.warning("Speaker '%s' not in model '%s', using first available", speaker, model_name)
                 speaker = next(iter(inference.speakers.keys()))
 
+            _LOGGER.info("Synthesizing: speaker=%s, text=%r, synth_kwargs=%s", speaker, plan["text"], synth_kwargs)
             audio = inference.synthesize_span(plan["text"], speaker=speaker, **synth_kwargs)
             audio_parts.append(audio)
 

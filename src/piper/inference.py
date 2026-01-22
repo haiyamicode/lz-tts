@@ -177,6 +177,8 @@ class PiperInference:
         phoneme_ids = span["phoneme_ids"]
         speaker_id = span.get("speaker_id", 0)
 
+        _LOGGER.info("synthesize_span: phoneme_ids[:20]=%s, len=%d", phoneme_ids[:20], len(phoneme_ids))
+
         with torch.no_grad():
             text_tensor = torch.LongTensor(phoneme_ids).unsqueeze(0).to(self.device)
             text_lengths = torch.LongTensor([len(phoneme_ids)]).to(self.device)
