@@ -41,7 +41,8 @@ class SynthesizeRequest(BaseModel):
 
     text: Optional[str] = Field(None, description="Plain text to synthesize (mutually exclusive with ssml)")
     ssml: Optional[str] = Field(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)")
-    speaker: Optional[str] = Field(None, description="Speaker label (overrides auto language detection)")
+    speaker: Optional[str] = Field(None, description="Speaker label (overrides auto language detection for ALL segments)")
+    primary_speaker: Optional[str] = Field(None, description="Speaker for the primary language only (e.g., 'en-GB' applies to English segments, other languages use their defaults)")
     format: Literal["wav", "mp3"] = Field("wav", description="Output audio format (wav or mp3)")
     noise_scale: Optional[float] = Field(None, description="Prosody randomness")
     length_scale: Optional[float] = Field(None, description="Speech rate multiplier (>1 = slower)")
@@ -77,6 +78,11 @@ def _normalize_locale(lang: str) -> str:
     if len(parts) == 2:
         return f"{parts[0]}-{parts[1].upper()}"
     return parts[0]
+
+
+def _get_base_language(speaker_or_locale: str) -> str:
+    """Extract base language from a speaker/locale string (e.g., 'en-GB' -> 'en')."""
+    return speaker_or_locale.lower().split("-")[0]
 
 
 def _load_config() -> ServerConfig:
@@ -202,11 +208,17 @@ def _resolve_speaker_and_model(input_speaker: str | None) -> tuple[str | None, s
 
 def _synthesize_multilingual(
     text: str,
+    primary_speaker: Optional[str] = None,
     noise_scale: Optional[float] = None,
     length_scale: Optional[float] = None,
     noise_w: Optional[float] = None,
 ) -> tuple[np.ndarray, int]:
     """Synthesize multilingual text using multiple models.
+
+    Args:
+        text: Text to synthesize.
+        primary_speaker: If set, use this speaker for segments matching its base language
+                        (e.g., "en-GB" applies to "en" segments only).
 
     Returns (audio, sample_rate).
     """
@@ -217,6 +229,9 @@ def _synthesize_multilingual(
     result = _splitter.split(text)
     segments = result.segments
     main_lang = result.main_language or "en"
+
+    # Extract base language from primary_speaker if provided
+    primary_lang = _get_base_language(primary_speaker) if primary_speaker else None
 
     synth_kwargs = {}
     if noise_scale is not None:
@@ -234,7 +249,12 @@ def _synthesize_multilingual(
             continue
 
         lang = (seg.language if seg.language and seg.language != "und" else main_lang) or "en"
-        speaker, model_name = _resolve_speaker_and_model(lang)
+
+        # Use primary_speaker if language matches, otherwise normal resolution
+        if primary_speaker and _get_base_language(lang) == primary_lang:
+            speaker, model_name = _resolve_speaker_and_model(primary_speaker)
+        else:
+            speaker, model_name = _resolve_speaker_and_model(lang)
 
         routing_plan.append({
             "lang": lang,
@@ -280,16 +300,17 @@ def _synthesize_multilingual(
 def _synthesize_ssml(
     ssml_text: str,
     global_speaker: Optional[str] = None,
+    primary_speaker: Optional[str] = None,
     noise_scale: Optional[float] = None,
     length_scale: Optional[float] = None,
     noise_w: Optional[float] = None,
 ) -> tuple[np.ndarray, int]:
-    print("_synthesize_ssml called with ssml_text:", ssml_text)
     """Synthesize SSML text with break and multilingual support.
 
     Args:
         ssml_text: SSML string to synthesize.
         global_speaker: If set, overrides all segment speakers.
+        primary_speaker: If set, use this speaker for segments matching its base language.
 
     Returns (audio, sample_rate).
     """
@@ -298,6 +319,9 @@ def _synthesize_ssml(
         _splitter = MultilingualSplitter()
 
     segments = parse_ssml(ssml_text)
+
+    # Extract base language from primary_speaker if provided
+    primary_lang = _get_base_language(primary_speaker) if primary_speaker else None
 
     synth_kwargs = {}
     if noise_scale is not None:
@@ -318,13 +342,13 @@ def _synthesize_ssml(
             if not seg_text:
                 continue
 
-            # Determine speaker: global override > segment speaker > auto-detect
+            # Determine speaker: global override > segment speaker > primary speaker > auto-detect
             if global_speaker is not None:
-                # Global override
-                global_speaker, model_name = _resolve_speaker_and_model(global_speaker)
+                # Global override - applies to ALL segments
+                resolved_speaker, model_name = _resolve_speaker_and_model(global_speaker)
                 routing_plan.append({
                     "type": "text",
-                    "speaker": global_speaker,
+                    "speaker": resolved_speaker,
                     "model": model_name,
                     "text": seg_text,
                 })
@@ -348,7 +372,12 @@ def _synthesize_ssml(
                         continue
 
                     lang = (lang_seg.language if lang_seg.language and lang_seg.language != "und" else main_lang) or "en"
-                    speaker, model_name = _resolve_speaker_and_model(lang)
+
+                    # Use primary_speaker if language matches, otherwise normal resolution
+                    if primary_speaker and _get_base_language(lang) == primary_lang:
+                        speaker, model_name = _resolve_speaker_and_model(primary_speaker)
+                    else:
+                        speaker, model_name = _resolve_speaker_and_model(lang)
 
                     routing_plan.append({
                         "type": "text",
@@ -663,11 +692,16 @@ curl -X POST "http://localhost:8000/synthesize" \\
             audio, sample_rate = _synthesize_ssml(
                 request.ssml,
                 global_speaker=request.speaker,
+                primary_speaker=request.primary_speaker,
                 **synth_kwargs,
             )
         elif request.speaker is None and model is None:
-            # Auto multilingual synthesis (default)
-            audio, sample_rate = _synthesize_multilingual(request.text, **synth_kwargs)
+            # Auto multilingual synthesis (default, with optional primary_speaker)
+            audio, sample_rate = _synthesize_multilingual(
+                request.text,
+                primary_speaker=request.primary_speaker,
+                **synth_kwargs,
+            )
         else:
             # Single-model synthesis
             if model is None:
@@ -698,7 +732,8 @@ curl -X POST "http://localhost:8000/synthesize" \\
         text: Optional[str] = Query(None, description="Plain text to synthesize (mutually exclusive with ssml)"),
         ssml: Optional[str] = Query(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)"),
         model: str = Query(None, description="Model to use (overrides auto routing)"),
-        speaker: Optional[str] = Query(None, description="Speaker label (overrides auto language detection)"),
+        speaker: Optional[str] = Query(None, description="Speaker label (overrides auto language detection for ALL segments)"),
+        primary_speaker: Optional[str] = Query(None, description="Speaker for primary language only (e.g., 'en-GB' applies to English segments)"),
         format: Literal["wav", "mp3"] = Query("wav", description="Output audio format (wav or mp3)"),
         noise_scale: Optional[float] = Query(None, description="Prosody randomness"),
         length_scale: Optional[float] = Query(None, description="Speech rate multiplier"),
@@ -710,6 +745,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
 
         By default, text is split by language and routed to appropriate speakers automatically.
         Specify `speaker` to override and use a single speaker for the entire text.
+        Specify `primary_speaker` to override only segments matching that language (e.g., 'en-GB' for English).
         """
         # Validate exactly one of text or ssml is provided
         if text and ssml:
@@ -730,11 +766,16 @@ curl -X POST "http://localhost:8000/synthesize" \\
             audio, sample_rate = _synthesize_ssml(
                 ssml,
                 global_speaker=speaker,
+                primary_speaker=primary_speaker,
                 **synth_kwargs,
             )
         elif speaker is None and model is None:
-            # Auto multilingual synthesis (default)
-            audio, sample_rate = _synthesize_multilingual(text, **synth_kwargs)
+            # Auto multilingual synthesis (default, with optional primary_speaker)
+            audio, sample_rate = _synthesize_multilingual(
+                text,
+                primary_speaker=primary_speaker,
+                **synth_kwargs,
+            )
         else:
             # Single-speaker synthesis
             if model is None:
