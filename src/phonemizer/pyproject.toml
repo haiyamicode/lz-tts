@@ -1,0 +1,36 @@
+[build-system]
+requires = ["scikit-build-core>=0.11", "pybind11>=2.10.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "piper_phonemize"
+version = "1.2.0"
+description = "Phonemization library used by Piper text to speech system"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Michael Hansen", email = "mike@rhasspy.org" },
+]
+requires-python = ">=3.9"
+
+[tool.scikit-build]
+# Minimum CMake version required
+cmake.version = ">=3.15"
+
+# Build type
+cmake.build-type = "Release"
+
+# Targets to build
+build.targets = ["piper_phonemize_python"]
+
+# Install directory for cmake targets (root of wheel)
+wheel.install-dir = "."
+
+# Include Python package
+wheel.packages = ["piper_phonemize"]
+
+# Build verbosity
+cmake.verbose = true
+
+[tool.scikit-build.cmake.define]
+BUILD_PYTHON_MODULE = "ON"
