@@ -9,7 +9,7 @@ dependencies = [
     "torch==2.9.1",
     "pytorch-lightning==2.6.0",
     "torchmetrics==1.8.2",
-    "piper-phonemize==1.1.0",
+    "piper-phonemize",
     "transformers>=4.39.0,<4.40",
     "sentencepiece>=0.2.0,<0.3",
     # piper_train dependencies for inference
@@ -33,11 +33,15 @@ dependencies = [
     "pydub>=0.25.1",
     "boto3>=1.42.30",
     "python-dotenv>=1.2.1",
+    "rapidfuzz>=3.14.3",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
@@ -45,3 +49,6 @@ packages = ["src"]
 [project.scripts]
 lz-tts = "src.cli:main"
 lz-tts-server = "src.api.server:run"
+
+[tool.uv.sources]
+piper-phonemize = { path = "./src/phonemizer" }

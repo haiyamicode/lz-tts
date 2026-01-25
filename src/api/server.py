@@ -27,6 +27,16 @@ DATA_DIR = Path("data")
 CONFIG_PATH = Path("local/server.json")
 DEFAULT_MODEL = "lzspeech-enzhja-1000-bert"
 
+class ModelConfig(BaseModel):
+    """Per-model configuration override."""
+
+    # Speaker mappings: {"speaker_label": speaker_id_or_null}
+    # Use null for single-speaker models that don't need a speaker ID
+    speakers: dict[str, Optional[int]] = Field(default_factory=dict)
+    # Override espeak voice for phonemization (e.g., "en-us", "en-gb")
+    phoneme_voice: Optional[str] = None
+
+
 class ServerConfig(BaseModel):
     """Server configuration."""
 
@@ -34,6 +44,8 @@ class ServerConfig(BaseModel):
     preload_models: list[str] = Field(default_factory=list)
     model_priority: list[str] = Field(default_factory=list)
     lang_speaker_map: dict[str, str] = Field(default_factory=dict)
+    # Per-model configuration overrides
+    model_config_overrides: dict[str, ModelConfig] = Field(default_factory=dict, alias="model_config")
 
 
 class SynthesizeRequest(BaseModel):
@@ -47,6 +59,7 @@ class SynthesizeRequest(BaseModel):
     noise_scale: Optional[float] = Field(None, description="Prosody randomness")
     length_scale: Optional[float] = Field(None, description="Speech rate multiplier (>1 = slower)")
     noise_w: Optional[float] = Field(None, description="Duration predictor noise")
+    neural: bool = Field(True, description="Use neural heteronym disambiguation for more accurate pronunciation of ambiguous words")
 
 
 class SpeakerInfo(BaseModel):
@@ -67,7 +80,7 @@ class ModelInfo(BaseModel):
 # Global state
 _inference_cache: dict[str, PiperInference] = {}
 _server_config: ServerConfig = ServerConfig()
-_speaker_routes: dict[str, tuple[str, int]] = {}  # speaker -> (model, speaker_id)
+_speaker_routes: dict[str, tuple[str, Optional[int]]] = {}  # speaker -> (model, speaker_id or None)
 _lang_speaker_map: dict[str, str] = {}  # canonical locale -> speaker
 _splitter: MultilingualSplitter | None = None
 
@@ -160,23 +173,33 @@ def _preload_models(models: list[str]) -> None:
             _LOGGER.warning("Failed to preload model %s: %s", model, e)
 
 
-def _build_speaker_routes(model_priority: list[str]) -> dict[str, tuple[str, int]]:
+def _build_speaker_routes(model_priority: list[str]) -> dict[str, tuple[str, Optional[int]]]:
     """Build speaker routing table based on model priority.
 
     For each speaker, the first model in the priority list that has that speaker wins.
+    Uses model_config overrides first, then falls back to model's native speakers.
     """
-    routes: dict[str, tuple[str, int]] = {}
+    routes: dict[str, tuple[str, Optional[int]]] = {}
 
     for model_name in model_priority:
         if model_name not in _inference_cache:
             _LOGGER.warning("Model %s in priority list but not loaded, skipping", model_name)
             continue
 
-        inference = _inference_cache[model_name]
-        for speaker, speaker_id in inference.speakers.items():
-            if speaker not in routes:
-                routes[speaker] = (model_name, speaker_id)
-                _LOGGER.debug("Routing speaker '%s' -> model '%s' (id=%d)", speaker, model_name, speaker_id)
+        # Check for config override first (useful for single-speaker models with empty labels)
+        model_cfg = _server_config.model_config_overrides.get(model_name)
+        if model_cfg and model_cfg.speakers:
+            for speaker, speaker_id in model_cfg.speakers.items():
+                if speaker not in routes:
+                    routes[speaker] = (model_name, speaker_id)
+                    _LOGGER.debug("Routing speaker '%s' -> model '%s' (id=%s) [config override]", speaker, model_name, speaker_id)
+        else:
+            # Use model's native speaker map
+            inference = _inference_cache[model_name]
+            for speaker, speaker_id in inference.speakers.items():
+                if speaker and speaker not in routes:  # Skip empty speaker labels
+                    routes[speaker] = (model_name, speaker_id)
+                    _LOGGER.debug("Routing speaker '%s' -> model '%s' (id=%d)", speaker, model_name, speaker_id)
 
     return routes
 
@@ -212,6 +235,7 @@ def _synthesize_multilingual(
     noise_scale: Optional[float] = None,
     length_scale: Optional[float] = None,
     noise_w: Optional[float] = None,
+    neural: bool = True,
 ) -> tuple[np.ndarray, int]:
     """Synthesize multilingual text using multiple models.
 
@@ -280,12 +304,18 @@ def _synthesize_multilingual(
         inference = _get_inference(model_name)
         sample_rate = inference.sample_rate
 
-        # Check if speaker exists in this model
-        if speaker not in inference.speakers:
+        # Check if this speaker is configured via model_config (may have null speaker_id)
+        model_cfg = _server_config.model_config_overrides.get(model_name)
+        if model_cfg and speaker in model_cfg.speakers:
+            # Use None for single-speaker models configured with null speaker_id
+            internal_speaker = None if model_cfg.speakers[speaker] is None else speaker
+        elif speaker in inference.speakers:
+            internal_speaker = speaker
+        else:
             _LOGGER.warning("Speaker '%s' not in model '%s', using first available", speaker, model_name)
-            speaker = next(iter(inference.speakers.keys()))
+            internal_speaker = next(iter(inference.speakers.keys()), None)
 
-        audio = inference.synthesize_span(seg_text, speaker=speaker, **synth_kwargs)
+        audio = inference.synthesize_span(seg_text, speaker=internal_speaker, neural=neural, **synth_kwargs)
         audio_parts.append(audio)
 
     if not audio_parts:
@@ -700,6 +730,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
             audio, sample_rate = _synthesize_multilingual(
                 request.text,
                 primary_speaker=request.primary_speaker,
+                neural=request.neural,
                 **synth_kwargs,
             )
         else:
@@ -713,6 +744,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
             audio = inference.synthesize(
                 text=request.text,
                 speaker=request.speaker,
+                neural=request.neural,
                 **synth_kwargs,
             )
             sample_rate = inference.sample_rate
@@ -738,6 +770,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
         noise_scale: Optional[float] = Query(None, description="Prosody randomness"),
         length_scale: Optional[float] = Query(None, description="Speech rate multiplier"),
         noise_w: Optional[float] = Query(None, description="Duration predictor noise"),
+        neural: bool = Query(True, description="Use neural heteronym disambiguation"),
     ):
         """Synthesize text or SSML to speech (GET endpoint for easy testing).
 
@@ -774,6 +807,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
             audio, sample_rate = _synthesize_multilingual(
                 text,
                 primary_speaker=primary_speaker,
+                neural=neural,
                 **synth_kwargs,
             )
         else:
@@ -785,6 +819,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
             audio = inference.synthesize(
                 text=text,
                 speaker=speaker,
+                neural=neural,
                 **synth_kwargs,
             )
             sample_rate = inference.sample_rate

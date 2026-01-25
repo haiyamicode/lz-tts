@@ -116,6 +116,7 @@ class PiperInference:
         text: str,
         speaker: Optional[str] = None,
         espeak_data_path: Optional[str] = None,
+        neural: bool = False,
     ) -> list[dict]:
         """Convert text to phoneme spans with speaker IDs.
 
@@ -123,6 +124,7 @@ class PiperInference:
             text: Input text to phonemize.
             speaker: Optional speaker label to force (skips language detection).
             espeak_data_path: Optional path to espeak-ng data directory.
+            neural: If True, use neural heteronym disambiguation.
 
         Returns:
             List of dicts with 'phoneme_ids', 'speaker_id', and 'text' keys.
@@ -134,21 +136,22 @@ class PiperInference:
 
         if speaker:
             span = phonemize_text_for_speaker(
-                text, self.config_path, speaker, espeak_data_path
+                text, self.config_path, speaker, espeak_data_path, neural=neural
             )
             return [span]
         else:
             return phonemize_spans_with_speakers(
-                text, self.config_path, espeak_data_path
+                text, self.config_path, espeak_data_path, neural=neural
             )
 
     def synthesize_span(
         self,
         text: str,
-        speaker: str,
+        speaker: Optional[str] = None,
         noise_scale: Optional[float] = None,
         length_scale: Optional[float] = None,
         noise_w: Optional[float] = None,
+        neural: bool = True,
     ) -> np.ndarray:
         """Synthesize a single text span with a specific speaker.
 
@@ -157,10 +160,11 @@ class PiperInference:
 
         Args:
             text: Input text to synthesize.
-            speaker: Speaker label to use (must exist in this model).
+            speaker: Speaker label (None for single-speaker models, uses default).
             noise_scale: Override for prosody randomness (default from config).
             length_scale: Override for speech rate (default from config).
             noise_w: Override for duration predictor noise (default from config).
+            neural: Use neural heteronym disambiguation (default True).
 
         Returns:
             Audio waveform as int16 numpy array.
@@ -173,7 +177,8 @@ class PiperInference:
             noise_w if noise_w is not None else self.inference_config.noise_w,
         ]
 
-        span = phonemize_text_for_speaker(text, self.config_path, speaker, None)
+        # For single-speaker models, speaker can be None - phonemize will use default speaker_id=0
+        span = phonemize_text_for_speaker(text, self.config_path, speaker or "", None, neural=neural)
         phoneme_ids = span["phoneme_ids"]
         speaker_id = span.get("speaker_id", 0)
 
@@ -211,6 +216,7 @@ class PiperInference:
         noise_scale: Optional[float] = None,
         length_scale: Optional[float] = None,
         noise_w: Optional[float] = None,
+        neural: bool = False,
     ) -> np.ndarray:
         """Synthesize speech from text.
 
@@ -220,6 +226,7 @@ class PiperInference:
             noise_scale: Override for prosody randomness (default from config).
             length_scale: Override for speech rate (default from config).
             noise_w: Override for duration predictor noise (default from config).
+            neural: If True, use neural heteronym disambiguation.
 
         Returns:
             Audio waveform as int16 numpy array.
@@ -232,7 +239,7 @@ class PiperInference:
         ]
 
         # Phonemize text
-        spans = self.phonemize(text, speaker=speaker)
+        spans = self.phonemize(text, speaker=speaker, neural=neural)
 
         # Synthesize each span and concatenate
         audio_segments = []
