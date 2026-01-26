@@ -164,14 +164,15 @@ def _phonemize_espeak_with_reset(text: str, voice: str, data_path) -> list:
     return result
 
 
-def _phonemize_espeak_with_mapping(text: str, voice: str, data_path) -> Tuple[list, List[Tuple[int, int, int, int]]]:
+def _phonemize_espeak_with_mapping(text: str, voice: str, data_path) -> Tuple[list, List[Tuple[int, int, int, int, int]]]:
     """Phonemize text and return word-to-phoneme mapping.
 
     Returns:
         Tuple of (phonemes, word_mapping) where:
         - phonemes: List of sentences, each a list of phoneme strings
-        - word_mapping: List of (textStart, textLength, phonemeStart, phonemeEnd)
+        - word_mapping: List of (textStart, textLength, phonemeStart, phonemeEnd, punctuationLength)
           tuples. Note: textStart is 1-indexed byte position from espeak.
+          punctuationLength is 0 or 1, indicating trailing punctuation (.?!,;:).
     """
     phonemes, mapping = _phonemize_espeak_with_mapping_raw(text, voice, data_path)
     # Reset espeak state
@@ -448,48 +449,53 @@ def _phonemize_neural(
         [(h[0], h[1], h[2], h[3]) for h in heteronyms],
     )
 
-    # Get phonemes WITH word-to-phoneme mapping from C++
+    # Get phonemes WITH word-to-phoneme mapping from C++ (per sentence)
     norm_text = _normalize_text_for_voice(text, voice)
     processed_text = casing_fn(norm_text)
-    sent_ph, word_mapping = _phonemize_espeak_with_mapping(processed_text, voice, espeak_data)
-    all_phonemes = [p for sent in sent_ph for p in sent]
+    sent_ph, sent_word_mapping = _phonemize_espeak_with_mapping(processed_text, voice, espeak_data)
 
-    _LOGGER.debug("neural: full phonemes=%s", _short_list(all_phonemes, 48))
-    _LOGGER.debug(
-        "neural: word mapping from C++: %s",
-        [(ts, tl, ps, pe, processed_text[ts-1:ts-1+tl] if ts > 0 else "") for ts, tl, ps, pe in word_mapping],
-    )
+    _LOGGER.debug("neural: %d sentences", len(sent_ph))
+    for sent_idx, (sentence, mappings) in enumerate(zip(sent_ph, sent_word_mapping)):
+        _LOGGER.debug("neural: sentence %d phonemes=%s", sent_idx, _short_list(sentence, 32))
+        _LOGGER.debug(
+            "neural: sentence %d word_mapping: %s",
+            sent_idx,
+            [(ts, tl, ps, pe, pl, processed_text[ts-1:ts-1+tl] if ts > 0 else "") for ts, tl, ps, pe, pl in mappings],
+        )
 
-    # Build replacement map: mapping_index -> new_phonemes
+    # Build replacement map: (sent_idx, word_idx) -> new_phonemes
     # Match heteronym positions to word mapping entries
-    replacements: Dict[int, List[str]] = {}
+    replacements: Dict[Tuple[int, int], List[str]] = {}
 
     for word, h_start, h_end, correct_ipa in heteronyms:
         # Find which word mapping entry this heteronym corresponds to
         # Note: word_mapping textStart is 1-indexed byte position
         # heteronym positions are 0-indexed character positions
         # For ASCII (English), byte position == character position
-        matched_idx = None
+        matched = None
 
-        for idx, (text_start, text_len, ph_start, ph_end) in enumerate(word_mapping):
-            # Convert 1-indexed byte position to 0-indexed
-            map_start = text_start - 1
-            map_end = map_start + text_len
+        for sent_idx, mappings in enumerate(sent_word_mapping):
+            for word_idx, (text_start, text_len, ph_start, ph_end, punct_len) in enumerate(mappings):
+                # Convert 1-indexed byte position to 0-indexed
+                map_start = text_start - 1
+                map_end = map_start + text_len
 
-            # Check if heteronym overlaps with this word
-            if map_start <= h_start < map_end or map_start < h_end <= map_end:
-                matched_idx = idx
+                # Check if heteronym overlaps with this word
+                if map_start <= h_start < map_end or map_start < h_end <= map_end:
+                    matched = (sent_idx, word_idx)
+                    break
+                # Exact match
+                if map_start == h_start and map_end == h_end:
+                    matched = (sent_idx, word_idx)
+                    break
+            if matched:
                 break
-            # Exact match
-            if map_start == h_start and map_end == h_end:
-                matched_idx = idx
-                break
 
-        if matched_idx is not None:
-            replacements[matched_idx] = list(correct_ipa)
+        if matched is not None:
+            replacements[matched] = list(correct_ipa)
             _LOGGER.debug(
-                "neural: heteronym '%s' at text[%d:%d] -> mapping_idx=%d, replacement=%s",
-                word, h_start, h_end, matched_idx, correct_ipa,
+                "neural: heteronym '%s' at text[%d:%d] -> sent=%d, word=%d, replacement=%s",
+                word, h_start, h_end, matched[0], matched[1], correct_ipa,
             )
         else:
             _LOGGER.warning(
@@ -497,39 +503,40 @@ def _phonemize_neural(
                 word, h_start, h_end,
             )
 
-    # Build result by replacing segments using the mapping
+    # Build result by processing each sentence separately using LOCAL indices
     result: List[str] = []
-    last_end = 0
 
-    for idx, (text_start, text_len, ph_start, ph_end) in enumerate(word_mapping):
-        # Add any phonemes between the last word and this word (spaces, etc.)
-        if ph_start > last_end:
-            result.extend(all_phonemes[last_end:ph_start])
+    for sent_idx, (sentence, mappings) in enumerate(zip(sent_ph, sent_word_mapping)):
+        last_end = 0
 
-        if idx in replacements:
-            # Use BERT pronunciation, but preserve trailing punctuation
-            segment = list(all_phonemes[ph_start:ph_end])
-            # Check for trailing punctuation (., !, ?, etc.)
-            trailing_punct = []
-            while segment and segment[-1] in ".!?;:,":
-                trailing_punct.insert(0, segment.pop())
+        for word_idx, (text_start, text_len, ph_start, ph_end, punct_len) in enumerate(mappings):
+            # Add any phonemes between the last word and this word (spaces, etc.)
+            if ph_start > last_end:
+                result.extend(sentence[last_end:ph_start])
 
-            result.extend(replacements[idx])
-            result.extend(trailing_punct)
+            if (sent_idx, word_idx) in replacements:
+                # Use BERT pronunciation, but preserve trailing punctuation
+                # punct_len tells us exactly how many trailing phonemes are punctuation
+                word_ph_end = ph_end - punct_len
+                trailing_punct = sentence[word_ph_end:ph_end]
 
-            _LOGGER.debug(
-                "neural: segment %d replaced: %s -> %s%s",
-                idx, all_phonemes[ph_start:ph_end], replacements[idx], trailing_punct,
-            )
-        else:
-            # Keep original
-            result.extend(all_phonemes[ph_start:ph_end])
+                result.extend(replacements[(sent_idx, word_idx)])
+                result.extend(trailing_punct)
 
-        last_end = ph_end
+                _LOGGER.debug(
+                    "neural: sent %d word %d replaced: %s -> %s + %s",
+                    sent_idx, word_idx, sentence[ph_start:ph_end],
+                    replacements[(sent_idx, word_idx)], trailing_punct,
+                )
+            else:
+                # Keep original
+                result.extend(sentence[ph_start:ph_end])
 
-    # Add any remaining phonemes after the last word
-    if last_end < len(all_phonemes):
-        result.extend(all_phonemes[last_end:])
+            last_end = ph_end
+
+        # Add any remaining phonemes after the last word in this sentence
+        if last_end < len(sentence):
+            result.extend(sentence[last_end:])
 
     return result
 

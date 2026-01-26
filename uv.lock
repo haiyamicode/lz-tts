@@ -863,6 +863,11 @@ name = "piper-phonemize"
 version = "1.2.0"
 source = { directory = "src/phonemizer" }
 
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pybind11", specifier = ">=3.0.1" }]
+
 [[package]]
 name = "platformdirs"
 version = "4.5.1"

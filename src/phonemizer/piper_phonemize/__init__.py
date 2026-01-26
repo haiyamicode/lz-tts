@@ -53,16 +53,17 @@ def phonemize_espeak(
     return _phonemize_espeak(text, voice, str(data_path))
 
 
-# Type alias for word mapping: (textStart, textLength, phonemeStart, phonemeEnd)
-WordMapping = tuple[int, int, int, int]
+# Type alias for word mapping: (textStart, textLength, phonemeStart, phonemeEnd, punctuationLength)
+# phonemeStart/End are LOCAL indices into the sentence's phoneme list
+WordMapping = tuple[int, int, int, int, int]
 
 
 def phonemize_espeak_with_mapping(
     text: str,
     voice: str,
     data_path: Optional[Union[str, Path]] = None,
-) -> tuple[List[List[str]], List[WordMapping]]:
-    """Phonemize text and return word-to-phoneme mapping.
+) -> tuple[List[List[str]], List[List[WordMapping]]]:
+    """Phonemize text and return word-to-phoneme mapping per sentence.
 
     Args:
         text: Input text to phonemize.
@@ -70,11 +71,14 @@ def phonemize_espeak_with_mapping(
         data_path: Optional path to espeak-ng data.
 
     Returns:
-        Tuple of (phonemes, word_mapping) where:
+        Tuple of (phonemes, sentence_word_mappings) where:
         - phonemes: List of sentences, each a list of phoneme strings
-        - word_mapping: List of (textStart, textLength, phonemeStart, phonemeEnd)
-          tuples mapping input text byte positions to phoneme indices.
-          Note: textStart is 1-indexed (from espeak).
+        - sentence_word_mappings: List of word mappings per sentence.
+          Each word mapping is (textStart, textLength, phonemeStart, phonemeEnd, punctuationLength).
+          phonemeStart/End are LOCAL indices into that sentence's phoneme list.
+          Note: textStart is 1-indexed byte position (from espeak).
+          punctuationLength is 0 or 1, indicating trailing punctuation (.?!,;:).
+          To get pure word phonemes: sentence[phonemeStart:phonemeEnd-punctuationLength]
     """
     if data_path is None:
         data_path = _DIR / "espeak-ng-data"

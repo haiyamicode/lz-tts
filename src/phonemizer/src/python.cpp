@@ -47,10 +47,11 @@ phonemize_espeak(std::string text, std::string voice, std::string dataPath) {
   return phonemes;
 }
 
-// WordMapping: (textStart, textLength, phonemeStart, phonemeEnd)
-using WordMapping = std::tuple<std::size_t, std::size_t, std::size_t, std::size_t>;
+// WordMapping: (textStart, textLength, phonemeStart, phonemeEnd, punctuationLength)
+// phonemeStart/End are LOCAL indices into the sentence's phoneme list
+using WordMapping = std::tuple<std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>;
 
-std::pair<std::vector<std::vector<piper::Phoneme>>, std::vector<WordMapping>>
+std::pair<std::vector<std::vector<piper::Phoneme>>, std::vector<std::vector<WordMapping>>>
 phonemize_espeak_with_mapping(std::string text, std::string voice, std::string dataPath) {
   if (!eSpeakInitialized) {
     int result =
@@ -62,61 +63,89 @@ phonemize_espeak_with_mapping(std::string text, std::string voice, std::string d
     eSpeakInitialized = true;
   }
 
-  // Get phonemes using existing function
+  // Get phonemes and punctuation data
   piper::eSpeakPhonemeConfig config;
   config.voice = voice;
 
   std::vector<std::vector<piper::Phoneme>> phonemes;
-  piper::phonemize_eSpeak(text, config, phonemes);
+  std::vector<piper::ClausePunctuation> punctuation;
+  piper::phonemize_eSpeak(text, config, phonemes, &punctuation);
 
   // Get word positions using espeak_Synth callback
   std::vector<piper::WordPosition> wordPositions = piper::get_word_positions(text, voice);
 
-  // Build word mapping by correlating word events with phoneme groups
-  // Phoneme groups are separated by spaces in the output
-  std::vector<WordMapping> wordMapping;
+  // Build word mapping PER SENTENCE with LOCAL indices
+  // Each sentence gets its own list of word mappings
+  std::vector<std::vector<WordMapping>> sentenceWordMappings;
 
-  // Flatten all phonemes to find space-separated groups
-  std::vector<piper::Phoneme> allPhonemes;
-  for (const auto &sentence : phonemes) {
-    allPhonemes.insert(allPhonemes.end(), sentence.begin(), sentence.end());
-  }
+  // Build phoneme groups per sentence (LOCAL indices)
+  // Also track which sentence each group belongs to
+  struct PhonemeGroup {
+    std::size_t sentenceIdx;
+    std::size_t localStart;
+    std::size_t localEnd;
+    std::size_t globalStart;  // For punctuation matching
+    std::size_t globalEnd;
+  };
+  std::vector<PhonemeGroup> allGroups;
 
-  // Find phoneme group boundaries (split by space)
-  std::vector<std::pair<std::size_t, std::size_t>> phonemeGroups; // (start, end)
-  std::size_t groupStart = 0;
-  bool inGroup = false;
+  std::size_t globalOffset = 0;
+  for (std::size_t sentIdx = 0; sentIdx < phonemes.size(); sentIdx++) {
+    const auto &sentence = phonemes[sentIdx];
+    std::size_t groupStart = 0;
+    bool inGroup = false;
 
-  for (std::size_t i = 0; i < allPhonemes.size(); i++) {
-    if (allPhonemes[i] == U' ') {
-      if (inGroup) {
-        phonemeGroups.push_back({groupStart, i});
-        inGroup = false;
-      }
-    } else {
-      if (!inGroup) {
-        groupStart = i;
-        inGroup = true;
+    for (std::size_t i = 0; i < sentence.size(); i++) {
+      if (sentence[i] == U' ') {
+        if (inGroup) {
+          allGroups.push_back({sentIdx, groupStart, i, globalOffset + groupStart, globalOffset + i});
+          inGroup = false;
+        }
+      } else {
+        if (!inGroup) {
+          groupStart = i;
+          inGroup = true;
+        }
       }
     }
+    // Don't forget the last group in this sentence
+    if (inGroup) {
+      allGroups.push_back({sentIdx, groupStart, sentence.size(), globalOffset + groupStart, globalOffset + sentence.size()});
+    }
+
+    globalOffset += sentence.size();
   }
-  // Don't forget the last group
-  if (inGroup) {
-    phonemeGroups.push_back({groupStart, allPhonemes.size()});
+
+  // Initialize empty mapping lists for each sentence
+  for (std::size_t i = 0; i < phonemes.size(); i++) {
+    sentenceWordMappings.emplace_back();
   }
 
   // Match word positions to phoneme groups by index
-  std::size_t numMappings = std::min(wordPositions.size(), phonemeGroups.size());
+  std::size_t numMappings = std::min(wordPositions.size(), allGroups.size());
   for (std::size_t i = 0; i < numMappings; i++) {
-    wordMapping.push_back({
+    const auto &group = allGroups[i];
+    std::size_t punctLen = 0;
+
+    // Check if any punctuation position falls within this word's GLOBAL phoneme range
+    for (const auto &punct : punctuation) {
+      if (punct.phonemePosition >= group.globalStart && punct.phonemePosition < group.globalEnd) {
+        punctLen = punct.phonemeCount;
+        break;
+      }
+    }
+
+    // Add to the appropriate sentence's mapping list with LOCAL indices
+    sentenceWordMappings[group.sentenceIdx].push_back({
         wordPositions[i].textStart,
         wordPositions[i].textLength,
-        phonemeGroups[i].first,
-        phonemeGroups[i].second
+        group.localStart,
+        group.localEnd,
+        punctLen
     });
   }
 
-  return {phonemes, wordMapping};
+  return {phonemes, sentenceWordMappings};
 }
 
 std::vector<std::vector<piper::Phoneme>>
@@ -215,9 +244,13 @@ PYBIND11_MODULE(piper_phonemize_cpp, m) {
     )pbdoc");
 
   m.def("phonemize_espeak_with_mapping", &phonemize_espeak_with_mapping, R"pbdoc(
-        Phonemize text using espeak-ng and return word-to-phoneme mapping.
-        Returns (phonemes, word_mapping) where word_mapping is a list of
-        (textStart, textLength, phonemeStart, phonemeEnd) tuples.
+        Phonemize text using espeak-ng and return word-to-phoneme mapping per sentence.
+        Returns (phonemes, sentence_word_mappings) where:
+        - phonemes: List[List[str]] - phonemes per sentence
+        - sentence_word_mappings: List[List[tuple]] - word mappings per sentence
+        Each word mapping tuple is (textStart, textLength, phonemeStart, phonemeEnd, punctuationLength).
+        phonemeStart/End are LOCAL indices into that sentence's phoneme list.
+        punctuationLength is the number of trailing punctuation phonemes (0 or 1).
     )pbdoc");
 
   m.def("phonemize_codepoints", &phonemize_codepoints, R"pbdoc(

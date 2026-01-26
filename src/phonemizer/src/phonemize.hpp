@@ -35,6 +35,12 @@ struct WordPosition {
   std::size_t textLength;  // Byte length in input text
 };
 
+// Punctuation added by phonemize_eSpeak
+struct ClausePunctuation {
+  std::size_t phonemePosition;  // Position in phoneme output where punctuation starts
+  std::size_t phonemeCount;     // Number of phonemes (1 for .?! or 2 for ,;: which add space)
+};
+
 // Get word positions using espeak_Synth callback.
 // Returns WORD events with text positions.
 // Assumes espeak_Initialize has already been called.
@@ -60,11 +66,13 @@ struct eSpeakPhonemeConfig {
 
 // Phonemizes text using espeak-ng.
 // Returns phonemes for each sentence as a separate std::vector.
+// Optionally outputs punctuation positions if punctuation pointer is non-null.
 //
 // Assumes espeak_Initialize has already been called.
 PIPERPHONEMIZE_EXPORT void
 phonemize_eSpeak(std::string text, eSpeakPhonemeConfig &config,
-                 std::vector<std::vector<Phoneme>> &phonemes);
+                 std::vector<std::vector<Phoneme>> &phonemes,
+                 std::vector<ClausePunctuation> *punctuation = nullptr);
 
 enum TextCasing {
   CASING_IGNORE = 0,

@@ -1,3 +1,4 @@
+#include <iostream>
 #include <map>
 #include <string>
 #include <vector>
@@ -76,7 +77,8 @@ get_word_positions(const std::string &text, const std::string &voice) {
 
 PIPERPHONEMIZE_EXPORT void
 phonemize_eSpeak(std::string text, eSpeakPhonemeConfig &config,
-                 std::vector<std::vector<Phoneme>> &phonemes) {
+                 std::vector<std::vector<Phoneme>> &phonemes,
+                 std::vector<ClausePunctuation> *punctuationOut) {
 
   auto voice = config.voice;
   int result = espeak_SetVoiceByName(voice.c_str());
@@ -97,6 +99,9 @@ phonemize_eSpeak(std::string text, eSpeakPhonemeConfig &config,
   std::vector<Phoneme> *sentencePhonemes = nullptr;
   const char *inputTextPointer = textCopy.c_str();
   int terminator = 0;
+
+  // Track cumulative phoneme offset across sentences
+  std::size_t cumulativeOffset = 0;
 
   while (inputTextPointer != NULL) {
     // Modified espeak-ng API to get access to clause terminator
@@ -166,26 +171,41 @@ phonemize_eSpeak(std::string text, eSpeakPhonemeConfig &config,
     }
 
     // Add appropriate punctuation depending on terminator type
-    int punctuation = terminator & 0x000FFFFF;
-    if (punctuation == CLAUSE_PERIOD) {
+    int punctuationType = terminator & 0x000FFFFF;
+    std::size_t punctPosition = cumulativeOffset + sentencePhonemes->size();
+    std::size_t punctCount = 0;
+
+    if (punctuationType == CLAUSE_PERIOD) {
       sentencePhonemes->push_back(config.period);
-    } else if (punctuation == CLAUSE_QUESTION) {
+      punctCount = 1;
+    } else if (punctuationType == CLAUSE_QUESTION) {
       sentencePhonemes->push_back(config.question);
-    } else if (punctuation == CLAUSE_EXCLAMATION) {
+      punctCount = 1;
+    } else if (punctuationType == CLAUSE_EXCLAMATION) {
       sentencePhonemes->push_back(config.exclamation);
-    } else if (punctuation == CLAUSE_COMMA) {
+      punctCount = 1;
+    } else if (punctuationType == CLAUSE_COMMA) {
       sentencePhonemes->push_back(config.comma);
       sentencePhonemes->push_back(config.space);
-    } else if (punctuation == CLAUSE_COLON) {
+      punctCount = 1;  // Only count the comma, space becomes separator
+    } else if (punctuationType == CLAUSE_COLON) {
       sentencePhonemes->push_back(config.colon);
       sentencePhonemes->push_back(config.space);
-    } else if (punctuation == CLAUSE_SEMICOLON) {
+      punctCount = 1;  // Only count the colon, space becomes separator
+    } else if (punctuationType == CLAUSE_SEMICOLON) {
       sentencePhonemes->push_back(config.semicolon);
       sentencePhonemes->push_back(config.space);
+      punctCount = 1;  // Only count the semicolon, space becomes separator
+    }
+
+    // Record punctuation if requested
+    if (punctuationOut && punctCount > 0) {
+      punctuationOut->push_back({punctPosition, punctCount});
     }
 
     if ((terminator & CLAUSE_TYPE_SENTENCE) == CLAUSE_TYPE_SENTENCE) {
-      // End of sentence
+      // End of sentence - update cumulative offset
+      cumulativeOffset += sentencePhonemes->size();
       sentencePhonemes = nullptr;
     }
 
