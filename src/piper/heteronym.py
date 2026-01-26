@@ -256,7 +256,7 @@ def get_resolver(
             checkpoint_path = pkg_dir / "local" / "exp" / "checkpoints" / "heteronym_v2" / "best.pt"
         if heretonyms_path is None:
             pkg_dir = Path(__file__).parent.parent.parent
-            heretonyms_path = pkg_dir / "local" / "datasets" / "heretonyms.jsonl"
+            heretonyms_path = pkg_dir / "data" / "heteronyms" / "heretonyms.jsonl"
 
         _resolver = HeteronymResolver(checkpoint_path, heretonyms_path, device)
 
