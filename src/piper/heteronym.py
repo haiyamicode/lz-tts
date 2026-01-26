@@ -169,6 +169,16 @@ class HeteronymResolver:
             if start < word_end and end > word_start:
                 word_indices.append(i)
 
+        # Check if all variants are in the trained model
+        # Skip words whose variants weren't included in training
+        for v in variants:
+            if v not in self._variant_to_idx:
+                _LOGGER.debug(
+                    "Skipping heteronym '%s': variant '%s' not in trained model",
+                    word, v
+                )
+                return None
+
         with torch.no_grad():
             hidden = self._bert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
             if word_indices:
