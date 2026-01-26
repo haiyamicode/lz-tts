@@ -253,7 +253,7 @@ def get_resolver(
         if checkpoint_path is None:
             # Default paths relative to package
             pkg_dir = Path(__file__).parent.parent.parent
-            checkpoint_path = pkg_dir / "local" / "exp" / "checkpoints" / "heteronym_v2" / "best.pt"
+            checkpoint_path = pkg_dir / "data" / "heteronyms" / "best.pt"
         if heretonyms_path is None:
             pkg_dir = Path(__file__).parent.parent.parent
             heretonyms_path = pkg_dir / "data" / "heteronyms" / "heretonyms.jsonl"
