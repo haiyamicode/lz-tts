@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from torch import autocast
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -74,6 +76,11 @@ class PiperInference:
         else:
             self.device = torch.device(device)
 
+        # Precision mode: enable fp16 on CUDA unless disabled via env
+        self.fp16 = self.device.type == "cuda" and bool(
+            int(os.environ.get("PIPER_USE_FP16", "1"))
+        )
+
         # Load model
         _LOGGER.info("Loading model: %s", self.checkpoint_path.name)
         self.model = VitsModel.load_from_checkpoint(
@@ -81,6 +88,8 @@ class PiperInference:
         )
         self.model.eval()
         self.model.to(self.device)
+        if self.fp16:
+            self.model.half()
 
         # Remove weight norm for inference (suppress warnings)
         with torch.no_grad(), warnings.catch_warnings():
@@ -198,9 +207,14 @@ class PiperInference:
                         "attention_mask": bert_dict["attention_mask"].to(self.device),
                     }
 
-            audio = self.model(
-                text_tensor, text_lengths, scales, sid=sid, bert_input=bert_input
-            )
+            with autocast(
+                device_type=self.device.type,
+                dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
+                enabled=self.fp16,
+            ):
+                audio = self.model(
+                    text_tensor, text_lengths, scales, sid=sid, bert_input=bert_input
+                )
             audio = audio.detach().cpu().numpy()
             audio = audio_float_to_int16(audio)
 
@@ -270,9 +284,14 @@ class PiperInference:
                         }
 
                 # Run inference
-                audio = self.model(
-                    text_tensor, text_lengths, scales, sid=sid, bert_input=bert_input
-                )
+                with autocast(
+                    device_type=self.device.type,
+                    dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
+                    enabled=self.fp16,
+                ):
+                    audio = self.model(
+                        text_tensor, text_lengths, scales, sid=sid, bert_input=bert_input
+                    )
                 audio = audio.detach().cpu().numpy()
                 audio = audio_float_to_int16(audio)
 

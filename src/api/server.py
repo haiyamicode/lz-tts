@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import gc
 import io
 import json
 import logging
 import wave
+from collections import OrderedDict
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -41,6 +43,8 @@ class ServerConfig(BaseModel):
     """Server configuration."""
 
     default_model: str = DEFAULT_MODEL
+    models: list[str] = Field(default_factory=list)
+    max_models_in_cache: int = Field(1, ge=1)
     preload_models: list[str] = Field(default_factory=list)
     model_priority: list[str] = Field(default_factory=list)
     lang_speaker_map: dict[str, str] = Field(default_factory=dict)
@@ -78,7 +82,7 @@ class ModelInfo(BaseModel):
 
 
 # Global state
-_inference_cache: dict[str, PiperInference] = {}
+_inference_cache: OrderedDict[str, PiperInference] = OrderedDict()
 _server_config: ServerConfig = ServerConfig()
 _speaker_routes: dict[str, tuple[str, Optional[int]]] = {}  # speaker -> (model, speaker_id or None)
 _lang_speaker_map: dict[str, str] = {}  # canonical locale -> speaker
@@ -129,8 +133,48 @@ def _list_available_models() -> list[str]:
     return sorted(models)
 
 
+def _allowed_models() -> list[str]:
+    """Configured models that may be loaded on demand."""
+    return _server_config.models or _list_available_models()
+
+
+def _is_model_allowed(model: str) -> bool:
+    """Check whether a model is allowed to be loaded on demand."""
+    return model in _allowed_models()
+
+
+def _get_model_speakers(model: str) -> dict[str, int]:
+    """Read a model's native speaker map from config without loading weights."""
+    config_path = DATA_DIR / model / "config.json"
+    if not config_path.exists():
+        raise ValueError(f"Model config not found: {model}")
+
+    with config_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    return {str(label): int(sid) for label, sid in (data.get("speaker_id_map") or {}).items()}
+
+
+def _enforce_cache_limit() -> None:
+    """Evict least-recently-used models until the cache is within its limit."""
+    while len(_inference_cache) > _server_config.max_models_in_cache:
+        evicted, _ = _inference_cache.popitem(last=False)
+        _LOGGER.info("Evicted model from cache: %s", evicted)
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
+
 def _load_model(model: str) -> PiperInference:
     """Load a model (used internally, raises ValueError instead of HTTPException)."""
+    if not _is_model_allowed(model):
+        raise ValueError(f"Model is not configured for on-demand use: {model}")
+
     model_dir = DATA_DIR / model
     config_path = model_dir / "config.json"
     checkpoint_path = _find_checkpoint(model_dir)
@@ -145,13 +189,16 @@ def _load_model(model: str) -> PiperInference:
         config_path=config_path,
     )
     _inference_cache[model] = inference
+    _enforce_cache_limit()
     return inference
 
 
 def _get_inference(model: str) -> PiperInference:
     """Get or create an inference instance for a model."""
     if model in _inference_cache:
-        return _inference_cache[model]
+        inference = _inference_cache.pop(model)
+        _inference_cache[model] = inference
+        return inference
 
     try:
         return _load_model(model)
@@ -177,13 +224,13 @@ def _build_speaker_routes(model_priority: list[str]) -> dict[str, tuple[str, Opt
     """Build speaker routing table based on model priority.
 
     For each speaker, the first model in the priority list that has that speaker wins.
-    Uses model_config overrides first, then falls back to model's native speakers.
+    Uses model_config overrides first, then falls back to model config metadata.
     """
     routes: dict[str, tuple[str, Optional[int]]] = {}
 
     for model_name in model_priority:
-        if model_name not in _inference_cache:
-            _LOGGER.warning("Model %s in priority list but not loaded, skipping", model_name)
+        if not _is_model_allowed(model_name):
+            _LOGGER.warning("Model %s in priority list but not configured for on-demand use, skipping", model_name)
             continue
 
         # Check for config override first (useful for single-speaker models with empty labels)
@@ -195,8 +242,13 @@ def _build_speaker_routes(model_priority: list[str]) -> dict[str, tuple[str, Opt
                     _LOGGER.debug("Routing speaker '%s' -> model '%s' (id=%s) [config override]", speaker, model_name, speaker_id)
         else:
             # Use model's native speaker map
-            inference = _inference_cache[model_name]
-            for speaker, speaker_id in inference.speakers.items():
+            try:
+                speakers = _get_model_speakers(model_name)
+            except ValueError as e:
+                _LOGGER.warning("Failed to read speakers for model %s: %s", model_name, e)
+                continue
+
+            for speaker, speaker_id in speakers.items():
                 if speaker and speaker not in routes:  # Skip empty speaker labels
                     routes[speaker] = (model_name, speaker_id)
                     _LOGGER.debug("Routing speaker '%s' -> model '%s' (id=%d)", speaker, model_name, speaker_id)
@@ -526,8 +578,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             _preload_models(_server_config.preload_models)
             _LOGGER.info("Preloading complete. Loaded models: %s", list(_inference_cache.keys()))
 
-        if _server_config.model_priority:
-            _speaker_routes = _build_speaker_routes(_server_config.model_priority)
+        route_models = _server_config.model_priority or _allowed_models()
+        if route_models:
+            _speaker_routes = _build_speaker_routes(route_models)
             _LOGGER.info("Built speaker routes for %d speakers", len(_speaker_routes))
 
         _LOGGER.info("Server ready")
@@ -565,6 +618,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "status": "ok",
             "version": "0.1.0",
             "models_loaded": list(_inference_cache.keys()),
+            "models_enabled": _allowed_models(),
+            "max_models_in_cache": _server_config.max_models_in_cache,
             "default_model": _server_config.default_model,
             "speakers": speakers,
         }
@@ -672,8 +727,8 @@ curl -X POST "http://localhost:8000/synthesize" \\
 
     @app.get("/models", response_model=list[str])
     async def list_models():
-        """List available models."""
-        return _list_available_models()
+        """List models enabled for on-demand use."""
+        return _allowed_models()
 
     @app.get("/models/{model}", response_model=ModelInfo)
     async def get_model_info(model: str):
