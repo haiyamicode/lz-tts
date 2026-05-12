@@ -99,11 +99,11 @@ class ResolvedQwenLanguage:
 class DpBudgetSettings(BaseModel):
     enabled: bool = True
     preload: bool = True
-    checkpoint: str = "data/lzspeech-gm/glow_tts.pt"
+    checkpoint: str = "data/lzspeech-multilingual-bert/lzspeech-multilingual-bert-189.ckpt"
+    config_path: Optional[str] = None
     device: str = "cuda"
     language: str = "multilingual"
     noise_scale: float = 0.8
-    semantic_guidance_scale: float = 1.7
     length_scale: float = 1.0
     token_rate: float = 12.0
     samples: int = 32
@@ -112,8 +112,6 @@ class DpBudgetSettings(BaseModel):
     max_margin: float = 1.35
     min_extra_tokens: int = 0
     max_extra_tokens: int = 72
-    bert_model: str = "distilbert-base-multilingual-cased"
-    fusion_weight: float = 0.5
     language_profiles: dict[str, dict[str, float | int]] = Field(default_factory=dict)
 
 
@@ -344,10 +342,10 @@ def get_dp_budget_model() -> Any:
         dp_budget_model = QwenDpBudget(
             DpBudgetConfig(
                 checkpoint=Path(dp_settings.checkpoint),
+                config_path=Path(dp_settings.config_path) if dp_settings.config_path else None,
                 device=dp_settings.device,
                 language=dp_settings.language,
                 noise_scale=dp_settings.noise_scale,
-                semantic_guidance_scale=dp_settings.semantic_guidance_scale,
                 length_scale=dp_settings.length_scale,
                 token_rate=dp_settings.token_rate,
                 samples=dp_settings.samples,
@@ -356,8 +354,6 @@ def get_dp_budget_model() -> Any:
                 max_margin=dp_settings.max_margin,
                 min_extra_tokens=dp_settings.min_extra_tokens,
                 max_extra_tokens=dp_settings.max_extra_tokens,
-                bert_model=dp_settings.bert_model,
-                fusion_weight=dp_settings.fusion_weight,
                 language_profiles=dp_settings.language_profiles,
             )
         )

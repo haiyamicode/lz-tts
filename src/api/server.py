@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+import base64
 import gc
 import importlib.util
 import io
 import json
 import logging
 import os
+import secrets
 import wave
 from collections import OrderedDict
 from pathlib import Path
 from typing import Literal, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse, Response
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 
@@ -27,6 +30,7 @@ from .qwen3 import router as qwen3_router
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
 _LOGGER = logging.getLogger(__name__)
+load_dotenv()
 
 # Default paths
 DATA_DIR = Path("data")
@@ -907,12 +911,64 @@ curl -X POST "http://localhost:8000/synthesize" \\
     return app
 
 
+class _BasicAuthWrapper:
+    def __init__(self, app, username: str, password: str):
+        self.app = app
+        self.username = username
+        self.password = password
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        auth_header = ""
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"authorization":
+                auth_header = value.decode("latin1")
+                break
+
+        if not _basic_auth_matches(auth_header, self.username, self.password):
+            response = _basic_auth_challenge()
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+def _basic_auth_matches(auth_header: str, username: str, password: str) -> bool:
+    if not auth_header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+        submitted_username, submitted_password = decoded.split(":", 1)
+    except Exception:
+        return False
+    return secrets.compare_digest(submitted_username, username) and secrets.compare_digest(
+        submitted_password,
+        password,
+    )
+
+
+def _basic_auth_challenge() -> Response:
+    return Response(
+        "Unauthorized",
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="qwen3-demo"'},
+    )
+
+
 def _mount_qwen_demo(app: FastAPI) -> None:
-    """Mount the copied faster-qwen3-tts demo inside this server."""
+    """Mount the bundled faster-qwen3-tts demo inside this server."""
     if not qwen3.env_bool("QWEN_TTS_DEMO", True):
         return
 
-    demo_server = Path("local/faster-qwen3-tts-demo/server.py")
+    demo_password = os.environ.get("QWEN_TTS_DEMO_PASSWORD")
+    if not demo_password:
+        _LOGGER.warning("Qwen3 demo disabled: QWEN_TTS_DEMO_PASSWORD is not set")
+        return
+
+    demo_server = Path(__file__).resolve().parents[1] / "qwen3_demo" / "server.py"
     if not demo_server.exists():
         _LOGGER.warning("Qwen3 demo server not found: %s", demo_server)
         return
@@ -925,7 +981,14 @@ def _mount_qwen_demo(app: FastAPI) -> None:
 
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    app.mount("/qwen3/demo", module.app)
+
+    @app.get("/qwen3/demo", include_in_schema=False)
+    async def qwen_demo_entrypoint(request: Request):
+        if not _basic_auth_matches(request.headers.get("authorization", ""), "admin", demo_password):
+            return _basic_auth_challenge()
+        return RedirectResponse("/qwen3/demo/")
+
+    app.mount("/qwen3/demo", _BasicAuthWrapper(module.app, "admin", demo_password))
     _LOGGER.info("Mounted Qwen3 demo at /qwen3/demo")
 
 
