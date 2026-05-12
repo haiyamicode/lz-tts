@@ -20,6 +20,7 @@ from pydub import AudioSegment
 from ..multilingual_splitter import MultilingualSplitter
 from ..piper import PiperInference
 from ..ssml import BreakSegment, TextSegment, generate_silence, parse_ssml
+from .qwen3 import router as qwen3_router
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
 _LOGGER = logging.getLogger(__name__)
@@ -561,6 +562,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         description="Piper TTS inference API",
         version="0.1.0",
     )
+    app.include_router(qwen3_router)
 
     @app.on_event("startup")
     async def startup_event():

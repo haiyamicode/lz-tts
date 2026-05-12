@@ -10,7 +10,7 @@ dependencies = [
     "pytorch-lightning==2.6.0",
     "torchmetrics==1.8.2",
     "piper-phonemize",
-    "transformers>=4.39.0,<4.40",
+    "transformers>=4.57",
     "sentencepiece>=0.2.0,<0.3",
     # piper_train dependencies for inference
     "pycld2==0.41",
@@ -34,6 +34,12 @@ dependencies = [
     "boto3>=1.42.30",
     "python-dotenv>=1.2.1",
     "rapidfuzz>=3.14.3",
+    "qwen-tts>=0.1.1",
+    "soundfile>=0.13.1",
+    "huggingface-hub>=0.36.0",
+    "nano-parakeet>=0.2.1",
+    "deepfilternet>=0.5.6",
+    "torchaudio==2.9.1",
 ]
 
 [build-system]
@@ -44,7 +50,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["src", "faster_qwen3_tts"]
 
 [project.scripts]
 lz-tts = "src.cli:main"
