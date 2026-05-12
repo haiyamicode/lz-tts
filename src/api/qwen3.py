@@ -16,14 +16,14 @@ import numpy as np
 import soundfile as sf
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 CACHE_DIR = Path("cache/voice_samples")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 QWEN_DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 QWEN_DEFAULT_DTYPE = "bfloat16"
-QWEN_DEFAULT_LANGUAGE = "English"
+QWEN_DEFAULT_LANGUAGE = "Auto"
 QWEN_DEFAULT_MAX_NEW_TOKENS = 360
 QWEN_DEFAULT_TEMPERATURE = 0.9
 QWEN_DEFAULT_TOP_K = 50
@@ -32,11 +32,12 @@ QWEN_DEFAULT_REPETITION_PENALTY = 1.03
 QWEN_DEFAULT_XVEC_ONLY = False
 QWEN_DEFAULT_NON_STREAMING_MODE = True
 QWEN_DEFAULT_EXPRESSIVENESS = 1.0
+QWEN_DP_BUDGET_DEFAULT = True
 ENABLE_DEEPFILTER_DEFAULT = True
 ENABLE_SILENCE_TRIM_DEFAULT = True
 SILENCE_TRIM_THRESHOLD_DB = -45.0
 SILENCE_TRIM_RELATIVE_THRESHOLD_DB = -35.0
-SILENCE_TRIM_PADDING_MS = 80
+SILENCE_TRIM_PADDING_MS = 150
 EXPRESSIVENESS_PRESETS = {
     1.0: {"temperature": 0.90, "top_k": 50, "repetition_penalty": 1.03},
     0.8: {"temperature": 0.84, "top_k": 48, "repetition_penalty": 1.035},
@@ -51,7 +52,110 @@ model: Optional[Any] = None
 parakeet_model: Optional[Any] = None
 deepfilter_model: Optional[Any] = None
 deepfilter_state: Optional[Any] = None
+dp_budget_model: Optional[Any] = None
 inference_lock = threading.Lock()
+_qwen_language_splitter: Optional[Any] = None
+
+QWEN_LANGUAGE_NAMES = {
+    "zh": "Chinese",
+    "en": "English",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "fr": "French",
+    "de": "German",
+    "ru": "Russian",
+    "pt": "Portuguese",
+    "es": "Spanish",
+    "it": "Italian",
+}
+QWEN_LANGUAGE_LOCALES = {
+    "zh": "zh-CN",
+    "en": "en-US",
+    "ja": "ja-JP",
+    "ko": "ko-KR",
+    "fr": "fr-FR",
+    "de": "de-DE",
+    "ru": "ru-RU",
+    "pt": "pt-PT",
+    "es": "es-ES",
+    "it": "it-IT",
+}
+QWEN_LANGUAGE_CODES = {
+    language_name.lower(): language_name
+    for language_name in QWEN_LANGUAGE_NAMES.values()
+}
+QWEN_NAME_TO_CODE = {
+    language_name.lower(): language_code
+    for language_code, language_name in QWEN_LANGUAGE_NAMES.items()
+}
+
+
+@dataclass(frozen=True)
+class ResolvedQwenLanguage:
+    qwen_language: str
+    dp_language: str
+
+
+class DpBudgetSettings(BaseModel):
+    enabled: bool = True
+    preload: bool = True
+    checkpoint: str = "data/lzspeech-gm/glow_tts.pt"
+    device: str = "cuda"
+    language: str = "multilingual"
+    noise_scale: float = 0.8
+    semantic_guidance_scale: float = 1.7
+    length_scale: float = 1.0
+    token_rate: float = 12.0
+    samples: int = 32
+    upper_quantile: float = 0.90
+    min_margin: float = 1.0
+    max_margin: float = 1.35
+    min_extra_tokens: int = 0
+    max_extra_tokens: int = 72
+    bert_model: str = "distilbert-base-multilingual-cased"
+    fusion_weight: float = 0.5
+    language_profiles: dict[str, dict[str, float | int]] = Field(default_factory=dict)
+
+
+class QwenSettings(BaseModel):
+    preload: bool = True
+    model: str = QWEN_DEFAULT_MODEL
+    device: str = "cuda"
+    dtype: str = QWEN_DEFAULT_DTYPE
+    warmup: bool = True
+    attn: str = "sdpa"
+    max_seq_len: int = 2048
+    language: str = QWEN_DEFAULT_LANGUAGE
+    max_new_tokens: int = QWEN_DEFAULT_MAX_NEW_TOKENS
+    xvec_only: bool = QWEN_DEFAULT_XVEC_ONLY
+    non_streaming_mode: bool = QWEN_DEFAULT_NON_STREAMING_MODE
+    temperature: float = QWEN_DEFAULT_TEMPERATURE
+    top_k: int = QWEN_DEFAULT_TOP_K
+    top_p: float = QWEN_DEFAULT_TOP_P
+    repetition_penalty: float = QWEN_DEFAULT_REPETITION_PENALTY
+    dp_budget: DpBudgetSettings = Field(default_factory=DpBudgetSettings)
+
+
+_qwen_settings = QwenSettings()
+
+
+def configure(settings: QwenSettings) -> None:
+    global _qwen_settings, dp_budget_model
+    _qwen_settings = settings
+    dp_budget_model = None
+
+
+def demo_defaults() -> dict[str, Any]:
+    return {
+        "language": _qwen_settings.language,
+        "temperature": _qwen_settings.temperature,
+        "top_k": _qwen_settings.top_k,
+        "top_p": _qwen_settings.top_p,
+        "repetition_penalty": _qwen_settings.repetition_penalty,
+        "xvec_only": _qwen_settings.xvec_only,
+        "non_streaming_mode": _qwen_settings.non_streaming_mode,
+        "dp_budget": _qwen_settings.dp_budget.enabled,
+    }
 
 
 @router.get("/health")
@@ -77,18 +181,134 @@ def resolve_expressiveness(value: Optional[float]) -> tuple[float, dict[str, flo
     return level, EXPRESSIVENESS_PRESETS[level]
 
 
+def _get_qwen_language_splitter() -> Any:
+    global _qwen_language_splitter
+    if _qwen_language_splitter is None:
+        from src.multilingual_splitter import MultilingualSplitter
+
+        _qwen_language_splitter = MultilingualSplitter()
+    return _qwen_language_splitter
+
+
+def _language_weight(text: str) -> int:
+    return len(re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE))
+
+
+def _canonical_locale(language_code: str) -> str:
+    code = language_code.strip().replace("_", "-")
+    parts = [part for part in code.split("-") if part]
+    if not parts:
+        return ""
+    base = parts[0].lower()
+    if len(parts) == 1:
+        return base
+    region = parts[1].upper()
+    rest = parts[2:]
+    return "-".join([base, region, *rest])
+
+
+def _locale_base(locale: str) -> str:
+    return locale.strip().lower().replace("_", "-").split("-", 1)[0]
+
+
+def _qwen_name_for_code(language_code: str) -> Optional[str]:
+    return QWEN_LANGUAGE_NAMES.get(_locale_base(language_code))
+
+
+def detect_qwen_language(text: str) -> ResolvedQwenLanguage:
+    splitter = _get_qwen_language_splitter()
+    result = splitter.split(text)
+
+    weights: dict[str, int] = {}
+    locales: dict[str, str] = {}
+    for segment in result.segments:
+        language = (segment.language if segment.language and segment.language != "und" else result.main_language).lower()
+        qwen_language = QWEN_LANGUAGE_NAMES.get(language)
+        if not qwen_language:
+            continue
+        locales[qwen_language] = QWEN_LANGUAGE_LOCALES.get(language, language)
+        weight = _language_weight(segment.text)
+        if weight:
+            weights[qwen_language] = weights.get(qwen_language, 0) + weight
+
+    if not weights:
+        main_code = (result.main_language or "").lower()
+        main_language = QWEN_LANGUAGE_NAMES.get(main_code)
+        if main_language:
+            return ResolvedQwenLanguage(main_language, QWEN_LANGUAGE_LOCALES.get(main_code, main_code))
+        return ResolvedQwenLanguage("Auto", "multilingual")
+
+    total_weight = sum(weights.values())
+    prominence_threshold = max(4, int(total_weight * 0.20))
+    prominent = [
+        language
+        for language, weight in weights.items()
+        if weight >= prominence_threshold
+    ]
+    if len(prominent) == 1:
+        qwen_language = prominent[0]
+        return ResolvedQwenLanguage(qwen_language, locales.get(qwen_language, "multilingual"))
+    return ResolvedQwenLanguage("Auto", "multilingual")
+
+
+def normalize_qwen_language(language: str) -> str:
+    requested = language.strip()
+    requested_lower = requested.lower()
+    if requested_lower == "auto":
+        return "Auto"
+    if "-" in requested or "_" in requested:
+        qwen_language = _qwen_name_for_code(requested)
+        if qwen_language:
+            return qwen_language
+    return QWEN_LANGUAGE_NAMES.get(requested_lower) or QWEN_LANGUAGE_CODES.get(requested_lower) or requested
+
+
+def resolve_qwen_language_code(language_code: str) -> ResolvedQwenLanguage:
+    requested = language_code.strip()
+    if not requested or requested.lower() == "auto":
+        return ResolvedQwenLanguage("Auto", "multilingual")
+
+    locale = _canonical_locale(requested)
+    if "-" not in locale:
+        raise HTTPException(400, "language_code must be a full locale code like ja-JP or en-US")
+
+    qwen_language = _qwen_name_for_code(locale)
+    if qwen_language is None:
+        raise HTTPException(400, f"Unsupported Qwen language_code: {language_code}")
+
+    return ResolvedQwenLanguage(qwen_language, locale)
+
+
+def resolve_qwen_language(
+    text: str,
+    language: Optional[str],
+    language_code: Optional[str] = None,
+) -> ResolvedQwenLanguage:
+    if language_code is not None and language_code.strip():
+        return resolve_qwen_language_code(language_code)
+
+    requested = (language or _qwen_settings.language).strip()
+    if not requested or requested.lower() == "auto":
+        return detect_qwen_language(text)
+
+    qwen_language = normalize_qwen_language(requested)
+    language_base = QWEN_NAME_TO_CODE.get(qwen_language.lower()) or _locale_base(requested)
+    dp_language = QWEN_LANGUAGE_LOCALES.get(language_base, "multilingual")
+    return ResolvedQwenLanguage(qwen_language, dp_language)
+
+
 def get_model() -> Any:
     global model
     if model is None:
         import torch
         from faster_qwen3_tts import FasterQwen3TTS
 
-        model_name = os.environ.get("QWEN_TTS_MODEL", QWEN_DEFAULT_MODEL)
-        device = os.environ.get("QWEN_TTS_DEVICE", "cuda")
-        dtype_name = os.environ.get("QWEN_TTS_DTYPE", QWEN_DEFAULT_DTYPE)
+        model_name = _qwen_settings.model
+        device = _qwen_settings.device
+        dtype_name = _qwen_settings.dtype
         dtype = getattr(torch, dtype_name, torch.bfloat16)
-        attn_implementation = os.environ.get("QWEN_TTS_ATTN", "sdpa")
-        max_seq_len = int(os.environ.get("QWEN_TTS_MAX_SEQ_LEN", "2048"))
+        attn_implementation = _qwen_settings.attn
+        max_seq_len = _qwen_settings.max_seq_len
         print(
             "Loading FasterQwen3TTS "
             f"model={model_name} device={device} dtype={dtype_name} "
@@ -103,11 +323,51 @@ def get_model() -> Any:
             attn_implementation=attn_implementation,
             max_seq_len=max_seq_len,
         )
-        if env_bool("QWEN_TTS_WARMUP", True) and hasattr(model, "_warmup"):
+        if _qwen_settings.warmup and hasattr(model, "_warmup"):
             print("Capturing CUDA graphs...", file=sys.stderr, flush=True)
             model._warmup(prefill_len=100)
         print(f"FasterQwen3TTS loaded. Sample rate: {model.sample_rate}", file=sys.stderr, flush=True)
     return model
+
+
+def preload_model() -> None:
+    get_model()
+
+
+def get_dp_budget_model() -> Any:
+    global dp_budget_model
+    if dp_budget_model is None:
+        from src.qwen_dp_budget import DpBudgetConfig, QwenDpBudget
+
+        print("Loading Qwen DP budget model...", file=sys.stderr, flush=True)
+        dp_settings = _qwen_settings.dp_budget
+        dp_budget_model = QwenDpBudget(
+            DpBudgetConfig(
+                checkpoint=Path(dp_settings.checkpoint),
+                device=dp_settings.device,
+                language=dp_settings.language,
+                noise_scale=dp_settings.noise_scale,
+                semantic_guidance_scale=dp_settings.semantic_guidance_scale,
+                length_scale=dp_settings.length_scale,
+                token_rate=dp_settings.token_rate,
+                samples=dp_settings.samples,
+                upper_quantile=dp_settings.upper_quantile,
+                min_margin=dp_settings.min_margin,
+                max_margin=dp_settings.max_margin,
+                min_extra_tokens=dp_settings.min_extra_tokens,
+                max_extra_tokens=dp_settings.max_extra_tokens,
+                bert_model=dp_settings.bert_model,
+                fusion_weight=dp_settings.fusion_weight,
+                language_profiles=dp_settings.language_profiles,
+            )
+        )
+        dp_budget_model.load()
+        print("Qwen DP budget model ready.", file=sys.stderr, flush=True)
+    return dp_budget_model
+
+
+def predict_dp_budget(text: str, language: Optional[str] = None) -> dict[str, Any]:
+    return get_dp_budget_model().predict(text, language=language)
 
 
 def get_parakeet_model() -> Any:
@@ -423,6 +683,7 @@ class SynthesizeRequest(BaseModel):
     voice_text: Optional[str] = None
     speed: float = 1.0
     language: Optional[str] = None
+    language_code: Optional[str] = None
     max_new_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_k: Optional[int] = None
@@ -431,6 +692,7 @@ class SynthesizeRequest(BaseModel):
     xvec_only: Optional[bool] = None
     non_streaming_mode: Optional[bool] = None
     expressiveness: Optional[float] = None
+    dp_budget: Optional[bool] = None
 
 
 @router.post("/synthesize")
@@ -444,7 +706,7 @@ def synthesize(req: SynthesizeRequest):
         raise HTTPException(400, f"Failed to download voice sample: {e}")
 
     m = get_model()
-    xvec_only = req.xvec_only if req.xvec_only is not None else env_bool("QWEN_TTS_XVEC_ONLY", QWEN_DEFAULT_XVEC_ONLY)
+    xvec_only = req.xvec_only if req.xvec_only is not None else _qwen_settings.xvec_only
     try:
         prompt_text = (
             req.voice_text.strip()
@@ -454,39 +716,52 @@ def synthesize(req: SynthesizeRequest):
     except Exception as e:
         raise HTTPException(400, f"Failed to transcribe voice sample: {e}")
 
-    language = req.language or os.environ.get("QWEN_TTS_LANGUAGE", QWEN_DEFAULT_LANGUAGE)
+    resolved_language = resolve_qwen_language(req.text, req.language, req.language_code)
+    language = resolved_language.qwen_language
     expressiveness_level, expressiveness_config = resolve_expressiveness(req.expressiveness)
-    max_new_tokens = (
-        req.max_new_tokens
-        if req.max_new_tokens is not None
-        else int(os.environ.get("QWEN_TTS_MAX_NEW_TOKENS", str(QWEN_DEFAULT_MAX_NEW_TOKENS)))
+    dp_budget_enabled = (
+        req.dp_budget
+        if req.dp_budget is not None
+        else _qwen_settings.dp_budget.enabled
     )
+    dp_budget_info = None
+    if req.max_new_tokens is not None:
+        max_new_tokens = req.max_new_tokens
+    elif dp_budget_enabled:
+        try:
+            dp_budget_info = predict_dp_budget(req.text, language=resolved_language.dp_language)
+            max_new_tokens = int(dp_budget_info["max_tokens"])
+        except Exception as e:
+            print(f"DP budget failed; falling back to default max_new_tokens: {e}", file=sys.stderr, flush=True)
+            max_new_tokens = _qwen_settings.max_new_tokens
+    else:
+        max_new_tokens = _qwen_settings.max_new_tokens
     temperature = (
         req.temperature
         if req.temperature is not None
         else expressiveness_config["temperature"]
         if req.expressiveness is not None
-        else float(os.environ.get("QWEN_TTS_TEMPERATURE", str(expressiveness_config["temperature"])))
+        else _qwen_settings.temperature
     )
     top_k = (
         req.top_k
         if req.top_k is not None
         else expressiveness_config["top_k"]
         if req.expressiveness is not None
-        else int(os.environ.get("QWEN_TTS_TOP_K", str(expressiveness_config["top_k"])))
+        else _qwen_settings.top_k
     )
-    top_p = req.top_p if req.top_p is not None else float(os.environ.get("QWEN_TTS_TOP_P", str(QWEN_DEFAULT_TOP_P)))
+    top_p = req.top_p if req.top_p is not None else _qwen_settings.top_p
     repetition_penalty = (
         req.repetition_penalty
         if req.repetition_penalty is not None
         else expressiveness_config["repetition_penalty"]
         if req.expressiveness is not None
-        else float(os.environ.get("QWEN_TTS_REPETITION_PENALTY", str(QWEN_DEFAULT_REPETITION_PENALTY)))
+        else _qwen_settings.repetition_penalty
     )
     non_streaming_mode = (
         req.non_streaming_mode
         if req.non_streaming_mode is not None
-        else env_bool("QWEN_TTS_NON_STREAMING_MODE", QWEN_DEFAULT_NON_STREAMING_MODE)
+        else _qwen_settings.non_streaming_mode
     )
 
     text_hash = hashlib.sha256(req.text.encode()).hexdigest()[:12]
@@ -502,6 +777,7 @@ def synthesize(req: SynthesizeRequest):
         f"voice_text_len={len(prompt_text)} "
         f"voice_text_source={'request' if req.voice_text and req.voice_text.strip() else 'none' if xvec_only else 'nano-parakeet'} "
         f"language={language!r} "
+        f"dp_language={resolved_language.dp_language!r} "
         f"xvec_only={xvec_only} "
         f"non_streaming_mode={non_streaming_mode} "
         f"expressiveness={req.expressiveness if req.expressiveness is not None else QWEN_DEFAULT_EXPRESSIVENESS} "
@@ -511,6 +787,8 @@ def synthesize(req: SynthesizeRequest):
         f"top_p={top_p} "
         f"repetition_penalty={repetition_penalty} "
         f"max_new_tokens={max_new_tokens} "
+        f"dp_budget={dp_budget_enabled} "
+        f"dp_budget_info={json.dumps(dp_budget_info, ensure_ascii=False) if dp_budget_info else None} "
         f"speed_ignored={req.speed != 1.0} "
         f"prompt_preview={prompt_text[:180]!r} "
         f"preview={req.text[:240]!r}",
@@ -544,11 +822,15 @@ def synthesize(req: SynthesizeRequest):
         raw_audio_seconds = wav_data.size / sample_rate
         wav_data, postprocess_info = postprocess_audio(wav_data, sample_rate)
 
+    cap_seconds = max_new_tokens / 12.0
+    hit_token_cap = raw_audio_seconds >= max(0.0, cap_seconds - 0.25)
     print(
         "synthesize response "
         f"text_hash={text_hash} "
         f"raw_audio_seconds={raw_audio_seconds:.2f} "
         f"audio_seconds={wav_data.size / sample_rate:.2f} "
+        f"cap_seconds={cap_seconds:.2f} "
+        f"hit_token_cap={hit_token_cap} "
         f"deepfilter={postprocess_info.get('deepfilter')} "
         f"silence_trim={postprocess_info.get('trim')} "
         f"trim_head_seconds={postprocess_info.get('trim_head_seconds', 0.0):.2f} "

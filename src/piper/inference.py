@@ -86,6 +86,7 @@ class PiperInference:
         self.model = VitsModel.load_from_checkpoint(
             str(self.checkpoint_path), dataset=None, weights_only=False
         )
+        self._sync_config_from_checkpoint()
         self.model.eval()
         self.model.to(self.device)
         if self.fp16:
@@ -120,6 +121,29 @@ class PiperInference:
             self.use_bert,
         )
 
+    def _sync_config_from_checkpoint(self) -> None:
+        speaker_map = getattr(self.model.hparams, "speaker_id_map", None)
+        if not isinstance(speaker_map, dict) or not speaker_map:
+            return
+
+        checkpoint_speakers = {str(label): int(sid) for label, sid in speaker_map.items()}
+        configured_speakers = {
+            str(label): int(sid)
+            for label, sid in (self.config.get("speaker_id_map") or {}).items()
+        }
+        if configured_speakers != checkpoint_speakers:
+            _LOGGER.warning(
+                "Config speaker_id_map does not match checkpoint; using checkpoint speaker map "
+                "(config=%d speakers, checkpoint=%d speakers)",
+                len(configured_speakers),
+                len(checkpoint_speakers),
+            )
+
+        self.config["speaker_id_map"] = checkpoint_speakers
+        num_speakers = getattr(self.model.hparams, "num_speakers", None)
+        if isinstance(num_speakers, int):
+            self.config["num_speakers"] = num_speakers
+
     def phonemize(
         self,
         text: str,
@@ -145,12 +169,12 @@ class PiperInference:
 
         if speaker:
             span = phonemize_text_for_speaker(
-                text, self.config_path, speaker, espeak_data_path, neural=neural
+                text, self.config, speaker, espeak_data_path, neural=neural
             )
             return [span]
         else:
             return phonemize_spans_with_speakers(
-                text, self.config_path, espeak_data_path, neural=neural
+                text, self.config, espeak_data_path, neural=neural
             )
 
     def synthesize_span(
@@ -187,7 +211,7 @@ class PiperInference:
         ]
 
         # For single-speaker models, speaker can be None - phonemize will use default speaker_id=0
-        span = phonemize_text_for_speaker(text, self.config_path, speaker or "", None, neural=neural)
+        span = phonemize_text_for_speaker(text, self.config, speaker or "", None, neural=neural)
         phoneme_ids = span["phoneme_ids"]
         speaker_id = span.get("speaker_id", 0)
 

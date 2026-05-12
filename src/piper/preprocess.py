@@ -20,6 +20,15 @@ from ..multilingual_splitter import MultilingualSplitter
 from .heteronym import get_resolver as _get_heteronym_resolver
 
 
+def _load_model_config(config_path):
+    if isinstance(config_path, dict):
+        return config_path
+
+    cfg_path = Path(config_path)
+    with cfg_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 # -----------------------------------------------------------------------------
 # espeak-ng 1.52+ ctypes interface for word-to-phoneme alignment
 #
@@ -575,9 +584,7 @@ def phonemize_text_for_infer(
 
     Returns a dict with 'phonemes' and 'phoneme_ids'.
     """
-    cfg_path = Path(config_path)
-    with cfg_path.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    cfg = _load_model_config(config_path)
 
     lang_code = (cfg.get("language") or {}).get("code")
     es_conf = cfg.get("espeak") or {}
@@ -625,9 +632,7 @@ def phonemize_spans_with_speakers(
 
     Returns a list of spans: [{"phoneme_ids": [...], "speaker_id": int, "text": str}, ...]
     """
-    cfg_path = Path(config_path)
-    with cfg_path.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    cfg = _load_model_config(config_path)
 
     es_conf = cfg.get("espeak") or {}
     primary = es_conf.get("primary") or "en-us"
@@ -723,9 +728,7 @@ def phonemize_text_for_speaker(
 
     Returns: {"phoneme_ids": [...], "speaker_id": int, "text": str}
     """
-    cfg_path = Path(config_path)
-    with cfg_path.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    cfg = _load_model_config(config_path)
 
     es_conf = cfg.get("espeak") or {}
     primary = es_conf.get("primary") or "en-us"

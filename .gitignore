@@ -13,6 +13,8 @@ wheels/
 local
 output
 data
+cache
+checkpoints
 
 # IDE files
 .claude

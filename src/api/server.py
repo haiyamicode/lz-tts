@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import gc
+import importlib.util
 import io
 import json
 import logging
+import os
 import wave
 from collections import OrderedDict
 from pathlib import Path
@@ -20,6 +22,7 @@ from pydub import AudioSegment
 from ..multilingual_splitter import MultilingualSplitter
 from ..piper import PiperInference
 from ..ssml import BreakSegment, TextSegment, generate_silence, parse_ssml
+from . import qwen3
 from .qwen3 import router as qwen3_router
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
@@ -49,6 +52,7 @@ class ServerConfig(BaseModel):
     preload_models: list[str] = Field(default_factory=list)
     model_priority: list[str] = Field(default_factory=list)
     lang_speaker_map: dict[str, str] = Field(default_factory=dict)
+    qwen: qwen3.QwenSettings = Field(default_factory=qwen3.QwenSettings)
     # Per-model configuration overrides
     model_config_overrides: dict[str, ModelConfig] = Field(default_factory=dict, alias="model_config")
 
@@ -556,6 +560,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     if config is None:
         config = _load_config()
     _server_config = config
+    qwen3.configure(config.qwen)
 
     app = FastAPI(
         title="LZ-TTS API",
@@ -563,6 +568,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         version="0.1.0",
     )
     app.include_router(qwen3_router)
+    _mount_qwen_demo(app)
 
     @app.on_event("startup")
     async def startup_event():
@@ -584,6 +590,13 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if route_models:
             _speaker_routes = _build_speaker_routes(route_models)
             _LOGGER.info("Built speaker routes for %d speakers", len(_speaker_routes))
+
+        if _server_config.qwen.preload:
+            _LOGGER.info("Preloading Qwen3 TTS...")
+            qwen3.preload_model()
+            if _server_config.qwen.dp_budget.preload:
+                qwen3.get_dp_budget_model()
+            _LOGGER.info("Qwen3 TTS preload complete")
 
         _LOGGER.info("Server ready")
 
@@ -892,6 +905,28 @@ curl -X POST "http://localhost:8000/synthesize" \\
         return Response(content=audio_bytes, media_type=media_type)
 
     return app
+
+
+def _mount_qwen_demo(app: FastAPI) -> None:
+    """Mount the copied faster-qwen3-tts demo inside this server."""
+    if not qwen3.env_bool("QWEN_TTS_DEMO", True):
+        return
+
+    demo_server = Path("local/faster-qwen3-tts-demo/server.py")
+    if not demo_server.exists():
+        _LOGGER.warning("Qwen3 demo server not found: %s", demo_server)
+        return
+
+    os.environ["LZ_TTS_EMBEDDED_DEMO"] = "1"
+    spec = importlib.util.spec_from_file_location("lz_tts_faster_qwen3_demo", demo_server)
+    if spec is None or spec.loader is None:
+        _LOGGER.warning("Could not load Qwen3 demo server: %s", demo_server)
+        return
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    app.mount("/qwen3/demo", module.app)
+    _LOGGER.info("Mounted Qwen3 demo at /qwen3/demo")
 
 
 app = create_app()
