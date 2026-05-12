@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gc
 import json
-import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,26 +28,6 @@ class DpBudgetConfig:
     min_extra_tokens: int = 0
     max_extra_tokens: int = 36
     language_profiles: dict[str, dict[str, float | int]] = field(default_factory=dict)
-
-    @classmethod
-    def from_env(cls) -> "DpBudgetConfig":
-        language_profiles = parse_language_profiles(os.environ.get("QWEN_DP_BUDGET_LANGUAGE_PROFILES", ""))
-        return cls(
-            checkpoint=Path(os.environ.get("QWEN_DP_BUDGET_CHECKPOINT", str(cls.checkpoint))),
-            config_path=Path(os.environ["QWEN_DP_BUDGET_CONFIG"]) if os.environ.get("QWEN_DP_BUDGET_CONFIG") else None,
-            device=os.environ.get("QWEN_DP_BUDGET_DEVICE", cls.device),
-            language=os.environ.get("QWEN_DP_BUDGET_LANGUAGE", cls.language),
-            noise_scale=float(os.environ.get("QWEN_DP_BUDGET_NOISE_SCALE", cls.noise_scale)),
-            length_scale=float(os.environ.get("QWEN_DP_BUDGET_LENGTH_SCALE", cls.length_scale)),
-            token_rate=float(os.environ.get("QWEN_DP_BUDGET_TOKEN_RATE", cls.token_rate)),
-            samples=int(os.environ.get("QWEN_DP_BUDGET_SAMPLES", cls.samples)),
-            upper_quantile=float(os.environ.get("QWEN_DP_BUDGET_UPPER_QUANTILE", cls.upper_quantile)),
-            min_margin=float(os.environ.get("QWEN_DP_BUDGET_MIN_MARGIN", cls.min_margin)),
-            max_margin=float(os.environ.get("QWEN_DP_BUDGET_MAX_MARGIN", cls.max_margin)),
-            min_extra_tokens=int(os.environ.get("QWEN_DP_BUDGET_MIN_EXTRA_TOKENS", cls.min_extra_tokens)),
-            max_extra_tokens=int(os.environ.get("QWEN_DP_BUDGET_MAX_EXTRA_TOKENS", cls.max_extra_tokens)),
-            language_profiles=language_profiles,
-        )
 
 
 LANGUAGE_ALIASES = {
@@ -126,7 +105,7 @@ class QwenDpBudget:
     """Predict a conservative Qwen codec-token cap from duration samples."""
 
     def __init__(self, config: DpBudgetConfig | None = None):
-        self.config = config or DpBudgetConfig.from_env()
+        self.config = config or DpBudgetConfig()
         self.device = torch.device(self.config.device)
         self._lock = threading.Lock()
         self._model = None
