@@ -8,13 +8,7 @@ from torch.nn import Conv1d, Conv2d, ConvTranspose1d
 from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 
-from . import attentions, commons, modules
-
-# Training-only import (optional for inference)
-try:
-    from . import monotonic_align
-except ImportError:
-    monotonic_align = None
+from . import attentions, commons, modules, monotonic_align
 from .commons import get_padding, init_weights
 
 _DEBUG_SEMANTIC = bool(int(os.environ.get("PIPER_SEMANTIC_DEBUG", "0")))

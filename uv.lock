@@ -780,6 +780,7 @@ dependencies = [
     { name = "librosa" },
     { name = "mecab-ko-dic" },
     { name = "mecab-python3" },
+    { name = "monotonic-align" },
     { name = "nano-parakeet" },
     { name = "numpy" },
     { name = "piper-phonemize" },
@@ -815,6 +816,7 @@ requires-dist = [
     { name = "librosa", specifier = ">=0.11.0,<0.12" },
     { name = "mecab-ko-dic", specifier = ">=1.0.0,<1.1" },
     { name = "mecab-python3", specifier = ">=1.0.0,<1.1" },
+    { name = "monotonic-align", specifier = ">=1.0.0" },
     { name = "nano-parakeet", specifier = ">=0.2.1" },
     { name = "numpy", specifier = ">=1.26.0,<1.27" },
     { name = "piper-phonemize", directory = "src/phonemizer" },
@@ -897,6 +899,12 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/eb/3d/ff0ececd09018495946b30ed69fb9d33269c5bbb71042a091632c45ce5bc/mecab_python3-1.0.12-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:8654e3bce320800b19bb14683db77f7184bcab5f23023827bab97804591ca6a0", size = 581968, upload-time = "2025-11-25T11:23:37.822Z" },
     { url = "https://files.pythonhosted.org/packages/d8/9b/6ad5ed4d96f0f5ffb6077b54c179b0303effd7fa19d268368658787687ba/mecab_python3-1.0.12-cp310-cp310-win_amd64.whl", hash = "sha256:47c42624e8a406562bab1d9f8ae514bc7761a50c2cd2d6d1ff7101299c406998", size = 501729, upload-time = "2025-11-25T11:22:03.62Z" },
 ]
+
+[[package]]
+name = "monotonic-align"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2e/fc/814cbd78dd57880267355179ef74ba24d12daeb68776221f58072ac70643/monotonic_align-1.0.0.tar.gz", hash = "sha256:10bed2cf6f5f3cab716d1d14064cee4c759cd06e0eba63d199306f0c6839ffb1", size = 4807, upload-time = "2023-03-09T03:10:06.281Z" }
 
 [[package]]
 name = "mpmath"
