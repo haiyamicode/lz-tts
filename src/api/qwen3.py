@@ -119,9 +119,17 @@ class QwenSettings(BaseModel):
     preload: bool = True
     model: str = QWEN_DEFAULT_MODEL
     device: str = "cuda"
+    precision_mode: str = "config"
     dtype: str = QWEN_DEFAULT_DTYPE
+    audio_dtype: str = "auto"
     warmup: bool = True
     attn: str = "sdpa"
+    layer_precision: str = "auto"
+    predictor_layer_precision: str = "auto"
+    audio_decoder_precision: str = "auto"
+    large_block_precision: str = "auto"
+    extra_precision: str = "auto"
+    linear_precision: str = "none"
     max_seq_len: int = 2048
     language: str = QWEN_DEFAULT_LANGUAGE
     max_new_tokens: int = QWEN_DEFAULT_MAX_NEW_TOKENS
@@ -135,6 +143,102 @@ class QwenSettings(BaseModel):
 
 
 _qwen_settings = QwenSettings()
+
+
+def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
+    """Apply .env overrides for Qwen runtime and precision settings."""
+
+    def env_bool_value(name: str, default: bool) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    mode = os.environ.get("QWEN_TTS_PRECISION_MODE")
+    optimized = os.environ.get("QWEN_TTS_OPTIMIZED")
+    if mode:
+        mode = mode.strip().lower()
+    elif optimized is not None:
+        mode = "optimized" if env_bool_value("QWEN_TTS_OPTIMIZED", False) else "bf16"
+
+    if mode in {"optimized", "auto", "fp16", "mixed"}:
+        settings.precision_mode = "optimized"
+        settings.dtype = "auto"
+        settings.audio_dtype = "auto"
+        settings.attn = "auto"
+        settings.layer_precision = "auto"
+        settings.predictor_layer_precision = "auto"
+        settings.audio_decoder_precision = "auto"
+        settings.large_block_precision = "auto"
+        settings.extra_precision = "auto"
+        settings.linear_precision = "none"
+    elif mode in {"bf16", "bfloat16", "off", "disabled", "original"}:
+        settings.precision_mode = "bf16"
+        settings.dtype = "bfloat16"
+        settings.audio_dtype = "same"
+        settings.attn = "sdpa"
+        settings.layer_precision = "none"
+        settings.predictor_layer_precision = "none"
+        settings.audio_decoder_precision = "none"
+        settings.large_block_precision = "none"
+        settings.extra_precision = "none"
+        settings.linear_precision = "none"
+    elif mode:
+        raise ValueError(
+            "QWEN_TTS_PRECISION_MODE must be optimized or bf16 "
+            f"(got {mode!r})"
+        )
+
+    string_overrides = {
+        "QWEN_TTS_MODEL": "model",
+        "QWEN_TTS_DEVICE": "device",
+        "QWEN_TTS_DTYPE": "dtype",
+        "QWEN_TTS_AUDIO_DTYPE": "audio_dtype",
+        "QWEN_TTS_ATTN": "attn",
+        "QWEN_TTS_LAYER_PRECISION": "layer_precision",
+        "QWEN_TTS_PREDICTOR_LAYER_PRECISION": "predictor_layer_precision",
+        "QWEN_TTS_AUDIO_DECODER_PRECISION": "audio_decoder_precision",
+        "QWEN_TTS_LARGE_BLOCK_PRECISION": "large_block_precision",
+        "QWEN_TTS_EXTRA_PRECISION": "extra_precision",
+        "QWEN_TTS_LINEAR_PRECISION": "linear_precision",
+    }
+    for env_name, attr in string_overrides.items():
+        value = os.environ.get(env_name)
+        if value is not None and value.strip():
+            setattr(settings, attr, value.strip())
+            if attr in {
+                "dtype",
+                "audio_dtype",
+                "attn",
+                "layer_precision",
+                "predictor_layer_precision",
+                "audio_decoder_precision",
+                "large_block_precision",
+                "extra_precision",
+                "linear_precision",
+            }:
+                settings.precision_mode = "custom"
+
+    int_overrides = {
+        "QWEN_TTS_MAX_SEQ_LEN": "max_seq_len",
+        "QWEN_TTS_MAX_NEW_TOKENS": "max_new_tokens",
+    }
+    for env_name, attr in int_overrides.items():
+        value = os.environ.get(env_name)
+        if value is not None and value.strip():
+            setattr(settings, attr, int(value.strip()))
+
+    bool_overrides = {
+        "QWEN_TTS_PRELOAD": "preload",
+        "QWEN_TTS_WARMUP": "warmup",
+        "QWEN_TTS_XVEC_ONLY": "xvec_only",
+        "QWEN_TTS_NON_STREAMING_MODE": "non_streaming_mode",
+    }
+    for env_name, attr in bool_overrides.items():
+        if os.environ.get(env_name) is not None:
+            setattr(settings, attr, env_bool_value(env_name, getattr(settings, attr)))
+
+    return settings
 
 
 def configure(settings: QwenSettings) -> None:
@@ -153,6 +257,7 @@ def demo_defaults() -> dict[str, Any]:
         "xvec_only": _qwen_settings.xvec_only,
         "non_streaming_mode": _qwen_settings.non_streaming_mode,
         "dp_budget": _qwen_settings.dp_budget.enabled,
+        "precision_mode": _qwen_settings.precision_mode,
     }
 
 
@@ -304,13 +409,25 @@ def get_model() -> Any:
         model_name = _qwen_settings.model
         device = _qwen_settings.device
         dtype_name = _qwen_settings.dtype
-        dtype = getattr(torch, dtype_name, torch.bfloat16)
+        if dtype_name.lower() == "auto":
+            dtype = "auto"
+        else:
+            dtype = getattr(torch, dtype_name, torch.bfloat16)
+        audio_dtype = _qwen_settings.audio_dtype
         attn_implementation = _qwen_settings.attn
         max_seq_len = _qwen_settings.max_seq_len
         print(
             "Loading FasterQwen3TTS "
+            f"precision_mode={_qwen_settings.precision_mode} "
             f"model={model_name} device={device} dtype={dtype_name} "
-            f"attn={attn_implementation} max_seq_len={max_seq_len}...",
+            f"audio_dtype={audio_dtype} attn={attn_implementation} "
+            f"layer_precision={_qwen_settings.layer_precision} "
+            f"predictor_layer_precision={_qwen_settings.predictor_layer_precision} "
+            f"audio_decoder_precision={_qwen_settings.audio_decoder_precision} "
+            f"large_block_precision={_qwen_settings.large_block_precision} "
+            f"extra_precision={_qwen_settings.extra_precision} "
+            f"linear_precision={_qwen_settings.linear_precision} "
+            f"max_seq_len={max_seq_len}...",
             file=sys.stderr,
             flush=True,
         )
@@ -318,6 +435,13 @@ def get_model() -> Any:
             model_name,
             device=device,
             dtype=dtype,
+            audio_dtype=audio_dtype,
+            layer_precision=_qwen_settings.layer_precision,
+            predictor_layer_precision=_qwen_settings.predictor_layer_precision,
+            audio_decoder_precision=_qwen_settings.audio_decoder_precision,
+            large_block_precision=_qwen_settings.large_block_precision,
+            extra_precision=_qwen_settings.extra_precision,
+            linear_precision=_qwen_settings.linear_precision,
             attn_implementation=attn_implementation,
             max_seq_len=max_seq_len,
         )

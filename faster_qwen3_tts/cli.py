@@ -11,8 +11,21 @@ import torch
 from faster_qwen3_tts import FasterQwen3TTS
 
 
-def _load_model(model_id: str, device: str, dtype: str):
-    if dtype == "bf16":
+def _load_model(
+    model_id: str,
+    device: str,
+    dtype: str,
+    layer_precision: str,
+    predictor_layer_precision: str,
+    audio_decoder_precision: str,
+    large_block_precision: str,
+    extra_precision: str,
+    linear_precision: str,
+    attn_implementation: str,
+):
+    if dtype == "auto":
+        torch_dtype = "auto"
+    elif dtype == "bf16":
         torch_dtype = torch.bfloat16
     elif dtype == "fp16":
         torch_dtype = torch.float16
@@ -23,7 +36,13 @@ def _load_model(model_id: str, device: str, dtype: str):
         model_id,
         device=device,
         dtype=torch_dtype,
-        attn_implementation="sdpa",
+        layer_precision=layer_precision,
+        predictor_layer_precision=predictor_layer_precision,
+        audio_decoder_precision=audio_decoder_precision,
+        large_block_precision=large_block_precision,
+        extra_precision=extra_precision,
+        linear_precision=linear_precision,
+        attn_implementation=attn_implementation,
         max_seq_len=2048,
     )
 
@@ -44,7 +63,18 @@ def _stream_to_audio(gen):
 
 
 def cmd_clone(args):
-    model = _load_model(args.model, args.device, args.dtype)
+    model = _load_model(
+        args.model,
+        args.device,
+        args.dtype,
+        args.layer_precision,
+        args.predictor_layer_precision,
+        args.audio_decoder_precision,
+        args.large_block_precision,
+        args.extra_precision,
+        args.linear_precision,
+        args.attn_implementation,
+    )
 
     if args.streaming:
         start = time.perf_counter()
@@ -91,7 +121,18 @@ def cmd_clone(args):
 
 
 def cmd_custom(args):
-    model = _load_model(args.model, args.device, args.dtype)
+    model = _load_model(
+        args.model,
+        args.device,
+        args.dtype,
+        args.layer_precision,
+        args.predictor_layer_precision,
+        args.audio_decoder_precision,
+        args.large_block_precision,
+        args.extra_precision,
+        args.linear_precision,
+        args.attn_implementation,
+    )
 
     if args.list_speakers:
         speakers = model.model.get_supported_speakers() or []
@@ -143,7 +184,18 @@ def cmd_custom(args):
 
 
 def cmd_design(args):
-    model = _load_model(args.model, args.device, args.dtype)
+    model = _load_model(
+        args.model,
+        args.device,
+        args.dtype,
+        args.layer_precision,
+        args.predictor_layer_precision,
+        args.audio_decoder_precision,
+        args.large_block_precision,
+        args.extra_precision,
+        args.linear_precision,
+        args.attn_implementation,
+    )
 
     if args.streaming:
         start = time.perf_counter()
@@ -184,7 +236,18 @@ def cmd_design(args):
 
 
 def cmd_serve(args):
-    model = _load_model(args.model, args.device, args.dtype)
+    model = _load_model(
+        args.model,
+        args.device,
+        args.dtype,
+        args.layer_precision,
+        args.predictor_layer_precision,
+        args.audio_decoder_precision,
+        args.large_block_precision,
+        args.extra_precision,
+        args.linear_precision,
+        args.attn_implementation,
+    )
 
     if args.mode == "clone":
         if not args.ref_audio or not args.ref_text:
@@ -308,7 +371,47 @@ def cmd_serve(args):
 def build_parser():
     p = argparse.ArgumentParser(prog="faster-qwen3-tts", description="FasterQwen3TTS CLI")
     p.add_argument("--device", default="cuda", help="Device (cuda or cpu)")
-    p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"], help="Model dtype")
+    p.add_argument("--dtype", default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Model dtype")
+    p.add_argument(
+        "--layer-precision",
+        default="auto",
+        help="Talker decoder fp16 island layers: auto, none, all, lastN, firstN, even, odd, range, or indices",
+    )
+    p.add_argument(
+        "--predictor-layer-precision",
+        default="auto",
+        help="Code-predictor fp16 island layers: auto, none, all, lastN, firstN, even, odd, range, or indices",
+    )
+    p.add_argument(
+        "--audio-decoder-precision",
+        default="auto",
+        choices=["auto", "none", "fp16"],
+        help="fp16 islands for the speech-tokenizer decoder",
+    )
+    p.add_argument(
+        "--large-block-precision",
+        default="auto",
+        choices=["auto", "none", "fp16"],
+        help="fp16 conversion for validated large embedding/audio blocks",
+    )
+    p.add_argument(
+        "--extra-precision",
+        default="auto",
+        choices=["auto", "none", "fp16_inner"],
+        help="fp16-inner wrappers for validated non-layer modules",
+    )
+    p.add_argument(
+        "--linear-precision",
+        default="none",
+        choices=["auto", "none", "fp16_inner"],
+        help="Inner precision for selected talker Linear layers",
+    )
+    p.add_argument(
+        "--attn-implementation",
+        default="auto",
+        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        help="Attention implementation; auto uses eager on V100 and sdpa on Ampere+",
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp):

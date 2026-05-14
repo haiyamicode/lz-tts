@@ -6,6 +6,7 @@ CUDA graphs for 6-10x speedup.
 """
 import logging
 from pathlib import Path
+from types import MethodType
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import numpy as np
@@ -34,6 +35,7 @@ class FasterQwen3TTS:
         talker_graph,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        audio_dtype: Optional[torch.dtype] = None,
         max_seq_len: int = 2048,
     ):
         self.model = base_model  # The qwen-tts Qwen3TTSModel instance
@@ -41,6 +43,7 @@ class FasterQwen3TTS:
         self.talker_graph = talker_graph
         self.device = device
         self.dtype = dtype
+        self.audio_dtype = audio_dtype or dtype
         self.max_seq_len = max_seq_len
         self.sample_rate = self._infer_sample_rate(base_model)
         self._warmed_up = False
@@ -82,6 +85,340 @@ class FasterQwen3TTS:
         return int(sample_rate)
 
     @staticmethod
+    def _parse_dtype(dtype: Optional[Union[str, torch.dtype]]) -> Optional[torch.dtype]:
+        """Parse common dtype spellings."""
+        if dtype is None or isinstance(dtype, torch.dtype):
+            return dtype
+        normalized = dtype.lower().replace("torch.", "")
+        aliases = {
+            "auto": None,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "half": torch.float16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+            "float": torch.float32,
+        }
+        if normalized not in aliases:
+            raise ValueError(
+                f"Unsupported dtype {dtype!r}. Expected auto, bf16, fp16, or fp32."
+            )
+        return aliases[normalized]
+
+    @staticmethod
+    def _auto_generation_dtype(device: str) -> torch.dtype:
+        """Pick the stable generation dtype for the current device."""
+        if device.startswith("cuda") and torch.cuda.is_available():
+            device_index = torch.device(device).index
+            device_index = device_index if device_index is not None else torch.cuda.current_device()
+            major, _minor = torch.cuda.get_device_capability(device_index)
+            if major < 8:
+                return torch.float32
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+        return torch.float32 if device == "cpu" else torch.bfloat16
+
+    @staticmethod
+    def _resolve_dtypes(
+        dtype: Optional[Union[str, torch.dtype]],
+        audio_dtype: Optional[Union[str, torch.dtype]],
+        device: str,
+    ) -> Tuple[torch.dtype, torch.dtype]:
+        generation_dtype = FasterQwen3TTS._parse_dtype(dtype)
+        if generation_dtype is None:
+            generation_dtype = FasterQwen3TTS._auto_generation_dtype(device)
+
+        if isinstance(audio_dtype, str) and audio_dtype.lower() == "same":
+            resolved_audio_dtype = generation_dtype
+        else:
+            resolved_audio_dtype = FasterQwen3TTS._parse_dtype(audio_dtype)
+            if resolved_audio_dtype is None:
+                # Keep audio-side modules fp32 when the caller explicitly experiments
+                # with fp16 generation. Full fp16 can make the codec decoder noisy.
+                resolved_audio_dtype = (
+                    torch.float32 if generation_dtype is torch.float16 else generation_dtype
+                )
+        return generation_dtype, resolved_audio_dtype
+
+    @staticmethod
+    def _is_pre_ampere_cuda(device: str) -> bool:
+        if not device.startswith("cuda") or not torch.cuda.is_available():
+            return False
+        device_index = torch.device(device).index
+        device_index = device_index if device_index is not None else torch.cuda.current_device()
+        major, _minor = torch.cuda.get_device_capability(device_index)
+        return major < 8
+
+    @staticmethod
+    def _resolve_attn_implementation(attn_implementation: str, device: str) -> str:
+        if attn_implementation.lower() != "auto":
+            return attn_implementation
+        # On V100/Volta, PyTorch SDPA cannot use flash or cuDNN attention, and
+        # the memory-efficient path is slower than eager for this token-by-token
+        # decode shape. Ampere+ keeps SDPA as the default.
+        return "eager" if FasterQwen3TTS._is_pre_ampere_cuda(device) else "sdpa"
+
+    @staticmethod
+    def _apply_linear_precision(base_model, linear_precision: str, device: str, dtype: torch.dtype) -> int:
+        """Apply optional inner-fp16 Linear wrappers to stable fp32 models."""
+        mode = linear_precision.lower()
+        if mode == "auto":
+            mode = "fp16_inner" if dtype is torch.float32 and FasterQwen3TTS._is_pre_ampere_cuda(device) else "none"
+        if mode in ("none", "off", "disabled"):
+            return 0
+        if mode not in ("fp16_inner", "talker_fp16_inner"):
+            raise ValueError(
+                "Unsupported linear_precision "
+                f"{linear_precision!r}. Expected auto, none, or fp16_inner."
+            )
+        if dtype is not torch.float32:
+            raise ValueError("linear_precision='fp16_inner' requires generation dtype fp32")
+
+        from .mixed_precision import replace_linear_modules
+
+        talker_model = base_model.model.talker.model
+        target_names = {
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        }
+        return replace_linear_modules(
+            talker_model,
+            lambda name, _linear: name in target_names,
+            inner_dtype=torch.float16,
+        )
+
+    @staticmethod
+    def _apply_layer_precision(base_model, layer_precision: str, device: str, dtype: torch.dtype) -> list[int]:
+        """Wrap selected talker decoder layers as fp16 islands."""
+        mode = layer_precision.lower()
+        if mode == "auto":
+            mode = "all" if dtype is torch.float32 and FasterQwen3TTS._is_pre_ampere_cuda(device) else "none"
+        if mode in ("none", "off", "disabled"):
+            return []
+        if dtype is not torch.float32:
+            raise ValueError("layer_precision requires generation dtype fp32")
+
+        from .mixed_precision import wrap_decoder_layers
+
+        return wrap_decoder_layers(base_model.model.talker.model, mode)
+
+    @staticmethod
+    def _apply_predictor_layer_precision(base_model, predictor_layer_precision: str, device: str, dtype: torch.dtype) -> list[int]:
+        """Wrap selected code-predictor decoder layers as fp16 islands."""
+        mode = predictor_layer_precision.lower()
+        if mode == "auto":
+            mode = "0,1,3,4" if dtype is torch.float32 and FasterQwen3TTS._is_pre_ampere_cuda(device) else "none"
+        if mode in ("none", "off", "disabled"):
+            return []
+        if dtype is not torch.float32:
+            raise ValueError("predictor_layer_precision requires generation dtype fp32")
+
+        from .mixed_precision import wrap_decoder_layers
+
+        return wrap_decoder_layers(base_model.model.talker.code_predictor.model, mode)
+
+    @staticmethod
+    def _apply_audio_decoder_precision(base_model, audio_decoder_precision: str, device: str, dtype: torch.dtype) -> dict[str, object]:
+        """Apply fp16 islands to the speech-tokenizer decoder."""
+        mode = audio_decoder_precision.lower()
+        if mode == "auto":
+            mode = "fp16" if dtype is torch.float32 and FasterQwen3TTS._is_pre_ampere_cuda(device) else "none"
+        if mode in ("none", "off", "disabled"):
+            return {
+                "transformer_layers": [],
+                "synthesis_wrappers": 0,
+                "quantizer": False,
+                "projection_wrappers": 0,
+            }
+        if mode != "fp16":
+            raise ValueError(
+                f"Unsupported audio_decoder_precision {audio_decoder_precision!r}. Expected auto, none, or fp16."
+            )
+        if dtype is not torch.float32:
+            raise ValueError("audio_decoder_precision='fp16' requires generation dtype fp32")
+
+        speech_tokenizer = FasterQwen3TTS._get_speech_tokenizer(base_model)
+        if speech_tokenizer is None or getattr(speech_tokenizer, "model", None) is None:
+            return {
+                "transformer_layers": [],
+                "synthesis_wrappers": 0,
+                "quantizer": False,
+                "projection_wrappers": 0,
+            }
+
+        from .mixed_precision import InnerDtypeLinear, wrap_decoder_layers, wrap_tokenizer_decoder_synthesis
+
+        decoder = speech_tokenizer.model.decoder
+        transformer_layers = wrap_decoder_layers(decoder.pre_transformer, "all")
+        synthesis_wrappers = wrap_tokenizer_decoder_synthesis(decoder, output_dtype=torch.float32)
+        decoder.quantizer.to(dtype=torch.float16)
+        projection_wrappers = 0
+        decoder.pre_transformer.input_proj = InnerDtypeLinear(
+            decoder.pre_transformer.input_proj,
+            torch.float16,
+        )
+        projection_wrappers += 1
+        decoder.pre_transformer.output_proj = InnerDtypeLinear(
+            decoder.pre_transformer.output_proj,
+            torch.float16,
+        )
+        projection_wrappers += 1
+        decoder.pre_transformer.norm.to(dtype=torch.float16)
+        return {
+            "transformer_layers": transformer_layers,
+            "synthesis_wrappers": synthesis_wrappers,
+            "quantizer": True,
+            "projection_wrappers": projection_wrappers,
+        }
+
+    @staticmethod
+    def _apply_large_block_precision(base_model, large_block_precision: str, device: str, dtype: torch.dtype) -> int:
+        """Move validated large non-decoder blocks to fp16."""
+        mode = large_block_precision.lower()
+        if mode == "auto":
+            mode = "fp16" if dtype is torch.float32 and FasterQwen3TTS._is_pre_ampere_cuda(device) else "none"
+        if mode in ("none", "off", "disabled"):
+            return 0
+        if mode != "fp16":
+            raise ValueError(
+                f"Unsupported large_block_precision {large_block_precision!r}. Expected auto, none, or fp16."
+            )
+        if dtype is not torch.float32:
+            raise ValueError("large_block_precision='fp16' requires generation dtype fp32")
+
+        count = 0
+        talker = base_model.model.talker
+        talker.model.text_embedding.to(dtype=torch.float16)
+        count += 1
+        talker.model.codec_embedding.to(dtype=torch.float16)
+        count += 1
+        talker.code_predictor.model.codec_embedding.to(dtype=torch.float16)
+        count += 1
+
+        speech_tokenizer = FasterQwen3TTS._get_speech_tokenizer(base_model)
+        if speech_tokenizer is not None and getattr(speech_tokenizer, "model", None) is not None:
+            speech_tokenizer.model.encoder.to(dtype=torch.float16)
+            count += 1
+
+        speaker_encoder = getattr(base_model.model, "speaker_encoder", None)
+        if speaker_encoder is not None:
+            speaker_encoder.to(dtype=torch.float16)
+            count += 1
+
+        talker.model.norm.to(dtype=torch.float16)
+        count += 1
+        talker.code_predictor.model.norm.to(dtype=torch.float16)
+        count += 1
+
+        return count
+
+    @staticmethod
+    def _apply_extra_precision(base_model, extra_precision: str, device: str, dtype: torch.dtype) -> int:
+        """Apply validated fp16-inner wrappers outside decoder-layer islands."""
+        mode = extra_precision.lower()
+        if mode == "auto":
+            mode = "fp16_inner" if dtype is torch.float32 and FasterQwen3TTS._is_pre_ampere_cuda(device) else "none"
+        if mode in ("none", "off", "disabled"):
+            return 0
+        if mode != "fp16_inner":
+            raise ValueError(
+                f"Unsupported extra_precision {extra_precision!r}. Expected auto, none, or fp16_inner."
+            )
+        if dtype is not torch.float32:
+            raise ValueError("extra_precision='fp16_inner' requires generation dtype fp32")
+
+        from .mixed_precision import InnerDtypeLinear, replace_linear_modules
+
+        talker = base_model.model.talker
+        count = 0
+
+        talker.codec_head = InnerDtypeLinear(talker.codec_head, torch.float16)
+        count += 1
+
+        count += replace_linear_modules(
+            talker.text_projection,
+            lambda _name, _linear: True,
+            inner_dtype=torch.float16,
+        )
+
+        for idx, head in enumerate(talker.code_predictor.lm_head):
+            talker.code_predictor.lm_head[idx] = InnerDtypeLinear(head, torch.float16)
+            count += 1
+
+        # Predictor layer 2 is content-sensitive as a full fp16 island and its
+        # MLP also fails in fp16. The attention projections alone are stable as
+        # fp16-inner linears and cover the largest safe remainder in that layer.
+        predictor_layers = talker.code_predictor.model.layers
+        if len(predictor_layers) > 2 and hasattr(predictor_layers[2], "self_attn"):
+            layer = predictor_layers[2]
+            layer.input_layernorm.to(dtype=torch.float16)
+            count += 1
+            layer.post_attention_layernorm.to(dtype=torch.float16)
+            count += 1
+            attn = layer.self_attn
+            attn.q_norm.to(dtype=torch.float16)
+            count += 1
+            attn.k_norm.to(dtype=torch.float16)
+            count += 1
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                setattr(attn, name, InnerDtypeLinear(getattr(attn, name), torch.float16))
+                count += 1
+
+        return count
+
+    @staticmethod
+    def _patch_audio_frontend_dtype(base_model, audio_dtype: torch.dtype) -> None:
+        """Move audio-side modules to audio_dtype and keep their inputs there.
+
+        qwen-tts ties speech tokenizer and speaker encoder precision to the top-level
+        model dtype. That breaks mixed precision: after moving speaker_encoder to
+        fp32, upstream extract_speaker_embedding would still cast mels to the
+        talker dtype. Patch that method locally so fp16 talker + fp32 audio modules
+        works without modifying qwen-tts itself.
+        """
+        model = getattr(base_model, "model", None)
+        if model is None:
+            return
+
+        speech_tokenizer = FasterQwen3TTS._get_speech_tokenizer(base_model)
+        if speech_tokenizer is not None and getattr(speech_tokenizer, "model", None) is not None:
+            speech_tokenizer.model.to(dtype=audio_dtype)
+
+        speaker_encoder = getattr(model, "speaker_encoder", None)
+        if speaker_encoder is None:
+            return
+
+        speaker_encoder.to(dtype=audio_dtype)
+
+        @torch.inference_mode()
+        def extract_speaker_embedding(self, audio, sr):
+            assert sr == 24000, "Only support 24kHz audio"
+            from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
+
+            enc_param = next(self.speaker_encoder.parameters())
+            mels = mel_spectrogram(
+                torch.from_numpy(audio).unsqueeze(0),
+                n_fft=1024,
+                num_mels=128,
+                sampling_rate=24000,
+                hop_size=256,
+                win_size=1024,
+                fmin=0,
+                fmax=12000,
+            ).transpose(1, 2)
+            mels = mels.to(device=enc_param.device, dtype=enc_param.dtype)
+            return self.speaker_encoder(mels)[0]
+
+        model.extract_speaker_embedding = MethodType(extract_speaker_embedding, model)
+
+    @staticmethod
     def _resolve_non_streaming_mode(
         non_streaming_mode: Optional[bool],
         *,
@@ -95,8 +432,15 @@ class FasterQwen3TTS:
         cls,
         model_name: str,
         device: str = "cuda",
-        dtype: Union[str, torch.dtype] = torch.bfloat16,
-        attn_implementation: str = "sdpa",
+        dtype: Union[str, torch.dtype, None] = "auto",
+        audio_dtype: Union[str, torch.dtype, None] = "auto",
+        layer_precision: str = "auto",
+        predictor_layer_precision: str = "auto",
+        audio_decoder_precision: str = "auto",
+        large_block_precision: str = "auto",
+        extra_precision: str = "auto",
+        linear_precision: str = "none",
+        attn_implementation: str = "auto",
         max_seq_len: int = 2048,
     ):
         """
@@ -105,20 +449,51 @@ class FasterQwen3TTS:
         Args:
             model_name: Model path or HuggingFace Hub ID
             device: Device to use ("cuda" or "cpu")
-            dtype: Data type for inference
-            attn_implementation: Attention implementation ("sdpa" or "flash_attention_2")
+            dtype: Data type for the autoregressive talker/predictor. "auto" uses
+                fp32 on pre-Ampere CUDA GPUs such as V100, bf16 on native-bf16 GPUs,
+                and fp32 on CPU. fp16 is available for experiments but can change
+                generated codec tokens.
+            audio_dtype: Data type for speech tokenizer and speaker encoder. "auto"
+                keeps these modules fp32 when dtype resolves to fp16, because full
+                fp16 decode can produce noisy audio.
+            layer_precision: Select talker decoder layers to run as fp16 islands.
+                "auto" wraps all talker decoder layers on V100 when dtype resolves
+                to fp32. Also accepts "none", "all", "lastN", "firstN", "even",
+                "odd", ranges like "14-27", or comma-separated indices.
+            predictor_layer_precision: Select code-predictor decoder layers to run
+                as fp16 islands. "auto" wraps predictor layers 0, 1, 3, and 4 on V100.
+            audio_decoder_precision: Select speech-tokenizer decoder precision.
+                "auto" runs the tokenizer decoder transformer and synthesis blocks
+                as fp16 islands on V100 while keeping caller-visible tensors fp32.
+            large_block_precision: Select large non-decoder blocks to keep in fp16.
+                "auto" converts the talker text/code embeddings, predictor code
+                embeddings, speech-tokenizer encoder, and speaker encoder on V100.
+            extra_precision: Apply validated fp16-inner wrappers to codec_head,
+                text_projection, and code-predictor lm heads. "auto" enables this
+                on V100 when dtype resolves to fp32.
+            linear_precision: Optional inner precision for selected talker Linear
+                layers. This is disabled by default because whole-layer fp16 islands
+                are faster on V100.
+            attn_implementation: Attention implementation. "auto" uses eager on
+                pre-Ampere CUDA GPUs such as V100 and sdpa elsewhere.
             max_seq_len: Maximum sequence length for static cache
             
         Returns:
             FasterQwen3TTS instance
         """
-        if isinstance(dtype, str):
-            dtype = getattr(torch, dtype)
-            
         if not device.startswith("cuda") or not torch.cuda.is_available():
             raise ValueError("CUDA graphs require CUDA device")
+
+        dtype, audio_dtype = cls._resolve_dtypes(dtype, audio_dtype, device)
+        attn_implementation = cls._resolve_attn_implementation(attn_implementation, device)
         
-        logger.info(f"Loading Qwen3-TTS model: {model_name}")
+        logger.info(
+            "Loading Qwen3-TTS model: %s (generation_dtype=%s, audio_dtype=%s, attn=%s)",
+            model_name,
+            dtype,
+            audio_dtype,
+            attn_implementation,
+        )
         
         # Import here to avoid dependency issues (and suppress flash-attn warning)
         with suppress_flash_attn_warning():
@@ -132,6 +507,48 @@ class FasterQwen3TTS:
             torch_dtype=dtype,
             attn_implementation=attn_implementation,
         )
+        cls._patch_audio_frontend_dtype(base_model, audio_dtype)
+        fp16_layer_indices = cls._apply_layer_precision(
+            base_model,
+            layer_precision,
+            device,
+            dtype,
+        )
+        fp16_predictor_layer_indices = cls._apply_predictor_layer_precision(
+            base_model,
+            predictor_layer_precision,
+            device,
+            dtype,
+        )
+        audio_decoder_precision_result = cls._apply_audio_decoder_precision(
+            base_model,
+            audio_decoder_precision,
+            device,
+            dtype,
+        )
+        large_block_wrappers = cls._apply_large_block_precision(
+            base_model,
+            large_block_precision,
+            device,
+            dtype,
+        )
+        extra_wrappers = cls._apply_extra_precision(
+            base_model,
+            extra_precision,
+            device,
+            dtype,
+        )
+        replaced_linears = cls._apply_linear_precision(
+            base_model,
+            linear_precision,
+            device,
+            dtype,
+        )
+        if replaced_linears:
+            logger.info(
+                "Applied %s inner-fp16 talker Linear wrappers",
+                replaced_linears,
+            )
         
         talker = base_model.model.talker
         talker_config = base_model.model.config.talker_config
@@ -153,6 +570,36 @@ class FasterQwen3TTS:
             top_k=50,
             temperature=0.9,
         )
+        for layer_idx in fp16_predictor_layer_indices:
+            predictor_graph.set_layer_cache_dtype(layer_idx, torch.float16)
+        if fp16_predictor_layer_indices:
+            logger.info(
+                "Applied fp16 predictor layer islands: %s",
+                fp16_predictor_layer_indices,
+            )
+        if extra_wrappers:
+            logger.info(
+                "Applied %s extra fp16-inner wrappers",
+                extra_wrappers,
+            )
+        if (
+            audio_decoder_precision_result["transformer_layers"]
+            or audio_decoder_precision_result["synthesis_wrappers"]
+            or audio_decoder_precision_result["quantizer"]
+            or audio_decoder_precision_result["projection_wrappers"]
+        ):
+            logger.info(
+                "Applied fp16 audio decoder conversions: transformer_layers=%s, synthesis_wrappers=%s, quantizer=%s, projection_wrappers=%s",
+                audio_decoder_precision_result["transformer_layers"],
+                audio_decoder_precision_result["synthesis_wrappers"],
+                audio_decoder_precision_result["quantizer"],
+                audio_decoder_precision_result["projection_wrappers"],
+            )
+        if large_block_wrappers:
+            logger.info(
+                "Applied fp16 large-block conversions: %s",
+                large_block_wrappers,
+            )
         
         talker_graph = TalkerGraph(
             talker.model,
@@ -161,6 +608,13 @@ class FasterQwen3TTS:
             dtype=dtype,
             max_seq_len=max_seq_len,
         )
+        for layer_idx in fp16_layer_indices:
+            talker_graph.set_layer_cache_dtype(layer_idx, torch.float16)
+        if fp16_layer_indices:
+            logger.info(
+                "Applied fp16 talker layer islands: %s",
+                fp16_layer_indices,
+            )
         
         logger.info("CUDA graphs initialized (will capture on first run)")
         
@@ -170,6 +624,7 @@ class FasterQwen3TTS:
             talker_graph=talker_graph,
             device=device,
             dtype=dtype,
+            audio_dtype=audio_dtype,
             max_seq_len=max_seq_len,
         )
     

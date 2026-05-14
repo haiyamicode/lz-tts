@@ -35,6 +35,7 @@ class TalkerGraph:
         self.max_seq_len = max_seq_len
         self.hidden_size = talker_config.hidden_size
         self.num_layers = talker_config.num_hidden_layers
+        self.layer_cache_dtypes = [dtype] * self.num_layers
 
         # Keep reference to the inner model (transformer backbone)
         self.model = talker_model
@@ -58,13 +59,26 @@ class TalkerGraph:
         self.attn_mask_table = None
         self._mask_key = None
 
+    def set_layer_cache_dtype(self, layer_idx: int, dtype: torch.dtype):
+        """Set the StaticCache dtype for a specific decoder layer before capture."""
+        if self.captured:
+            raise RuntimeError("Cannot change layer cache dtype after CUDA graph capture")
+        self.layer_cache_dtypes[layer_idx] = dtype
+
     def _init_cache_layers(self):
         """Force lazy initialization of StaticCache layers before graph capture."""
         config = self.model.config
         num_kv_heads = getattr(config, 'num_key_value_heads', config.num_attention_heads)
         head_dim = getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads)
-        dummy_k = torch.zeros(1, num_kv_heads, 1, head_dim, dtype=self.dtype, device=self.device)
-        for layer in self.static_cache.layers:
+        for idx, layer in enumerate(self.static_cache.layers):
+            dummy_k = torch.zeros(
+                1,
+                num_kv_heads,
+                1,
+                head_dim,
+                dtype=self.layer_cache_dtypes[idx],
+                device=self.device,
+            )
             if not layer.is_initialized:
                 layer.lazy_initialization(dummy_k)
 
@@ -166,6 +180,11 @@ class TalkerGraph:
                     "Use shorter text or shorter reference audio."
                 )
             cache_pos = torch.arange(seq_len, device=self.device)
+            cache_dtype = self.layer_cache_dtypes[li]
+            if k.dtype != cache_dtype:
+                k = k.to(cache_dtype)
+            if v.dtype != cache_dtype:
+                v = v.to(cache_dtype)
             self.static_cache.update(k, v, li, {"cache_position": cache_pos})
         return seq_len
 

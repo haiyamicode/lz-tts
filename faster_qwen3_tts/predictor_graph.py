@@ -40,6 +40,7 @@ class PredictorGraph:
 
         self.dtype = dtype
         self.num_layers = pred_config.num_hidden_layers
+        self.layer_cache_dtypes = [dtype] * self.num_layers
         self.hidden_size = pred_config.hidden_size
         self.num_code_groups = pred_config.num_code_groups
         self.num_codebooks = self.num_code_groups - 1  # 15
@@ -75,13 +76,26 @@ class PredictorGraph:
         self.prefill_attn = None
         self.decode_attn = None
 
+    def set_layer_cache_dtype(self, layer_idx: int, dtype: torch.dtype):
+        """Set the StaticCache dtype for a specific predictor layer before capture."""
+        if self.captured:
+            raise RuntimeError("Cannot change layer cache dtype after CUDA graph capture")
+        self.layer_cache_dtypes[layer_idx] = dtype
+
     def _init_cache_layers(self):
         """Force lazy initialization of StaticCache layers before graph capture."""
         config = self.pred_model.config
         num_kv_heads = getattr(config, 'num_key_value_heads', config.num_attention_heads)
         head_dim = getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads)
-        dummy_k = torch.zeros(1, num_kv_heads, 1, head_dim, dtype=self.dtype, device=self.device)
-        for layer in self.static_cache.layers:
+        for idx, layer in enumerate(self.static_cache.layers):
+            dummy_k = torch.zeros(
+                1,
+                num_kv_heads,
+                1,
+                head_dim,
+                dtype=self.layer_cache_dtypes[idx],
+                device=self.device,
+            )
             if not layer.is_initialized:
                 layer.lazy_initialization(dummy_k)
 
@@ -142,6 +156,8 @@ class PredictorGraph:
         for cb_idx in range(1, self.num_codebooks):
             # Embed previous token using codebook-specific embedding
             emb = self.codec_embeds[cb_idx - 1](tok.unsqueeze(0))  # [1, 1, codec_hidden]
+            if emb.dtype != self.input_buf.dtype:
+                emb = emb.to(self.input_buf.dtype)
             emb = self.small_to_mtp(emb)  # [1, 1, hidden]
 
             # Single-token decode through all layers

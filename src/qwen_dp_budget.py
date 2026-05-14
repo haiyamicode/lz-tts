@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import torch
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,14 @@ class QwenDpBudget:
 
             checkpoint_path = Path(self.config.checkpoint)
             config_path = Path(self.config.config_path) if self.config.config_path else checkpoint_path.parent / "config.json"
+            _LOGGER.info("Loading Qwen DP budget checkpoint=%s config=%s", checkpoint_path, config_path)
+            if not checkpoint_path.exists():
+                raise FileNotFoundError(f"Qwen DP budget checkpoint not found: {checkpoint_path}")
+            if not config_path.exists():
+                raise FileNotFoundError(
+                    f"Qwen DP budget config not found: {config_path} "
+                    f"(checkpoint={checkpoint_path})"
+                )
             with config_path.open("r", encoding="utf-8") as f:
                 self._model_config = json.load(f)
 

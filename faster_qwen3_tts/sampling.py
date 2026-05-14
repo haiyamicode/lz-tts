@@ -43,11 +43,17 @@ def sample_logits(
 
     Mirrors HF order: suppress -> temperature -> top-k -> top-p -> sample.
     """
-    logits = logits.clone()
+    logits = logits.to(torch.float32).clone()
     if suppress_mask is not None:
         logits[..., suppress_mask] = float("-inf")
     if suppress_tokens:
         logits[..., list(suppress_tokens)] = float("-inf")
+    logits = torch.nan_to_num(
+        logits,
+        nan=0.0,
+        posinf=torch.finfo(logits.dtype).max,
+        neginf=torch.finfo(logits.dtype).min,
+    )
     if not do_sample:
         return torch.argmax(logits, dim=-1)
     logits = logits / temperature

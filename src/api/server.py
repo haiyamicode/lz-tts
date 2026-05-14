@@ -114,10 +114,14 @@ def _get_base_language(speaker_or_locale: str) -> str:
 def _load_config() -> ServerConfig:
     """Load server configuration from local/server.json."""
     if not CONFIG_PATH.exists():
-        return ServerConfig()
+        config = ServerConfig()
+        qwen3.apply_env_overrides(config.qwen)
+        return config
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    return ServerConfig(**data)
+    config = ServerConfig(**data)
+    qwen3.apply_env_overrides(config.qwen)
+    return config
 
 
 def _find_checkpoint(model_dir: Path) -> Path | None:
