@@ -168,16 +168,38 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
     elif optimized is not None:
         mode = "optimized" if env_bool_value("QWEN_TTS_OPTIMIZED", False) else "bf16"
 
-    if mode in {"optimized", "auto", "fp16", "mixed"}:
+    if mode in {"optimized", "auto", "fp16", "mixed", "stable"}:
         settings.precision_mode = "optimized"
         settings.dtype = "auto"
         settings.audio_dtype = "auto"
         settings.attn = "auto"
         settings.layer_precision = "auto"
-        settings.predictor_layer_precision = "auto"
-        settings.audio_decoder_precision = "auto"
-        settings.large_block_precision = "auto"
-        settings.extra_precision = "auto"
+        settings.predictor_layer_precision = "none"
+        settings.audio_decoder_precision = "none"
+        settings.large_block_precision = "none"
+        settings.extra_precision = "none"
+        settings.linear_precision = "none"
+    elif mode in {"balanced"}:
+        settings.precision_mode = "balanced"
+        settings.dtype = "auto"
+        settings.audio_dtype = "auto"
+        settings.attn = "auto"
+        settings.layer_precision = "auto"
+        settings.predictor_layer_precision = "0,1,3,4"
+        settings.audio_decoder_precision = "none"
+        settings.large_block_precision = "none"
+        settings.extra_precision = "none"
+        settings.linear_precision = "none"
+    elif mode in {"aggressive", "max", "maximum"}:
+        settings.precision_mode = "aggressive"
+        settings.dtype = "auto"
+        settings.audio_dtype = "auto"
+        settings.attn = "auto"
+        settings.layer_precision = "auto"
+        settings.predictor_layer_precision = "0,1,3,4"
+        settings.audio_decoder_precision = "fp16"
+        settings.large_block_precision = "fp16"
+        settings.extra_precision = "fp16_inner"
         settings.linear_precision = "none"
     elif mode in {"bf16", "bfloat16", "off", "disabled", "original"}:
         settings.precision_mode = "bf16"
@@ -192,7 +214,7 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
         settings.linear_precision = "none"
     elif mode:
         raise ValueError(
-            "QWEN_TTS_PRECISION_MODE must be optimized or bf16 "
+            "QWEN_TTS_PRECISION_MODE must be optimized, aggressive, or bf16 "
             f"(got {mode!r})"
         )
 
@@ -424,6 +446,12 @@ def model_status() -> dict[str, Any]:
         "dtype": _qwen_settings.dtype,
         "audio_dtype": _qwen_settings.audio_dtype,
         "attn": _qwen_settings.attn,
+        "layer_precision": _qwen_settings.layer_precision,
+        "predictor_layer_precision": _qwen_settings.predictor_layer_precision,
+        "audio_decoder_precision": _qwen_settings.audio_decoder_precision,
+        "large_block_precision": _qwen_settings.large_block_precision,
+        "extra_precision": _qwen_settings.extra_precision,
+        "linear_precision": _qwen_settings.linear_precision,
     }
 
 

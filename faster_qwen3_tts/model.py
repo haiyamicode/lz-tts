@@ -214,7 +214,10 @@ class FasterQwen3TTS:
         """Wrap selected code-predictor decoder layers as fp16 islands."""
         mode = predictor_layer_precision.lower()
         if mode == "auto":
-            mode = "0,1,3,4" if dtype is torch.float32 and FasterQwen3TTS._is_pre_ampere_cuda(device) else "none"
+            # The predictor directly emits codec codebooks. Small numerical
+            # changes here can become short audible glitches, while the module is
+            # much smaller than the main talker stack. Keep it stable by default.
+            mode = "none"
         if mode in ("none", "off", "disabled"):
             return []
         if dtype is not torch.float32:
@@ -229,7 +232,11 @@ class FasterQwen3TTS:
         """Apply fp16 islands to the speech-tokenizer decoder."""
         mode = audio_decoder_precision.lower()
         if mode == "auto":
-            mode = "fp16" if dtype is torch.float32 and FasterQwen3TTS._is_pre_ampere_cuda(device) else "none"
+            # The codec/audio decoder is downstream of token generation and is
+            # sensitive to quantizer/synthesis precision. It is also a smaller
+            # share of end-to-end latency than the autoregressive transformer
+            # loops, so leave it in the stable dtype unless explicitly enabled.
+            mode = "none"
         if mode in ("none", "off", "disabled"):
             return {
                 "transformer_layers": [],
@@ -283,7 +290,9 @@ class FasterQwen3TTS:
         """Move validated large non-decoder blocks to fp16."""
         mode = large_block_precision.lower()
         if mode == "auto":
-            mode = "fp16" if dtype is torch.float32 and FasterQwen3TTS._is_pre_ampere_cuda(device) else "none"
+            # Embeddings, speaker encoder, and final norms are low Tensor-Core
+            # value compared with decoder layers and affect voice/tone stability.
+            mode = "none"
         if mode in ("none", "off", "disabled"):
             return 0
         if mode != "fp16":
@@ -324,7 +333,9 @@ class FasterQwen3TTS:
         """Apply validated fp16-inner wrappers outside decoder-layer islands."""
         mode = extra_precision.lower()
         if mode == "auto":
-            mode = "fp16_inner" if dtype is torch.float32 and FasterQwen3TTS._is_pre_ampere_cuda(device) else "none"
+            # These include codec/logit heads and a partial predictor layer.
+            # They can perturb token selection, so keep them stable by default.
+            mode = "none"
         if mode in ("none", "off", "disabled"):
             return 0
         if mode != "fp16_inner":
@@ -461,16 +472,17 @@ class FasterQwen3TTS:
                 to fp32. Also accepts "none", "all", "lastN", "firstN", "even",
                 "odd", ranges like "14-27", or comma-separated indices.
             predictor_layer_precision: Select code-predictor decoder layers to run
-                as fp16 islands. "auto" wraps predictor layers 0, 1, 3, and 4 on V100.
+                as fp16 islands. "auto" keeps predictor layers in the stable dtype;
+                use an explicit selector such as "0,1,3,4" to opt in.
             audio_decoder_precision: Select speech-tokenizer decoder precision.
-                "auto" runs the tokenizer decoder transformer and synthesis blocks
-                as fp16 islands on V100 while keeping caller-visible tensors fp32.
+                "auto" keeps the tokenizer decoder in the stable dtype; pass "fp16"
+                to opt into codec decoder fp16 islands.
             large_block_precision: Select large non-decoder blocks to keep in fp16.
-                "auto" converts the talker text/code embeddings, predictor code
-                embeddings, speech-tokenizer encoder, and speaker encoder on V100.
+                "auto" keeps embeddings, norms, speech-tokenizer encoder, and
+                speaker encoder in the stable dtype; pass "fp16" to opt in.
             extra_precision: Apply validated fp16-inner wrappers to codec_head,
-                text_projection, and code-predictor lm heads. "auto" enables this
-                on V100 when dtype resolves to fp32.
+                text_projection, and code-predictor lm heads. "auto" keeps these
+                logits/projection paths in the stable dtype.
             linear_precision: Optional inner precision for selected talker Linear
                 layers. This is disabled by default because whole-layer fp16 islands
                 are faster on V100.
