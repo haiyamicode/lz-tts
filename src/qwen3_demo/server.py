@@ -338,7 +338,7 @@ async def get_status():
     return {
         "loaded": active is not None,
         "model": EMBEDDED_MODEL_ID if EMBEDDED_IN_LZ_TTS and active is not None else _active_model_name,
-        "loading": False if EMBEDDED_IN_LZ_TTS else _loading,
+        "loading": shared_qwen3.model_status()["model_loading"] if EMBEDDED_IN_LZ_TTS else _loading,
         "available_models": AVAILABLE_MODELS,
         "model_type": model_type,
         "speakers": speakers,
@@ -384,7 +384,7 @@ async def load_model(model_id: str = Form(...)):
     if EMBEDDED_IN_LZ_TTS:
         if model_id != EMBEDDED_MODEL_ID:
             raise HTTPException(status_code=400, detail=f"This server is running {EMBEDDED_MODEL_ID}")
-        shared_qwen3.get_model()
+        await asyncio.to_thread(shared_qwen3.get_model)
         return {"status": "already_loaded", "model": EMBEDDED_MODEL_ID}
 
     # Already in cache — instant switch, no GPU work needed

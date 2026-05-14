@@ -600,11 +600,17 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             _LOGGER.info("Built speaker routes for %d speakers", len(_speaker_routes))
 
         if _server_config.qwen.preload:
-            _LOGGER.info("Preloading Qwen3 TTS...")
-            qwen3.preload_model()
-            if _server_config.qwen.dp_budget.preload:
-                qwen3.get_dp_budget_model()
-            _LOGGER.info("Qwen3 TTS preload complete")
+            if _server_config.qwen.preload_background:
+                _LOGGER.info("Starting Qwen3 TTS preload in background...")
+                qwen3.start_preload_background(
+                    include_dp_budget=_server_config.qwen.dp_budget.preload
+                )
+            else:
+                _LOGGER.info("Preloading Qwen3 TTS...")
+                qwen3.preload_model(
+                    include_dp_budget=_server_config.qwen.dp_budget.preload
+                )
+                _LOGGER.info("Qwen3 TTS preload complete")
 
         _LOGGER.info("Server ready")
 
@@ -644,6 +650,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "models_enabled": _allowed_models(),
             "max_models_in_cache": _server_config.max_models_in_cache,
             "default_model": _server_config.default_model,
+            "qwen3": qwen3.model_status(),
             "speakers": speakers,
         }
 

@@ -54,6 +54,12 @@ deepfilter_model: Optional[Any] = None
 deepfilter_state: Optional[Any] = None
 dp_budget_model: Optional[Any] = None
 inference_lock = threading.Lock()
+model_load_lock = threading.Lock()
+model_ready_event = threading.Event()
+model_loading = False
+model_load_error: Optional[str] = None
+model_load_started_at: Optional[float] = None
+model_load_finished_at: Optional[float] = None
 _qwen_language_splitter: Optional[Any] = None
 
 QWEN_LANGUAGE_NAMES = {
@@ -117,6 +123,7 @@ class DpBudgetSettings(BaseModel):
 
 class QwenSettings(BaseModel):
     preload: bool = True
+    preload_background: bool = True
     model: str = QWEN_DEFAULT_MODEL
     device: str = "cuda"
     precision_mode: str = "config"
@@ -230,6 +237,7 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
 
     bool_overrides = {
         "QWEN_TTS_PRELOAD": "preload",
+        "QWEN_TTS_PRELOAD_BACKGROUND": "preload_background",
         "QWEN_TTS_WARMUP": "warmup",
         "QWEN_TTS_XVEC_ONLY": "xvec_only",
         "QWEN_TTS_NON_STREAMING_MODE": "non_streaming_mode",
@@ -263,7 +271,11 @@ def demo_defaults() -> dict[str, Any]:
 
 @router.get("/health")
 async def healthcheck():
-    return {"status": "ok", "backend": "faster-qwen3-tts", "model_loaded": model is not None}
+    return {
+        "status": "ok",
+        "backend": "faster-qwen3-tts",
+        **model_status(),
+    }
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -400,60 +412,125 @@ def resolve_qwen_language(
     return ResolvedQwenLanguage(qwen_language, dp_language)
 
 
+def model_status() -> dict[str, Any]:
+    return {
+        "model_loaded": model is not None,
+        "model_loading": model_loading,
+        "model_load_error": model_load_error,
+        "model_load_started_at": model_load_started_at,
+        "model_load_finished_at": model_load_finished_at,
+        "precision_mode": _qwen_settings.precision_mode,
+        "model": _qwen_settings.model,
+        "dtype": _qwen_settings.dtype,
+        "audio_dtype": _qwen_settings.audio_dtype,
+        "attn": _qwen_settings.attn,
+    }
+
+
+def _load_model_unlocked() -> Any:
+    import torch
+    from faster_qwen3_tts import FasterQwen3TTS
+
+    model_name = _qwen_settings.model
+    device = _qwen_settings.device
+    dtype_name = _qwen_settings.dtype
+    if dtype_name.lower() == "auto":
+        dtype = "auto"
+    else:
+        dtype = getattr(torch, dtype_name, torch.bfloat16)
+    audio_dtype = _qwen_settings.audio_dtype
+    attn_implementation = _qwen_settings.attn
+    max_seq_len = _qwen_settings.max_seq_len
+    print(
+        "Loading FasterQwen3TTS "
+        f"precision_mode={_qwen_settings.precision_mode} "
+        f"model={model_name} device={device} dtype={dtype_name} "
+        f"audio_dtype={audio_dtype} attn={attn_implementation} "
+        f"layer_precision={_qwen_settings.layer_precision} "
+        f"predictor_layer_precision={_qwen_settings.predictor_layer_precision} "
+        f"audio_decoder_precision={_qwen_settings.audio_decoder_precision} "
+        f"large_block_precision={_qwen_settings.large_block_precision} "
+        f"extra_precision={_qwen_settings.extra_precision} "
+        f"linear_precision={_qwen_settings.linear_precision} "
+        f"max_seq_len={max_seq_len}...",
+        file=sys.stderr,
+        flush=True,
+    )
+    loaded_model = FasterQwen3TTS.from_pretrained(
+        model_name,
+        device=device,
+        dtype=dtype,
+        audio_dtype=audio_dtype,
+        layer_precision=_qwen_settings.layer_precision,
+        predictor_layer_precision=_qwen_settings.predictor_layer_precision,
+        audio_decoder_precision=_qwen_settings.audio_decoder_precision,
+        large_block_precision=_qwen_settings.large_block_precision,
+        extra_precision=_qwen_settings.extra_precision,
+        linear_precision=_qwen_settings.linear_precision,
+        attn_implementation=attn_implementation,
+        max_seq_len=max_seq_len,
+    )
+    if _qwen_settings.warmup and hasattr(loaded_model, "_warmup"):
+        print("Capturing CUDA graphs...", file=sys.stderr, flush=True)
+        loaded_model._warmup(prefill_len=100)
+    print(f"FasterQwen3TTS loaded. Sample rate: {loaded_model.sample_rate}", file=sys.stderr, flush=True)
+    return loaded_model
+
+
 def get_model() -> Any:
-    global model
-    if model is None:
-        import torch
-        from faster_qwen3_tts import FasterQwen3TTS
+    global model, model_loading, model_load_error, model_load_started_at, model_load_finished_at
+    if model is not None:
+        return model
 
-        model_name = _qwen_settings.model
-        device = _qwen_settings.device
-        dtype_name = _qwen_settings.dtype
-        if dtype_name.lower() == "auto":
-            dtype = "auto"
-        else:
-            dtype = getattr(torch, dtype_name, torch.bfloat16)
-        audio_dtype = _qwen_settings.audio_dtype
-        attn_implementation = _qwen_settings.attn
-        max_seq_len = _qwen_settings.max_seq_len
-        print(
-            "Loading FasterQwen3TTS "
-            f"precision_mode={_qwen_settings.precision_mode} "
-            f"model={model_name} device={device} dtype={dtype_name} "
-            f"audio_dtype={audio_dtype} attn={attn_implementation} "
-            f"layer_precision={_qwen_settings.layer_precision} "
-            f"predictor_layer_precision={_qwen_settings.predictor_layer_precision} "
-            f"audio_decoder_precision={_qwen_settings.audio_decoder_precision} "
-            f"large_block_precision={_qwen_settings.large_block_precision} "
-            f"extra_precision={_qwen_settings.extra_precision} "
-            f"linear_precision={_qwen_settings.linear_precision} "
-            f"max_seq_len={max_seq_len}...",
-            file=sys.stderr,
-            flush=True,
-        )
-        model = FasterQwen3TTS.from_pretrained(
-            model_name,
-            device=device,
-            dtype=dtype,
-            audio_dtype=audio_dtype,
-            layer_precision=_qwen_settings.layer_precision,
-            predictor_layer_precision=_qwen_settings.predictor_layer_precision,
-            audio_decoder_precision=_qwen_settings.audio_decoder_precision,
-            large_block_precision=_qwen_settings.large_block_precision,
-            extra_precision=_qwen_settings.extra_precision,
-            linear_precision=_qwen_settings.linear_precision,
-            attn_implementation=attn_implementation,
-            max_seq_len=max_seq_len,
-        )
-        if _qwen_settings.warmup and hasattr(model, "_warmup"):
-            print("Capturing CUDA graphs...", file=sys.stderr, flush=True)
-            model._warmup(prefill_len=100)
-        print(f"FasterQwen3TTS loaded. Sample rate: {model.sample_rate}", file=sys.stderr, flush=True)
-    return model
+    with model_load_lock:
+        if model is not None:
+            return model
+        model_loading = True
+        model_load_error = None
+        model_load_started_at = time.time()
+        model_load_finished_at = None
+        model_ready_event.clear()
+        try:
+            model = _load_model_unlocked()
+            model_load_error = None
+            return model
+        except Exception as e:
+            model_load_error = str(e)
+            raise
+        finally:
+            model_loading = False
+            model_load_finished_at = time.time()
+            model_ready_event.set()
 
 
-def preload_model() -> None:
+def _preload_worker(include_dp_budget: bool) -> None:
+    try:
+        get_model()
+        if include_dp_budget:
+            get_dp_budget_model()
+    except Exception as e:
+        print(f"Qwen3 preload failed: {e}", file=sys.stderr, flush=True)
+
+
+def start_preload_background(include_dp_budget: bool = False) -> None:
+    if model is not None or model_loading:
+        return
+    thread = threading.Thread(
+        target=_preload_worker,
+        args=(include_dp_budget,),
+        name="qwen3-preload",
+        daemon=True,
+    )
+    thread.start()
+
+
+def preload_model(background: bool = False, include_dp_budget: bool = False) -> None:
+    if background:
+        start_preload_background(include_dp_budget=include_dp_budget)
+        return
     get_model()
+    if include_dp_budget:
+        get_dp_budget_model()
 
 
 def get_dp_budget_model() -> Any:
