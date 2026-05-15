@@ -5,6 +5,8 @@ Wrapper class that provides a Qwen3-TTS API while using
 CUDA graphs for 6-10x speedup.
 """
 import logging
+import os
+from collections import OrderedDict
 from pathlib import Path
 from types import MethodType
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
@@ -47,7 +49,25 @@ class FasterQwen3TTS:
         self.max_seq_len = max_seq_len
         self.sample_rate = self._infer_sample_rate(base_model)
         self._warmed_up = False
-        self._voice_prompt_cache = {}  # Cache (ref_audio, ref_text) -> (vcp, ref_ids)
+        self.max_voice_prompt_cache_entries = max(
+            0,
+            int(os.environ.get("QWEN_TTS_VOICE_PROMPT_CACHE_ENTRIES", "8")),
+        )
+        self._voice_prompt_cache = OrderedDict()  # (ref_audio, ref_text, mode) -> (vcp, ref_ids)
+
+    def _get_voice_prompt_cache(self, cache_key):
+        if cache_key not in self._voice_prompt_cache:
+            return None
+        self._voice_prompt_cache.move_to_end(cache_key)
+        return self._voice_prompt_cache[cache_key]
+
+    def _set_voice_prompt_cache(self, cache_key, value) -> None:
+        if self.max_voice_prompt_cache_entries <= 0:
+            return
+        self._voice_prompt_cache[cache_key] = value
+        self._voice_prompt_cache.move_to_end(cache_key)
+        while len(self._voice_prompt_cache) > self.max_voice_prompt_cache_entries:
+            self._voice_prompt_cache.popitem(last=False)
 
     @staticmethod
     def _get_speech_tokenizer(base_model):
@@ -818,8 +838,9 @@ class FasterQwen3TTS:
     ) -> Tuple[Dict[str, Any], list, bool]:
         using_icl_mode = not xvec_only
         cache_key = (str(ref_audio), ref_text, xvec_only, append_silence)
-        if cache_key in self._voice_prompt_cache:
-            vcp, ref_ids = self._voice_prompt_cache[cache_key]
+        cached_prompt = self._get_voice_prompt_cache(cache_key)
+        if cached_prompt is not None:
+            vcp, ref_ids = cached_prompt
             return vcp, ref_ids, using_icl_mode
 
         if xvec_only:
@@ -836,7 +857,7 @@ class FasterQwen3TTS:
                 icl_mode=[False],
             )
             ref_ids = [None] * len(input_ids)
-            self._voice_prompt_cache[cache_key] = (vcp, ref_ids)
+            self._set_voice_prompt_cache(cache_key, (vcp, ref_ids))
             return vcp, ref_ids, using_icl_mode
 
         silence_secs = 0.5 if append_silence else 0.0
@@ -855,7 +876,7 @@ class FasterQwen3TTS:
         else:
             ref_ids.append(None)
 
-        self._voice_prompt_cache[cache_key] = (vcp, ref_ids)
+        self._set_voice_prompt_cache(cache_key, (vcp, ref_ids))
         return vcp, ref_ids, using_icl_mode
 
     def _prepare_generation(

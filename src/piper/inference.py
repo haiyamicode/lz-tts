@@ -217,7 +217,7 @@ class PiperInference:
 
         _LOGGER.info("synthesize_span: phoneme_ids[:20]=%s, len=%d", phoneme_ids[:20], len(phoneme_ids))
 
-        with torch.no_grad():
+        with torch.inference_mode():
             text_tensor = torch.LongTensor(phoneme_ids).unsqueeze(0).to(self.device)
             text_lengths = torch.LongTensor([len(phoneme_ids)]).to(self.device)
             sid = torch.LongTensor([speaker_id]).to(self.device)
@@ -282,7 +282,7 @@ class PiperInference:
         # Synthesize each span and concatenate
         audio_segments = []
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for span in spans:
                 phoneme_ids = span["phoneme_ids"]
                 speaker_id = span.get("speaker_id")

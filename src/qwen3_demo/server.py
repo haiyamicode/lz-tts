@@ -318,7 +318,8 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         wav_t = torch.from_numpy(wav)
         if sr != 16000:
             wav_t = torchaudio.functional.resample(wav_t.unsqueeze(0), sr, 16000).squeeze(0)
-        return parakeet.transcribe(wav_t.cuda())
+        with torch.inference_mode():
+            return parakeet.transcribe(wav_t.cuda())
 
     text = await asyncio.to_thread(run)
     return {"text": text}
@@ -399,7 +400,8 @@ async def load_model(model_id: str = Form(...)):
         global _active_model_name, _loading
         try:
             if len(_model_cache) >= _model_cache_max:
-                evicted, _ = _model_cache.popitem(last=False)
+                evicted, old_model = _model_cache.popitem(last=False)
+                del old_model
                 print(f"Model cache full — evicted: {evicted}")
             new_model = FasterQwen3TTS.from_pretrained(
                 model_id,

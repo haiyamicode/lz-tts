@@ -146,6 +146,7 @@ class QwenSettings(BaseModel):
     top_k: int = QWEN_DEFAULT_TOP_K
     top_p: float = QWEN_DEFAULT_TOP_P
     repetition_penalty: float = QWEN_DEFAULT_REPETITION_PENALTY
+    voice_prompt_cache_entries: int = Field(8, ge=0)
     dp_budget: DpBudgetSettings = Field(default_factory=DpBudgetSettings)
 
 
@@ -251,6 +252,7 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
     int_overrides = {
         "QWEN_TTS_MAX_SEQ_LEN": "max_seq_len",
         "QWEN_TTS_MAX_NEW_TOKENS": "max_new_tokens",
+        "QWEN_TTS_VOICE_PROMPT_CACHE_ENTRIES": "voice_prompt_cache_entries",
     }
     for env_name, attr in int_overrides.items():
         value = os.environ.get(env_name)
@@ -501,6 +503,8 @@ def _load_model_unlocked() -> Any:
     if _qwen_settings.warmup and hasattr(loaded_model, "_warmup"):
         print("Capturing CUDA graphs...", file=sys.stderr, flush=True)
         loaded_model._warmup(prefill_len=100)
+    if hasattr(loaded_model, "max_voice_prompt_cache_entries"):
+        loaded_model.max_voice_prompt_cache_entries = _qwen_settings.voice_prompt_cache_entries
     print(f"FasterQwen3TTS loaded. Sample rate: {loaded_model.sample_rate}", file=sys.stderr, flush=True)
     return loaded_model
 
@@ -807,7 +811,8 @@ def transcribe_voice_sample(audio_file: Path) -> str:
     if sr != 16000:
         wav_t = torchaudio.functional.resample(wav_t.unsqueeze(0), sr, 16000).squeeze(0)
 
-    text = parakeet.transcribe(wav_t.cuda()).strip()
+    with torch.inference_mode():
+        text = parakeet.transcribe(wav_t.cuda()).strip()
     if not text:
         raise RuntimeError("nano-parakeet transcript completed with empty text")
     transcript_file.write_text(text, encoding="utf-8")
@@ -852,10 +857,11 @@ def deepfilter_audio(wav_data: np.ndarray, sample_rate: int) -> np.ndarray:
     if sample_rate != df_sample_rate:
         wav_tensor = torchaudio.functional.resample(wav_tensor, sample_rate, df_sample_rate)
 
-    enhanced = enhance(df_model, df_state, wav_tensor, pad=True)
-    if sample_rate != df_sample_rate:
-        enhanced = torchaudio.functional.resample(enhanced, df_sample_rate, sample_rate)
-    return enhanced.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
+    with torch.inference_mode():
+        enhanced = enhance(df_model, df_state, wav_tensor, pad=True)
+        if sample_rate != df_sample_rate:
+            enhanced = torchaudio.functional.resample(enhanced, df_sample_rate, sample_rate)
+        return enhanced.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
 
 
 def postprocess_audio(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, dict[str, Any]]:
@@ -1064,11 +1070,5 @@ def synthesize(req: SynthesizeRequest):
         flush=True,
     )
     mp3_bytes = wav_to_mp3(wav_data, sample_rate)
-
-    import gc
-    import torch
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     return StreamingResponse(io.BytesIO(mp3_bytes), media_type="audio/mpeg")
