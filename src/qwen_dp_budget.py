@@ -31,6 +31,7 @@ class DpBudgetConfig:
     min_extra_tokens: int = 0
     max_extra_tokens: int = 36
     language_profiles: dict[str, dict[str, float | int]] = field(default_factory=dict)
+    use_bert: bool = False
 
 
 LANGUAGE_ALIASES = {
@@ -153,13 +154,31 @@ class QwenDpBudget:
             gc.collect()
 
             self._sync_config_from_checkpoint(model)
-            if bool(getattr(model.hparams, "use_bert", False)):
+            checkpoint_uses_bert = bool(getattr(model.hparams, "use_bert", False))
+            if checkpoint_uses_bert and self.config.use_bert:
                 bert_model_name = getattr(model.hparams, "bert_model_name", None)
                 self._semantic_tokenizer = SemanticTokenizer(model_name=bert_model_name)
                 self._build_bert_input = build_bert_input
+            elif checkpoint_uses_bert:
+                self._strip_bert_from_text_encoder(model_g)
 
             self._model = model_g.to(self.device).eval()
             gc.collect()
+
+    @staticmethod
+    def _strip_bert_from_text_encoder(model_g: Any) -> None:
+        """Drop semantic-only modules from the DP budget model.
+
+        The DP budget only needs the phoneme encoder and duration predictor.
+        BertTextEncoder already supports bert_input=None, so removing these
+        modules keeps that path while avoiding a ~514 MiB BERT allocation.
+        """
+        enc_p = getattr(model_g, "enc_p", None)
+        if enc_p is None:
+            return
+        for attr in ("bert", "bert_projection", "cross_attention", "layer_norm"):
+            if hasattr(enc_p, attr):
+                setattr(enc_p, attr, None)
 
     def _phoneme_config(self, language: str | None = None) -> dict[str, Any]:
         language = (language or self.config.language).strip()

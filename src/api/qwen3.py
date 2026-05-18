@@ -105,6 +105,7 @@ class ResolvedQwenLanguage:
 class DpBudgetSettings(BaseModel):
     enabled: bool = True
     preload: bool = True
+    use_bert: bool = False
     checkpoint: str = "data/lzspeech-multilingual-bert/lzspeech-multilingual-bert-189.ckpt"
     config_path: Optional[str] = None
     device: str = "cuda"
@@ -588,6 +589,7 @@ def get_dp_budget_model() -> Any:
                 min_extra_tokens=dp_settings.min_extra_tokens,
                 max_extra_tokens=dp_settings.max_extra_tokens,
                 language_profiles=dp_settings.language_profiles,
+                use_bert=dp_settings.use_bert,
             )
         )
         dp_budget_model.load()
