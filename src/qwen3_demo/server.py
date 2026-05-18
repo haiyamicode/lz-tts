@@ -177,7 +177,7 @@ _generation_lock = asyncio.Lock()
 _generation_waiters: int = 0  # requests waiting for or holding the generation lock
 _dp_budget_defaults: dict[str, object] = {
     "enabled": shared_qwen3.env_bool("QWEN_DP_BUDGET", True) if EMBEDDED_IN_LZ_TTS else False,
-    "checkpoint": str(REPO_DIR / "data/lzspeech-multilingual-bert/lzspeech-multilingual-bert-189.ckpt"),
+    "checkpoint": str(REPO_DIR / "data/lzspeech-multilingual/model.ckpt"),
     "device": "cpu",
     "language": "multilingual",
     "noise_scale": 0.8,
@@ -825,7 +825,7 @@ def main():
         action="store_true",
         help="Enable DP-derived max_new_tokens budget by default for voice cloning.",
     )
-    parser.add_argument("--dp-checkpoint", default=str(REPO_DIR / "data/lzspeech-multilingual-bert/lzspeech-multilingual-bert-189.ckpt"))
+    parser.add_argument("--dp-checkpoint", default=str(REPO_DIR / "data/lzspeech-multilingual/model.ckpt"))
     parser.add_argument("--dp-device", default="cpu")
     parser.add_argument("--dp-language", default="multilingual")
     parser.add_argument("--dp-noise-scale", type=float, default=0.8)

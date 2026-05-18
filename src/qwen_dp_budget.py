@@ -17,7 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DpBudgetConfig:
-    checkpoint: Path = Path("data/lzspeech-multilingual-bert/lzspeech-multilingual-bert-189.ckpt")
+    checkpoint: Path = Path("data/lzspeech-multilingual/model.ckpt")
     config_path: Optional[Path] = None
     device: str = "cpu"
     language: str = "multilingual"
@@ -123,7 +123,6 @@ class QwenDpBudget:
             if self._model is not None:
                 return
 
-            from src.piper.semantic import SemanticTokenizer, build_bert_input
             from src.piper.vits.lightning import VitsModel
 
             checkpoint_path = Path(self.config.checkpoint)
@@ -154,6 +153,8 @@ class QwenDpBudget:
 
             self._sync_config_from_checkpoint(model)
             if bool(getattr(model.hparams, "use_bert", False)):
+                from src.piper.semantic import SemanticTokenizer, build_bert_input
+
                 bert_model_name = getattr(model.hparams, "bert_model_name", None)
                 self._semantic_tokenizer = SemanticTokenizer(model_name=bert_model_name)
                 self._build_bert_input = build_bert_input
@@ -248,7 +249,7 @@ class QwenDpBudget:
         phoneme_result = phonemize_text_for_infer(
             text,
             self._phoneme_config(language),
-            neural=True,
+            neural=False,
         )
         phoneme_ids = phoneme_result["phoneme_ids"]
         if not phoneme_ids:

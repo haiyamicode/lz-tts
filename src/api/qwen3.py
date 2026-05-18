@@ -105,7 +105,7 @@ class ResolvedQwenLanguage:
 class DpBudgetSettings(BaseModel):
     enabled: bool = True
     preload: bool = True
-    checkpoint: str = "data/lzspeech-multilingual-bert/lzspeech-multilingual-bert-189.ckpt"
+    checkpoint: str = "data/lzspeech-multilingual/model.ckpt"
     config_path: Optional[str] = None
     device: str = "cuda"
     language: str = "multilingual"

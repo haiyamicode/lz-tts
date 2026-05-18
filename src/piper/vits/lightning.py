@@ -204,36 +204,45 @@ class VitsModel(pl.LightningModule):
         return audio
 
     def train_dataloader(self):
+        num_workers = int(self.hparams.num_workers)
         return DataLoader(
             self._train_dataset,
             collate_fn=UtteranceCollate(
                 is_multispeaker=self.hparams.num_speakers > 1,
                 segment_size=self.hparams.segment_size,
             ),
-            num_workers=self.hparams.num_workers,
+            num_workers=num_workers,
             batch_size=self.hparams.batch_size,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=num_workers > 0,
         )
 
     def val_dataloader(self):
+        num_workers = int(self.hparams.num_workers)
         return DataLoader(
             self._val_dataset,
             collate_fn=UtteranceCollate(
                 is_multispeaker=self.hparams.num_speakers > 1,
                 segment_size=self.hparams.segment_size,
             ),
-            num_workers=self.hparams.num_workers,
+            num_workers=num_workers,
             batch_size=self.hparams.batch_size,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=num_workers > 0,
         )
 
     def test_dataloader(self):
+        num_workers = int(self.hparams.num_workers)
         return DataLoader(
             self._test_dataset,
             collate_fn=UtteranceCollate(
                 is_multispeaker=self.hparams.num_speakers > 1,
                 segment_size=self.hparams.segment_size,
             ),
-            num_workers=self.hparams.num_workers,
+            num_workers=num_workers,
             batch_size=self.hparams.batch_size,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=num_workers > 0,
         )
 
     def training_step(self, batch: Batch, batch_idx: int):
@@ -336,16 +345,17 @@ class VitsModel(pl.LightningModule):
             ids_slice,
             self.hparams.segment_size // self.hparams.hop_length,
         )
-        y_hat_mel = mel_spectrogram_torch(
-            y_hat.squeeze(1),
-            self.hparams.filter_length,
-            self.hparams.mel_channels,
-            self.hparams.sample_rate,
-            self.hparams.hop_length,
-            self.hparams.win_length,
-            self.hparams.mel_fmin,
-            self.hparams.mel_fmax,
-        )
+        with autocast(self.device.type, enabled=False):
+            y_hat_mel = mel_spectrogram_torch(
+                y_hat.float().squeeze(1),
+                self.hparams.filter_length,
+                self.hparams.mel_channels,
+                self.hparams.sample_rate,
+                self.hparams.hop_length,
+                self.hparams.win_length,
+                self.hparams.mel_fmin,
+                self.hparams.mel_fmax,
+            )
         y = slice_segments(
             y,
             ids_slice * self.hparams.hop_length,
@@ -448,6 +458,7 @@ class VitsModel(pl.LightningModule):
     def add_model_specific_args(parent_parser):
         parser = parent_parser.add_argument_group("VitsModel")
         parser.add_argument("--batch-size", type=int, required=True)
+        parser.add_argument("--num-workers", type=int, default=1)
         parser.add_argument("--validation-split", type=float, default=0.1)
         parser.add_argument("--num-test-examples", type=int, default=5)
         parser.add_argument(
