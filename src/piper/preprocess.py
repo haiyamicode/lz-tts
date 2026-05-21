@@ -630,7 +630,8 @@ def phonemize_spans_with_speakers(
         espeak_data: Optional path to espeak-ng data.
         neural: If True, use neural heteronym disambiguation.
 
-    Returns a list of spans: [{"phoneme_ids": [...], "speaker_id": int, "text": str}, ...]
+    Returns a list of spans:
+        [{"phonemes": [...], "phoneme_ids": [...], "speaker_id": int, "text": str}, ...]
     """
     cfg = _load_model_config(config_path)
 
@@ -705,7 +706,7 @@ def phonemize_spans_with_speakers(
         _LOGGER.debug("infer-multispan: phonemes=%s", _short_list(ph, 40))
 
         ids = phoneme_ids_espeak(ph)
-        results.append({"phoneme_ids": ids, "speaker_id": int(spk_id), "text": span_text})
+        results.append({"phonemes": phonemes, "phoneme_ids": ids, "speaker_id": int(spk_id), "text": span_text})
 
     return results
 
@@ -726,7 +727,7 @@ def phonemize_text_for_speaker(
         espeak_data: Optional path to espeak-ng data.
         neural: If True, use neural heteronym disambiguation.
 
-    Returns: {"phoneme_ids": [...], "speaker_id": int, "text": str}
+    Returns: {"phonemes": [...], "phoneme_ids": [...], "speaker_id": int, "text": str}
     """
     cfg = _load_model_config(config_path)
 
@@ -756,4 +757,4 @@ def phonemize_text_for_speaker(
 
     ids = phoneme_ids_espeak(phonemes)
     spk_id = spk_id_map.get(label, 0)
-    return {"phoneme_ids": ids, "speaker_id": int(spk_id), "text": text}
+    return {"phonemes": phonemes, "phoneme_ids": ids, "speaker_id": int(spk_id), "text": text}
