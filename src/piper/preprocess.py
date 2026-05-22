@@ -160,17 +160,11 @@ def _espeak_get_aligned_phonemes(text: str, voice: str = "en-us") -> Dict:
 
 
 def _phonemize_espeak_with_reset(text: str, voice: str, data_path) -> list:
-    """Wrapper around phonemize_espeak that resets espeak state after each call.
+    """Wrapper around phonemize_espeak.
 
-    espeak-ng has a bug where processing text with consecutive periods (..)
-    corrupts internal state, causing "dot" to be prepended to the NEXT call's output.
-    Switching voices resets this state.
+    The C++ extension owns eSpeak lifecycle reset for each call.
     """
-    result = _phonemize_espeak_raw(text, voice, data_path)
-    # Reset espeak state by switching to a different voice
-    # This prevents the ".." bug from affecting subsequent calls
-    _phonemize_espeak_raw("", "de", data_path)
-    return result
+    return _phonemize_espeak_raw(text, voice, data_path)
 
 
 def _phonemize_espeak_with_mapping(text: str, voice: str, data_path) -> Tuple[list, List[Tuple[int, int, int, int, int]]]:
@@ -186,10 +180,7 @@ def _phonemize_espeak_with_mapping(text: str, voice: str, data_path) -> Tuple[li
     if (voice or "").lower().startswith("ja"):
         return _phonemize_japanese_with_mapping(text, voice, data_path)
 
-    phonemes, mapping = _phonemize_espeak_with_mapping_raw(text, voice, data_path)
-    # Reset espeak state
-    _phonemize_espeak_raw("", "de", data_path)
-    return phonemes, mapping
+    return _phonemize_espeak_with_mapping_raw(text, voice, data_path)
 
 _DEBUG = os.environ.get("PREPROCESS_DEBUG", "").lower() in ("1", "true", "yes")
 if _DEBUG:
@@ -323,7 +314,7 @@ def _japanese_reading_tokens(text: str) -> List[Tuple[int, int, str]]:
     import ipadic
     from fugashi import GenericTagger
 
-    norm_text = _normalize_punct_and_space(text)
+    norm_text = text
     tagger = GenericTagger(ipadic.MECAB_ARGS)
     tokens: List[Tuple[int, int, str]] = []
     cursor = 0
@@ -338,6 +329,10 @@ def _japanese_reading_tokens(text: str) -> List[Tuple[int, int, str]]:
             start = cursor
         end = start + len(surface)
         cursor = end
+
+        if surface in _PUNCT_MAP:
+            tokens.append((start, end, _PUNCT_MAP[surface].strip() or surface))
+            continue
 
         pos = _token_feature_value(token, 0)
         pronunciation = _token_feature_value(token, 8)

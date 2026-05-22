@@ -457,7 +457,7 @@ def _japanese_reading_tokens(text: str) -> List[Tuple[int, int, str]]:
     import ipadic  # type: ignore
     from fugashi import GenericTagger  # type: ignore
 
-    norm_text = _normalize_punct_and_space(text)
+    norm_text = text
     tagger = GenericTagger(ipadic.MECAB_ARGS)
     tokens: List[Tuple[int, int, str]] = []
     cursor = 0
@@ -472,6 +472,10 @@ def _japanese_reading_tokens(text: str) -> List[Tuple[int, int, str]]:
             start = cursor
         end = start + len(surface)
         cursor = end
+
+        if surface in _PUNCT_MAP:
+            tokens.append((start, end, _PUNCT_MAP[surface].strip() or surface))
+            continue
 
         pos = _token_feature_value(token, 0)
         pronunciation = _token_feature_value(token, 8)

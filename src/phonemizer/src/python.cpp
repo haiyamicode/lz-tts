@@ -26,8 +26,17 @@ std::map<std::string, tashkeel::State> tashkeelStates;
 
 // ----------------------------------------------------------------------------
 
-std::vector<std::vector<piper::Phoneme>>
-phonemize_espeak(std::string text, std::string voice, std::string dataPath) {
+void terminate_espeak() {
+  if (eSpeakInitialized) {
+    espeak_SetSynthCallback(nullptr);
+    espeak_Cancel();
+    espeak_Synchronize();
+    espeak_Terminate();
+    eSpeakInitialized = false;
+  }
+}
+
+void initialize_espeak(std::string dataPath) {
   if (!eSpeakInitialized) {
     int result =
         espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, dataPath.c_str(), 0);
@@ -37,6 +46,20 @@ phonemize_espeak(std::string text, std::string voice, std::string dataPath) {
 
     eSpeakInitialized = true;
   }
+}
+
+struct ScopedESpeak {
+  explicit ScopedESpeak(std::string dataPath) {
+    terminate_espeak();
+    initialize_espeak(dataPath);
+  }
+
+  ~ScopedESpeak() { terminate_espeak(); }
+};
+
+std::vector<std::vector<piper::Phoneme>>
+phonemize_espeak(std::string text, std::string voice, std::string dataPath) {
+  ScopedESpeak espeak(dataPath);
 
   piper::eSpeakPhonemeConfig config;
   config.voice = voice;
@@ -116,7 +139,7 @@ void repair_unclaimed_text_spans(
   for (std::size_t i = 0; i < records.size(); i++) {
     std::size_t start = std::get<0>(records[i].mapping);
     std::size_t length = std::get<1>(records[i].mapping);
-    if (start == 0 || length == 0) {
+    if (start == 0) {
       starts[i] = 0;
       ends[i] = 0;
       continue;
@@ -124,7 +147,20 @@ void repair_unclaimed_text_spans(
 
     start = std::min(start, textSize);
     starts[i] = start;
-    ends[i] = std::min(start + length - 1, textSize);
+    if (length == 0) {
+      // Some eSpeak voices emit WORD events with a valid start but zero span,
+      // commonly around paired quotes. Use the next space/punctuation boundary
+      // as the span end so the emitted phoneme group still claims its text.
+      std::size_t end = start;
+      while (end < textSize &&
+             !is_text_space(textCodepoints[end]) &&
+             !is_text_punctuation(textCodepoints[end])) {
+        end++;
+      }
+      ends[i] = end;
+    } else {
+      ends[i] = std::min(start + length - 1, textSize);
+    }
   }
 
   // eSpeak sometimes emits WORD events for CJK characters that do not get their
@@ -191,26 +227,23 @@ void repair_unclaimed_text_spans(
 
 std::pair<std::vector<std::vector<piper::Phoneme>>, std::vector<std::vector<WordMapping>>>
 phonemize_espeak_with_mapping(std::string text, std::string voice, std::string dataPath) {
-  if (!eSpeakInitialized) {
-    int result =
-        espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, dataPath.c_str(), 0);
-    if (result < 0) {
-      throw std::runtime_error("Failed to initialize eSpeak");
-    }
-
-    eSpeakInitialized = true;
-  }
-
   // Get phonemes and punctuation data
   piper::eSpeakPhonemeConfig config;
   config.voice = voice;
 
   std::vector<std::vector<piper::Phoneme>> phonemes;
   std::vector<piper::ClausePunctuation> punctuation;
-  piper::phonemize_eSpeak(text, config, phonemes, &punctuation);
+  {
+    ScopedESpeak espeak(dataPath);
+    piper::phonemize_eSpeak(text, config, phonemes, &punctuation);
+  }
 
   // Get word positions using espeak_Synth callback
-  std::vector<piper::WordPosition> wordPositions = piper::get_word_positions(text, voice);
+  std::vector<piper::WordPosition> wordPositions;
+  {
+    ScopedESpeak espeak(dataPath);
+    wordPositions = piper::get_word_positions(text, voice);
+  }
   std::vector<char32_t> textCodepoints = utf8_to_codepoints(text);
 
   // Build word mapping PER SENTENCE with LOCAL indices
