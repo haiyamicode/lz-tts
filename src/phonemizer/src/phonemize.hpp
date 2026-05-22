@@ -31,8 +31,8 @@ typedef std::map<Phoneme, std::vector<Phoneme>> PhonemeMap;
 
 // Word position from espeak WORD events
 struct WordPosition {
-  std::size_t textStart;   // Byte offset in input text (1-indexed from espeak)
-  std::size_t textLength;  // Byte length in input text
+  std::size_t textStart;   // Character offset in input text (1-indexed from espeak)
+  std::size_t textLength;  // Character length in input text
 };
 
 // Punctuation added by phonemize_eSpeak

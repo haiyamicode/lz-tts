@@ -51,6 +51,144 @@ phonemize_espeak(std::string text, std::string voice, std::string dataPath) {
 // phonemeStart/End are LOCAL indices into the sentence's phoneme list
 using WordMapping = std::tuple<std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>;
 
+std::vector<char32_t> utf8_to_codepoints(const std::string &text) {
+  std::vector<char32_t> codepoints;
+  for (std::size_t i = 0; i < text.size();) {
+    unsigned char c = static_cast<unsigned char>(text[i]);
+    char32_t cp = 0;
+    std::size_t len = 1;
+
+    if (c < 0x80) {
+      cp = c;
+    } else if ((c >> 5) == 0x6 && i + 1 < text.size()) {
+      cp = ((c & 0x1F) << 6) |
+           (static_cast<unsigned char>(text[i + 1]) & 0x3F);
+      len = 2;
+    } else if ((c >> 4) == 0xE && i + 2 < text.size()) {
+      cp = ((c & 0x0F) << 12) |
+           ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 6) |
+           (static_cast<unsigned char>(text[i + 2]) & 0x3F);
+      len = 3;
+    } else if ((c >> 3) == 0x1E && i + 3 < text.size()) {
+      cp = ((c & 0x07) << 18) |
+           ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 12) |
+           ((static_cast<unsigned char>(text[i + 2]) & 0x3F) << 6) |
+           (static_cast<unsigned char>(text[i + 3]) & 0x3F);
+      len = 4;
+    } else {
+      cp = U'\uFFFD';
+    }
+
+    codepoints.push_back(cp);
+    i += len;
+  }
+  return codepoints;
+}
+
+bool is_text_space(char32_t cp) {
+  return cp == U' ' || cp == U'\t' || cp == U'\n' || cp == U'\r' ||
+         cp == U'\f' || cp == U'\v' || cp == U'\u3000';
+}
+
+bool is_text_punctuation(char32_t cp) {
+  return cp == U'.' || cp == U',' || cp == U';' || cp == U':' ||
+         cp == U'!' || cp == U'?' || cp == U'。' || cp == U'，' ||
+         cp == U'、' || cp == U'；' || cp == U'：' || cp == U'！' ||
+         cp == U'？';
+}
+
+struct MappingRecord {
+  std::size_t sentenceIdx;
+  WordMapping mapping;
+};
+
+void repair_unclaimed_text_spans(
+    std::vector<MappingRecord> &records,
+    const std::vector<char32_t> &textCodepoints) {
+  if (records.empty() || textCodepoints.empty()) {
+    return;
+  }
+
+  const std::size_t textSize = textCodepoints.size();
+  std::vector<std::size_t> starts(records.size());
+  std::vector<std::size_t> ends(records.size());
+
+  for (std::size_t i = 0; i < records.size(); i++) {
+    std::size_t start = std::get<0>(records[i].mapping);
+    std::size_t length = std::get<1>(records[i].mapping);
+    if (start == 0 || length == 0) {
+      starts[i] = 0;
+      ends[i] = 0;
+      continue;
+    }
+
+    start = std::min(start, textSize);
+    starts[i] = start;
+    ends[i] = std::min(start + length - 1, textSize);
+  }
+
+  // eSpeak sometimes emits WORD events for CJK characters that do not get their
+  // own phoneme group. Keep the WORD events as anchors, then give any skipped
+  // non-space text to the previous mapped span. Prefix text belongs to the first
+  // mapped span because there is no previous WORD to attach to.
+  if (starts[0] > 1) {
+    for (std::size_t pos = 1; pos < starts[0]; pos++) {
+      if (!is_text_space(textCodepoints[pos - 1]) &&
+          !is_text_punctuation(textCodepoints[pos - 1])) {
+        starts[0] = pos;
+        break;
+      }
+    }
+  }
+
+  for (std::size_t i = 1; i < records.size(); i++) {
+    if (starts[i] == 0 || ends[i - 1] == 0 || starts[i] <= ends[i - 1] + 1) {
+      continue;
+    }
+
+    std::size_t lastUnclaimed = 0;
+    for (std::size_t pos = ends[i - 1] + 1; pos < starts[i]; pos++) {
+      if (!is_text_space(textCodepoints[pos - 1]) &&
+          !is_text_punctuation(textCodepoints[pos - 1])) {
+        lastUnclaimed = pos;
+      }
+    }
+
+    if (lastUnclaimed > 0) {
+      ends[i - 1] = lastUnclaimed;
+    }
+  }
+
+  if (ends.back() > 0 && ends.back() < textSize) {
+    std::size_t lastUnclaimed = 0;
+    for (std::size_t pos = ends.back() + 1; pos <= textSize; pos++) {
+      if (!is_text_space(textCodepoints[pos - 1]) &&
+          !is_text_punctuation(textCodepoints[pos - 1])) {
+        lastUnclaimed = pos;
+      }
+    }
+
+    if (lastUnclaimed > 0) {
+      ends.back() = lastUnclaimed;
+    }
+  }
+
+  for (std::size_t i = 0; i < records.size(); i++) {
+    if (starts[i] == 0 || ends[i] < starts[i]) {
+      continue;
+    }
+
+    while (ends[i] > starts[i] &&
+           (is_text_space(textCodepoints[ends[i] - 1]) ||
+            is_text_punctuation(textCodepoints[ends[i] - 1]))) {
+      ends[i]--;
+    }
+
+    std::get<0>(records[i].mapping) = starts[i];
+    std::get<1>(records[i].mapping) = ends[i] - starts[i] + 1;
+  }
+}
+
 std::pair<std::vector<std::vector<piper::Phoneme>>, std::vector<std::vector<WordMapping>>>
 phonemize_espeak_with_mapping(std::string text, std::string voice, std::string dataPath) {
   if (!eSpeakInitialized) {
@@ -73,6 +211,7 @@ phonemize_espeak_with_mapping(std::string text, std::string voice, std::string d
 
   // Get word positions using espeak_Synth callback
   std::vector<piper::WordPosition> wordPositions = piper::get_word_positions(text, voice);
+  std::vector<char32_t> textCodepoints = utf8_to_codepoints(text);
 
   // Build word mapping PER SENTENCE with LOCAL indices
   // Each sentence gets its own list of word mappings
@@ -122,6 +261,7 @@ phonemize_espeak_with_mapping(std::string text, std::string voice, std::string d
   }
 
   // Match word positions to phoneme groups by index
+  std::vector<MappingRecord> mappingRecords;
   std::size_t numMappings = std::min(wordPositions.size(), allGroups.size());
   for (std::size_t i = 0; i < numMappings; i++) {
     const auto &group = allGroups[i];
@@ -135,14 +275,22 @@ phonemize_espeak_with_mapping(std::string text, std::string voice, std::string d
       }
     }
 
-    // Add to the appropriate sentence's mapping list with LOCAL indices
-    sentenceWordMappings[group.sentenceIdx].push_back({
+    mappingRecords.push_back({
+      group.sentenceIdx,
+      {
         wordPositions[i].textStart,
         wordPositions[i].textLength,
         group.localStart,
         group.localEnd,
         punctLen
+      }
     });
+  }
+
+  repair_unclaimed_text_spans(mappingRecords, textCodepoints);
+
+  for (const auto &record : mappingRecords) {
+    sentenceWordMappings[record.sentenceIdx].push_back(record.mapping);
   }
 
   return {phonemes, sentenceWordMappings};

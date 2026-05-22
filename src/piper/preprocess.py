@@ -180,9 +180,12 @@ def _phonemize_espeak_with_mapping(text: str, voice: str, data_path) -> Tuple[li
         Tuple of (phonemes, word_mapping) where:
         - phonemes: List of sentences, each a list of phoneme strings
         - word_mapping: List of (textStart, textLength, phonemeStart, phonemeEnd, punctuationLength)
-          tuples. Note: textStart is 1-indexed byte position from espeak.
+          tuples. Note: textStart is 1-indexed character position.
           punctuationLength is 0 or 1, indicating trailing punctuation (.?!,;:).
     """
+    if (voice or "").lower().startswith("ja"):
+        return _phonemize_japanese_with_mapping(text, voice, data_path)
+
     phonemes, mapping = _phonemize_espeak_with_mapping_raw(text, voice, data_path)
     # Reset espeak state
     _phonemize_espeak_raw("", "de", data_path)
@@ -294,6 +297,122 @@ def _normalize_punct_and_space(text: str) -> str:
     return _PUNCT_PATTERN.sub(lambda m: _PUNCT_MAP.get(m.group(0), m.group(0)), text)
 
 
+def _katakana_to_hiragana(text: str) -> str:
+    chars = []
+    for ch in text:
+        code = ord(ch)
+        if 0x30A1 <= code <= 0x30F6:
+            chars.append(chr(code - 0x60))
+        else:
+            chars.append(ch)
+    return "".join(chars)
+
+
+def _token_feature_value(token, index: int) -> str:
+    feature = getattr(token, "feature", None)
+    if feature is None:
+        return ""
+    try:
+        value = feature[index]
+    except (IndexError, TypeError):
+        return ""
+    return "" if value in (None, "*") else str(value)
+
+
+def _japanese_reading_tokens(text: str) -> List[Tuple[int, int, str]]:
+    import ipadic
+    from fugashi import GenericTagger
+
+    norm_text = _normalize_punct_and_space(text)
+    tagger = GenericTagger(ipadic.MECAB_ARGS)
+    tokens: List[Tuple[int, int, str]] = []
+    cursor = 0
+
+    for token in tagger(norm_text):
+        surface = token.surface
+        if not surface:
+            continue
+
+        start = norm_text.find(surface, cursor)
+        if start < 0:
+            start = cursor
+        end = start + len(surface)
+        cursor = end
+
+        pos = _token_feature_value(token, 0)
+        pronunciation = _token_feature_value(token, 8)
+        reading = pronunciation or _token_feature_value(token, 7) or surface
+
+        if pos == "助詞":
+            if surface == "は":
+                reading = "ワ"
+            elif surface == "へ":
+                reading = "エ"
+            elif surface == "を":
+                reading = "オ"
+
+        tokens.append((start, end, _katakana_to_hiragana(reading)))
+
+    return tokens
+
+
+def _normalize_japanese_text(text: str) -> str:
+    return " ".join(reading for _, _, reading in _japanese_reading_tokens(text))
+
+
+def _phonemize_espeak_for_voice(text: str, voice: str, casing_fn, espeak_data) -> list:
+    norm_text = _normalize_text_for_voice(text, voice)
+    sent_ph = _phonemize_espeak_with_reset(casing_fn(norm_text), voice, espeak_data)
+    return [p for sent in sent_ph for p in sent]
+
+
+def _phonemize_japanese_with_mapping(
+    text: str,
+    voice: str,
+    data_path,
+) -> Tuple[list, List[Tuple[int, int, int, int, int]]]:
+    sentence: List[str] = []
+    mappings: List[Tuple[int, int, int, int, int]] = []
+
+    for start, end, reading in _japanese_reading_tokens(text):
+        if not reading or reading.isspace():
+            continue
+
+        if reading in {".", "?", "!", ",", ":", ";"}:
+            if mappings:
+                punct_start = len(sentence)
+                sentence.append(reading)
+                if reading in {",", ":", ";"}:
+                    sentence.append(" ")
+
+                text_start, text_len, ph_start, _, _ = mappings[-1]
+                mappings[-1] = (
+                    text_start,
+                    max(text_len, end - (text_start - 1)),
+                    ph_start,
+                    punct_start + 1,
+                    1,
+                )
+            else:
+                sentence.append(reading)
+                if reading in {",", ":", ";"}:
+                    sentence.append(" ")
+            continue
+
+        if sentence and sentence[-1] != " ":
+            sentence.append(" ")
+
+        ph_start = len(sentence)
+        token_sents = _phonemize_espeak_with_reset(reading, voice, data_path)
+        token_phonemes = [p for sent in token_sents for p in sent]
+        sentence.extend(token_phonemes)
+        ph_end = len(sentence)
+
+        mappings.append((start + 1, end - start, ph_start, ph_end, 0))
+
+    return [sentence], [mappings]
+
+
 # -----------------------------------------------------------------------------
 # Language/voice mapping
 # -----------------------------------------------------------------------------
@@ -339,31 +458,7 @@ def _normalize_text_for_voice(text: str, voice: str) -> str:
     v = (voice or "").lower()
 
     if v.startswith("ja"):
-        import ipadic
-        from fugashi import GenericTagger
-        from pykakasi import kakasi
-
-        tagger = GenericTagger(ipadic.MECAB_ARGS)
-        parts = []
-        for token in tagger(norm_text):
-            surf = token.surface
-            pos = str(token.part_of_speech) if hasattr(token, "part_of_speech") else ""
-            primary_pos = pos.split(",")[0] if pos else ""
-            if primary_pos == "助詞":
-                if surf == "は":
-                    surf = "わ"
-                elif surf == "へ":
-                    surf = "え"
-                elif surf == "を":
-                    surf = "お"
-            parts.append(surf)
-        norm_text = "".join(parts)
-
-        kks = kakasi()
-        kks.setMode("J", "H")
-        kks.setMode("K", "H")
-        conv = kks.getConverter()
-        norm_text = conv.do(norm_text)
+        norm_text = _normalize_japanese_text(norm_text)
 
     elif v.startswith("ar"):
         norm_text = tashkeel_run(norm_text)
@@ -403,12 +498,11 @@ def _phonemize_multilingual(
             continue
 
         voice = _map_cld2_to_espeak(lang or "en", primary_voice)
-        span_text = _normalize_text_for_voice(span_text, voice)
+        norm_span_text = _normalize_text_for_voice(span_text, voice)
 
-        _LOGGER.debug("span[%s]: lang=%s voice=%s text='%s'", idx, lang, voice, _short_text(span_text, 80))
+        _LOGGER.debug("span[%s]: lang=%s voice=%s text='%s'", idx, lang, voice, _short_text(norm_span_text, 80))
 
-        span_phoneme_sents = _phonemize_espeak_with_reset(casing_fn(span_text), voice, espeak_data)
-        span_phonemes = [p for sp in span_phoneme_sents for p in sp]
+        span_phonemes = _phonemize_espeak_for_voice(span_text, voice, casing_fn, espeak_data)
 
         _LOGGER.debug("span[%s] phonemes=%s", idx, _short_list(span_phonemes, 32))
 
@@ -437,9 +531,7 @@ def _phonemize_neural(
     # Only apply neural disambiguation for English voices
     # The heteronym model is trained on English
     if not voice.startswith("en"):
-        norm_text = _normalize_text_for_voice(text, voice)
-        sent_ph = _phonemize_espeak_with_reset(casing_fn(norm_text), voice, espeak_data)
-        return [p for sent in sent_ph for p in sent]
+        return _phonemize_espeak_for_voice(text, voice, casing_fn, espeak_data)
 
     resolver = _get_heteronym_resolver()
 
@@ -448,9 +540,7 @@ def _phonemize_neural(
 
     if not heteronyms:
         # No heteronyms - just phonemize normally
-        norm_text = _normalize_text_for_voice(text, voice)
-        sent_ph = _phonemize_espeak_with_reset(casing_fn(norm_text), voice, espeak_data)
-        return [p for sent in sent_ph for p in sent]
+        return _phonemize_espeak_for_voice(text, voice, casing_fn, espeak_data)
 
     _LOGGER.debug(
         "neural: found %d heteronyms: %s",
@@ -478,14 +568,14 @@ def _phonemize_neural(
 
     for word, h_start, h_end, correct_ipa in heteronyms:
         # Find which word mapping entry this heteronym corresponds to
-        # Note: word_mapping textStart is 1-indexed byte position
+        # Note: word_mapping textStart is 1-indexed character position
         # heteronym positions are 0-indexed character positions
         # For ASCII (English), byte position == character position
         matched = None
 
         for sent_idx, mappings in enumerate(sent_word_mapping):
             for word_idx, (text_start, text_len, ph_start, ph_end, punct_len) in enumerate(mappings):
-                # Convert 1-indexed byte position to 0-indexed
+                # Convert 1-indexed character position to 0-indexed
                 map_start = text_start - 1
                 map_end = map_start + text_len
 
@@ -608,8 +698,7 @@ def phonemize_text_for_infer(
         voice = _map_cld2_to_espeak(voice, primary)
         norm_text = _normalize_text_for_voice(text, voice)
         _LOGGER.debug("infer: voice=%s text='%s'", voice, _short_text(norm_text, 120))
-        sent_ph = _phonemize_espeak_with_reset(casing(norm_text), voice, espeak_data)
-        phonemes = [p for sent in sent_ph for p in sent]
+        phonemes = _phonemize_espeak_for_voice(text, voice, casing, espeak_data)
 
     _LOGGER.debug("infer: phonemes=%s", _short_list(phonemes, 48))
     ids = phoneme_ids_espeak(phonemes)
@@ -700,13 +789,12 @@ def phonemize_spans_with_speakers(
         if neural:
             ph = _phonemize_neural(span_text, casing, espeak_data, voice)
         else:
-            ph_sent = _phonemize_espeak_with_reset(casing(span_text), voice, espeak_data)
-            ph = [p for s in ph_sent for p in s]
+            ph = _phonemize_espeak_for_voice(span_text, voice, casing, espeak_data)
 
         _LOGGER.debug("infer-multispan: phonemes=%s", _short_list(ph, 40))
 
         ids = phoneme_ids_espeak(ph)
-        results.append({"phonemes": phonemes, "phoneme_ids": ids, "speaker_id": int(spk_id), "text": span_text})
+        results.append({"phonemes": ph, "phoneme_ids": ids, "speaker_id": int(spk_id), "text": span_text})
 
     return results
 
@@ -750,8 +838,7 @@ def phonemize_text_for_speaker(
     else:
         norm_text = _normalize_text_for_voice(text, voice)
         _LOGGER.debug("infer-forced: text='%s'", _short_text(norm_text, 120))
-        ph_sents = _phonemize_espeak_with_reset(casing(norm_text), voice, espeak_data)
-        phonemes = [p for s in ph_sents for p in s]
+        phonemes = _phonemize_espeak_for_voice(text, voice, casing, espeak_data)
 
     _LOGGER.debug("infer-forced: phonemes=%s", _short_list(phonemes, 48))
 
