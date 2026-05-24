@@ -1,5 +1,4 @@
 #include <iostream>
-#include <optional>
 #include <string>
 #include <map>
 #include <vector>
@@ -117,7 +116,158 @@ bool is_text_punctuation(char32_t cp) {
   return cp == U'.' || cp == U',' || cp == U';' || cp == U':' ||
          cp == U'!' || cp == U'?' || cp == U'。' || cp == U'，' ||
          cp == U'、' || cp == U'；' || cp == U'：' || cp == U'！' ||
-         cp == U'？';
+         cp == U'？' || cp == U'"' || cp == U'\'' || cp == U'“' ||
+         cp == U'”' || cp == U'‘' || cp == U'’' || cp == U'¿' ||
+         cp == U'¡' || cp == U'«' || cp == U'»' || cp == U'‹' ||
+         cp == U'›' || cp == U'(' || cp == U')' || cp == U'[' ||
+         cp == U']' || cp == U'{' || cp == U'}' || cp == U'-' ||
+         cp == U'–' || cp == U'—';
+}
+
+bool span_has_space(const std::vector<char32_t> &textCodepoints,
+                    std::size_t start,
+                    std::size_t end) {
+  for (std::size_t pos = start; pos <= end; pos++) {
+    if (is_text_space(textCodepoints[pos - 1])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool is_ascii_alpha(char32_t cp) {
+  return (cp >= U'a' && cp <= U'z') || (cp >= U'A' && cp <= U'Z');
+}
+
+bool is_ascii_digit(char32_t cp) {
+  return cp >= U'0' && cp <= U'9';
+}
+
+bool is_ascii_alnum(char32_t cp) {
+  return is_ascii_alpha(cp) || is_ascii_digit(cp);
+}
+
+bool is_code_token_char(char32_t cp) {
+  return is_ascii_alnum(cp) || cp == U'-';
+}
+
+bool is_code_connector_at(const std::vector<char32_t> &textCodepoints,
+                          std::size_t index) {
+  return index > 0 && (index + 1) < textCodepoints.size() &&
+         textCodepoints[index] == U'-' &&
+         is_ascii_alnum(textCodepoints[index - 1]) &&
+         is_ascii_alnum(textCodepoints[index + 1]);
+}
+
+bool is_code_hyphen_word(const piper::WordPosition &wordPosition,
+                         const std::vector<char32_t> &textCodepoints) {
+  if (wordPosition.textStart == 0 || wordPosition.textLength != 1) {
+    return false;
+  }
+
+  const std::size_t index = wordPosition.textStart - 1;
+  if (index >= textCodepoints.size() || textCodepoints[index] != U'-') {
+    return false;
+  }
+
+  if (index == 0 || index + 1 >= textCodepoints.size()) {
+    return false;
+  }
+
+  return is_ascii_alpha(textCodepoints[index - 1]) &&
+         is_ascii_digit(textCodepoints[index + 1]);
+}
+
+std::vector<piper::WordPosition> normalize_punctuation_word_positions(
+    const std::vector<piper::WordPosition> &wordPositions,
+    const std::vector<char32_t> &textCodepoints) {
+  std::vector<piper::WordPosition> normalized;
+  normalized.reserve(wordPositions.size());
+
+  for (auto wordPosition : wordPositions) {
+    if (wordPosition.textStart > 0) {
+      std::size_t start = wordPosition.textStart - 1;
+      if (start < textCodepoints.size() &&
+          (is_text_space(textCodepoints[start]) ||
+           (is_text_punctuation(textCodepoints[start]) &&
+            !is_code_connector_at(textCodepoints, start)))) {
+        std::size_t next = start + 1;
+        while (next < textCodepoints.size() &&
+               (is_text_space(textCodepoints[next]) ||
+                is_text_punctuation(textCodepoints[next]))) {
+          next++;
+        }
+
+        if (next < textCodepoints.size()) {
+          std::size_t end = next;
+          while (end < textCodepoints.size() &&
+                 !is_text_space(textCodepoints[end]) &&
+                 !is_text_punctuation(textCodepoints[end])) {
+            end++;
+          }
+
+          wordPosition.textStart = next + 1;
+          wordPosition.textLength = end - next;
+        }
+      }
+    }
+
+    normalized.push_back(wordPosition);
+  }
+
+  return normalized;
+}
+
+bool has_ascii_code_hyphen(const std::vector<char32_t> &textCodepoints,
+                           std::size_t tokenStart,
+                           std::size_t tokenEnd) {
+  for (std::size_t i = tokenStart + 1; i + 1 < tokenEnd; i++) {
+    if (textCodepoints[i] == U'-' && is_ascii_alnum(textCodepoints[i - 1]) &&
+        is_ascii_alnum(textCodepoints[i + 1])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+std::vector<piper::WordPosition> merge_code_hyphen_word_positions(
+    const std::vector<piper::WordPosition> &wordPositions,
+    const std::vector<char32_t> &textCodepoints) {
+  std::vector<piper::WordPosition> filtered;
+
+  for (const auto &wordPosition : wordPositions) {
+    if (is_code_hyphen_word(wordPosition, textCodepoints)) {
+      continue;
+    }
+
+    auto merged = wordPosition;
+    if (wordPosition.textStart > 0) {
+      std::size_t tokenStart = wordPosition.textStart - 1;
+      if (tokenStart < textCodepoints.size() &&
+          is_code_token_char(textCodepoints[tokenStart])) {
+        while (tokenStart > 0 && is_code_token_char(textCodepoints[tokenStart - 1])) {
+          tokenStart--;
+        }
+
+        std::size_t tokenEnd = tokenStart;
+        while (tokenEnd < textCodepoints.size() &&
+               is_code_token_char(textCodepoints[tokenEnd])) {
+          tokenEnd++;
+        }
+
+        if (has_ascii_code_hyphen(textCodepoints, tokenStart, tokenEnd)) {
+          merged.textStart = tokenStart + 1;
+          merged.textLength = tokenEnd - tokenStart;
+        }
+      }
+    }
+
+    filtered.push_back(merged);
+  }
+
+  return filtered;
 }
 
 struct MappingRecord {
@@ -182,6 +332,24 @@ void repair_unclaimed_text_spans(
       continue;
     }
 
+    std::size_t contiguousEnd = ends[i - 1];
+    for (std::size_t pos = ends[i - 1] + 1; pos < starts[i]; pos++) {
+      if (is_text_space(textCodepoints[pos - 1])) {
+        break;
+      }
+
+      contiguousEnd = pos;
+    }
+
+    if (contiguousEnd > ends[i - 1]) {
+      ends[i - 1] = contiguousEnd;
+      continue;
+    }
+
+    if (span_has_space(textCodepoints, ends[i - 1] + 1, starts[i] - 1)) {
+      continue;
+    }
+
     std::size_t lastUnclaimed = 0;
     for (std::size_t pos = ends[i - 1] + 1; pos < starts[i]; pos++) {
       if (!is_text_space(textCodepoints[pos - 1]) &&
@@ -196,16 +364,31 @@ void repair_unclaimed_text_spans(
   }
 
   if (ends.back() > 0 && ends.back() < textSize) {
-    std::size_t lastUnclaimed = 0;
+    std::size_t contiguousEnd = ends.back();
     for (std::size_t pos = ends.back() + 1; pos <= textSize; pos++) {
-      if (!is_text_space(textCodepoints[pos - 1]) &&
-          !is_text_punctuation(textCodepoints[pos - 1])) {
-        lastUnclaimed = pos;
+      if (is_text_space(textCodepoints[pos - 1])) {
+        break;
       }
+
+      contiguousEnd = pos;
     }
 
-    if (lastUnclaimed > 0) {
-      ends.back() = lastUnclaimed;
+    if (contiguousEnd > ends.back()) {
+      ends.back() = contiguousEnd;
+    }
+
+    if (!span_has_space(textCodepoints, ends.back() + 1, textSize)) {
+      std::size_t lastUnclaimed = 0;
+      for (std::size_t pos = ends.back() + 1; pos <= textSize; pos++) {
+        if (!is_text_space(textCodepoints[pos - 1]) &&
+            !is_text_punctuation(textCodepoints[pos - 1])) {
+          lastUnclaimed = pos;
+        }
+      }
+
+      if (lastUnclaimed > 0) {
+        ends.back() = lastUnclaimed;
+      }
     }
   }
 
@@ -245,6 +428,8 @@ phonemize_espeak_with_mapping(std::string text, std::string voice, std::string d
     wordPositions = piper::get_word_positions(text, voice);
   }
   std::vector<char32_t> textCodepoints = utf8_to_codepoints(text);
+  wordPositions = normalize_punctuation_word_positions(wordPositions, textCodepoints);
+  wordPositions = merge_code_hyphen_word_positions(wordPositions, textCodepoints);
 
   // Build word mapping PER SENTENCE with LOCAL indices
   // Each sentence gets its own list of word mappings
@@ -293,11 +478,37 @@ phonemize_espeak_with_mapping(std::string text, std::string voice, std::string d
     sentenceWordMappings.emplace_back();
   }
 
-  // Match word positions to phoneme groups by index
+  // Match word positions to phoneme groups by index. eSpeak can emit
+  // overlapping WORD events for one written token that is spoken as multiple
+  // groups, e.g. "42" or "2.0". Consume those extra groups into the same text
+  // span so later words do not shift.
   std::vector<MappingRecord> mappingRecords;
-  std::size_t numMappings = std::min(wordPositions.size(), allGroups.size());
-  for (std::size_t i = 0; i < numMappings; i++) {
-    const auto &group = allGroups[i];
+  std::size_t wordIndex = 0;
+  std::size_t groupIndex = 0;
+  while (wordIndex < wordPositions.size() && groupIndex < allGroups.size()) {
+    const auto &word = wordPositions[wordIndex];
+    auto group = allGroups[groupIndex];
+
+    std::size_t wordEnd = word.textStart + word.textLength;
+    while ((wordIndex + 1) < wordPositions.size() &&
+           (groupIndex + 1) < allGroups.size()) {
+      const auto &nextWord = wordPositions[wordIndex + 1];
+      if (nextWord.textStart >= wordEnd) {
+        break;
+      }
+
+      const auto &nextGroup = allGroups[groupIndex + 1];
+      if (nextGroup.sentenceIdx != group.sentenceIdx) {
+        break;
+      }
+
+      group.localEnd = nextGroup.localEnd;
+      group.globalEnd = nextGroup.globalEnd;
+      wordEnd = std::max(wordEnd, nextWord.textStart + nextWord.textLength);
+      wordIndex++;
+      groupIndex++;
+    }
+
     std::size_t punctLen = 0;
 
     // Check if any punctuation position falls within this word's GLOBAL phoneme range
@@ -311,13 +522,16 @@ phonemize_espeak_with_mapping(std::string text, std::string voice, std::string d
     mappingRecords.push_back({
       group.sentenceIdx,
       {
-        wordPositions[i].textStart,
-        wordPositions[i].textLength,
+        word.textStart,
+        wordEnd - word.textStart,
         group.localStart,
         group.localEnd,
         punctLen
       }
     });
+
+    wordIndex++;
+    groupIndex++;
   }
 
   repair_unclaimed_text_spans(mappingRecords, textCodepoints);

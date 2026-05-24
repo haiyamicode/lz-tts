@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import gc
 import importlib.util
 import io
@@ -10,10 +11,13 @@ import json
 import logging
 import os
 import secrets
+import sys
+import time
 import wave
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -34,8 +38,49 @@ load_dotenv()
 
 # Default paths
 DATA_DIR = Path("data")
-CONFIG_PATH = Path("local/server.json")
+CONFIG_PATH = Path(os.environ.get("LZ_TTS_SERVER_CONFIG", "local/server.json"))
 DEFAULT_MODEL = "lzspeech-enzhja-1000-bert"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MATCHA_ROOT = PROJECT_ROOT / "local" / "Matcha-TTS"
+MATCHA_DEFAULT_CHECKPOINT = (
+    MATCHA_ROOT
+    / "logs/train/lzspeech_multilingual_plus_fused_icbpe10000_semantic_mixed50_resume"
+    / "runs/2026-05-23_15-58-42/checkpoints/last.ckpt"
+)
+MATCHA_DEFAULT_ICBPE_VOCAB = MATCHA_ROOT / "data/flores200/tokenizers/unicode_codepoint_byte_fallback_10000/vocab.json"
+MATCHA_DEFAULT_PHONEME_VOCAB = MATCHA_ROOT / "data/lzspeech_multilingual_plus_22050/fused_phoneme_vocab.json"
+MATCHA_DEFAULT_FILELIST = MATCHA_ROOT / "data/lzspeech_multilingual_plus_22050/aligned_fused_test.txt"
+MATCHA_LANGUAGE_ID_MAP = {
+    "en": 1,
+    "ar": 2,
+    "bn": 3,
+    "de": 4,
+    "es": 5,
+    "fa": 6,
+    "fr": 7,
+    "hi": 8,
+    "id": 9,
+    "it": 10,
+    "ja": 11,
+    "jv": 12,
+    "ko": 13,
+    "pt": 14,
+    "ru": 15,
+    "sw": 16,
+    "ta": 17,
+    "te": 18,
+    "tr": 19,
+    "ur": 20,
+    "vi": 21,
+    "zh": 22,
+}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 class ModelConfig(BaseModel):
     """Per-model configuration override."""
@@ -45,6 +90,27 @@ class ModelConfig(BaseModel):
     speakers: dict[str, Optional[int]] = Field(default_factory=dict)
     # Override espeak voice for phonemization (e.g., "en-us", "en-gb")
     phoneme_voice: Optional[str] = None
+
+
+class MatchaConfig(BaseModel):
+    """Temporary Matcha-TTS backend configuration."""
+
+    enabled: bool = Field(default_factory=lambda: _env_bool("MATCHA_TTS_ENABLED", False))
+    preload: bool = Field(default_factory=lambda: _env_bool("MATCHA_TTS_PRELOAD", True))
+    device: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_DEVICE", "cuda:2"))
+    checkpoint: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_CHECKPOINT", str(MATCHA_DEFAULT_CHECKPOINT)))
+    icbpe_vocab_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_ICBPE_VOCAB", str(MATCHA_DEFAULT_ICBPE_VOCAB)))
+    phoneme_vocab_path: str = Field(
+        default_factory=lambda: os.environ.get("MATCHA_TTS_PHONEME_VOCAB", str(MATCHA_DEFAULT_PHONEME_VOCAB))
+    )
+    filelist_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_FILELIST", str(MATCHA_DEFAULT_FILELIST)))
+    max_batch_size: int = Field(default_factory=lambda: int(os.environ.get("MATCHA_TTS_MAX_BATCH_SIZE", "128")), ge=1)
+    batch_wait_ms: float = Field(default_factory=lambda: float(os.environ.get("MATCHA_TTS_BATCH_WAIT_MS", "10")), ge=0)
+    n_timesteps: int = Field(default_factory=lambda: int(os.environ.get("MATCHA_TTS_STEPS", "32")), ge=1)
+    temperature: float = Field(default_factory=lambda: float(os.environ.get("MATCHA_TTS_TEMPERATURE", "0.667")), ge=0)
+    length_scale: float = Field(default_factory=lambda: float(os.environ.get("MATCHA_TTS_LENGTH_SCALE", "1.0")), gt=0)
+    denoiser_strength: float = Field(default_factory=lambda: float(os.environ.get("MATCHA_TTS_DENOISER_STRENGTH", "0.00025")), ge=0)
+    sample_rate: int = 22050
 
 
 class ServerConfig(BaseModel):
@@ -57,6 +123,7 @@ class ServerConfig(BaseModel):
     model_priority: list[str] = Field(default_factory=list)
     lang_speaker_map: dict[str, str] = Field(default_factory=dict)
     qwen: qwen3.QwenSettings = Field(default_factory=qwen3.QwenSettings)
+    matcha: MatchaConfig = Field(default_factory=MatchaConfig)
     # Per-model configuration overrides
     model_config_overrides: dict[str, ModelConfig] = Field(default_factory=dict, alias="model_config")
 
@@ -73,6 +140,20 @@ class SynthesizeRequest(BaseModel):
     length_scale: Optional[float] = Field(None, description="Speech rate multiplier (>1 = slower)")
     noise_w: Optional[float] = Field(None, description="Duration predictor noise")
     neural: bool = Field(True, description="Use neural heteronym disambiguation for more accurate pronunciation of ambiguous words")
+
+
+class MatchaSynthesizeRequest(BaseModel):
+    """Request body for the temporary Matcha backend."""
+
+    text: str
+    language: str = Field("en", description="Language code used for phonemization and speaker/language conditioning")
+    format: Literal["wav", "json"] = "wav"
+    input_type: Literal["aligned", "phoneme", "text"] = "aligned"
+    speaker_id: Optional[int] = Field(None, description="Override language speaker id; 0 means auto")
+    neural: bool = True
+    steps: Optional[int] = None
+    temperature: Optional[float] = None
+    length_scale: Optional[float] = None
 
 
 class SpeakerInfo(BaseModel):
@@ -96,6 +177,8 @@ _server_config: ServerConfig = ServerConfig()
 _speaker_routes: dict[str, tuple[str, Optional[int]]] = {}  # speaker -> (model, speaker_id or None)
 _lang_speaker_map: dict[str, str] = {}  # canonical locale -> speaker
 _splitter: MultilingualSplitter | None = None
+_matcha_backend: "_MatchaBackend | None" = None
+_matcha_batcher: "_MatchaBatcher | None" = None
 
 
 def _normalize_locale(lang: str) -> str:
@@ -561,6 +644,342 @@ def _audio_to_mp3_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     return mp3_buffer.getvalue()
 
 
+@dataclass
+class _MatchaPreparedItem:
+    text: str
+    language: str
+    phoneme_text: str
+    x_phoneme: Any
+    x_text_tokens: Any
+    x_phoneme_mask: Any
+    x_text_mask: Any
+    speaker_id: int
+
+
+@dataclass
+class _MatchaBatchRequest:
+    text: str
+    language: str
+    input_type: str
+    speaker_id: int | None
+    neural: bool
+    steps: int | None
+    temperature: float | None
+    length_scale: float | None
+    future: asyncio.Future
+    queued_at: float
+
+
+@dataclass
+class _MatchaBatchResult:
+    audio: np.ndarray
+    sample_rate: int
+    audio_seconds: float
+    backend_seconds: float
+    model_rtf: float
+    backend_rtf: float
+    batch_size: int
+    queue_seconds: float
+    text: str
+    phoneme_text: str
+
+
+class _MatchaBackend:
+    """Temporary local Matcha inference backend for batching experiments."""
+
+    def __init__(self, settings: MatchaConfig):
+        self.settings = settings
+        self.sample_rate = settings.sample_rate
+        self.device_name = settings.device
+        self.checkpoint_path = Path(settings.checkpoint)
+        self._load()
+
+    def _load(self) -> None:
+        if not self.checkpoint_path.exists():
+            raise FileNotFoundError(f"Matcha checkpoint not found: {self.checkpoint_path}")
+        if str(MATCHA_ROOT) not in sys.path:
+            sys.path.insert(0, str(MATCHA_ROOT))
+
+        import torch  # pylint: disable=import-outside-toplevel
+        from matcha.cli import VOCODER_URLS, assert_model_downloaded, load_vocoder  # pylint: disable=import-outside-toplevel
+        from matcha.data.text_mel_datamodule import TextMelDataset  # pylint: disable=import-outside-toplevel
+        from matcha.models.matcha_tts import MatchaTTSFusedSemantic  # pylint: disable=import-outside-toplevel
+
+        self.torch = torch
+        self.device = torch.device(self.device_name if torch.cuda.is_available() else "cpu")
+        self.model = MatchaTTSFusedSemantic.load_from_checkpoint(
+            str(self.checkpoint_path),
+            map_location=self.device,
+            weights_only=False,
+        )
+        self.model = self.model.to(self.device).eval()
+
+        vocoder_path = Path.home() / ".cache" / "matcha_tts" / "hifigan_univ_v1"
+        vocoder_path.parent.mkdir(parents=True, exist_ok=True)
+        assert_model_downloaded(vocoder_path, VOCODER_URLS["hifigan_univ_v1"])
+        self.vocoder, self.denoiser = load_vocoder("hifigan_univ_v1", vocoder_path, self.device)
+        self.vocoder = self.vocoder.to(self.device).eval()
+        self.denoiser = self.denoiser.to(self.device).eval()
+
+        self.dataset = TextMelDataset(
+            str(Path(self.settings.filelist_path)),
+            n_spks=23,
+            cleaners=["english_cleaners2"],
+            add_blank=True,
+            n_fft=1024,
+            n_mels=80,
+            sample_rate=self.sample_rate,
+            hop_length=256,
+            win_length=1024,
+            f_min=0,
+            f_max=8000,
+            data_parameters={"mel_mean": -5.772607, "mel_std": 2.773259},
+            seed=1234,
+            load_durations=False,
+            text_input_type="aligned_phoneme_icbpe",
+            icbpe_vocab_path=str(Path(self.settings.icbpe_vocab_path)),
+            phoneme_vocab_path=str(Path(self.settings.phoneme_vocab_path)),
+            language_id_map=MATCHA_LANGUAGE_ID_MAP,
+            language_auto_id=0,
+            language_auto_prob=0.0,
+        )
+        _LOGGER.info("Loaded Matcha backend: checkpoint=%s device=%s", self.checkpoint_path, self.device)
+
+    @staticmethod
+    def _normalize_for_alignment(text: str, language: str) -> str:
+        from src.piper.preprocess import _map_cld2_to_espeak, _normalize_punct_and_space  # pylint: disable=import-outside-toplevel
+
+        voice = _map_cld2_to_espeak(language, "en-us")
+        if voice.lower().startswith("ja"):
+            return text
+        return " ".join(_normalize_punct_and_space(text).split())
+
+    @staticmethod
+    def _flatten_phonemes(sentence) -> str:
+        return "".join(sentence)
+
+    def _build_units(self, text: str, language: str, neural: bool) -> tuple[str, list[dict[str, str]], str]:
+        from src.piper.heteronym import get_resolver  # pylint: disable=import-outside-toplevel
+        from src.piper.preprocess import _map_cld2_to_espeak, _phonemize_espeak_with_mapping  # pylint: disable=import-outside-toplevel
+
+        normalized_text = self._normalize_for_alignment(text, language)
+        voice = _map_cld2_to_espeak(language, "en-us")
+        sentences, mappings = _phonemize_espeak_with_mapping(normalized_text, voice, None)
+        replacements: dict[tuple[int, int], str] = {}
+
+        if neural and voice.lower().startswith("en"):
+            for word, h_start, h_end, correct_ipa in get_resolver(device=str(self.device)).resolve_all(normalized_text):
+                matched = None
+                for sent_idx, sentence_mappings in enumerate(mappings):
+                    for word_idx, (text_start, text_len, *_rest) in enumerate(sentence_mappings):
+                        map_start = text_start - 1
+                        map_end = map_start + text_len
+                        if (map_start <= h_start < map_end) or (map_start < h_end <= map_end) or (
+                            map_start == h_start and map_end == h_end
+                        ):
+                            matched = (sent_idx, word_idx)
+                            break
+                    if matched is not None:
+                        break
+                if matched is not None:
+                    replacements[matched] = correct_ipa
+                else:
+                    _LOGGER.warning("Matcha neural phonemizer could not map heteronym %r in %r", word, normalized_text)
+
+        units: list[dict[str, str]] = []
+        for sent_idx, (sentence, sentence_mappings) in enumerate(zip(sentences, mappings)):
+            for word_idx, (text_start, text_len, ph_start, ph_end, punct_len) in enumerate(sentence_mappings):
+                if text_start <= 0:
+                    continue
+                start = text_start - 1
+                end = start + text_len
+                if punct_len and end < len(normalized_text) and normalized_text[end : end + punct_len].strip():
+                    end += punct_len
+                unit_text = normalized_text[start:end]
+                unit_phonemes = sentence[ph_start:ph_end]
+                replacement = replacements.get((sent_idx, word_idx))
+                if replacement is not None:
+                    word_ph_end = ph_end - punct_len
+                    trailing_punct = sentence[word_ph_end:ph_end]
+                    unit_phonemes = list(replacement) + trailing_punct
+                phonemes = self._flatten_phonemes(unit_phonemes)
+                if unit_text and phonemes:
+                    units.append({"text": unit_text, "phonemes": phonemes})
+
+        if not units:
+            raise ValueError(f"No Matcha alignment units produced for language={language!r}, text={text!r}")
+
+        phoneme_text = " ".join(unit["phonemes"] for unit in units)
+        return normalized_text, units, phoneme_text
+
+    def _prepare_item(self, request: _MatchaBatchRequest) -> _MatchaPreparedItem:
+        language = request.language.lower().split("-")[0]
+        if language not in MATCHA_LANGUAGE_ID_MAP:
+            language = "en"
+        normalized_text, units, phoneme_text = self._build_units(request.text, language, request.neural)
+        aligned = self.dataset.get_aligned_phoneme_icbpe(phoneme_text, normalized_text, units)
+        speaker_id = request.speaker_id if request.speaker_id is not None else MATCHA_LANGUAGE_ID_MAP[language]
+        return _MatchaPreparedItem(
+            text=normalized_text,
+            language=language,
+            phoneme_text=phoneme_text,
+            x_phoneme=aligned["phoneme_ids"],
+            x_text_tokens=aligned["text_ids"],
+            x_phoneme_mask=aligned["phoneme_mask"],
+            x_text_mask=aligned["text_mask"],
+            speaker_id=speaker_id,
+        )
+
+    def synthesize_batch(self, requests: list[_MatchaBatchRequest]) -> list[_MatchaBatchResult]:
+        torch = self.torch
+        started = time.perf_counter()
+        prepared = [self._prepare_item(request) for request in requests]
+        batch_size = len(prepared)
+        max_len = max(item.x_phoneme.shape[-1] for item in prepared)
+
+        x = torch.zeros((batch_size, max_len), dtype=torch.long, device=self.device)
+        x_text = torch.zeros((batch_size, max_len), dtype=torch.long, device=self.device)
+        x_phoneme_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=self.device)
+        x_text_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=self.device)
+        x_lengths = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
+        spks = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
+
+        for idx, item in enumerate(prepared):
+            length = item.x_phoneme.shape[-1]
+            x_lengths[idx] = length
+            spks[idx] = item.speaker_id
+            x[idx, :length] = item.x_phoneme.to(self.device)
+            x_text[idx, :length] = item.x_text_tokens.to(self.device)
+            x_phoneme_mask[idx, :length] = item.x_phoneme_mask.to(self.device)
+            x_text_mask[idx, :length] = item.x_text_mask.to(self.device)
+
+        steps = requests[0].steps or self.settings.n_timesteps
+        temperature = requests[0].temperature or self.settings.temperature
+        length_scale = requests[0].length_scale or self.settings.length_scale
+        input_type = requests[0].input_type
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        with torch.inference_mode():
+            output = self.model.synthesise(
+                x,
+                x_lengths,
+                n_timesteps=steps,
+                temperature=temperature,
+                length_scale=length_scale,
+                spks=spks,
+                input_type=input_type,
+                texts=[item.text for item in prepared],
+                x_text=x_text,
+                x_text_lengths=x_lengths,
+                x_phoneme_mask=x_phoneme_mask,
+                x_text_mask=x_text_mask,
+            )
+            audio = self.vocoder(output["mel"]).clamp(-1, 1)
+            audio = self.denoiser(audio.squeeze(1), strength=self.settings.denoiser_strength)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+        elapsed = time.perf_counter() - started
+        audio = audio.detach().float().cpu()
+        if audio.ndim == 1:
+            audio = audio.unsqueeze(0)
+
+        results: list[_MatchaBatchResult] = []
+        total_audio_seconds = 0.0
+        trimmed_audio = []
+        for idx, mel_length in enumerate(output["mel_lengths"].detach().cpu().tolist()):
+            audio_samples = max(1, int(mel_length) * 256)
+            current = audio[idx, : min(audio_samples, audio.shape[-1])].numpy()
+            current = np.clip(current, -1.0, 1.0)
+            audio_int16 = (current * 32767.0).astype(np.int16)
+            audio_seconds = float(audio_int16.shape[-1]) / self.sample_rate
+            total_audio_seconds += audio_seconds
+            trimmed_audio.append((audio_int16, audio_seconds))
+
+        backend_rtf = elapsed / total_audio_seconds if total_audio_seconds else 0.0
+        for request, item, (audio_int16, audio_seconds) in zip(requests, prepared, trimmed_audio):
+            results.append(
+                _MatchaBatchResult(
+                    audio=audio_int16,
+                    sample_rate=self.sample_rate,
+                    audio_seconds=audio_seconds,
+                    backend_seconds=elapsed,
+                    model_rtf=float(output["rtf"]),
+                    backend_rtf=backend_rtf,
+                    batch_size=batch_size,
+                    queue_seconds=max(0.0, started - request.queued_at),
+                    text=item.text,
+                    phoneme_text=item.phoneme_text,
+                )
+            )
+        return results
+
+
+class _MatchaBatcher:
+    def __init__(self, backend: _MatchaBackend, settings: MatchaConfig):
+        self.backend = backend
+        self.settings = settings
+        self._queue: list[_MatchaBatchRequest] = []
+        self._condition = asyncio.Condition()
+        self._worker_task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._worker())
+
+    async def submit(self, request: MatchaSynthesizeRequest) -> _MatchaBatchResult:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        item = _MatchaBatchRequest(
+            text=request.text,
+            language=request.language,
+            input_type=request.input_type,
+            speaker_id=request.speaker_id,
+            neural=request.neural,
+            steps=request.steps,
+            temperature=request.temperature,
+            length_scale=request.length_scale,
+            future=future,
+            queued_at=time.perf_counter(),
+        )
+        async with self._condition:
+            self._queue.append(item)
+            self._condition.notify()
+        return await future
+
+    async def _worker(self) -> None:
+        while True:
+            async with self._condition:
+                while not self._queue:
+                    await self._condition.wait()
+            wait_seconds = self.settings.batch_wait_ms / 1000.0
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+            async with self._condition:
+                batch = self._queue[: self.settings.max_batch_size]
+                del self._queue[: len(batch)]
+
+            try:
+                results = await asyncio.to_thread(self.backend.synthesize_batch, batch)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                _LOGGER.exception("Matcha batch failed")
+                for item in batch:
+                    if not item.future.done():
+                        item.future.set_exception(exc)
+                continue
+
+            for item, result in zip(batch, results):
+                if not item.future.done():
+                    item.future.set_result(result)
+
+
+def _get_matcha_batcher() -> _MatchaBatcher:
+    if _matcha_batcher is None:
+        raise HTTPException(status_code=503, detail="Matcha backend is not enabled or not loaded")
+    return _matcha_batcher
+
+
 def create_app(config: ServerConfig | None = None) -> FastAPI:
     """Create the FastAPI application."""
     global _server_config, _speaker_routes
@@ -581,7 +1000,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     @app.on_event("startup")
     async def startup_event():
         """Preload models and build routing table on startup."""
-        global _speaker_routes, _lang_speaker_map
+        global _speaker_routes, _lang_speaker_map, _matcha_backend, _matcha_batcher
 
         # Build canonical lookup for lang_speaker_map
         _lang_speaker_map.clear()
@@ -611,6 +1030,13 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     include_dp_budget=_server_config.qwen.dp_budget.preload
                 )
                 _LOGGER.info("Qwen3 TTS preload complete")
+
+        if _server_config.matcha.enabled and _server_config.matcha.preload:
+            _LOGGER.info("Preloading Matcha backend on %s...", _server_config.matcha.device)
+            _matcha_backend = await asyncio.to_thread(_MatchaBackend, _server_config.matcha)
+            _matcha_batcher = _MatchaBatcher(_matcha_backend, _server_config.matcha)
+            _matcha_batcher.start()
+            _LOGGER.info("Matcha backend ready")
 
         _LOGGER.info("Server ready")
 
@@ -651,6 +1077,14 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "max_models_in_cache": _server_config.max_models_in_cache,
             "default_model": _server_config.default_model,
             "qwen3": qwen3.model_status(),
+            "matcha": {
+                "enabled": _server_config.matcha.enabled,
+                "loaded": _matcha_backend is not None,
+                "device": _server_config.matcha.device,
+                "checkpoint": _server_config.matcha.checkpoint,
+                "max_batch_size": _server_config.matcha.max_batch_size,
+                "batch_wait_ms": _server_config.matcha.batch_wait_ms,
+            },
             "speakers": speakers,
         }
 
@@ -775,6 +1209,47 @@ curl -X POST "http://localhost:8000/synthesize" \\
         """List speakers for a specific model."""
         inference = _get_inference(model)
         return [SpeakerInfo(label=label, id=sid) for label, sid in inference.speakers.items()]
+
+    @app.get("/matcha/status")
+    async def matcha_status():
+        """Temporary Matcha backend status."""
+        return {
+            "enabled": _server_config.matcha.enabled,
+            "loaded": _matcha_backend is not None,
+            "device": _server_config.matcha.device,
+            "checkpoint": _server_config.matcha.checkpoint,
+            "n_timesteps": _server_config.matcha.n_timesteps,
+            "semantic": "always",
+            "max_batch_size": _server_config.matcha.max_batch_size,
+            "batch_wait_ms": _server_config.matcha.batch_wait_ms,
+        }
+
+    @app.post("/matcha/synthesize")
+    async def matcha_synthesize(request: MatchaSynthesizeRequest):
+        """Temporary Matcha synthesis endpoint with dynamic request batching."""
+        if not request.text.strip():
+            raise HTTPException(status_code=400, detail="text is required")
+        result = await _get_matcha_batcher().submit(request)
+        headers = {
+            "X-Matcha-Audio-Seconds": f"{result.audio_seconds:.6f}",
+            "X-Matcha-Backend-Seconds": f"{result.backend_seconds:.6f}",
+            "X-Matcha-Backend-RTF": f"{result.backend_rtf:.6f}",
+            "X-Matcha-Model-RTF": f"{result.model_rtf:.6f}",
+            "X-Matcha-Batch-Size": str(result.batch_size),
+            "X-Matcha-Queue-Seconds": f"{result.queue_seconds:.6f}",
+        }
+        if request.format == "json":
+            return {
+                "audio_seconds": result.audio_seconds,
+                "backend_seconds": result.backend_seconds,
+                "backend_rtf": result.backend_rtf,
+                "model_rtf": result.model_rtf,
+                "batch_size": result.batch_size,
+                "queue_seconds": result.queue_seconds,
+                "text": result.text,
+                "phoneme": result.phoneme_text,
+            }
+        return Response(content=_audio_to_wav_bytes(result.audio, result.sample_rate), media_type="audio/wav", headers=headers)
 
     @app.post("/synthesize")
     async def synthesize(

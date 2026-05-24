@@ -39,6 +39,8 @@ def _load_model_config(config_path):
 _ESPEAK_LIB = None
 _ESPEAK_INITIALIZED = False
 _ESPEAK_EVENTS: List[Tuple] = []
+_KOREAN_G2P = None
+_ESPEAK_TOKEN_CACHE: Dict[Tuple[str, str, str], List[str]] = {}
 
 
 class _EspeakID(Union):
@@ -180,7 +182,11 @@ def _phonemize_espeak_with_mapping(text: str, voice: str, data_path) -> Tuple[li
     if (voice or "").lower().startswith("ja"):
         return _phonemize_japanese_with_mapping(text, voice, data_path)
 
-    return _phonemize_espeak_with_mapping_raw(text, voice, data_path)
+    if (voice or "").lower().startswith("ko"):
+        return _phonemize_korean_with_mapping(text, voice, data_path)
+
+    return _phonemize_espeak_with_mapping_dp(text, voice, data_path)
+
 
 _DEBUG = os.environ.get("PREPROCESS_DEBUG", "").lower() in ("1", "true", "yes")
 if _DEBUG:
@@ -355,6 +361,332 @@ def _normalize_japanese_text(text: str) -> str:
     return " ".join(reading for _, _, reading in _japanese_reading_tokens(text))
 
 
+def _utf16_offset_to_py_index(text: str) -> Dict[int, int]:
+    offsets = {0: 0}
+    offset = 0
+    for index, ch in enumerate(text):
+        offset += 2 if ord(ch) > 0xFFFF else 1
+        offsets[offset] = index + 1
+    return offsets
+
+
+def _has_lexical_text(text: str) -> bool:
+    return any(ch.isalpha() or ch.isnumeric() for ch in text)
+
+
+def _icu_word_spans(text: str, voice: str) -> List[Tuple[int, int, str]]:
+    from icu import BreakIterator, Locale
+
+    locale_name = (voice or "und").replace("-", "_")
+    iterator = BreakIterator.createWordInstance(Locale(locale_name))
+    iterator.setText(text)
+    utf16_to_py = _utf16_offset_to_py_index(text)
+
+    spans: List[Tuple[int, int, str]] = []
+    start16 = iterator.first()
+    for end16 in iterator:
+        status = iterator.getRuleStatus()
+        start = utf16_to_py.get(start16)
+        end = utf16_to_py.get(end16)
+        start16 = end16
+
+        if start is None or end is None or end <= start:
+            continue
+
+        piece = text[start:end]
+        if status == 0 or not _has_lexical_text(piece):
+            continue
+
+        spans.append((start, end, piece))
+
+    return spans
+
+
+def _extend_anchor_text_end(text: str, end: int) -> int:
+    while end < len(text) and text[end] in {".", ",", ";", ":", "!", "?"}:
+        end += 1
+    return end
+
+
+def _flatten_sentences(sentences: list) -> List[str]:
+    return [p for sentence in sentences for p in sentence]
+
+
+def _trim_phoneme_edges(phonemes: List[str]) -> List[str]:
+    start = 0
+    end = len(phonemes)
+    while start < end and phonemes[start] == " ":
+        start += 1
+    while end > start and phonemes[end - 1] == " ":
+        end -= 1
+    return phonemes[start:end]
+
+
+def _phonemize_espeak_token_cached(text: str, voice: str, data_path) -> List[str]:
+    key = (text, voice, str(data_path or ""))
+    cached = _ESPEAK_TOKEN_CACHE.get(key)
+    if cached is not None:
+        return list(cached)
+
+    phonemes = _trim_phoneme_edges(_flatten_sentences(_phonemize_espeak_with_reset(text, voice, data_path)))
+    if len(_ESPEAK_TOKEN_CACHE) > 20000:
+        _ESPEAK_TOKEN_CACHE.clear()
+    _ESPEAK_TOKEN_CACHE[key] = list(phonemes)
+    return phonemes
+
+
+def _is_low_value_phoneme(phoneme: str) -> bool:
+    return phoneme == " " or phoneme in {".", ",", ";", ":", "!", "?"}
+
+
+def _is_phoneme_punctuation(phoneme: str) -> bool:
+    return phoneme in {".", ",", ";", ":", "!", "?"}
+
+
+def _phoneme_insert_cost(phoneme: str) -> float:
+    return 0.02 if _is_low_value_phoneme(phoneme) else 0.2
+
+
+def _phoneme_delete_cost(phoneme: str) -> float:
+    return 1.0
+
+
+def _phoneme_substitution_cost(left: str, right: str) -> float:
+    if left == right:
+        return 0.0
+    if _is_low_value_phoneme(left) and _is_low_value_phoneme(right):
+        return 0.05
+    if left in {"ˈ", "ˌ"} or right in {"ˈ", "ˌ"}:
+        return 0.35
+    return 1.0
+
+
+def _align_phoneme_sequences(anchor: List[str], full: List[str]) -> Tuple[float, List[Optional[int]]]:
+    n = len(anchor)
+    m = len(full)
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    back = [[""] * (m + 1) for _ in range(n + 1)]
+
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] + _phoneme_delete_cost(anchor[i - 1])
+        back[i][0] = "D"
+    for j in range(1, m + 1):
+        dp[0][j] = dp[0][j - 1] + _phoneme_insert_cost(full[j - 1])
+        back[0][j] = "I"
+
+    for i in range(1, n + 1):
+        left = anchor[i - 1]
+        for j in range(1, m + 1):
+            right = full[j - 1]
+            subst_cost = dp[i - 1][j - 1] + _phoneme_substitution_cost(left, right)
+            delete_cost = dp[i - 1][j] + _phoneme_delete_cost(left)
+            insert_cost = dp[i][j - 1] + _phoneme_insert_cost(right)
+
+            if subst_cost <= delete_cost and subst_cost <= insert_cost:
+                dp[i][j] = subst_cost
+                back[i][j] = "M"
+            elif insert_cost <= delete_cost:
+                dp[i][j] = insert_cost
+                back[i][j] = "I"
+            else:
+                dp[i][j] = delete_cost
+                back[i][j] = "D"
+
+    anchor_to_full: List[Optional[int]] = [None] * n
+    i = n
+    j = m
+    while i > 0 or j > 0:
+        op = back[i][j]
+        if op == "M":
+            anchor_to_full[i - 1] = j - 1
+            i -= 1
+            j -= 1
+        elif op == "D":
+            i -= 1
+        elif op == "I":
+            j -= 1
+        else:
+            break
+
+    return dp[n][m], anchor_to_full
+
+
+def _phonemize_espeak_with_mapping_dp(
+    text: str,
+    voice: str,
+    data_path,
+) -> Tuple[list, List[Tuple[int, int, int, int, int]]]:
+    spans = _icu_word_spans(text, voice)
+    full_phonemes = _flatten_sentences(_phonemize_espeak_with_reset(text, voice, data_path))
+    if not spans:
+        return [full_phonemes], [[]]
+    if not full_phonemes:
+        return [full_phonemes], [[]]
+
+    anchor: List[str] = []
+    anchor_tokens: List[int] = []
+    active_spans: List[Tuple[int, int, str]] = []
+
+    for start, end, piece in spans:
+        anchor_end = _extend_anchor_text_end(text, end)
+        token_phonemes = _phonemize_espeak_token_cached(text[start:anchor_end], voice, data_path)
+        if not token_phonemes:
+            continue
+
+        token_index = len(active_spans)
+        active_spans.append((start, end, piece))
+        anchor.extend(token_phonemes)
+        anchor_tokens.extend([token_index] * len(token_phonemes))
+
+    if not anchor:
+        return _phonemize_espeak_with_mapping_raw(text, voice, data_path)
+
+    cost, anchor_to_full = _align_phoneme_sequences(anchor, full_phonemes)
+    average_cost = cost / max(len(anchor), 1)
+    if average_cost > 1.8:
+        raise ValueError(f"high DP alignment cost {average_cost:.3f}")
+
+    matched_by_token: List[List[int]] = [[] for _ in active_spans]
+    for anchor_index, full_index in enumerate(anchor_to_full):
+        if full_index is None:
+            continue
+        matched_by_token[anchor_tokens[anchor_index]].append(full_index)
+
+    mappings: List[Tuple[int, int, int, int, int]] = []
+    previous_end = 0
+    for token_index, (start, end, _) in enumerate(active_spans):
+        matched = matched_by_token[token_index]
+        if not matched:
+            if mappings:
+                text_start, text_len, ph_start, ph_end, punct_len = mappings[-1]
+                mappings[-1] = (
+                    text_start,
+                    max(text_len, end - (text_start - 1)),
+                    ph_start,
+                    ph_end,
+                    punct_len,
+                )
+                continue
+            raise ValueError(f"unmatched token {text[start:end]!r}")
+
+        ph_start = min(matched)
+        ph_end = max(matched) + 1
+        if ph_start < previous_end:
+            ph_start = previous_end
+        if ph_end <= ph_start:
+            raise ValueError(f"non-monotonic token {text[start:end]!r}")
+
+        while ph_start < ph_end and full_phonemes[ph_start] == " ":
+            ph_start += 1
+        while ph_end > ph_start and full_phonemes[ph_end - 1] == " ":
+            ph_end -= 1
+        if ph_end <= ph_start:
+            if mappings:
+                text_start, text_len, prev_ph_start, prev_ph_end, punct_len = mappings[-1]
+                mappings[-1] = (
+                    text_start,
+                    max(text_len, end - (text_start - 1)),
+                    prev_ph_start,
+                    prev_ph_end,
+                    punct_len,
+                )
+                continue
+            raise ValueError(f"empty token range {text[start:end]!r}")
+
+        base_ph_end = ph_end
+        next_start = len(full_phonemes)
+        for later in matched_by_token[token_index + 1 :]:
+            if later:
+                next_start = min(later)
+                break
+        while ph_end < next_start and ph_end < len(full_phonemes) and _is_phoneme_punctuation(full_phonemes[ph_end]):
+            ph_end += 1
+
+        punct_len = ph_end - base_ph_end
+        punct_scan = ph_end
+        while punct_scan > ph_start and _is_phoneme_punctuation(full_phonemes[punct_scan - 1]):
+            punct_scan -= 1
+        punct_len = max(punct_len, ph_end - punct_scan)
+        mappings.append((start + 1, end - start, ph_start, ph_end, punct_len))
+        previous_end = ph_end
+
+    return [full_phonemes], [mappings]
+
+
+def _korean_g2p():
+    global _KOREAN_G2P
+    if _KOREAN_G2P is None:
+        from g2pk import G2p
+
+        _KOREAN_G2P = G2p()
+    return _KOREAN_G2P
+
+
+def _nonspace_spans(text: str) -> List[Tuple[int, int, str]]:
+    return [(match.start(), match.end(), match.group(0)) for match in re.finditer(r"\S+", text)]
+
+
+def _korean_reading_tokens(text: str) -> List[Tuple[int, int, str]]:
+    original_spans = _nonspace_spans(text)
+    if not original_spans:
+        return []
+
+    pronounced_text = _korean_g2p()(text, descriptive=True)
+    pronounced_spans = _nonspace_spans(pronounced_text)
+
+    if len(original_spans) != len(pronounced_spans):
+        return [
+            (start, end, _korean_g2p()(surface, descriptive=True))
+            for start, end, surface in original_spans
+        ]
+
+    return [
+        (start, end, pronounced)
+        for (start, end, _), (_, _, pronounced) in zip(original_spans, pronounced_spans)
+    ]
+
+
+def _phonemize_korean_with_mapping(
+    text: str,
+    voice: str,
+    data_path,
+) -> Tuple[list, List[Tuple[int, int, int, int, int]]]:
+    sentence: List[str] = []
+    mappings: List[Tuple[int, int, int, int, int]] = []
+
+    for start, end, reading in _korean_reading_tokens(text):
+        if not reading or reading.isspace():
+            continue
+
+        if sentence and sentence[-1] != " ":
+            sentence.append(" ")
+
+        ph_start = len(sentence)
+        token_sents = _phonemize_espeak_with_reset(reading, voice, data_path)
+        token_phonemes = [p for sent in token_sents for p in sent]
+        while token_phonemes and token_phonemes[0] == " ":
+            token_phonemes.pop(0)
+        while token_phonemes and token_phonemes[-1] == " ":
+            token_phonemes.pop()
+        if not token_phonemes:
+            if mappings:
+                text_start, text_len, prev_ph_start, prev_ph_end, _ = mappings[-1]
+                mappings[-1] = (
+                    text_start,
+                    max(text_len, end - (text_start - 1)),
+                    prev_ph_start,
+                    prev_ph_end,
+                    0,
+                )
+            continue
+        sentence.extend(token_phonemes)
+        ph_end = len(sentence)
+
+        mappings.append((start + 1, end - start, ph_start, ph_end, 0))
+
+    return [sentence], [mappings]
+
+
 def _phonemize_espeak_for_voice(text: str, voice: str, casing_fn, espeak_data) -> list:
     norm_text = _normalize_text_for_voice(text, voice)
     sent_ph = _phonemize_espeak_with_reset(casing_fn(norm_text), voice, espeak_data)
@@ -386,7 +718,7 @@ def _phonemize_japanese_with_mapping(
                     max(text_len, end - (text_start - 1)),
                     ph_start,
                     punct_start + 1,
-                    1,
+                    0,
                 )
             else:
                 sentence.append(reading)
@@ -400,6 +732,21 @@ def _phonemize_japanese_with_mapping(
         ph_start = len(sentence)
         token_sents = _phonemize_espeak_with_reset(reading, voice, data_path)
         token_phonemes = [p for sent in token_sents for p in sent]
+        while token_phonemes and token_phonemes[0] == " ":
+            token_phonemes.pop(0)
+        while token_phonemes and token_phonemes[-1] == " ":
+            token_phonemes.pop()
+        if not token_phonemes:
+            if mappings:
+                text_start, text_len, prev_ph_start, prev_ph_end, _ = mappings[-1]
+                mappings[-1] = (
+                    text_start,
+                    max(text_len, end - (text_start - 1)),
+                    prev_ph_start,
+                    prev_ph_end,
+                    0,
+                )
+            continue
         sentence.extend(token_phonemes)
         ph_end = len(sentence)
 

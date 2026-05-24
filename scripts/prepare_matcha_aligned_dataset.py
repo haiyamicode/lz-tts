@@ -11,6 +11,7 @@ import unicodedata
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ import soundfile as sf
 from scipy.signal import resample_poly
 from tqdm import tqdm
 
+from src.piper.heteronym import get_resolver as _get_heteronym_resolver
 from src.piper.preprocess import _map_cld2_to_espeak, _normalize_punct_and_space, _phonemize_espeak_with_mapping
 
 
@@ -27,6 +29,7 @@ DEFAULT_SAMPLE_RATE = 22050
 DEFAULT_VALID_RATIO = 0.025
 DEFAULT_SEED = 1234
 ASTERISK_STAGE_DIRECTION = re.compile(r"\*\([^)]*\)\*")
+WORD_RE = re.compile(r"\b(\w+)\b")
 
 
 @dataclass(frozen=True)
@@ -154,6 +157,37 @@ def build_korean_units(text: str, sentences):
     ]
 
 
+@lru_cache(maxsize=1)
+def _heteronym_words():
+    heretonyms_path = Path(__file__).resolve().parents[1] / "data" / "heteronyms" / "heretonyms.jsonl"
+    words = set()
+    with heretonyms_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            data = json.loads(line)
+            words.add(data["word"].lower())
+    return words
+
+
+def _has_english_heteronym(text: str):
+    heteronyms = _heteronym_words()
+    return any(match.group(1).lower() in heteronyms for match in WORD_RE.finditer(text))
+
+
+def _resolve_english_heteronyms(text: str, voice: str):
+    if not voice.lower().startswith("en") or not _has_english_heteronym(text):
+        return []
+
+    resolver = _get_heteronym_resolver(device="cpu")
+    return resolver.resolve_all(text)
+
+
+def _find_replacement(replacements, start: int, end: int):
+    for word, h_start, h_end, phonemes in replacements:
+        if start <= h_start < end or start < h_end <= end or (h_start <= start and end <= h_end):
+            return word, phonemes
+    return None
+
+
 def normalize_for_alignment(text: str, lang: str):
     text = ASTERISK_STAGE_DIRECTION.sub(" ", text)
     voice = _map_cld2_to_espeak(lang, "en-us")
@@ -165,6 +199,7 @@ def normalize_for_alignment(text: str, lang: str):
 def build_units(text: str, lang: str):
     voice = _map_cld2_to_espeak(lang, "en-us")
     sentences, mappings = _phonemize_espeak_with_mapping(text, voice, None)
+    neural_replacements = _resolve_english_heteronyms(text, voice)
     if lang == "ko" and not any(sentence_mappings for sentence_mappings in mappings):
         units = build_korean_units(text, sentences)
         if units:
@@ -182,7 +217,13 @@ def build_units(text: str, lang: str):
                 end += punct_len
 
             unit_text = text[start:end]
-            phonemes = _flatten_phonemes(sentence[ph_start:ph_end])
+            replacement = _find_replacement(neural_replacements, start, start + text_len)
+            if replacement is not None:
+                _, replacement_phonemes = replacement
+                word_ph_end = max(ph_start, ph_end - punct_len)
+                phonemes = replacement_phonemes + _flatten_phonemes(sentence[word_ph_end:ph_end])
+            else:
+                phonemes = _flatten_phonemes(sentence[ph_start:ph_end])
             if "|" in phonemes:
                 raise ValueError(f"Pipe character is not supported in phonemes: lang={lang!r} text={text!r}")
             if not unit_text:
