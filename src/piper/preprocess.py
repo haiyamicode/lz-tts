@@ -305,6 +305,85 @@ def _katakana_to_hiragana(text: str) -> str:
     return "".join(chars)
 
 
+_KANA_LONG_VOWELS = {
+    **dict.fromkeys("あかさたなはまやらわがざだばぱぁゃ", "あ"),
+    **dict.fromkeys("いきしちにひみりぎじぢびぴぃ", "い"),
+    **dict.fromkeys("うくすつぬふむゆるぐずづぶぷぅゅ", "う"),
+    **dict.fromkeys("えけせてねへめれげぜでべぺぇ", "え"),
+    **dict.fromkeys("おこそとのほもよろをごぞどぼぽぉょ", "お"),
+}
+
+
+def _japanese_long_vowel_suffix(reading: str) -> str:
+    for ch in reversed(_katakana_to_hiragana(reading)):
+        suffix = _KANA_LONG_VOWELS.get(ch)
+        if suffix is not None:
+            return suffix
+    return "う"
+
+
+def _append_to_last_japanese_reading(
+    tokens: List[Tuple[int, int, str]], end: int, suffix: str
+) -> bool:
+    if not tokens:
+        return False
+    start, _, reading = tokens[-1]
+    tokens[-1] = (start, end, reading + suffix)
+    return True
+
+
+_JAPANESE_READING_OVERRIDES = {
+    # These occur in malformed/truncated dataset rows where ipadic has no
+    # reading. Keeping them as raw CJK makes eSpeak say "Chinese letter".
+    "詳": "しょう",
+    "也": "や",
+    "遤": "おそ",
+    "衔": "しゅう",
+    "衔国": "しゅうこく",
+}
+
+_JAPANESE_READING_REPLACEMENTS = (
+    ("・", " "),
+    ("ゔぁ", "ば"),
+    ("ゔぃ", "び"),
+    ("ゔぇ", "べ"),
+    ("ゔぉ", "ぼ"),
+    ("ゔゅ", "びゅ"),
+    ("ゔ", "ぶ"),
+    ("うぃ", "うい"),
+    ("うぇ", "うえ"),
+    ("うぉ", "うお"),
+)
+
+
+def _normalize_japanese_reading_for_espeak(reading: str) -> str:
+    normalized = _katakana_to_hiragana(reading)
+    for old, new in _JAPANESE_READING_REPLACEMENTS:
+        normalized = normalized.replace(old, new)
+    return normalized
+
+
+def _fallback_japanese_reading(surface: str) -> str:
+    override = _JAPANESE_READING_OVERRIDES.get(surface)
+    if override is not None:
+        return override
+
+    try:
+        import pykakasi
+
+        converted = pykakasi.kakasi().convert(surface)
+    except Exception:
+        converted = []
+
+    reading = "".join(str(item.get("hira") or "") for item in converted)
+    if reading:
+        return reading
+
+    if any("\u4e00" <= ch <= "\u9fff" for ch in surface):
+        return ""
+    return surface
+
+
 def _token_feature_value(token, index: int) -> str:
     feature = getattr(token, "feature", None)
     if feature is None:
@@ -316,33 +395,73 @@ def _token_feature_value(token, index: int) -> str:
     return "" if value in (None, "*") else str(value)
 
 
+def _locate_japanese_surface(text: str, surface: str, cursor: int) -> Tuple[int, int]:
+    start = text.find(surface, cursor)
+    if start < 0:
+        start = cursor
+    return start, start + len(surface)
+
+
 def _japanese_reading_tokens(text: str) -> List[Tuple[int, int, str]]:
     import ipadic
     from fugashi import GenericTagger
 
     norm_text = text
     tagger = GenericTagger(ipadic.MECAB_ARGS)
+    parsed_tokens = list(tagger(norm_text))
     tokens: List[Tuple[int, int, str]] = []
     cursor = 0
+    token_index = 0
 
-    for token in tagger(norm_text):
+    while token_index < len(parsed_tokens):
+        token = parsed_tokens[token_index]
         surface = token.surface
         if not surface:
+            token_index += 1
             continue
 
-        start = norm_text.find(surface, cursor)
-        if start < 0:
-            start = cursor
-        end = start + len(surface)
+        start, end = _locate_japanese_surface(norm_text, surface, cursor)
+
+        next_surfaces = [
+            parsed_tokens[token_index + offset].surface
+            for offset in range(3)
+            if token_index + offset < len(parsed_tokens)
+        ]
+        if len(next_surfaces) >= 3 and next_surfaces[:3] == ["N", "700", "系"]:
+            _, end_700 = _locate_japanese_surface(norm_text, "700", end)
+            _, end_series = _locate_japanese_surface(norm_text, "系", end_700)
+            tokens.append((start, end_series, "えぬななひゃくけい"))
+            cursor = end_series
+            token_index += 3
+            continue
+        if len(next_surfaces) >= 2 and next_surfaces[:2] == ["700", "系"]:
+            _, end_series = _locate_japanese_surface(norm_text, "系", end)
+            tokens.append((start, end_series, "ななひゃくけい"))
+            cursor = end_series
+            token_index += 2
+            continue
+
         cursor = end
+
+        if surface == "ー":
+            _append_to_last_japanese_reading(tokens, end, _japanese_long_vowel_suffix(tokens[-1][2] if tokens else ""))
+            token_index += 1
+            continue
+
+        if surface == "々":
+            if tokens:
+                _append_to_last_japanese_reading(tokens, end, tokens[-1][2])
+            token_index += 1
+            continue
 
         if surface in _PUNCT_MAP:
             tokens.append((start, end, _PUNCT_MAP[surface].strip() or surface))
+            token_index += 1
             continue
 
         pos = _token_feature_value(token, 0)
         pronunciation = _token_feature_value(token, 8)
-        reading = pronunciation or _token_feature_value(token, 7) or surface
+        reading = pronunciation or _token_feature_value(token, 7) or _fallback_japanese_reading(surface)
 
         if pos == "助詞":
             if surface == "は":
@@ -352,7 +471,9 @@ def _japanese_reading_tokens(text: str) -> List[Tuple[int, int, str]]:
             elif surface == "を":
                 reading = "オ"
 
-        tokens.append((start, end, _katakana_to_hiragana(reading)))
+        if reading:
+            tokens.append((start, end, _normalize_japanese_reading_for_espeak(reading)))
+        token_index += 1
 
     return tokens
 
@@ -693,6 +814,90 @@ def _phonemize_espeak_for_voice(text: str, voice: str, casing_fn, espeak_data) -
     return [p for sent in sent_ph for p in sent]
 
 
+def _word_spans_from_mapping(
+    sentences: list,
+    sent_word_mapping: list,
+) -> List[List[int]]:
+    spans: List[List[int]] = []
+    ph_offset = 0
+    for sentence, mappings in zip(sentences, sent_word_mapping):
+        for text_start, text_len, ph_start, ph_end, _punct_len in mappings:
+            start = int(text_start) - 1
+            end = start + int(text_len)
+            spans.append(
+                [
+                    start,
+                    end,
+                    ph_offset + int(ph_start),
+                    ph_offset + int(ph_end),
+                ]
+            )
+        ph_offset += len(sentence)
+    return spans
+
+
+def _validate_word_spans(
+    phonemes: List[str],
+    word_spans: Optional[List[List[int]]],
+    text: str,
+    context: str,
+) -> None:
+    if not phonemes:
+        if _has_lexical_text(text):
+            raise ValueError(f"{context}: lexical text produced no phonemes: {text!r}")
+        return
+
+    if not word_spans:
+        if _has_lexical_text(text):
+            raise ValueError(f"{context}: lexical text produced phonemes without word spans: {text!r}")
+        return
+
+    previous_ph_end = -1
+    previous_text_end = -1
+    for raw in word_spans:
+        if raw is None or len(raw) < 4:
+            raise ValueError(f"{context}: malformed word span: {raw!r}")
+        text_start, text_end, ph_start, ph_end = [int(value) for value in raw[:4]]
+        if not (0 <= text_start < text_end <= len(text)):
+            raise ValueError(
+                f"{context}: word span text bounds out of range: "
+                f"span={raw!r}, text_len={len(text)}, text={text!r}"
+            )
+        if not (0 <= ph_start < ph_end <= len(phonemes)):
+            raise ValueError(
+                f"{context}: word span phoneme bounds out of range: "
+                f"span={raw!r}, phoneme_len={len(phonemes)}, text={text!r}"
+            )
+        if ph_start < previous_ph_end:
+            raise ValueError(f"{context}: non-monotonic phoneme span: span={raw!r}")
+        if text_start < previous_text_end:
+            raise ValueError(f"{context}: non-monotonic text span: span={raw!r}")
+        previous_ph_end = ph_end
+        previous_text_end = text_end
+
+
+def _phonemize_espeak_for_voice_with_spans(
+    text: str,
+    voice: str,
+    casing_fn,
+    espeak_data,
+) -> Tuple[list, Optional[List[List[int]]], str]:
+    norm_text = _normalize_text_for_mapping(text, voice)
+    processed_text = casing_fn(norm_text)
+    sent_ph, sent_word_mapping = _phonemize_espeak_with_mapping(
+        processed_text, voice, espeak_data
+    )
+    phonemes = _flatten_sentences(sent_ph)
+    word_spans = _word_spans_from_mapping(sent_ph, sent_word_mapping)
+    _validate_word_spans(
+        phonemes,
+        word_spans,
+        processed_text,
+        f"voice={voice}",
+    )
+    return phonemes, word_spans or None, processed_text
+
+
 def _phonemize_japanese_with_mapping(
     text: str,
     voice: str,
@@ -768,6 +973,12 @@ def _map_cld2_to_espeak(lang_code: str, primary_voice: str = "en-us") -> str:
     code = lang_code.strip().lower().replace("_", "-")
     base = code.split("-", 1)[0] if code else "en"
 
+    if code in ("en-us", "en-us+f3", "en-us+f4"):
+        return code
+
+    if code == "en":
+        return primary_voice
+
     if base == "yue" or code in ("zh-hk", "zh-yue"):
         return "yue"
 
@@ -783,10 +994,11 @@ def _map_cld2_to_espeak(lang_code: str, primary_voice: str = "en-us") -> str:
     if base == "mn":
         return "ru"
 
-    if lang_code == "en":
-        return primary_voice
-
     return base
+
+
+def _supports_neural_heteronyms(voice: str) -> bool:
+    return (voice or "").lower().startswith("en")
 
 
 # -----------------------------------------------------------------------------
@@ -808,6 +1020,26 @@ def _normalize_text_for_voice(text: str, voice: str) -> str:
     return norm_text
 
 
+def _normalize_text_for_mapping(text: str, voice: str) -> str:
+    """Normalize text before phonemization paths that build word mappings.
+
+    Japanese and Korean mapping functions perform their own tokenizer/G2P pass
+    so they can keep surface-text spans aligned to phoneme spans. Pre-normalizing
+    those languages would feed reading text back into the tokenizer and can make
+    symbols like the Japanese long-vowel mark become standalone spoken tokens.
+    """
+    v = (voice or "").lower()
+    if v.startswith("ja") or v.startswith("ko"):
+        return text
+
+    norm_text = _normalize_punct_and_space(text)
+
+    if v.startswith("ar"):
+        norm_text = tashkeel_run(norm_text)
+
+    return norm_text
+
+
 # -----------------------------------------------------------------------------
 # Phonemization
 # -----------------------------------------------------------------------------
@@ -820,6 +1052,24 @@ def _phonemize_multilingual(
     primary_voice: str = "en-us",
 ) -> list:
     """Phonemize mixed-language text using MultilingualSplitter."""
+    phonemes, _word_spans, _semantic_text = _phonemize_multilingual_with_spans(
+        text,
+        casing_fn,
+        espeak_data,
+        primary_voice,
+        neural=False,
+    )
+    return phonemes
+
+
+def _phonemize_multilingual_with_spans(
+    text: str,
+    casing_fn,
+    espeak_data: Optional[str] = None,
+    primary_voice: str = "en-us",
+    neural: bool = False,
+) -> Tuple[list, Optional[List[List[int]]], str]:
+    """Phonemize mixed-language text and preserve word-to-phoneme spans."""
     splitter = MultilingualSplitter()
     result = splitter.split(text)
     segments = result.segments
@@ -832,6 +1082,8 @@ def _phonemize_multilingual(
     )
 
     phonemes: list = []
+    word_spans: List[List[int]] = []
+    semantic_parts: List[str] = []
     for idx, seg in enumerate(segments):
         span_text = seg.text
         lang = seg.language if seg.language and seg.language != "und" else main_lang or "en"
@@ -844,45 +1096,94 @@ def _phonemize_multilingual(
 
         _LOGGER.debug("span[%s]: lang=%s voice=%s text='%s'", idx, lang, voice, _short_text(norm_span_text, 80))
 
-        span_phonemes = _phonemize_espeak_for_voice(span_text, voice, casing_fn, espeak_data)
+        if neural:
+            span_phonemes, span_word_spans, semantic_text = _phonemize_neural_with_spans(
+                span_text,
+                casing_fn,
+                espeak_data,
+                voice,
+            )
+        else:
+            span_phonemes, span_word_spans, semantic_text = _phonemize_espeak_for_voice_with_spans(
+                span_text,
+                voice,
+                casing_fn,
+                espeak_data,
+            )
 
         _LOGGER.debug("span[%s] phonemes=%s", idx, _short_list(span_phonemes, 32))
 
+        if not span_phonemes:
+            continue
+        _validate_word_spans(
+            span_phonemes,
+            span_word_spans,
+            semantic_text,
+            f"multilingual span={idx} voice={voice}",
+        )
+
         if phonemes and span_phonemes:
             phonemes.append(" ")
+        if semantic_parts and semantic_text:
+            semantic_parts.append(" ")
+
+        phoneme_offset = len(phonemes)
+        semantic_offset = sum(len(part) for part in semantic_parts)
+
+        if span_word_spans:
+            for text_start, text_end, ph_start, ph_end in span_word_spans:
+                word_spans.append(
+                    [
+                        semantic_offset + int(text_start),
+                        semantic_offset + int(text_end),
+                        phoneme_offset + int(ph_start),
+                        phoneme_offset + int(ph_end),
+                    ]
+                )
+        semantic_parts.append(semantic_text)
         phonemes.extend(span_phonemes)
 
-    return phonemes
+    semantic_text = "".join(semantic_parts) if semantic_parts else text
+    _validate_word_spans(
+        phonemes,
+        word_spans,
+        semantic_text,
+        "multilingual",
+    )
+    return phonemes, word_spans or None, semantic_text
 
 
-def _phonemize_neural(
+def _phonemize_neural_with_spans(
     text: str,
     casing_fn,
     espeak_data: Optional[str] = None,
     voice: str = "en-us",
-) -> list:
-    """Phonemize text using neural heteronym disambiguation.
+) -> Tuple[list, Optional[List[List[int]]], str]:
+    """Phonemize text using neural heteronym disambiguation with word spans.
 
     Strategy:
     1. Get phoneme output with word-to-phoneme mapping from C++ (using espeak_Synth callback)
     2. Match heteronym text positions to the mapping
     3. Replace the corresponding phoneme segments with BERT pronunciations
+    4. Rebuild word spans against the rewritten phoneme list
 
     Uses reliable C++ word mapping instead of space-based segmentation.
     """
+    norm_text = _normalize_text_for_voice(text, voice)
+    processed_text = casing_fn(norm_text)
+
     # Only apply neural disambiguation for English voices
     # The heteronym model is trained on English
     if not voice.startswith("en"):
-        return _phonemize_espeak_for_voice(text, voice, casing_fn, espeak_data)
+        return _phonemize_espeak_for_voice_with_spans(text, voice, casing_fn, espeak_data)
 
     resolver = _get_heteronym_resolver()
 
     # Find all heteronyms with their positions and correct pronunciations
-    heteronyms = resolver.resolve_all(text)
+    heteronyms = resolver.resolve_all(processed_text)
 
     if not heteronyms:
-        # No heteronyms - just phonemize normally
-        return _phonemize_espeak_for_voice(text, voice, casing_fn, espeak_data)
+        return _phonemize_espeak_for_voice_with_spans(text, voice, casing_fn, espeak_data)
 
     _LOGGER.debug(
         "neural: found %d heteronyms: %s",
@@ -890,9 +1191,7 @@ def _phonemize_neural(
         [(h[0], h[1], h[2], h[3]) for h in heteronyms],
     )
 
-    # Get phonemes WITH word-to-phoneme mapping from C++ (per sentence)
-    norm_text = _normalize_text_for_voice(text, voice)
-    processed_text = casing_fn(norm_text)
+    # Get phonemes WITH word-to-phoneme mapping from C++ (per sentence).
     sent_ph, sent_word_mapping = _phonemize_espeak_with_mapping(processed_text, voice, espeak_data)
 
     _LOGGER.debug("neural: %d sentences", len(sent_ph))
@@ -944,8 +1243,11 @@ def _phonemize_neural(
                 word, h_start, h_end,
             )
 
-    # Build result by processing each sentence separately using LOCAL indices
+    # Build result by processing each sentence separately using LOCAL indices.
+    # Word spans are rebuilt in the same pass so later spans naturally shift when
+    # a heteronym replacement has a different phoneme length.
     result: List[str] = []
+    word_spans: List[List[int]] = []
 
     for sent_idx, (sentence, mappings) in enumerate(zip(sent_ph, sent_word_mapping)):
         last_end = 0
@@ -955,6 +1257,7 @@ def _phonemize_neural(
             if ph_start > last_end:
                 result.extend(sentence[last_end:ph_start])
 
+            new_ph_start = len(result)
             if (sent_idx, word_idx) in replacements:
                 # Use BERT pronunciation, but preserve trailing punctuation
                 # punct_len tells us exactly how many trailing phonemes are punctuation
@@ -973,13 +1276,40 @@ def _phonemize_neural(
                 # Keep original
                 result.extend(sentence[ph_start:ph_end])
 
+            new_ph_end = len(result)
+            if new_ph_end > new_ph_start:
+                start = int(text_start) - 1
+                word_spans.append([start, start + int(text_len), new_ph_start, new_ph_end])
+
             last_end = ph_end
 
         # Add any remaining phonemes after the last word in this sentence
         if last_end < len(sentence):
             result.extend(sentence[last_end:])
 
-    return result
+    _validate_word_spans(
+        result,
+        word_spans,
+        processed_text,
+        f"neural voice={voice}",
+    )
+    return result, word_spans or None, processed_text
+
+
+def _phonemize_neural(
+    text: str,
+    casing_fn,
+    espeak_data: Optional[str] = None,
+    voice: str = "en-us",
+) -> list:
+    """Phonemize text using neural heteronym disambiguation."""
+    phonemes, _word_spans, _processed_text = _phonemize_neural_with_spans(
+        text,
+        casing_fn,
+        espeak_data,
+        voice,
+    )
+    return phonemes
 
 
 def _segment_phonemes_by_space(phonemes: List[str]) -> List[Tuple[int, int]]:
@@ -1028,23 +1358,37 @@ def phonemize_text_for_infer(
 
     _LOGGER.debug("infer: is_multi=%s voice=%s primary=%s neural=%s", is_multi, es_voice or lang_code, primary, neural)
 
-    if neural and not is_multi:
+    if neural and not is_multi and _supports_neural_heteronyms(es_voice or lang_code or primary):
         # Neural heteronym disambiguation mode
         voice = es_voice or lang_code or primary
         voice = _map_cld2_to_espeak(voice, primary)
-        phonemes = _phonemize_neural(text, casing, espeak_data, voice)
+        phonemes, word_spans, semantic_text = _phonemize_neural_with_spans(
+            text, casing, espeak_data, voice
+        )
     elif is_multi:
-        phonemes = _phonemize_multilingual(text, casing, espeak_data, primary)
+        phonemes, word_spans, semantic_text = _phonemize_multilingual_with_spans(
+            text,
+            casing,
+            espeak_data,
+            primary,
+            neural=neural,
+        )
     else:
         voice = es_voice or lang_code or primary
         voice = _map_cld2_to_espeak(voice, primary)
-        norm_text = _normalize_text_for_voice(text, voice)
-        _LOGGER.debug("infer: voice=%s text='%s'", voice, _short_text(norm_text, 120))
-        phonemes = _phonemize_espeak_for_voice(text, voice, casing, espeak_data)
+        phonemes, word_spans, semantic_text = _phonemize_espeak_for_voice_with_spans(
+            text, voice, casing, espeak_data
+        )
+        _LOGGER.debug("infer: voice=%s text='%s'", voice, _short_text(semantic_text, 120))
 
     _LOGGER.debug("infer: phonemes=%s", _short_list(phonemes, 48))
     ids = phoneme_ids_espeak(phonemes)
-    return {"phonemes": phonemes, "phoneme_ids": ids}
+    return {
+        "phonemes": phonemes,
+        "phoneme_ids": ids,
+        "text": semantic_text,
+        "word_spans": word_spans,
+    }
 
 
 def phonemize_spans_with_speakers(
@@ -1128,15 +1472,27 @@ def phonemize_spans_with_speakers(
 
         _LOGGER.debug("infer-multispan: lang=%s voice=%s spk_label=%s spk_id=%s neural=%s", lang, voice, spk_label, spk_id, neural)
 
-        if neural:
-            ph = _phonemize_neural(span_text, casing, espeak_data, voice)
+        if neural and _supports_neural_heteronyms(voice):
+            ph, word_spans, semantic_text = _phonemize_neural_with_spans(
+                span_text, casing, espeak_data, voice
+            )
         else:
-            ph = _phonemize_espeak_for_voice(span_text, voice, casing, espeak_data)
+            ph, word_spans, semantic_text = _phonemize_espeak_for_voice_with_spans(
+                span_text, voice, casing, espeak_data
+            )
 
         _LOGGER.debug("infer-multispan: phonemes=%s", _short_list(ph, 40))
 
         ids = phoneme_ids_espeak(ph)
-        results.append({"phonemes": ph, "phoneme_ids": ids, "speaker_id": int(spk_id), "text": span_text})
+        results.append(
+            {
+                "phonemes": ph,
+                "phoneme_ids": ids,
+                "speaker_id": int(spk_id),
+                "text": semantic_text,
+                "word_spans": word_spans,
+            }
+        )
 
     return results
 
@@ -1175,15 +1531,24 @@ def phonemize_text_for_speaker(
 
     casing = get_text_casing("ignore")
 
-    if neural:
-        phonemes = _phonemize_neural(text, casing, espeak_data, voice)
+    if neural and _supports_neural_heteronyms(voice):
+        phonemes, word_spans, semantic_text = _phonemize_neural_with_spans(
+            text, casing, espeak_data, voice
+        )
     else:
-        norm_text = _normalize_text_for_voice(text, voice)
-        _LOGGER.debug("infer-forced: text='%s'", _short_text(norm_text, 120))
-        phonemes = _phonemize_espeak_for_voice(text, voice, casing, espeak_data)
+        phonemes, word_spans, semantic_text = _phonemize_espeak_for_voice_with_spans(
+            text, voice, casing, espeak_data
+        )
+        _LOGGER.debug("infer-forced: text='%s'", _short_text(semantic_text, 120))
 
     _LOGGER.debug("infer-forced: phonemes=%s", _short_list(phonemes, 48))
 
     ids = phoneme_ids_espeak(phonemes)
     spk_id = spk_id_map.get(label, 0)
-    return {"phonemes": phonemes, "phoneme_ids": ids, "speaker_id": int(spk_id), "text": text}
+    return {
+        "phonemes": phonemes,
+        "phoneme_ids": ids,
+        "speaker_id": int(spk_id),
+        "text": semantic_text,
+        "word_spans": word_spans,
+    }

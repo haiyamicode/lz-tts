@@ -8,10 +8,10 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
 DATASET_SRC_DIR="${DATASET_SRC_DIR:-$ROOT_DIR/local/datasets/lzspeech-multilingual-plus}"
-TRAIN_DIR="${TRAIN_DIR:-$ROOT_DIR/local/data/exp/lzspeech-multilingual-plus-piper}"
+TRAIN_DIR="${TRAIN_DIR:-$ROOT_DIR/local/data/exp/lzspeech-multilingual-plus-piper-24k}"
 PUBLISH_DIR="${PUBLISH_DIR:-$ROOT_DIR/data/lzspeech-multilingual}"
 
-SAMPLE_RATE="${SAMPLE_RATE:-22050}"
+SAMPLE_RATE="${SAMPLE_RATE:-24000}"
 LANGUAGE="${LANGUAGE:-multilingual}"
 PRIMARY_VOICE="${PRIMARY_VOICE:-en-us}"
 QUALITY="${QUALITY:-high}"
@@ -33,10 +33,10 @@ if [[ -z "$INIT_CKPT" && -f "$DEFAULT_INIT_CKPT" ]]; then
 fi
 
 if [[ "${FORCE_PREPROCESS:-0}" == "1" ]]; then
-  rm -f "$TRAIN_DIR/config.json" "$TRAIN_DIR/dataset.jsonl"
+  rm -f "$TRAIN_DIR/config.json" "$TRAIN_DIR/dataset.parquet" "$TRAIN_DIR/dataset.jsonl"
 fi
 
-if [[ ! -f "$TRAIN_DIR/config.json" || ! -f "$TRAIN_DIR/dataset.jsonl" ]]; then
+if [[ ! -f "$TRAIN_DIR/config.json" || ( ! -f "$TRAIN_DIR/dataset.parquet" && ! -f "$TRAIN_DIR/dataset.jsonl" ) ]]; then
   mkdir -p "$TRAIN_DIR"
   echo "Preprocessing $DATASET_SRC_DIR -> $TRAIN_DIR"
   PREPROCESS_CMD=(uv run python -m src.piper.train_preprocess

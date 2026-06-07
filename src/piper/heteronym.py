@@ -5,12 +5,15 @@ Uses a trained BERT-based model to resolve heteronym pronunciations based on con
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+from .hf_cache import resolve_hf_model_path
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -193,8 +196,20 @@ class HeteronymResolver:
         # Load frozen context encoder
         from transformers import AutoModel, AutoTokenizer
 
-        self._tokenizer = AutoTokenizer.from_pretrained(self._context_model_name)
-        self._bert = AutoModel.from_pretrained(self._context_model_name).to(self.device)
+        model_path = resolve_hf_model_path(self._context_model_name)
+        local_files_only = any(
+            os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+            for name in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE")
+        )
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            local_files_only=local_files_only,
+            use_fast=True,
+        )
+        self._bert = AutoModel.from_pretrained(
+            model_path,
+            local_files_only=local_files_only,
+        ).to(self.device)
         self._bert.eval()
 
         self._loaded = True

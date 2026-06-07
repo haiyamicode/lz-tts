@@ -32,7 +32,7 @@ class PredictorGraph:
     """
 
     def __init__(self, code_predictor, pred_config, talker_hidden_size, device='cuda', dtype=torch.bfloat16,
-                 do_sample=True, top_k=50, top_p=1.0, temperature=0.9):
+                 do_sample=True, top_k=50, top_p=1.0, temperature=0.9, batch_size: int = 1):
         self.device = device
         device_index = torch.device(device).index
         device_index = device_index if device_index is not None else torch.cuda.current_device()
@@ -49,6 +49,7 @@ class PredictorGraph:
         self.top_k = top_k
         self.top_p = top_p
         self.temperature = temperature
+        self.batch_size = batch_size
 
         # Extract model components (references, not copies)
         cp = code_predictor
@@ -68,8 +69,8 @@ class PredictorGraph:
         ]
 
         # I/O buffers
-        self.input_buf = torch.zeros(1, 2, talker_hidden_size, dtype=dtype, device=device)
-        self.output_tokens = torch.zeros(self.num_codebooks, dtype=torch.long, device=device)
+        self.input_buf = torch.zeros(batch_size, 2, talker_hidden_size, dtype=dtype, device=device)
+        self.output_tokens = torch.zeros(batch_size, self.num_codebooks, dtype=torch.long, device=device)
 
         self.graph = None
         self.captured = False
@@ -89,7 +90,7 @@ class PredictorGraph:
         head_dim = getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads)
         for idx, layer in enumerate(self.static_cache.layers):
             dummy_k = torch.zeros(
-                1,
+                self.batch_size,
                 num_kv_heads,
                 1,
                 head_dim,
@@ -119,8 +120,8 @@ class PredictorGraph:
         return {"full_attention": mask}
 
     def _build_attention_masks(self):
-        dummy_prefill = torch.zeros(1, 2, self.hidden_size, dtype=self.dtype, device=self.device)
-        dummy_decode = torch.zeros(1, 1, self.hidden_size, dtype=self.dtype, device=self.device)
+        dummy_prefill = torch.zeros(self.batch_size, 2, self.hidden_size, dtype=self.dtype, device=self.device)
+        dummy_decode = torch.zeros(self.batch_size, 1, self.hidden_size, dtype=self.dtype, device=self.device)
         self.prefill_attn = self._make_attn_mask(dummy_prefill, self.prefill_cache_pos)
         self.decode_attn = []
         for pos in self.decode_cache_positions:
@@ -129,7 +130,7 @@ class PredictorGraph:
     def _full_loop(self):
         """The full 15-step predictor loop on static buffers."""
         # Project input from talker hidden size to predictor hidden size
-        h = self.small_to_mtp(self.input_buf)  # [1, 2, hidden]
+        h = self.small_to_mtp(self.input_buf)  # [B, 2, hidden]
 
         # Prefill: 2 tokens through all layers
         out = self.pred_model(
@@ -139,10 +140,10 @@ class PredictorGraph:
             cache_position=self.prefill_cache_pos,
             use_cache=True,
         )
-        h = out.last_hidden_state  # [1, 2, hidden] — already normalized
+        h = out.last_hidden_state  # [B, 2, hidden] — already normalized
 
         # First codebook: logits from last position
-        logits = self.lm_heads[0](h[:, -1:, :])  # [1, 1, vocab]
+        logits = self.lm_heads[0](h[:, -1:, :])  # [B, 1, vocab]
         tok = sample_logits(
             logits[:, 0, :],
             temperature=self.temperature,
@@ -150,12 +151,12 @@ class PredictorGraph:
             top_p=self.top_p,
             do_sample=self.do_sample,
         )
-        self.output_tokens[0] = tok[0]
+        self.output_tokens[:, 0] = tok
 
         # Remaining 14 codebooks
         for cb_idx in range(1, self.num_codebooks):
             # Embed previous token using codebook-specific embedding
-            emb = self.codec_embeds[cb_idx - 1](tok.unsqueeze(0))  # [1, 1, codec_hidden]
+            emb = self.codec_embeds[cb_idx - 1](tok.unsqueeze(1))  # [B, 1, codec_hidden]
             if emb.dtype != self.input_buf.dtype:
                 emb = emb.to(self.input_buf.dtype)
             emb = self.small_to_mtp(emb)  # [1, 1, hidden]
@@ -178,7 +179,7 @@ class PredictorGraph:
                 top_p=self.top_p,
                 do_sample=self.do_sample,
             )
-            self.output_tokens[cb_idx] = tok[0]
+            self.output_tokens[:, cb_idx] = tok
 
         return self.output_tokens
 
@@ -221,10 +222,11 @@ class PredictorGraph:
     def run(self, pred_input: torch.Tensor) -> torch.Tensor:
         """
         Run the captured graph.
-        pred_input: [1, 2, talker_hidden_size] (past_hidden cat first_codebook_embed)
-        Returns: [15] long tensor of codebook tokens
+        pred_input: [B, 2, talker_hidden_size] (past_hidden cat first_codebook_embed)
+        Returns: [15] for batch size 1, otherwise [B, 15] long tensor of codebook tokens
         """
         self.input_buf.copy_(pred_input)
         self.static_cache.reset()
         self.graph.replay()
-        return self.output_tokens.clone()
+        result = self.output_tokens.clone()
+        return result[0] if self.batch_size == 1 else result

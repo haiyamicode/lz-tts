@@ -17,7 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DpBudgetConfig:
-    checkpoint: Path = Path("data/lzspeech-multilingual/model.ckpt")
+    checkpoint: Path = Path("data/lzspeech-sparrow/lzspeech-sparrow-highplus-24k-epoch289.ckpt")
     config_path: Optional[Path] = None
     device: str = "cpu"
     language: str = "multilingual"
@@ -279,7 +279,11 @@ class QwenDpBudget:
         x = torch.tensor([phoneme_ids], dtype=torch.long, device=self.device)
         x_lengths = torch.tensor([len(phoneme_ids)], dtype=torch.long, device=self.device)
         sid = torch.tensor([speaker_id], dtype=torch.long, device=self.device)
-        bert_input = self._bert_input(text)
+        bert_input = self._bert_input(
+            phoneme_result.get("text") or text,
+            phoneme_length=len(phoneme_ids),
+            word_spans=phoneme_result.get("word_spans"),
+        )
         for _ in range(max(1, self.config.samples)):
             frame_values.append(self._predict_frames(x, x_lengths, sid, bert_input))
 
@@ -326,16 +330,32 @@ class QwenDpBudget:
             "noise_scale": self.config.noise_scale,
         }
 
-    def _bert_input(self, text: str) -> dict[str, torch.Tensor] | None:
+    def _bert_input(
+        self,
+        text: str,
+        phoneme_length: int | None = None,
+        word_spans: list[list[int]] | None = None,
+    ) -> dict[str, torch.Tensor] | None:
         if self._semantic_tokenizer is None or self._build_bert_input is None or not text:
             return None
-        bert_dict = self._build_bert_input([text], self._semantic_tokenizer)
+        if phoneme_length is None:
+            bert_dict = self._build_bert_input([text], self._semantic_tokenizer)
+        else:
+            bert_dict = self._build_bert_input(
+                [text],
+                self._semantic_tokenizer,
+                phoneme_lengths=[phoneme_length],
+                word_spans=[word_spans],
+            )
         if bert_dict is None:
             return None
-        return {
+        out = {
             "input_ids": bert_dict["input_ids"].to(self.device),
             "attention_mask": bert_dict["attention_mask"].to(self.device),
         }
+        if "word2ph" in bert_dict:
+            out["word2ph"] = bert_dict["word2ph"].to(self.device)
+        return out
 
     def _predict_frames(
         self,

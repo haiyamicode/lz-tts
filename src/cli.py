@@ -6,7 +6,7 @@ Usage:
 
 Examples:
     python main.py "Hello, this is a test."
-    python main.py -m lzspeech-enzhja-1000-bert -s en "Hello world"
+    python main.py -m lzspeech-sparrow -s en "Hello world"
     python main.py -o output.wav "Testing TTS"
 """
 
@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 # Default model name and paths
-DEFAULT_MODEL = "lzspeech-enzhja-1000-bert"
+DEFAULT_MODEL = "lzspeech-sparrow"
 DATA_DIR = Path("data")          # Model files (not tracked in git)
 OUTPUT_DIR = Path("output")
 
@@ -88,6 +88,11 @@ def main():
         help="Duration predictor noise (default: from config)",
     )
     parser.add_argument(
+        "--sdp-ratio",
+        type=float,
+        help="SDP blend ratio for duration-blend checkpoints (default: from config/checkpoint)",
+    )
+    parser.add_argument(
         "--device",
         choices=["cuda", "cpu"],
         help="Device to use (default: auto)",
@@ -149,6 +154,8 @@ def main():
         synth_kwargs["length_scale"] = args.length_scale
     if args.noise_w is not None:
         synth_kwargs["noise_w"] = args.noise_w
+    if args.sdp_ratio is not None:
+        synth_kwargs["sdp_ratio"] = args.sdp_ratio
 
     # Synthesize
     print("\nSynthesizing...")

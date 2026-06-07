@@ -25,7 +25,7 @@ class TalkerGraph:
     """
 
     def __init__(self, talker_model, talker_config, device='cuda', dtype=torch.bfloat16,
-                 max_seq_len=512):
+                 max_seq_len=512, batch_size: int = 1):
         self.device = device
         device_index = torch.device(device).index
         device_index = device_index if device_index is not None else torch.cuda.current_device()
@@ -33,6 +33,7 @@ class TalkerGraph:
 
         self.dtype = dtype
         self.max_seq_len = max_seq_len
+        self.batch_size = batch_size
         self.hidden_size = talker_config.hidden_size
         self.num_layers = talker_config.num_hidden_layers
         self.layer_cache_dtypes = [dtype] * self.num_layers
@@ -44,14 +45,14 @@ class TalkerGraph:
         self.static_cache = StaticCache(config=talker_config, max_cache_len=max_seq_len)
 
         # Static I/O buffers for CUDA graph
-        self.input_buf = torch.zeros(1, 1, self.hidden_size, dtype=dtype, device=device)
-        self.output_buf = torch.zeros(1, 1, self.hidden_size, dtype=dtype, device=device)
+        self.input_buf = torch.zeros(batch_size, 1, self.hidden_size, dtype=dtype, device=device)
+        self.output_buf = torch.zeros(batch_size, 1, self.hidden_size, dtype=dtype, device=device)
 
         # Cache position buffer — updated before each graph replay
         self.cache_position = torch.zeros(1, dtype=torch.long, device=device)
         # Rope deltas from prefill (shape [batch, 1]) and position ids buffer.
-        self.rope_deltas = torch.zeros(1, 1, dtype=torch.float32, device=device)
-        self.position_ids = torch.zeros(3, 1, 1, dtype=torch.float32, device=device)
+        self.rope_deltas = torch.zeros(batch_size, 1, dtype=torch.float32, device=device)
+        self.position_ids = torch.zeros(3, batch_size, 1, dtype=torch.float32, device=device)
 
         self.graph = None
         self.captured = False
@@ -72,7 +73,7 @@ class TalkerGraph:
         head_dim = getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads)
         for idx, layer in enumerate(self.static_cache.layers):
             dummy_k = torch.zeros(
-                1,
+                self.batch_size,
                 num_kv_heads,
                 1,
                 head_dim,
@@ -83,7 +84,7 @@ class TalkerGraph:
                 layer.lazy_initialization(dummy_k)
 
     def _build_attention_masks(self, attention_mask: torch.Tensor | None = None):
-        dummy = torch.zeros(1, 1, self.hidden_size, dtype=self.dtype, device=self.device)
+        dummy = torch.zeros(self.batch_size, 1, self.hidden_size, dtype=self.dtype, device=self.device)
         max_len = self.max_seq_len
         self.attn_mask_table = [None] * max_len
 
@@ -218,9 +219,9 @@ class TalkerGraph:
     def run(self, input_embeds: torch.Tensor, position: int) -> torch.Tensor:
         """
         Run one decode step.
-        input_embeds: [1, 1, hidden_size]
+        input_embeds: [B, 1, hidden_size]
         position: current sequence position
-        Returns: [1, 1, hidden_size] hidden states
+        Returns: [B, 1, hidden_size] hidden states
         """
         self.input_buf.copy_(input_embeds)
         self.cache_position[0] = position

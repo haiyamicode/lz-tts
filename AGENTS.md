@@ -2,6 +2,19 @@
 Use `uv add` to add packages.
 Use `uv run` to run python
 
+# Model naming convention
+- VITS/Piper based lzspeech model: Sparrow (`lzspeech sparrow`)
+- Matcha based lzspeech model: Starling (`lzspeech starling`)
+- Qwen3 based model: Falcon, but keep using the Qwen3 name until it is realized
+
+# Long-running tmux jobs
+When running long tasks in tmux:
+- Start a normal persistent tmux session.
+- Run the command directly inside the session.
+- Do not wrap the command so tmux exits or terminates when the command finishes.
+- Do not use `tee`, manual log redirection, or capture loops unless explicitly requested.
+- For debugging, inspect the tmux session directly or use the real framework logs/TensorBoard artifacts.
+
 # Building piper-phonemize C++ extension
 After modifying C++ code in `src/phonemizer/src/`:
 ```bash

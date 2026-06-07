@@ -19,6 +19,8 @@ class Encoder(nn.Module):
         kernel_size: int = 1,
         p_dropout: float = 0.0,
         window_size: int = 4,
+        gin_channels: int = 0,
+        speaker_condition_layer: int = 2,
         **kwargs
     ):
         super().__init__()
@@ -29,6 +31,17 @@ class Encoder(nn.Module):
         self.kernel_size = kernel_size
         self.p_dropout = p_dropout
         self.window_size = window_size
+        self.gin_channels = gin_channels
+        self.speaker_condition_layer = speaker_condition_layer
+
+        self.spk_emb_linear = None
+        if gin_channels > 0:
+            if not 0 <= speaker_condition_layer < n_layers:
+                raise ValueError(
+                    "speaker_condition_layer must be in [0, n_layers): "
+                    f"got {speaker_condition_layer} for n_layers={n_layers}"
+                )
+            self.spk_emb_linear = nn.Conv1d(gin_channels, hidden_channels, 1)
 
         self.drop = nn.Dropout(p_dropout)
         self.attn_layers = nn.ModuleList()
@@ -57,12 +70,24 @@ class Encoder(nn.Module):
             )
             self.norm_layers_2.append(LayerNorm(hidden_channels))
 
-    def forward(self, x, x_mask):
+    def forward(self, x, x_mask, g=None):
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
-        for attn_layer, norm_layer_1, ffn_layer, norm_layer_2 in zip(
-            self.attn_layers, self.norm_layers_1, self.ffn_layers, self.norm_layers_2
+        for i, (attn_layer, norm_layer_1, ffn_layer, norm_layer_2) in enumerate(
+            zip(
+                self.attn_layers,
+                self.norm_layers_1,
+                self.ffn_layers,
+                self.norm_layers_2,
+            )
         ):
+            if (
+                i == self.speaker_condition_layer
+                and g is not None
+                and self.spk_emb_linear is not None
+            ):
+                x = (x + self.spk_emb_linear(g)) * x_mask
+
             y = attn_layer(x, x, attn_mask)
             y = self.drop(y)
             x = norm_layer_1(x + y)

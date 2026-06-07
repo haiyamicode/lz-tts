@@ -74,7 +74,20 @@ class ModelConfig:
     use_spectral_norm: bool = False
     gin_channels: int = 0  # single speaker
     use_sdp: bool = True  # StochasticDurationPredictor
+    use_duration_blend: bool = False
+    """Train both stochastic and deterministic duration predictors."""
+
+    duration_blend_sdp_ratio: float = 0.2
+    """Default inference SDP blend ratio for duration-blend checkpoints."""
+
+    duration_sdp_loss_weight: float = 1.0
+    duration_dp_loss_weight: float = 1.0
     segment_size: int = 8192
+    use_spk_conditioned_encoder: bool = False
+    """Condition the text/prior encoder with speaker embedding."""
+
+    speaker_condition_layer: int = 2
+    """Transformer encoder layer index where speaker embedding is injected."""
 
     # Semantic encoder (BERT-style) configuration. These are not used by the
     # default Python training entry point, but are available for exported
@@ -90,9 +103,6 @@ class ModelConfig:
 
     freeze_bert: bool = True
     """Whether to freeze semantic encoder weights initially."""
-
-    bert_fusion_weight: float = 0.5
-    """Weight for semantic features in the fusion layer (0=phoneme-only, 1=semantic-only)."""
 
     @property
     def is_multispeaker(self) -> bool:

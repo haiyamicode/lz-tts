@@ -31,6 +31,7 @@ class InferenceConfig:
     noise_scale: float = 0.667
     length_scale: float = 1.0
     noise_w: float = 0.8
+    sdp_ratio: float = 0.2
     sample_rate: int = 22050
 
 
@@ -67,6 +68,7 @@ class PiperInference:
             noise_scale=inference_cfg.get("noise_scale", 0.667),
             length_scale=inference_cfg.get("length_scale", 1.0),
             noise_w=inference_cfg.get("noise_w", 0.8),
+            sdp_ratio=inference_cfg.get("sdp_ratio", 0.2),
             sample_rate=self.config.get("audio", {}).get("sample_rate", 22050),
         )
 
@@ -87,6 +89,7 @@ class PiperInference:
             str(self.checkpoint_path), dataset=None, weights_only=False
         )
         self._sync_config_from_checkpoint()
+        self._sync_inference_defaults_from_checkpoint(inference_cfg)
         self.model.eval()
         self.model.to(self.device)
         if self.fp16:
@@ -99,7 +102,12 @@ class PiperInference:
 
         # Setup BERT semantic tokenizer if model was trained with it
         self.use_bert = bool(getattr(self.model.hparams, "use_bert", False))
+        self.bert_features_precomputed = bool(
+            getattr(self.model.hparams, "bert_features_precomputed", False)
+        )
+        self.bert_model_name = getattr(self.model.hparams, "bert_model_name", None)
         self.semantic_tokenizer = None
+        self.semantic_model = None
         self._build_bert_input = None
 
         if self.use_bert:
@@ -108,10 +116,14 @@ class PiperInference:
                 build_bert_input,
             )
 
-            bert_model_name = getattr(self.model.hparams, "bert_model_name", None)
-            _LOGGER.info("Loading BERT tokenizer: %s", bert_model_name or "default")
-            self.semantic_tokenizer = SemanticTokenizer(model_name=bert_model_name)
+            _LOGGER.info("Loading BERT tokenizer: %s", self.bert_model_name or "default")
+            self.semantic_tokenizer = SemanticTokenizer(model_name=self.bert_model_name)
             self._build_bert_input = build_bert_input
+        self.semantic_fusion_mode = getattr(
+            getattr(self.model.model_g, "enc_p", None),
+            "semantic_fusion_mode",
+            None,
+        )
 
         _LOGGER.info(
             "Model ready: %s (device=%s, speakers=%d, bert=%s)",
@@ -143,6 +155,104 @@ class PiperInference:
         num_speakers = getattr(self.model.hparams, "num_speakers", None)
         if isinstance(num_speakers, int):
             self.config["num_speakers"] = num_speakers
+
+    def _sync_inference_defaults_from_checkpoint(self, inference_cfg: dict) -> None:
+        if not bool(getattr(self.model.hparams, "use_duration_blend", False)):
+            return
+
+        # Older dataset configs carry the classic Piper defaults. Duration-blend
+        # checkpoints should default to Melo/OpenVoice inference behavior unless
+        # the config was explicitly updated with an sdp_ratio field.
+        if "sdp_ratio" not in inference_cfg:
+            self.inference_config.noise_scale = 0.6
+            self.inference_config.noise_w = 0.8
+            self.inference_config.sdp_ratio = float(
+                getattr(self.model.hparams, "duration_blend_sdp_ratio", 0.2)
+            )
+
+    def _load_semantic_model(self):
+        if self.semantic_model is not None:
+            return self.semantic_model
+
+        from transformers import AutoModel
+
+        from .hf_cache import resolve_hf_model_path
+
+        model_path = resolve_hf_model_path(self.bert_model_name)
+        local_files_only = any(
+            os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+            for name in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE")
+        )
+        _LOGGER.info("Loading BERT feature model: %s", self.bert_model_name or model_path)
+        model = AutoModel.from_pretrained(
+            model_path,
+            local_files_only=local_files_only,
+        ).eval()
+        model.to(self.device)
+        if self.fp16:
+            model.half()
+        self.semantic_model = model
+        return model
+
+    def _semantic_input_for_span(
+        self,
+        span_text: str,
+        phoneme_ids: list[int],
+        word_spans,
+    ) -> dict[str, torch.Tensor] | None:
+        if not self.use_bert or self.semantic_tokenizer is None or not span_text:
+            return None
+
+        if self.semantic_fusion_mode == "legacy_cross_attention":
+            bert_dict = self._build_bert_input(
+                [span_text],
+                self.semantic_tokenizer,
+            )
+            if bert_dict is None:
+                return None
+            return {
+                key: value.to(self.device)
+                for key, value in bert_dict.items()
+            }
+
+        phoneme_len = len(phoneme_ids)
+        bert_dict = self._build_bert_input(
+            [span_text],
+            self.semantic_tokenizer,
+            phoneme_lengths=[phoneme_len],
+            word_spans=[word_spans],
+        )
+        if bert_dict is None:
+            return None
+
+        if self.bert_features_precomputed:
+            from .semantic import align_phone_features
+
+            semantic_model = self._load_semantic_model()
+            input_ids = bert_dict["input_ids"].to(self.device)
+            attention_mask = bert_dict["attention_mask"].to(self.device)
+            with torch.inference_mode():
+                hidden = semantic_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                ).last_hidden_state
+            features = align_phone_features(
+                hidden[0],
+                bert_dict["word2ph"][0],
+                phone_len=phoneme_len,
+            )
+            dtype = torch.float16 if self.fp16 else torch.float32
+            return {
+                "features": features.unsqueeze(0).to(
+                    device=self.device,
+                    dtype=dtype,
+                )
+            }
+
+        return {
+            key: value.to(self.device)
+            for key, value in bert_dict.items()
+        }
 
     def phonemize(
         self,
@@ -184,6 +294,7 @@ class PiperInference:
         noise_scale: Optional[float] = None,
         length_scale: Optional[float] = None,
         noise_w: Optional[float] = None,
+        sdp_ratio: Optional[float] = None,
         neural: bool = True,
     ) -> np.ndarray:
         """Synthesize a single text span with a specific speaker.
@@ -208,6 +319,7 @@ class PiperInference:
             noise_scale if noise_scale is not None else self.inference_config.noise_scale,
             length_scale if length_scale is not None else self.inference_config.length_scale,
             noise_w if noise_w is not None else self.inference_config.noise_w,
+            sdp_ratio if sdp_ratio is not None else self.inference_config.sdp_ratio,
         ]
 
         # For single-speaker models, speaker can be None - phonemize will use default speaker_id=0
@@ -222,14 +334,11 @@ class PiperInference:
             text_lengths = torch.LongTensor([len(phoneme_ids)]).to(self.device)
             sid = torch.LongTensor([speaker_id]).to(self.device)
 
-            bert_input = None
-            if self.use_bert and self.semantic_tokenizer and text:
-                bert_dict = self._build_bert_input([text], self.semantic_tokenizer)
-                if bert_dict is not None:
-                    bert_input = {
-                        "input_ids": bert_dict["input_ids"].to(self.device),
-                        "attention_mask": bert_dict["attention_mask"].to(self.device),
-                    }
+            bert_input = self._semantic_input_for_span(
+                span.get("text", text),
+                phoneme_ids,
+                span.get("word_spans"),
+            )
 
             with autocast(
                 device_type=self.device.type,
@@ -254,6 +363,7 @@ class PiperInference:
         noise_scale: Optional[float] = None,
         length_scale: Optional[float] = None,
         noise_w: Optional[float] = None,
+        sdp_ratio: Optional[float] = None,
         neural: bool = False,
     ) -> np.ndarray:
         """Synthesize speech from text.
@@ -274,6 +384,7 @@ class PiperInference:
             noise_scale if noise_scale is not None else self.inference_config.noise_scale,
             length_scale if length_scale is not None else self.inference_config.length_scale,
             noise_w if noise_w is not None else self.inference_config.noise_w,
+            sdp_ratio if sdp_ratio is not None else self.inference_config.sdp_ratio,
         ]
 
         # Phonemize text
@@ -298,14 +409,11 @@ class PiperInference:
                 )
 
                 # Prepare BERT input if enabled
-                bert_input = None
-                if self.use_bert and self.semantic_tokenizer and span_text:
-                    bert_dict = self._build_bert_input([span_text], self.semantic_tokenizer)
-                    if bert_dict is not None:
-                        bert_input = {
-                            "input_ids": bert_dict["input_ids"].to(self.device),
-                            "attention_mask": bert_dict["attention_mask"].to(self.device),
-                        }
+                bert_input = self._semantic_input_for_span(
+                    span_text,
+                    phoneme_ids,
+                    span.get("word_spans"),
+                )
 
                 # Run inference
                 with autocast(

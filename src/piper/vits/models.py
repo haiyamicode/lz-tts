@@ -179,6 +179,8 @@ class TextEncoder(nn.Module):
         n_layers: int,
         kernel_size: int,
         p_dropout: float,
+        gin_channels: int = 0,
+        speaker_condition_layer: int = 2,
     ):
         super().__init__()
         self.n_vocab = n_vocab
@@ -194,18 +196,25 @@ class TextEncoder(nn.Module):
         nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
 
         self.encoder = attentions.Encoder(
-            hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            p_dropout,
+            gin_channels=gin_channels,
+            speaker_condition_layer=speaker_condition_layer,
         )
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-    def forward(self, x, x_lengths):
+    def forward(self, x, x_lengths, g=None):
         x = self.emb(x) * math.sqrt(self.hidden_channels)  # [b, t, h]
         x = torch.transpose(x, 1, -1)  # [b, h, t]
         x_mask = torch.unsqueeze(
             commons.sequence_mask(x_lengths, x.size(2)), 1
         ).type_as(x)
 
-        x = self.encoder(x * x_mask, x_mask)
+        x = self.encoder(x * x_mask, x_mask, g=g)
         stats = self.proj(x) * x_mask
 
         m, logs = torch.split(stats, self.out_channels, dim=1)
@@ -224,6 +233,7 @@ class BertTextEncoder(nn.Module):
 
         - 'input_ids': LongTensor [B, T_text]
         - 'attention_mask': LongTensor [B, T_text]
+        - 'word2ph': LongTensor [B, T_text], repeat counts that sum to T_phone
     """
 
     def __init__(
@@ -239,14 +249,24 @@ class BertTextEncoder(nn.Module):
         bert_model: str = "distilbert-base-multilingual-cased",
         bert_hidden_size: int = 768,
         freeze_bert: bool = True,
+        bert_features_precomputed: bool = False,
         fusion_weight: float = 0.5,
+        semantic_fusion_mode: typing.Optional[str] = None,
+        gin_channels: int = 0,
+        speaker_condition_layer: int = 2,
     ):
         super().__init__()
 
         self.n_vocab = n_vocab
         self.out_channels = out_channels
         self.hidden_channels = hidden_channels
-        self.fusion_weight = fusion_weight
+        self.freeze_bert = bool(freeze_bert)
+        self.bert_features_precomputed = bool(bert_features_precomputed)
+        self.fusion_weight = float(fusion_weight)
+        self.semantic_fusion_mode = (
+            semantic_fusion_mode
+            or ("aligned" if self.bert_features_precomputed else "legacy_cross_attention")
+        )
         self._debug_once = False
 
         # === Phoneme branch (same structure as TextEncoder) ===
@@ -254,97 +274,227 @@ class BertTextEncoder(nn.Module):
         nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
 
         self.encoder = attentions.Encoder(
-            hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            p_dropout,
+            gin_channels=gin_channels,
+            speaker_condition_layer=speaker_condition_layer,
         )
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-        # === Semantic branch (BERT encoder) ===
-        # The model is loaded by identifier so it can be swapped easily.
-        from transformers import AutoModel  # lazy import to avoid hard dependency when unused
+        self.bert = None
+        if self.bert_features_precomputed:
+            bert_hidden = int(bert_hidden_size)
+        else:
+            # === Semantic branch (BERT encoder) ===
+            # The model is loaded by identifier so it can be swapped easily.
+            from transformers import AutoModel  # lazy import to avoid hard dependency when unused
 
-        if _DEBUG_SEMANTIC:
-            print(f"[BertTextEncoder] Loading semantic model: {bert_model}")
+            if _DEBUG_SEMANTIC:
+                print(f"[BertTextEncoder] Loading semantic model: {bert_model}")
 
-        self.bert = AutoModel.from_pretrained(bert_model)
+            self.bert = AutoModel.from_pretrained(bert_model)
 
-        if freeze_bert:
-            for param in self.bert.parameters():
-                param.requires_grad = False
+            if self.freeze_bert:
+                for param in self.bert.parameters():
+                    param.requires_grad = False
+                self.bert.eval()
 
-        bert_hidden = getattr(self.bert.config, "hidden_size", bert_hidden_size)
+            bert_hidden = getattr(self.bert.config, "hidden_size", bert_hidden_size)
         self.bert_projection = nn.Linear(bert_hidden, hidden_channels)
 
-        # Align semantic sequence to phoneme sequence via cross-attention.
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=hidden_channels,
-            num_heads=n_heads,
-            dropout=p_dropout,
-            batch_first=True,
-        )
+        self.cross_attention = None
+        if self.semantic_fusion_mode == "legacy_cross_attention":
+            # Compatibility path for older lzspeech-bert checkpoints.
+            self.cross_attention = nn.MultiheadAttention(
+                embed_dim=hidden_channels,
+                num_heads=n_heads,
+                dropout=p_dropout,
+                batch_first=True,
+            )
 
         self.layer_norm = nn.LayerNorm(hidden_channels)
+
+    def _expand_semantic_features(
+        self,
+        semantic_features: torch.Tensor,
+        bert_mask: torch.Tensor,
+        x_lengths: torch.Tensor,
+        word2ph: torch.Tensor,
+        max_phone_len: int,
+    ) -> torch.Tensor:
+        word2ph = word2ph.to(device=semantic_features.device, dtype=torch.long)
+
+        aligned = semantic_features.new_zeros(
+            semantic_features.size(0),
+            max_phone_len,
+            semantic_features.size(-1),
+        )
+        for b in range(semantic_features.size(0)):
+            phone_len = int(x_lengths[b].item())
+            counts = torch.clamp(word2ph[b], min=0)
+            diff = phone_len - int(counts.sum().item())
+            if diff:
+                active = torch.nonzero(bert_mask[b].bool(), as_tuple=False).flatten()
+                adjust_idx = int(active[-1].item()) if active.numel() else 0
+                counts = counts.clone()
+                counts[adjust_idx] = torch.clamp(counts[adjust_idx] + diff, min=0)
+
+            repeated = torch.repeat_interleave(semantic_features[b], counts, dim=0)
+            if repeated.size(0) == 0:
+                continue
+            copy_len = min(phone_len, repeated.size(0), max_phone_len)
+            aligned[b, :copy_len] = repeated[:copy_len]
+
+        return aligned
 
     def forward(
         self,
         x: torch.LongTensor,
         x_lengths: torch.LongTensor,
         bert_input: typing.Optional[typing.Dict[str, torch.Tensor]] = None,
+        g: typing.Optional[torch.Tensor] = None,
     ):
-        # === Phoneme branch (identical to TextEncoder) ===
-        x = self.emb(x) * math.sqrt(self.hidden_channels)  # [B, T, H]
-        x = torch.transpose(x, 1, -1)  # [B, H, T]
+        # === Phoneme branch ===
+        x_embed = self.emb(x) * math.sqrt(self.hidden_channels)  # [B, T_phone, H]
         x_mask = torch.unsqueeze(
-            commons.sequence_mask(x_lengths, x.size(2)), 1
-        ).type_as(x)
+            commons.sequence_mask(x_lengths, x_embed.size(1)), 1
+        ).type_as(x_embed)
 
-        x_enc = self.encoder(x * x_mask, x_mask)  # [B, H, T]
+        if self.semantic_fusion_mode == "legacy_cross_attention":
+            x_ph = torch.transpose(x_embed, 1, -1)  # [B, H, T_phone]
+            x_enc = self.encoder(x_ph * x_mask, x_mask, g=g)
+
+            if _DEBUG_SEMANTIC and not self._debug_once:
+                print(
+                    f"[BertTextEncoder] legacy x_enc shape={tuple(x_enc.shape)}, "
+                    f"x_mask shape={tuple(x_mask.shape)}, "
+                    f"bert_input={'yes' if bert_input is not None else 'no'}"
+                )
+                self._debug_once = True
+
+            if bert_input is not None:
+                if self.bert is None or self.cross_attention is None:
+                    raise ValueError(
+                        "Legacy cross-attention semantic fusion requires a runtime BERT model"
+                    )
+
+                bert_ids = bert_input["input_ids"]
+                bert_mask = bert_input["attention_mask"]
+                if self.freeze_bert:
+                    with torch.no_grad():
+                        bert_output = self.bert(
+                            input_ids=bert_ids,
+                            attention_mask=bert_mask,
+                        )
+                else:
+                    bert_output = self.bert(
+                        input_ids=bert_ids,
+                        attention_mask=bert_mask,
+                    )
+
+                semantic_features = self.bert_projection(bert_output.last_hidden_state)
+                x_seq = x_enc.transpose(1, 2)
+                aligned, _ = self.cross_attention(
+                    query=x_seq,
+                    key=semantic_features,
+                    value=semantic_features,
+                    key_padding_mask=~bert_mask.bool(),
+                )
+                fused = (1.0 - self.fusion_weight) * x_seq + self.fusion_weight * aligned
+                x_enc = self.layer_norm(fused).transpose(1, 2)
+
+            stats = self.proj(x_enc) * x_mask
+            m, logs = torch.split(stats, self.out_channels, dim=1)
+            return x_enc, m, logs, x_mask
 
         if _DEBUG_SEMANTIC and not self._debug_once:
             print(
-                f"[BertTextEncoder] x_enc shape={tuple(x_enc.shape)}, "
+                f"[BertTextEncoder] x_embed shape={tuple(x_embed.shape)}, "
                 f"x_mask shape={tuple(x_mask.shape)}, "
                 f"bert_input={'yes' if bert_input is not None else 'no'}"
             )
             self._debug_once = True
 
-        # === Optional semantic fusion ===
         if bert_input is not None:
-            bert_ids = bert_input["input_ids"]
-            bert_mask = bert_input["attention_mask"]
+            if "features" in bert_input:
+                raw_features = bert_input["features"]
+                if raw_features.dim() != 3:
+                    raise ValueError(
+                        f"Precomputed BERT features must be 3D, got {tuple(raw_features.shape)}"
+                    )
+                if raw_features.size(1) == self.bert_projection.in_features:
+                    # [B, H_bert, T_phone] -> [B, T_phone, H_bert]
+                    raw_features = raw_features.transpose(1, 2)
+                elif raw_features.size(2) != self.bert_projection.in_features:
+                    raise ValueError(
+                        "Precomputed BERT feature dim mismatch: "
+                        f"expected {self.bert_projection.in_features}, got {tuple(raw_features.shape)}"
+                    )
 
-            bert_output = self.bert(
-                input_ids=bert_ids,
-                attention_mask=bert_mask,
-            )
+                semantic_features = self.bert_projection(raw_features)
+                if semantic_features.size(1) == x_embed.size(1):
+                    aligned = semantic_features
+                elif semantic_features.size(1) > x_embed.size(1):
+                    aligned = semantic_features[:, : x_embed.size(1)]
+                else:
+                    aligned = F.pad(
+                        semantic_features,
+                        (0, 0, 0, x_embed.size(1) - semantic_features.size(1)),
+                    )
+            else:
+                if self.bert is None:
+                    raise ValueError(
+                        "This model expects precomputed BERT features, but bert_input['features'] is missing"
+                    )
 
-            # [B, T_text, H_bert] -> [B, T_text, H]
-            semantic_features = self.bert_projection(bert_output.last_hidden_state)
+                bert_ids = bert_input["input_ids"]
+                bert_mask = bert_input["attention_mask"]
+                word2ph = bert_input.get("word2ph")
+                if word2ph is None:
+                    raise ValueError(
+                        "Semantic input requires word2ph alignment counts. "
+                        "Build bert_input with phoneme_lengths and word_spans."
+                    )
 
-            # Cross-attention expects [B, T, H]
-            x_seq = x_enc.transpose(1, 2)  # [B, T_phone, H]
+                if self.freeze_bert:
+                    with torch.no_grad():
+                        bert_output = self.bert(
+                            input_ids=bert_ids,
+                            attention_mask=bert_mask,
+                        )
+                else:
+                    bert_output = self.bert(
+                        input_ids=bert_ids,
+                        attention_mask=bert_mask,
+                    )
 
-            key_padding_mask = ~bert_mask.bool()
+                # [B, T_text, H_bert] -> [B, T_text, H]
+                semantic_features = self.bert_projection(bert_output.last_hidden_state)
 
-            if _DEBUG_SEMANTIC and not self._debug_once:
-                bsz, t_phone, _ = x_seq.shape
-                _, t_text, _ = semantic_features.shape
-                eff_text_len = int(bert_mask[0].sum().item()) if bert_mask.size(0) > 0 else 0
-                print(
-                    f"[BertTextEncoder] cross-attn: B={bsz}, T_phone={t_phone}, "
-                    f"T_text={t_text}, eff_text_len[0]={eff_text_len}, "
-                    f"fusion_weight={self.fusion_weight}"
+                aligned = self._expand_semantic_features(
+                    semantic_features=semantic_features,
+                    bert_mask=bert_mask,
+                    x_lengths=x_lengths,
+                    word2ph=word2ph,
+                    max_phone_len=x_embed.size(1),
                 )
 
-            aligned, _ = self.cross_attention(
-                query=x_seq,
-                key=semantic_features,
-                value=semantic_features,
-                key_padding_mask=key_padding_mask,
-            )
+            if _DEBUG_SEMANTIC and not self._debug_once:
+                bsz, t_phone, _ = x_embed.shape
+                _, t_text, _ = semantic_features.shape
+                print(
+                    f"[BertTextEncoder] word2ph: B={bsz}, T_phone={t_phone}, "
+                    f"T_semantic={t_text}, precomputed={'features' in bert_input}"
+                )
 
-            fused = (1.0 - self.fusion_weight) * x_seq + self.fusion_weight * aligned
-            fused = self.layer_norm(fused)
-            x_enc = fused.transpose(1, 2)  # [B, H, T]
+            x_embed = self.layer_norm(x_embed + aligned)
+
+        x = torch.transpose(x_embed, 1, -1)  # [B, H, T_phone]
+        x_enc = self.encoder(x * x_mask, x_mask, g=g)
 
         # === Project to prior mean/log-std as usual ===
         stats = self.proj(x_enc) * x_mask
@@ -352,8 +502,17 @@ class BertTextEncoder(nn.Module):
         return x_enc, m, logs, x_mask
 
     def unfreeze_bert(self):
+        if self.bert is None:
+            raise RuntimeError("Cannot unfreeze BERT because this encoder uses precomputed features")
+        self.freeze_bert = False
         for param in self.bert.parameters():
             param.requires_grad = True
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_bert and self.bert is not None:
+            self.bert.eval()
+        return self
 
 
 class ResidualCouplingBlock(nn.Module):
@@ -692,12 +851,18 @@ class SynthesizerTrn(nn.Module):
         n_speakers: int = 1,
         gin_channels: int = 0,
         use_sdp: bool = True,
+        use_duration_blend: bool = False,
+        duration_blend_sdp_ratio: float = 0.2,
         # Semantic options
         use_bert: bool = False,
         bert_model: str = "distilbert-base-multilingual-cased",
         bert_hidden_size: int = 768,
         freeze_bert: bool = True,
+        bert_features_precomputed: bool = False,
         bert_fusion_weight: float = 0.5,
+        semantic_fusion_mode: typing.Optional[str] = None,
+        use_spk_conditioned_encoder: bool = False,
+        speaker_condition_layer: int = 2,
     ):
 
         super().__init__()
@@ -720,6 +885,14 @@ class SynthesizerTrn(nn.Module):
         self.n_speakers = n_speakers
         self.gin_channels = gin_channels
         self.use_sdp = use_sdp
+        self.use_duration_blend = bool(use_duration_blend)
+        self.duration_blend_sdp_ratio = float(duration_blend_sdp_ratio)
+        self.use_spk_conditioned_encoder = bool(use_spk_conditioned_encoder)
+        enc_gin_channels = (
+            gin_channels
+            if self.use_spk_conditioned_encoder and n_speakers > 1 and gin_channels > 0
+            else 0
+        )
 
         # Text encoder: phoneme-only or phoneme+semantic (BertTextEncoder)
         if use_bert:
@@ -735,7 +908,11 @@ class SynthesizerTrn(nn.Module):
                 bert_model=bert_model,
                 bert_hidden_size=bert_hidden_size,
                 freeze_bert=freeze_bert,
+                bert_features_precomputed=bert_features_precomputed,
                 fusion_weight=bert_fusion_weight,
+                semantic_fusion_mode=semantic_fusion_mode,
+                gin_channels=enc_gin_channels,
+                speaker_condition_layer=speaker_condition_layer,
             )
         else:
             self.enc_p = TextEncoder(
@@ -747,6 +924,8 @@ class SynthesizerTrn(nn.Module):
                 n_layers,
                 kernel_size,
                 p_dropout,
+                gin_channels=enc_gin_channels,
+                speaker_condition_layer=speaker_condition_layer,
             )
         self.dec = Generator(
             inter_channels,
@@ -771,7 +950,14 @@ class SynthesizerTrn(nn.Module):
             inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels
         )
 
-        if use_sdp:
+        if self.use_duration_blend:
+            self.sdp = StochasticDurationPredictor(
+                hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels
+            )
+            self.dp = DurationPredictor(
+                hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
+            )
+        elif use_sdp:
             self.dp = StochasticDurationPredictor(
                 hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels
             )
@@ -793,18 +979,20 @@ class SynthesizerTrn(nn.Module):
         bert_input: typing.Optional[typing.Dict[str, torch.Tensor]] = None,
     ):
 
+        if self.n_speakers > 1:
+            g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
+        else:
+            g = None
+
         if isinstance(self.enc_p, BertTextEncoder):
             x, m_p, logs_p, x_mask = self.enc_p(
                 x,
                 x_lengths,
                 bert_input=bert_input,
+                g=g,
             )
         else:
-            x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
-        if self.n_speakers > 1:
-            g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
-        else:
-            g = None
+            x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g)
 
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
         z_p = self.flow(z, y_mask, g=g)
@@ -834,7 +1022,18 @@ class SynthesizerTrn(nn.Module):
             )
 
         w = attn.sum(2)
-        if self.use_sdp:
+        duration_losses = None
+        if self.use_duration_blend:
+            l_length_sdp = self.sdp(x, x_mask, w, g=g)
+            l_length_sdp = l_length_sdp / torch.sum(x_mask)
+            logw_ = torch.log(w + 1e-6) * x_mask
+            logw = self.dp(x, x_mask, g=g)
+            l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
+                x_mask
+            )
+            l_length = l_length_sdp + l_length_dp
+            duration_losses = {"sdp": l_length_sdp, "dp": l_length_dp}
+        elif self.use_sdp:
             l_length = self.dp(x, x_mask, w, g=g)
             l_length = l_length / torch.sum(x_mask)
         else:
@@ -860,6 +1059,7 @@ class SynthesizerTrn(nn.Module):
             x_mask,
             y_mask,
             (z, z_p, m_p, logs_p, m_q, logs_q),
+            duration_losses,
         )
 
     def infer(
@@ -870,24 +1070,45 @@ class SynthesizerTrn(nn.Module):
         noise_scale=0.667,
         length_scale=1,
         noise_scale_w=0.8,
+        sdp_ratio: typing.Optional[float] = None,
         max_len=None,
         bert_input: typing.Optional[typing.Dict[str, torch.Tensor]] = None,
     ):
-        if isinstance(self.enc_p, BertTextEncoder):
-            x, m_p, logs_p, x_mask = self.enc_p(
-                x,
-                x_lengths,
-                bert_input=bert_input,
-            )
-        else:
-            x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
         if self.n_speakers > 1:
             assert sid is not None, "Missing speaker id"
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
             g = None
 
-        if self.use_sdp:
+        if isinstance(self.enc_p, BertTextEncoder):
+            x, m_p, logs_p, x_mask = self.enc_p(
+                x,
+                x_lengths,
+                bert_input=bert_input,
+                g=g,
+            )
+        else:
+            x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g)
+
+        if self.use_duration_blend:
+            ratio = (
+                self.duration_blend_sdp_ratio
+                if sdp_ratio is None
+                else float(sdp_ratio)
+            )
+            ratio = min(1.0, max(0.0, ratio))
+            logw = (
+                self.sdp(
+                    x,
+                    x_mask,
+                    g=g,
+                    reverse=True,
+                    noise_scale=noise_scale_w,
+                )
+                * ratio
+                + self.dp(x, x_mask, g=g) * (1.0 - ratio)
+            )
+        elif self.use_sdp:
             logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
         else:
             logw = self.dp(x, x_mask, g=g)

@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--noise-scale", type=float, default=0.667)
     parser.add_argument("--length-scale", type=float, default=1.0)
     parser.add_argument("--noise-w", type=float, default=0.8)
+    parser.add_argument("--sdp-ratio", type=float, default=0.2)
     #
     args = parser.parse_args()
 
@@ -54,7 +55,7 @@ def main():
 
         text = torch.LongTensor(phoneme_ids).unsqueeze(0)
         text_lengths = torch.LongTensor([len(phoneme_ids)])
-        scales = [args.noise_scale, args.length_scale, args.noise_w]
+        scales = [args.noise_scale, args.length_scale, args.noise_w, args.sdp_ratio]
         sid = torch.LongTensor([speaker_id]) if speaker_id is not None else None
 
         start_time = time.perf_counter()

@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import io
 import json
@@ -106,7 +107,7 @@ class DpBudgetSettings(BaseModel):
     enabled: bool = True
     preload: bool = True
     use_bert: bool = False
-    checkpoint: str = "data/lzspeech-multilingual/model.ckpt"
+    checkpoint: str = "data/lzspeech-sparrow/lzspeech-sparrow-highplus-24k-epoch289.ckpt"
     config_path: Optional[str] = None
     device: str = "cuda"
     language: str = "multilingual"
@@ -928,27 +929,61 @@ class SynthesizeRequest(BaseModel):
     dp_budget: Optional[bool] = None
 
 
-@router.post("/synthesize")
-def synthesize(req: SynthesizeRequest):
-    if not req.text.strip():
-        raise HTTPException(400, "text is required")
+class BatchSynthesizeRequest(BaseModel):
+    texts: list[str] = Field(..., min_length=1, max_length=64)
+    voice_url: str
+    voice_text: Optional[str] = None
+    speed: float = 1.0
+    language: Optional[str] = None
+    language_code: Optional[str] = None
+    max_new_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_k: Optional[int] = None
+    top_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    xvec_only: Optional[bool] = None
+    non_streaming_mode: Optional[bool] = None
+    expressiveness: Optional[float] = None
+    dp_budget: Optional[bool] = None
+    true_batch: bool = True
+    batch_backend: str = "cuda_graph"
 
-    try:
-        sample_path = download_and_cache(req.voice_url)
-    except Exception as e:
-        raise HTTPException(400, f"Failed to download voice sample: {e}")
 
-    m = get_model()
-    xvec_only = req.xvec_only if req.xvec_only is not None else _qwen_settings.xvec_only
-    try:
-        prompt_text = (
-            req.voice_text.strip()
-            if req.voice_text and req.voice_text.strip()
-            else "" if xvec_only else transcribe_voice_sample(sample_path)
-        )
-    except Exception as e:
-        raise HTTPException(400, f"Failed to transcribe voice sample: {e}")
+class BatchSynthesizeItem(BaseModel):
+    text: str
+    audio_base64: str
+    sample_rate: int
+    raw_audio_seconds: float
+    audio_seconds: float
+    max_new_tokens: int
+    hit_token_cap: bool
+    language: str
+    dp_language: str
 
+
+class BatchSynthesizeResponse(BaseModel):
+    items: list[BatchSynthesizeItem]
+    count: int
+    wall_seconds: float
+    audio_seconds_total: float
+
+
+@dataclass(frozen=True)
+class _ResolvedGenerationSettings:
+    language: str
+    dp_language: str
+    max_new_tokens: int
+    temperature: float
+    top_k: int
+    top_p: float
+    repetition_penalty: float
+    non_streaming_mode: bool
+    dp_budget_enabled: bool
+    dp_budget_info: Optional[dict[str, Any]]
+    expressiveness_level: float
+
+
+def _resolve_generation_settings(req: SynthesizeRequest) -> _ResolvedGenerationSettings:
     resolved_language = resolve_qwen_language(req.text, req.language, req.language_code)
     language = resolved_language.qwen_language
     expressiveness_level, expressiveness_config = resolve_expressiveness(req.expressiveness)
@@ -996,6 +1031,143 @@ def synthesize(req: SynthesizeRequest):
         if req.non_streaming_mode is not None
         else _qwen_settings.non_streaming_mode
     )
+    return _ResolvedGenerationSettings(
+        language=language,
+        dp_language=resolved_language.dp_language,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
+        non_streaming_mode=non_streaming_mode,
+        dp_budget_enabled=dp_budget_enabled,
+        dp_budget_info=dp_budget_info,
+        expressiveness_level=expressiveness_level,
+    )
+
+
+def _resolve_voice_prompt(req: SynthesizeRequest) -> tuple[Path, str, bool]:
+    try:
+        sample_path = download_and_cache(req.voice_url)
+    except Exception as e:
+        raise HTTPException(400, f"Failed to download voice sample: {e}") from e
+
+    xvec_only = req.xvec_only if req.xvec_only is not None else _qwen_settings.xvec_only
+    try:
+        prompt_text = (
+            req.voice_text.strip()
+            if req.voice_text and req.voice_text.strip()
+            else "" if xvec_only else transcribe_voice_sample(sample_path)
+        )
+    except Exception as e:
+        raise HTTPException(400, f"Failed to transcribe voice sample: {e}") from e
+    return sample_path, prompt_text, xvec_only
+
+
+def _generate_qwen_mp3(
+    req: SynthesizeRequest,
+    sample_path: Path,
+    prompt_text: str,
+    xvec_only: bool,
+    settings: _ResolvedGenerationSettings,
+) -> tuple[bytes, dict[str, Any]]:
+    m = get_model()
+    audio_list, sample_rate = m.generate_voice_clone(
+        text=req.text,
+        language=settings.language,
+        ref_audio=str(sample_path),
+        ref_text=prompt_text,
+        max_new_tokens=settings.max_new_tokens,
+        temperature=settings.temperature,
+        top_k=settings.top_k,
+        top_p=settings.top_p,
+        repetition_penalty=settings.repetition_penalty,
+        xvec_only=xvec_only,
+        non_streaming_mode=settings.non_streaming_mode,
+        append_silence=True,
+    )
+
+    if not audio_list:
+        raise HTTPException(500, "Model produced no output")
+
+    wav_data = np.asarray(audio_list[0], dtype=np.float32).flatten()
+    return _encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens)
+
+
+def _encode_qwen_audio(
+    wav_data: np.ndarray,
+    sample_rate: int,
+    max_new_tokens: int,
+) -> tuple[bytes, dict[str, Any]]:
+    raw_audio_seconds = wav_data.size / sample_rate
+    wav_data, postprocess_info = postprocess_audio(wav_data, sample_rate)
+    audio_seconds = wav_data.size / sample_rate
+    cap_seconds = max_new_tokens / 12.0
+    hit_token_cap = raw_audio_seconds >= max(0.0, cap_seconds - 0.25)
+    mp3_bytes = wav_to_mp3(wav_data, sample_rate)
+    return mp3_bytes, {
+        "sample_rate": sample_rate,
+        "raw_audio_seconds": raw_audio_seconds,
+        "audio_seconds": audio_seconds,
+        "cap_seconds": cap_seconds,
+        "hit_token_cap": hit_token_cap,
+        "postprocess": postprocess_info,
+    }
+
+
+def _generate_qwen_batch_mp3(
+    texts: list[str],
+    sample_path: Path,
+    prompt_text: str,
+    xvec_only: bool,
+    settings_list: list[_ResolvedGenerationSettings],
+    batch_backend: str = "hf",
+) -> list[tuple[bytes, dict[str, Any]]]:
+    if len(texts) != len(settings_list):
+        raise ValueError("texts and settings_list length mismatch")
+
+    m = get_model()
+    if not hasattr(m, "generate_voice_clone_batch"):
+        raise HTTPException(500, "Loaded Qwen backend does not support true batch generation")
+
+    batch_max_new_tokens = max(settings.max_new_tokens for settings in settings_list)
+    first = settings_list[0]
+    backend = batch_backend.strip().lower().replace("-", "_")
+    if backend not in {"hf", "cuda_graph"}:
+        raise HTTPException(400, "batch_backend must be 'hf' or 'cuda_graph'")
+    audio_list, sample_rate = m.generate_voice_clone_batch(
+        texts=texts,
+        language=[settings.language for settings in settings_list],
+        ref_audio=str(sample_path),
+        ref_text=prompt_text,
+        max_new_tokens=batch_max_new_tokens,
+        temperature=first.temperature,
+        top_k=first.top_k,
+        top_p=first.top_p,
+        repetition_penalty=first.repetition_penalty,
+        xvec_only=xvec_only,
+        non_streaming_mode=first.non_streaming_mode,
+        append_silence=True,
+        use_cuda_graph_batch=backend == "cuda_graph",
+    )
+
+    if len(audio_list) != len(texts):
+        raise HTTPException(500, f"Model produced {len(audio_list)} outputs for {len(texts)} inputs")
+
+    encoded = []
+    for audio, settings in zip(audio_list, settings_list):
+        wav_data = np.asarray(audio, dtype=np.float32).flatten()
+        encoded.append(_encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens))
+    return encoded
+
+
+@router.post("/synthesize")
+def synthesize(req: SynthesizeRequest):
+    if not req.text.strip():
+        raise HTTPException(400, "text is required")
+
+    sample_path, prompt_text, xvec_only = _resolve_voice_prompt(req)
+    settings = _resolve_generation_settings(req)
 
     text_hash = hashlib.sha256(req.text.encode()).hexdigest()[:12]
     prompt_hash = hashlib.sha256(prompt_text.encode()).hexdigest()[:12]
@@ -1009,19 +1181,19 @@ def synthesize(req: SynthesizeRequest):
         f"voice_hash={voice_hash} "
         f"voice_text_len={len(prompt_text)} "
         f"voice_text_source={'request' if req.voice_text and req.voice_text.strip() else 'none' if xvec_only else 'nano-parakeet'} "
-        f"language={language!r} "
-        f"dp_language={resolved_language.dp_language!r} "
+        f"language={settings.language!r} "
+        f"dp_language={settings.dp_language!r} "
         f"xvec_only={xvec_only} "
-        f"non_streaming_mode={non_streaming_mode} "
+        f"non_streaming_mode={settings.non_streaming_mode} "
         f"expressiveness={req.expressiveness if req.expressiveness is not None else QWEN_DEFAULT_EXPRESSIVENESS} "
-        f"expressiveness_level={expressiveness_level} "
-        f"temperature={temperature} "
-        f"top_k={top_k} "
-        f"top_p={top_p} "
-        f"repetition_penalty={repetition_penalty} "
-        f"max_new_tokens={max_new_tokens} "
-        f"dp_budget={dp_budget_enabled} "
-        f"dp_budget_info={json.dumps(dp_budget_info, ensure_ascii=False) if dp_budget_info else None} "
+        f"expressiveness_level={settings.expressiveness_level} "
+        f"temperature={settings.temperature} "
+        f"top_k={settings.top_k} "
+        f"top_p={settings.top_p} "
+        f"repetition_penalty={settings.repetition_penalty} "
+        f"max_new_tokens={settings.max_new_tokens} "
+        f"dp_budget={settings.dp_budget_enabled} "
+        f"dp_budget_info={json.dumps(settings.dp_budget_info, ensure_ascii=False) if settings.dp_budget_info else None} "
         f"speed_ignored={req.speed != 1.0} "
         f"prompt_preview={prompt_text[:180]!r} "
         f"preview={req.text[:240]!r}",
@@ -1029,48 +1201,76 @@ def synthesize(req: SynthesizeRequest):
         flush=True,
     )
 
-    audio_list = None
-    sample_rate = m.sample_rate
-    postprocess_info: dict[str, Any] = {}
     with inference_lock:
-        audio_list, sample_rate = m.generate_voice_clone(
-            text=req.text,
-            language=language,
-            ref_audio=str(sample_path),
-            ref_text=prompt_text,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            xvec_only=xvec_only,
-            non_streaming_mode=non_streaming_mode,
-            append_silence=True,
-        )
+        mp3_bytes, info = _generate_qwen_mp3(req, sample_path, prompt_text, xvec_only, settings)
 
-        if not audio_list:
-            raise HTTPException(500, "Model produced no output")
-
-        wav_data = np.asarray(audio_list[0], dtype=np.float32).flatten()
-        raw_audio_seconds = wav_data.size / sample_rate
-        wav_data, postprocess_info = postprocess_audio(wav_data, sample_rate)
-
-    cap_seconds = max_new_tokens / 12.0
-    hit_token_cap = raw_audio_seconds >= max(0.0, cap_seconds - 0.25)
     print(
         "synthesize response "
         f"text_hash={text_hash} "
-        f"raw_audio_seconds={raw_audio_seconds:.2f} "
-        f"audio_seconds={wav_data.size / sample_rate:.2f} "
-        f"cap_seconds={cap_seconds:.2f} "
-        f"hit_token_cap={hit_token_cap} "
-        f"deepfilter={postprocess_info.get('deepfilter')} "
-        f"silence_trim={postprocess_info.get('trim')} "
-        f"trim_head_seconds={postprocess_info.get('trim_head_seconds', 0.0):.2f} "
-        f"trim_tail_seconds={postprocess_info.get('trim_tail_seconds', 0.0):.2f}",
+        f"raw_audio_seconds={info['raw_audio_seconds']:.2f} "
+        f"audio_seconds={info['audio_seconds']:.2f} "
+        f"cap_seconds={info['cap_seconds']:.2f} "
+        f"hit_token_cap={info['hit_token_cap']} "
+        f"deepfilter={info['postprocess'].get('deepfilter')} "
+        f"silence_trim={info['postprocess'].get('trim')} "
+        f"trim_head_seconds={info['postprocess'].get('trim_head_seconds', 0.0):.2f} "
+        f"trim_tail_seconds={info['postprocess'].get('trim_tail_seconds', 0.0):.2f}",
         file=sys.stderr,
         flush=True,
     )
-    mp3_bytes = wav_to_mp3(wav_data, sample_rate)
 
     return StreamingResponse(io.BytesIO(mp3_bytes), media_type="audio/mpeg")
+
+
+@router.post("/synthesize-batch", response_model=BatchSynthesizeResponse)
+def synthesize_batch(req: BatchSynthesizeRequest):
+    texts = [text.strip() for text in req.texts]
+    if any(not text for text in texts):
+        raise HTTPException(400, "all texts must be non-empty")
+
+    common_request = req.dict(exclude={"texts", "true_batch", "batch_backend"})
+    first_req = SynthesizeRequest(**common_request, text=texts[0])
+    sample_path, prompt_text, xvec_only = _resolve_voice_prompt(first_req)
+    item_requests = [SynthesizeRequest(**common_request, text=text) for text in texts]
+    settings_list = [_resolve_generation_settings(item_req) for item_req in item_requests]
+
+    started = time.perf_counter()
+    items: list[BatchSynthesizeItem] = []
+    with inference_lock:
+        if req.true_batch:
+            generated = _generate_qwen_batch_mp3(
+                texts=texts,
+                sample_path=sample_path,
+                prompt_text=prompt_text,
+                xvec_only=xvec_only,
+                settings_list=settings_list,
+                batch_backend=req.batch_backend,
+            )
+        else:
+            generated = [
+                _generate_qwen_mp3(item_req, sample_path, prompt_text, xvec_only, settings)
+                for item_req, settings in zip(item_requests, settings_list)
+            ]
+
+        for text, settings, (mp3_bytes, info) in zip(texts, settings_list, generated):
+            items.append(
+                BatchSynthesizeItem(
+                    text=text,
+                    audio_base64=base64.b64encode(mp3_bytes).decode("ascii"),
+                    sample_rate=int(info["sample_rate"]),
+                    raw_audio_seconds=float(info["raw_audio_seconds"]),
+                    audio_seconds=float(info["audio_seconds"]),
+                    max_new_tokens=settings.max_new_tokens,
+                    hit_token_cap=bool(info["hit_token_cap"]),
+                    language=settings.language,
+                    dp_language=settings.dp_language,
+                )
+            )
+
+    wall_seconds = time.perf_counter() - started
+    return BatchSynthesizeResponse(
+        items=items,
+        count=len(items),
+        wall_seconds=wall_seconds,
+        audio_seconds_total=sum(item.audio_seconds for item in items),
+    )

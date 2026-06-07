@@ -49,6 +49,7 @@ class FasterQwen3TTS:
         self.max_seq_len = max_seq_len
         self.sample_rate = self._infer_sample_rate(base_model)
         self._warmed_up = False
+        self._batch_graphs = {}
         self.max_voice_prompt_cache_entries = max(
             0,
             int(os.environ.get("QWEN_TTS_VOICE_PROMPT_CACHE_ENTRIES", "8")),
@@ -670,6 +671,62 @@ class FasterQwen3TTS:
         self.talker_graph.capture(prefill_len=prefill_len, num_warmup=3)
         self._warmed_up = True
         logger.info("CUDA graphs captured and ready")
+
+    def _get_batch_graphs(self, batch_size: int, prefill_len: int):
+        """Return CUDA graphs captured for a fixed batch size."""
+        if batch_size == 1:
+            if not self._warmed_up:
+                self._warmup(prefill_len)
+            return self.predictor_graph, self.talker_graph
+
+        if batch_size in self._batch_graphs:
+            return self._batch_graphs[batch_size]
+
+        logger.info("Capturing CUDA graphs for batch_size=%s...", batch_size)
+        from .predictor_graph import PredictorGraph
+        from .talker_graph import TalkerGraph
+
+        talker = self.model.model.talker
+        talker_config = self.model.model.config.talker_config
+        predictor = talker.code_predictor
+        pred_config = predictor.model.config
+
+        predictor_graph = PredictorGraph(
+            predictor,
+            pred_config,
+            talker_config.hidden_size,
+            device=self.device,
+            dtype=self.dtype,
+            # Batched CUDA graph replay plus batched multinomial sampling in the
+            # residual codebook predictor produced unstable codec residuals. Keep
+            # the main talker token sampled, but make batched residual codebooks
+            # deterministic.
+            do_sample=False,
+            top_k=50,
+            temperature=0.9,
+            batch_size=batch_size,
+        )
+        for layer_idx, cache_dtype in enumerate(self.predictor_graph.layer_cache_dtypes):
+            if cache_dtype != self.dtype:
+                predictor_graph.set_layer_cache_dtype(layer_idx, cache_dtype)
+
+        talker_graph = TalkerGraph(
+            talker.model,
+            talker_config,
+            device=self.device,
+            dtype=self.dtype,
+            max_seq_len=self.max_seq_len,
+            batch_size=batch_size,
+        )
+        for layer_idx, cache_dtype in enumerate(self.talker_graph.layer_cache_dtypes):
+            if cache_dtype != self.dtype:
+                talker_graph.set_layer_cache_dtype(layer_idx, cache_dtype)
+
+        predictor_graph.capture(num_warmup=3)
+        talker_graph.capture(prefill_len=prefill_len, num_warmup=3)
+        self._batch_graphs[batch_size] = (predictor_graph, talker_graph)
+        logger.info("CUDA graphs captured for batch_size=%s", batch_size)
+        return predictor_graph, talker_graph
     
     def generate(
         self,
@@ -956,6 +1013,103 @@ class FasterQwen3TTS:
         ref_codes = None
         if using_icl_mode and vcp.get("ref_code") and vcp["ref_code"][0] is not None:
             ref_codes = vcp["ref_code"][0]
+
+        return m, talker, config, tie, tam, tth, tpe, ref_codes
+
+    @staticmethod
+    def _expand_voice_clone_prompt_batch(vcp: Dict[str, Any], ref_ids: list, batch_size: int):
+        """Reuse a single resolved reference prompt for every item in a batch."""
+        if batch_size <= 1:
+            return vcp, ref_ids
+
+        expanded = {}
+        for key, value in vcp.items():
+            if isinstance(value, list) and len(value) == 1:
+                expanded[key] = value * batch_size
+            else:
+                expanded[key] = value
+
+        if len(ref_ids) == 1:
+            ref_ids = ref_ids * batch_size
+        return expanded, ref_ids
+
+    def _prepare_generation_batch(
+        self,
+        texts: List[str],
+        ref_audio: Optional[Union[str, Path]] = None,
+        ref_text: str = "",
+        language: Union[str, List[str]] = "English",
+        xvec_only: bool = False,
+        non_streaming_mode: bool = False,
+        append_silence: bool = True,
+        voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
+        instruct: Optional[Union[str, List[Optional[str]]]] = None,
+    ):
+        """Prepare a true batch for non-streaming voice-clone generation."""
+        if not texts:
+            raise ValueError("texts must not be empty")
+
+        input_texts = [self.model._build_assistant_text(text) for text in texts]
+        input_ids = self.model._tokenize_texts(input_texts)
+        batch_size = len(input_ids)
+
+        if isinstance(language, str) or language is None:
+            languages = [language if language is not None else "Auto"] * batch_size
+        else:
+            languages = list(language)
+            if len(languages) != batch_size:
+                raise ValueError(f"language list must have length {batch_size}, got {len(languages)}")
+
+        if instruct is None or isinstance(instruct, str):
+            instructs = [instruct] * batch_size
+        else:
+            instructs = list(instruct)
+            if len(instructs) != batch_size:
+                raise ValueError(f"instruct list must have length {batch_size}, got {len(instructs)}")
+
+        instruct_ids = [
+            None if not item else self.model._tokenize_texts([self.model._build_instruct_text(item)])[0]
+            for item in instructs
+        ]
+
+        vcp, ref_ids, using_icl_mode = self._resolve_voice_clone_prompt(
+            input_ids=input_ids,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            xvec_only=xvec_only,
+            append_silence=append_silence,
+            voice_clone_prompt=voice_clone_prompt,
+        )
+        vcp, ref_ids = self._expand_voice_clone_prompt_batch(vcp, ref_ids, batch_size)
+
+        if any(instructs) and not using_icl_mode:
+            logger.warning(
+                "Base-model instruct with x-vector-only voice cloning is experimental. "
+                "Prefer xvec_only=False (ICL mode) when using instruct for voice cloning."
+            )
+
+        m = self.model.model
+        tie, tam, tth, tpe = self._build_talker_inputs_local(
+            m=m,
+            input_ids=input_ids,
+            ref_ids=ref_ids,
+            voice_clone_prompt=vcp,
+            languages=languages,
+            speakers=None,
+            non_streaming_mode=non_streaming_mode,
+            instruct_ids=instruct_ids,
+        )
+
+        talker = m.talker
+        config = m.config.talker_config
+        talker.rope_deltas = None
+
+        ref_codes = [None] * batch_size
+        if using_icl_mode and vcp.get("ref_code"):
+            ref_codes = [
+                vcp["ref_code"][i] if vcp["icl_mode"][i] and vcp["ref_code"][i] is not None else None
+                for i in range(batch_size)
+            ]
 
         return m, talker, config, tie, tam, tth, tpe, ref_codes
 
@@ -1350,6 +1504,130 @@ class FasterQwen3TTS:
             f"({timing['ms_per_step']:.1f}ms/step, RTF: {rtf:.2f})"
         )
         
+        return audio_arrays, sr
+
+    @torch.inference_mode()
+    def generate_voice_clone_batch(
+        self,
+        texts: List[str],
+        language: Union[str, List[str]],
+        ref_audio: Optional[Union[str, Path]] = None,
+        ref_text: str = "",
+        max_new_tokens: int = 2048,
+        min_new_tokens: int = 2,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        do_sample: bool = True,
+        repetition_penalty: float = 1.05,
+        xvec_only: bool = False,
+        non_streaming_mode: Optional[bool] = None,
+        append_silence: bool = True,
+        instruct: Optional[Union[str, List[Optional[str]]]] = None,
+        voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
+        use_cuda_graph_batch: bool = False,
+    ) -> Tuple[list, int]:
+        """Generate a batch of voice-cloned utterances in one model call.
+
+        The default uses the dynamic HF generation path because it matches the
+        model's native batched generation behavior. The experimental CUDA graph
+        path is faster, but remains opt-in until its batched codec residual path
+        is fully validated.
+        """
+        from .generate import fast_generate_batch_graph, hf_generate_batch
+
+        non_streaming_mode = self._resolve_non_streaming_mode(
+            non_streaming_mode,
+            default=False,
+        )
+
+        m, talker, config, tie, tam, tth, tpe, ref_codes_list = self._prepare_generation_batch(
+            texts=texts,
+            language=language,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            xvec_only=xvec_only,
+            non_streaming_mode=non_streaming_mode,
+            append_silence=append_silence,
+            voice_clone_prompt=voice_clone_prompt,
+            instruct=instruct,
+        )
+
+        if use_cuda_graph_batch:
+            predictor_graph, talker_graph = self._get_batch_graphs(
+                batch_size=len(texts),
+                prefill_len=tie.shape[1],
+            )
+            codec_ids_list, timing = fast_generate_batch_graph(
+                talker=talker,
+                talker_input_embeds=tie,
+                attention_mask=tam,
+                trailing_text_hiddens=tth,
+                tts_pad_embed=tpe,
+                config=config,
+                predictor_graph=predictor_graph,
+                talker_graph=talker_graph,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
+                repetition_penalty=repetition_penalty,
+            )
+        else:
+            codec_ids_list, timing = hf_generate_batch(
+                talker=talker,
+                talker_input_embeds=tie,
+                attention_mask=tam,
+                trailing_text_hiddens=tth,
+                tts_pad_embed=tpe,
+                config=config,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
+                repetition_penalty=repetition_penalty,
+            )
+
+        speech_tokenizer = m.speech_tokenizer
+        audio_arrays = []
+        sr = self.sample_rate
+        for codec_ids, ref_codes in zip(codec_ids_list, ref_codes_list):
+            if codec_ids is None or codec_ids.numel() == 0:
+                audio_arrays.append(np.zeros(1, dtype=np.float32))
+                continue
+
+            if ref_codes is not None:
+                ref_codes_dev = ref_codes.to(codec_ids.device)
+                codes_for_decode = torch.cat([ref_codes_dev, codec_ids], dim=0)
+            else:
+                codes_for_decode = codec_ids
+
+            audio_list, sr = speech_tokenizer.decode({"audio_codes": codes_for_decode.unsqueeze(0)})
+            audio = audio_list[0]
+            if hasattr(audio, "cpu"):
+                audio = audio.flatten().cpu().numpy()
+            else:
+                audio = audio.flatten() if hasattr(audio, "flatten") else audio
+
+            ref_len = ref_codes.shape[0] if ref_codes is not None else 0
+            if ref_len > 0:
+                cut = int(ref_len / max(codes_for_decode.shape[0], 1) * len(audio))
+                audio = audio[cut:]
+            audio_arrays.append(audio)
+
+        item_steps = timing.get("item_steps", [])
+        total_audio_duration = sum(steps / 12.0 for steps in item_steps)
+        total_time = timing["prefill_ms"] / 1000 + timing["decode_s"]
+        rtf = total_audio_duration / total_time if total_time > 0 else 0.0
+        logger.info(
+            f"Generated batch of {len(audio_arrays)} with {total_audio_duration:.2f}s audio "
+            f"in {total_time:.2f}s ({timing['ms_per_step']:.1f}ms/max-step, aggregate RTF: {rtf:.2f})"
+        )
+
         return audio_arrays, sr
 
     @torch.inference_mode()

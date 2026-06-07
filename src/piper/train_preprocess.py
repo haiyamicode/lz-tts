@@ -15,8 +15,12 @@ from multiprocessing import JoinableQueue, Process, Queue
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from piper_phonemize import (
     phonemize_espeak,
+    phonemize_espeak_with_mapping,
     phonemize_codepoints,
     phoneme_ids_espeak,
     phoneme_ids_codepoints,
@@ -28,6 +32,10 @@ from piper_phonemize import (
 from ..multilingual_splitter import MultilingualSplitter
 
 from .norm_audio import cache_norm_audio, make_silence_detector
+from .preprocess import (
+    _phonemize_espeak_for_voice_with_spans as _runtime_phonemize_espeak_for_voice_with_spans,
+    _phonemize_multilingual_with_spans as _runtime_phonemize_multilingual_with_spans,
+)
 
 _DIR = Path(__file__).parent
 _VERSION = (_DIR / "VERSION").read_text(encoding="utf-8").strip()
@@ -283,40 +291,38 @@ def main() -> None:
     _LOGGER.info(
         "Processing %s utterance(s) with %s worker(s)", num_utterances, args.max_workers
     )
-    with open(args.output_dir / "dataset.jsonl", "w", encoding="utf-8") as dataset_file:
-        for utt_batch in batched(
-            make_dataset(args),
-            batch_size,
-        ):
-            queue_in.put(utt_batch)
+    for utt_batch in batched(
+        make_dataset(args),
+        batch_size,
+    ):
+        queue_in.put(utt_batch)
 
-        _LOGGER.debug("Waiting for jobs to finish")
-        missing_phonemes: "Counter[str]" = Counter()
-        for _ in range(num_utterances):
-            utt = queue_out.get()
-            if utt is not None:
-                if utt.speaker is not None and utt.speaker in speaker_ids:
-                    utt.speaker_id = speaker_ids[utt.speaker]
+    _LOGGER.debug("Waiting for jobs to finish")
+    missing_phonemes: "Counter[str]" = Counter()
+    dataset_rows: List[dict] = []
+    for _ in range(num_utterances):
+        utt = queue_out.get()
+        if utt is not None:
+            if utt.speaker is not None and utt.speaker in speaker_ids:
+                utt.speaker_id = speaker_ids[utt.speaker]
 
-                utt_dict = dataclasses.asdict(utt)
-                utt_dict.pop("missing_phonemes")
+            utt_dict = dataclasses.asdict(utt)
+            utt_dict.pop("missing_phonemes")
+            dataset_rows.append(
+                json.loads(json.dumps(utt_dict, ensure_ascii=False, cls=PathEncoder))
+            )
 
-                # JSONL
-                json.dump(
-                    utt_dict,
-                    dataset_file,
-                    ensure_ascii=False,
-                    cls=PathEncoder,
-                )
-                print("", file=dataset_file)
+            missing_phonemes.update(utt.missing_phonemes)
 
-                missing_phonemes.update(utt.missing_phonemes)
+    dataset_path = args.output_dir / "dataset.parquet"
+    pq.write_table(pa.Table.from_pylist(dataset_rows), dataset_path, compression="zstd")
+    _LOGGER.info("Wrote %s utterance(s) to %s", len(dataset_rows), dataset_path)
 
-        if missing_phonemes:
-            for phoneme, count in missing_phonemes.most_common():
-                _LOGGER.warning("Missing %s (%s)", phoneme, count)
+    if missing_phonemes:
+        for phoneme, count in missing_phonemes.most_common():
+            _LOGGER.warning("Missing %s (%s)", phoneme, count)
 
-            _LOGGER.warning("Missing %s phoneme(s)", len(missing_phonemes))
+        _LOGGER.warning("Missing %s phoneme(s)", len(missing_phonemes))
 
     # Signal workers to stop
     for proc in processes:
@@ -442,6 +448,85 @@ def _katakana_to_hiragana(text: str) -> str:
     return "".join(chars)
 
 
+_KANA_LONG_VOWELS = {
+    **dict.fromkeys("あかさたなはまやらわがざだばぱぁゃ", "あ"),
+    **dict.fromkeys("いきしちにひみりぎじぢびぴぃ", "い"),
+    **dict.fromkeys("うくすつぬふむゆるぐずづぶぷぅゅ", "う"),
+    **dict.fromkeys("えけせてねへめれげぜでべぺぇ", "え"),
+    **dict.fromkeys("おこそとのほもよろをごぞどぼぽぉょ", "お"),
+}
+
+
+def _japanese_long_vowel_suffix(reading: str) -> str:
+    for ch in reversed(_katakana_to_hiragana(reading)):
+        suffix = _KANA_LONG_VOWELS.get(ch)
+        if suffix is not None:
+            return suffix
+    return "う"
+
+
+def _append_to_last_japanese_reading(
+    tokens: List[Tuple[int, int, str]], end: int, suffix: str
+) -> bool:
+    if not tokens:
+        return False
+    start, _, reading = tokens[-1]
+    tokens[-1] = (start, end, reading + suffix)
+    return True
+
+
+_JAPANESE_READING_OVERRIDES = {
+    # These occur in malformed/truncated dataset rows where ipadic has no
+    # reading. Keeping them as raw CJK makes eSpeak say "Chinese letter".
+    "詳": "しょう",
+    "也": "や",
+    "遤": "おそ",
+    "衔": "しゅう",
+    "衔国": "しゅうこく",
+}
+
+_JAPANESE_READING_REPLACEMENTS = (
+    ("・", " "),
+    ("ゔぁ", "ば"),
+    ("ゔぃ", "び"),
+    ("ゔぇ", "べ"),
+    ("ゔぉ", "ぼ"),
+    ("ゔゅ", "びゅ"),
+    ("ゔ", "ぶ"),
+    ("うぃ", "うい"),
+    ("うぇ", "うえ"),
+    ("うぉ", "うお"),
+)
+
+
+def _normalize_japanese_reading_for_espeak(reading: str) -> str:
+    normalized = _katakana_to_hiragana(reading)
+    for old, new in _JAPANESE_READING_REPLACEMENTS:
+        normalized = normalized.replace(old, new)
+    return normalized
+
+
+def _fallback_japanese_reading(surface: str) -> str:
+    override = _JAPANESE_READING_OVERRIDES.get(surface)
+    if override is not None:
+        return override
+
+    try:
+        import pykakasi
+
+        converted = pykakasi.kakasi().convert(surface)
+    except Exception:
+        converted = []
+
+    reading = "".join(str(item.get("hira") or "") for item in converted)
+    if reading:
+        return reading
+
+    if any("\u4e00" <= ch <= "\u9fff" for ch in surface):
+        return ""
+    return surface
+
+
 def _token_feature_value(token, index: int) -> str:
     feature = getattr(token, "feature", None)
     if feature is None:
@@ -453,33 +538,73 @@ def _token_feature_value(token, index: int) -> str:
     return "" if value in (None, "*") else str(value)
 
 
+def _locate_japanese_surface(text: str, surface: str, cursor: int) -> Tuple[int, int]:
+    start = text.find(surface, cursor)
+    if start < 0:
+        start = cursor
+    return start, start + len(surface)
+
+
 def _japanese_reading_tokens(text: str) -> List[Tuple[int, int, str]]:
     import ipadic  # type: ignore
     from fugashi import GenericTagger  # type: ignore
 
     norm_text = text
     tagger = GenericTagger(ipadic.MECAB_ARGS)
+    parsed_tokens = list(tagger(norm_text))
     tokens: List[Tuple[int, int, str]] = []
     cursor = 0
+    token_index = 0
 
-    for token in tagger(norm_text):
+    while token_index < len(parsed_tokens):
+        token = parsed_tokens[token_index]
         surface = token.surface
         if not surface:
+            token_index += 1
             continue
 
-        start = norm_text.find(surface, cursor)
-        if start < 0:
-            start = cursor
-        end = start + len(surface)
+        start, end = _locate_japanese_surface(norm_text, surface, cursor)
+
+        next_surfaces = [
+            parsed_tokens[token_index + offset].surface
+            for offset in range(3)
+            if token_index + offset < len(parsed_tokens)
+        ]
+        if len(next_surfaces) >= 3 and next_surfaces[:3] == ["N", "700", "系"]:
+            _, end_700 = _locate_japanese_surface(norm_text, "700", end)
+            _, end_series = _locate_japanese_surface(norm_text, "系", end_700)
+            tokens.append((start, end_series, "えぬななひゃくけい"))
+            cursor = end_series
+            token_index += 3
+            continue
+        if len(next_surfaces) >= 2 and next_surfaces[:2] == ["700", "系"]:
+            _, end_series = _locate_japanese_surface(norm_text, "系", end)
+            tokens.append((start, end_series, "ななひゃくけい"))
+            cursor = end_series
+            token_index += 2
+            continue
+
         cursor = end
+
+        if surface == "ー":
+            _append_to_last_japanese_reading(tokens, end, _japanese_long_vowel_suffix(tokens[-1][2] if tokens else ""))
+            token_index += 1
+            continue
+
+        if surface == "々":
+            if tokens:
+                _append_to_last_japanese_reading(tokens, end, tokens[-1][2])
+            token_index += 1
+            continue
 
         if surface in _PUNCT_MAP:
             tokens.append((start, end, _PUNCT_MAP[surface].strip() or surface))
+            token_index += 1
             continue
 
         pos = _token_feature_value(token, 0)
         pronunciation = _token_feature_value(token, 8)
-        reading = pronunciation or _token_feature_value(token, 7) or surface
+        reading = pronunciation or _token_feature_value(token, 7) or _fallback_japanese_reading(surface)
 
         if pos == "助詞":
             if surface == "は":
@@ -489,7 +614,9 @@ def _japanese_reading_tokens(text: str) -> List[Tuple[int, int, str]]:
             elif surface == "を":
                 reading = "オ"
 
-        tokens.append((start, end, _katakana_to_hiragana(reading)))
+        if reading:
+            tokens.append((start, end, _normalize_japanese_reading_for_espeak(reading)))
+        token_index += 1
 
     return tokens
 
@@ -504,12 +631,52 @@ def _phonemize_espeak_for_voice(text: str, voice: str, casing_fn, espeak_data) -
     return [p for sent in all_phonemes for p in sent]
 
 
+def _flatten_phoneme_sentences(sentences: list) -> List[str]:
+    return [p for sentence in sentences for p in sentence]
+
+
+def _word_spans_from_mapping(
+    sentences: list,
+    sent_word_mapping: list,
+) -> List[List[int]]:
+    spans: List[List[int]] = []
+    ph_offset = 0
+    for sentence, mappings in zip(sentences, sent_word_mapping):
+        for text_start, text_len, ph_start, ph_end, _punct_len in mappings:
+            start = int(text_start) - 1
+            end = start + int(text_len)
+            spans.append(
+                [
+                    start,
+                    end,
+                    ph_offset + int(ph_start),
+                    ph_offset + int(ph_end),
+                ]
+            )
+        ph_offset += len(sentence)
+    return spans
+
+
+def _phonemize_espeak_for_voice_with_spans(
+    text: str,
+    voice: str,
+    casing_fn,
+    espeak_data,
+) -> Tuple[list, Optional[List[List[int]]], str]:
+    return _runtime_phonemize_espeak_for_voice_with_spans(
+        text,
+        voice,
+        casing_fn,
+        espeak_data,
+    )
+
+
 def _map_cld2_to_espeak(lang_code: str, primary_voice: str = "en-us") -> str:
     """Map language code to an espeak-ng voice in a simple, predictable way.
 
     - Normalize to lowercase, replace '_' with '-'
     - Take the base language (split on '-')
-    - Special-cases: Chinese -> 'cmn-latn-pinyin'; 'en' -> 'en-us'
+    - Special-cases: Chinese -> 'cmn-latn-pinyin'; plain 'en' -> primary voice
     - Otherwise return the base code directly (most espeak voices match base code)
     """
     if not lang_code:
@@ -517,6 +684,12 @@ def _map_cld2_to_espeak(lang_code: str, primary_voice: str = "en-us") -> str:
 
     code = lang_code.strip().lower().replace("_", "-")
     base = code.split("-", 1)[0] if code else "en"
+
+    if code in ("en-us", "en-us+f3", "en-us+f4"):
+        return code
+
+    if code == "en":
+        return primary_voice
 
     # Cantonese: zh-HK, zh-yue, yue -> espeak "yue" voice
     if base == "yue" or code in ("zh-hk", "zh-yue"):
@@ -540,9 +713,6 @@ def _map_cld2_to_espeak(lang_code: str, primary_voice: str = "en-us") -> str:
         # Mongolian -> approximate with Russian
         return "ru"
 
-    if lang_code == "en":
-        return primary_voice
-
     return base
 
 
@@ -558,39 +728,30 @@ def _phonemize_multilingual(
     espeak_data: Optional[str] = None,
     primary_voice: str = "en-us",
 ) -> list:
-    """Phonemize mixed-language text using MultilingualSplitter for segmentation.
-    """
-    splitter = MultilingualSplitter()
-    result = splitter.split(text)
-    segments = result.segments
-    main_lang = result.main_language
-    _LOGGER.debug("multilingual_splitter segments: %s (main=%s)", [(seg.language, _short_text(seg.text, 40)) for seg in segments], main_lang)
-    phonemes: list = []
-
-    for idx, seg in enumerate(segments):
-        span_text = seg.text
-        # Use main language as fallback for undetermined/empty segments
-        lang = seg.language if seg.language and seg.language != "und" else main_lang or "en"
-        # Skip empty segments
-        if not span_text.strip():
-            continue
-        voice = _select_voice_for_span(lang, primary_voice)
-        norm_span_text = _normalize_text_for_voice(span_text, voice)
-        _LOGGER.debug(
-            "span[%s]: lang=%s voice=%s text='%s'",
-            idx,
-            lang,
-            voice,
-            _short_text(norm_span_text, 80),
-        )
-        # No explicit language tokens; language is conveyed via speaker (multi-speaker setup)
-        span_phonemes = _phonemize_espeak_for_voice(span_text, voice, casing_fn, espeak_data)
-        _LOGGER.debug("span[%s] phonemes=%s", idx, _short_list(span_phonemes, 32))
-        if phonemes and span_phonemes:
-            phonemes.append(" ")
-        phonemes.extend(span_phonemes)
-
+    """Phonemize mixed-language text using MultilingualSplitter for segmentation."""
+    phonemes, _word_spans, _semantic_text = _phonemize_multilingual_with_spans(
+        text,
+        casing_fn,
+        espeak_data,
+        primary_voice,
+    )
     return phonemes
+
+
+def _phonemize_multilingual_with_spans(
+    text: str,
+    casing_fn,
+    espeak_data: Optional[str] = None,
+    primary_voice: str = "en-us",
+) -> Tuple[list, Optional[List[List[int]]], str]:
+    """Training wrapper for the runtime multilingual span implementation."""
+    return _runtime_phonemize_multilingual_with_spans(
+        text,
+        casing_fn,
+        espeak_data,
+        primary_voice,
+        neural=False,
+    )
 
 
 def phonemize_text_for_infer(
@@ -620,17 +781,29 @@ def phonemize_text_for_infer(
         "infer: is_multi=%s voice=%s primary=%s", is_multi, es_voice or lang_code, primary
     )
     if is_multi:
-        phonemes = _phonemize_multilingual(text, casing, espeak_data, primary)
+        phonemes, word_spans, semantic_text = _phonemize_multilingual_with_spans(
+            text,
+            casing,
+            espeak_data,
+            primary,
+        )
     else:
         voice = es_voice or lang_code or primary
         voice = _map_cld2_to_espeak(voice, primary)
         norm_text = _normalize_text_for_voice(text, voice)
         _LOGGER.debug("infer: voice=%s text='%s'", voice, _short_text(norm_text, 120))
-        phonemes = _phonemize_espeak_for_voice(text, voice, casing, espeak_data)
+        phonemes, word_spans, semantic_text = _phonemize_espeak_for_voice_with_spans(
+            text, voice, casing, espeak_data
+        )
     _LOGGER.debug("infer: phonemes=%s", _short_list(phonemes, 48))
 
     ids = phoneme_ids_espeak(phonemes)
-    return {"phonemes": phonemes, "phoneme_ids": ids}
+    return {
+        "phonemes": phonemes,
+        "phoneme_ids": ids,
+        "text": semantic_text,
+        "word_spans": word_spans,
+    }
 
 
 def phonemize_spans_with_speakers(
@@ -710,14 +883,18 @@ def phonemize_spans_with_speakers(
             spk_label, spk_id, voice = speaker_info
 
         _LOGGER.debug("infer-multispan: lang=%s voice=%s spk_label=%s spk_id=%s", lang, voice, spk_label, spk_id)
-        ph = _phonemize_espeak_for_voice(span_text, voice, casing, espeak_data)
+        ph, word_spans, semantic_text = _phonemize_espeak_for_voice_with_spans(
+            span_text, voice, casing, espeak_data
+        )
         _LOGGER.debug("infer-multispan: phonemes=%s", _short_list(ph, 40))
         ids = phoneme_ids_espeak(ph)
         results.append(
             {
+                "phonemes": ph,
                 "phoneme_ids": ids,
                 "speaker_id": int(spk_id),
-                "text": span_text,
+                "text": semantic_text,
+                "word_spans": word_spans,
             }
         )
 
@@ -757,11 +934,19 @@ def phonemize_text_for_speaker(
     casing = get_text_casing("ignore")
     norm_text = _normalize_text_for_voice(text, voice)
     _LOGGER.debug("infer-forced: text='%s'", _short_text(norm_text, 120))
-    phonemes = _phonemize_espeak_for_voice(text, voice, casing, espeak_data)
+    phonemes, word_spans, semantic_text = _phonemize_espeak_for_voice_with_spans(
+        text, voice, casing, espeak_data
+    )
     _LOGGER.debug("infer-forced: phonemes=%s", _short_list(phonemes, 48))
     ids = phoneme_ids_espeak(phonemes)
     spk_id = spk_id_map.get(label, 0)
-    return {"phoneme_ids": ids, "speaker_id": int(spk_id), "text": text}
+    return {
+        "phonemes": phonemes,
+        "phoneme_ids": ids,
+        "speaker_id": int(spk_id),
+        "text": semantic_text,
+        "word_spans": word_spans,
+    }
 
 
 def phonemize_batch_espeak(
@@ -790,14 +975,14 @@ def phonemize_batch_espeak(
                                 spk, getattr(args, "primary_voice", "en-us")
                             )
                             _LOGGER.debug("train-ms: skip split, speaker=%s -> voice=%s", spk, voice)
-                            utt.phonemes = _phonemize_espeak_for_voice(
+                            utt.phonemes, utt.word_spans, utt.text = _phonemize_espeak_for_voice_with_spans(
                                 utt.text, voice, casing, args.espeak_data
                             )
                             _LOGGER.debug("train-ms: phonemes=%s", _short_list(utt.phonemes, 48))
                         else:
                             # No speaker provided; segment by language and normalize per-span
                             _LOGGER.debug("train-ms: no speaker -> split by language")
-                            utt.phonemes = _phonemize_multilingual(
+                            utt.phonemes, utt.word_spans, utt.text = _phonemize_multilingual_with_spans(
                                 utt.text,
                                 casing,
                                 args.espeak_data,
@@ -806,7 +991,7 @@ def phonemize_batch_espeak(
                             _LOGGER.debug("train-ms: phonemes=%s", _short_list(utt.phonemes, 48))
                     else:
                         voice = _map_cld2_to_espeak(args.language, getattr(args, "primary_voice", "en-us"))
-                        utt.phonemes = _phonemize_espeak_for_voice(
+                        utt.phonemes, utt.word_spans, utt.text = _phonemize_espeak_for_voice_with_spans(
                             utt.text, voice, casing, args.espeak_data
                         )
                         _LOGGER.debug("train-ss: voice=%s phonemes=%s", args.language, _short_list(utt.phonemes, 48))
@@ -893,6 +1078,7 @@ class Utterance:
     speaker_id: Optional[int] = None
     phonemes: Optional[List[str]] = None
     phoneme_ids: Optional[List[int]] = None
+    word_spans: Optional[List[List[int]]] = None
     audio_norm_path: Optional[Path] = None
     audio_spec_path: Optional[Path] = None
     missing_phonemes: "Counter[str]" = field(default_factory=Counter)
@@ -903,6 +1089,23 @@ class PathEncoder(json.JSONEncoder):
         if isinstance(o, Path):
             return str(o)
         return super().default(o)
+
+
+def _iter_pipe_metadata_rows(metadata_path: Path) -> Iterable[Tuple[int, List[str]]]:
+    with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+        for line_no, line in enumerate(metadata_file, 1):
+            line = line.rstrip("\n")
+            if not line:
+                continue
+
+            row = line.split("|", 2)
+            if len(row) < 2:
+                raise ValueError(
+                    f"Expected filename|text or filename|speaker|text at "
+                    f"{metadata_path}:{line_no}: {line[:200]!r}"
+                )
+
+            yield line_no, row
 
 
 def ljspeech_dataset(args: argparse.Namespace) -> Iterable[Utterance]:
@@ -920,44 +1123,44 @@ def ljspeech_dataset(args: argparse.Namespace) -> Iterable[Utterance]:
     if not wav_dir.is_dir():
         wav_dir = dataset_dir / "wavs"
 
-    with open(metadata_path, "r", encoding="utf-8") as csv_file:
-        reader = csv.reader(csv_file, delimiter="|")
-        for row in reader:
-            assert len(row) >= 2, "Not enough columns"
+    for line_no, row in _iter_pipe_metadata_rows(metadata_path):
+        speaker: Optional[str] = None
+        if is_single_speaker or (len(row) == 2):
+            filename, text = row[0], row[-1]
+        else:
+            filename, speaker, text = row[0], row[1], row[2]
 
-            speaker: Optional[str] = None
-            if is_single_speaker or (len(row) == 2):
-                filename, text = row[0], row[-1]
-            else:
-                filename, speaker, text = row[0], row[1], row[-1]
+        filename = filename.strip()
+        speaker = speaker.strip() if speaker is not None else None
+        text = text.strip()
 
-            # Try file name relative to metadata
-            wav_path = metadata_path.parent / filename
+        # Try file name relative to metadata
+        wav_path = metadata_path.parent / filename
 
+        if not wav_path.exists():
+            # Try with .wav
+            wav_path = metadata_path.parent / f"{filename}.wav"
+
+        if not wav_path.exists():
+            # Try wav/ or wavs/
+            wav_path = wav_dir / filename
+
+        if not wav_path.exists():
+            # Try with .wav
+            wav_path = wav_dir / f"{filename}.wav"
+
+        if not skip_audio:
             if not wav_path.exists():
-                # Try with .wav
-                wav_path = metadata_path.parent / f"{filename}.wav"
+                _LOGGER.warning("Missing %s", filename)
+                continue
 
-            if not wav_path.exists():
-                # Try wav/ or wavs/
-                wav_path = wav_dir / filename
+            if wav_path.stat().st_size == 0:
+                _LOGGER.warning("Empty file: %s", wav_path)
+                continue
 
-            if not wav_path.exists():
-                # Try with .wav
-                wav_path = wav_dir / f"{filename}.wav"
-
-            if not skip_audio:
-                if not wav_path.exists():
-                    _LOGGER.warning("Missing %s", filename)
-                    continue
-
-                if wav_path.stat().st_size == 0:
-                    _LOGGER.warning("Empty file: %s", wav_path)
-                    continue
-
-            yield Utterance(
-                text=text, audio_path=wav_path, speaker=speaker, speaker_id=speaker_id
-            )
+        yield Utterance(
+            text=text, audio_path=wav_path, speaker=speaker, speaker_id=speaker_id
+        )
 
 
 def mycroft_dataset(args: argparse.Namespace) -> Iterable[Utterance]:

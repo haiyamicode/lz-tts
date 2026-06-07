@@ -790,6 +790,48 @@ class MultilingualSplitter:
 
         return merged
 
+    def _merge_embedded_main_language_tokens(
+        self,
+        segments: list[Segment],
+        main_lang: str,
+    ) -> list[Segment]:
+        """Keep embedded Latin/alphanumeric tokens inside CJK main-language text.
+
+        Natural Japanese/Chinese routinely contains tokens such as "N700",
+        "FM", "USB-C", or product names. If such a short Latin/Common-script
+        token is surrounded by the same CJK language, treating it as an English
+        code-switch routes it to the wrong speaker/phonemizer.
+        """
+        if main_lang not in {"ja", "zh"} or len(segments) < 3:
+            return segments
+
+        merged: list[Segment] = []
+        idx = 0
+        while idx < len(segments):
+            if (
+                idx + 2 < len(segments)
+                and segments[idx].language == main_lang
+                and segments[idx + 2].language == main_lang
+                and segments[idx + 1].script in {"Latin", "Common", "Inherited"}
+                and regex.search(r"[\p{Letter}\p{Number}]", segments[idx + 1].text)
+            ):
+                merged.append(
+                    Segment(
+                        text=segments[idx].text + segments[idx + 1].text + segments[idx + 2].text,
+                        start=segments[idx].start,
+                        end=segments[idx + 2].end,
+                        script=segments[idx].script,
+                        language=main_lang,
+                    )
+                )
+                idx += 3
+                continue
+
+            merged.append(segments[idx])
+            idx += 1
+
+        return self._merge_adjacent_segments(merged)
+
     def split(self, text: str, main_lang: Optional[str] = None) -> SplitResult:
         """
         Split text into language-tagged segments.
@@ -938,6 +980,10 @@ class MultilingualSplitter:
 
         # Final merge of adjacent same-language segments
         merged_segments = self._merge_adjacent_segments(segments)
+        merged_segments = self._merge_embedded_main_language_tokens(
+            merged_segments,
+            main_lang,
+        )
 
         return SplitResult(
             original_text=text, main_language=main_lang, segments=merged_segments

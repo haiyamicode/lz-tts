@@ -1,0 +1,12 @@
+defaults:
+  - trainer: gpu
+  - experiment: lzspeech_multilingual_bert_87m
+  - _self_
+
+seed: 1234
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${dataset.default_root_dir}/hydra/${now:%Y-%m-%d_%H-%M-%S}
