@@ -823,9 +823,9 @@ def transcribe_voice_sample(audio_file: Path) -> str:
     return text
 
 
-def trim_silence(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, float, float]:
+def _voiced_bounds(wav_data: np.ndarray, sample_rate: int) -> tuple[int, int] | None:
     if wav_data.size == 0:
-        return wav_data, 0.0, 0.0
+        return None
 
     frame_size = max(1, int(sample_rate * 0.02))
     hop_size = max(1, int(sample_rate * 0.01))
@@ -833,20 +833,50 @@ def trim_silence(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, fl
     padded = np.pad(wav_data, (0, max(0, frame_size - wav_data.size % hop_size)))
     starts = np.arange(0, max(1, padded.size - frame_size + 1), hop_size)
     if starts.size == 0:
-        return wav_data, 0.0, 0.0
+        return None
 
     frames = np.stack([padded[start : start + frame_size] for start in starts])
     rms = np.sqrt(np.mean(np.square(frames), axis=1))
     threshold = max(absolute_threshold, float(rms.max()) * 10 ** (SILENCE_TRIM_RELATIVE_THRESHOLD_DB / 20))
     voiced = np.flatnonzero(rms > threshold)
     if voiced.size == 0:
+        return None
+
+    start = int(starts[voiced[0]])
+    end = min(wav_data.size, int(starts[voiced[-1]]) + frame_size)
+    return start, end
+
+
+def trim_silence(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, float, float]:
+    bounds = _voiced_bounds(wav_data, sample_rate)
+    if bounds is None:
         return wav_data, 0.0, 0.0
 
+    voiced_start, voiced_end = bounds
     pad = int(sample_rate * SILENCE_TRIM_PADDING_MS / 1000)
-    start = max(0, int(starts[voiced[0]]) - pad)
-    end = min(wav_data.size, int(starts[voiced[-1]]) + frame_size + pad)
+    start = max(0, voiced_start - pad)
+    end = min(wav_data.size, voiced_end + pad)
     trimmed = wav_data[start:end]
     return trimmed, start / sample_rate, (wav_data.size - end) / sample_rate
+
+
+def ensure_edge_silence(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, float, float]:
+    target_samples = int(sample_rate * SILENCE_TRIM_PADDING_MS / 1000)
+    if target_samples <= 0 or wav_data.size == 0:
+        return wav_data, 0.0, 0.0
+
+    bounds = _voiced_bounds(wav_data, sample_rate)
+    if bounds is None:
+        return wav_data, 0.0, 0.0
+
+    voiced_start, voiced_end = bounds
+    head_pad = max(0, target_samples - voiced_start)
+    tail_pad = max(0, target_samples - (wav_data.size - voiced_end))
+    if head_pad == 0 and tail_pad == 0:
+        return wav_data, 0.0, 0.0
+
+    padded = np.pad(wav_data, (head_pad, tail_pad), mode="constant")
+    return padded, head_pad / sample_rate, tail_pad / sample_rate
 
 
 def deepfilter_audio(wav_data: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -874,6 +904,8 @@ def postprocess_audio(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarra
         "trim": False,
         "trim_head_seconds": 0.0,
         "trim_tail_seconds": 0.0,
+        "pad_head_seconds": 0.0,
+        "pad_tail_seconds": 0.0,
     }
 
     if env_bool("ENABLE_DEEPFILTER", ENABLE_DEEPFILTER_DEFAULT):
@@ -893,6 +925,14 @@ def postprocess_audio(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarra
                 "trim_tail_seconds": tail_seconds,
             }
         )
+
+    wav_data, pad_head_seconds, pad_tail_seconds = ensure_edge_silence(wav_data, sample_rate)
+    info.update(
+        {
+            "pad_head_seconds": pad_head_seconds,
+            "pad_tail_seconds": pad_tail_seconds,
+        }
+    )
 
     return wav_data, info
 
@@ -1216,7 +1256,9 @@ def synthesize(req: SynthesizeRequest):
         f"deepfilter={info['postprocess'].get('deepfilter')} "
         f"silence_trim={info['postprocess'].get('trim')} "
         f"trim_head_seconds={info['postprocess'].get('trim_head_seconds', 0.0):.2f} "
-        f"trim_tail_seconds={info['postprocess'].get('trim_tail_seconds', 0.0):.2f}",
+        f"trim_tail_seconds={info['postprocess'].get('trim_tail_seconds', 0.0):.2f} "
+        f"pad_head_seconds={info['postprocess'].get('pad_head_seconds', 0.0):.2f} "
+        f"pad_tail_seconds={info['postprocess'].get('pad_tail_seconds', 0.0):.2f}",
         file=sys.stderr,
         flush=True,
     )
