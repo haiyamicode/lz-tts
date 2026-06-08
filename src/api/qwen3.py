@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 import numpy as np
 import soundfile as sf
+import torch
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -1203,6 +1204,7 @@ def synthesize(req: SynthesizeRequest):
 
     with inference_lock:
         mp3_bytes, info = _generate_qwen_mp3(req, sample_path, prompt_text, xvec_only, settings)
+        torch.cuda.empty_cache()
 
     print(
         "synthesize response "
@@ -1266,6 +1268,7 @@ def synthesize_batch(req: BatchSynthesizeRequest):
                     dp_language=settings.dp_language,
                 )
             )
+        torch.cuda.empty_cache()
 
     wall_seconds = time.perf_counter() - started
     return BatchSynthesizeResponse(
