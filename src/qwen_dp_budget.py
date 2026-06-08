@@ -17,7 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DpBudgetConfig:
-    checkpoint: Path = Path("data/lzspeech-sparrow/lzspeech-sparrow-highplus-24k-epoch289.ckpt")
+    checkpoint: Path = Path("data/lzspeech-sparrow/model.ckpt")
     config_path: Optional[Path] = None
     device: str = "cpu"
     language: str = "multilingual"

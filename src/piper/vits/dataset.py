@@ -432,7 +432,7 @@ class UtteranceCollate:
             audio_padded[utt_idx, :, :audio_length] = utt.audio_norm
             audio_lengths[utt_idx] = audio_length
 
-            if utt.speaker_id is not None:
+            if self.is_multispeaker and utt.speaker_id is not None:
                 assert speaker_ids is not None
                 speaker_ids[utt_idx] = utt.speaker_id
             # Preserve original text (if present) for optional semantic encoders

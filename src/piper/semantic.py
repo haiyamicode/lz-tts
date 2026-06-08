@@ -281,7 +281,7 @@ def align_phone_features(
     Returns a tensor shaped ``[hidden_dim, phone_len]``, matching the sidecar
     feature tensors used by the Piper precomputed-BERT training path.
     """
-    counts = torch.clamp(word2ph.to(torch.long).cpu(), min=0)
+    counts = torch.clamp(word2ph.to(device=hidden.device, dtype=torch.long), min=0)
     diff = int(phone_len) - int(counts.sum().item())
     if diff:
         active = torch.nonzero(counts > 0, as_tuple=False).flatten()
@@ -289,9 +289,9 @@ def align_phone_features(
         counts = counts.clone()
         counts[adjust_idx] = torch.clamp(counts[adjust_idx] + diff, min=0)
 
-    repeated = torch.repeat_interleave(hidden.cpu(), counts, dim=0)
+    repeated = torch.repeat_interleave(hidden, counts, dim=0)
     if repeated.size(0) == 0:
-        return hidden.new_zeros((hidden.size(-1), int(phone_len))).cpu()
+        return hidden.new_zeros((hidden.size(-1), int(phone_len)))
 
     if repeated.size(0) < phone_len:
         pad = repeated.new_zeros((phone_len - repeated.size(0), repeated.size(1)))

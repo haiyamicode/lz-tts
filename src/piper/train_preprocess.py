@@ -204,6 +204,9 @@ def main() -> None:
             speaker_ids[speaker] = speaker_id
     else:
         _LOGGER.info("Single speaker dataset")
+        only_speaker = next(iter(speaker_counts))
+        if only_speaker:
+            speaker_ids[only_speaker] = 0
 
     # Write config
     audio_quality = args.audio_quality or args.output_dir.name
@@ -688,6 +691,12 @@ def _map_cld2_to_espeak(lang_code: str, primary_voice: str = "en-us") -> str:
     if code in ("en-us", "en-us+f3", "en-us+f4"):
         return code
 
+    if code in ("en-gb", "en-uk"):
+        return "en-gb-x-rp"
+
+    if code.startswith("en-gb-"):
+        return code
+
     if code == "en":
         return primary_voice
 
@@ -1091,7 +1100,25 @@ class PathEncoder(json.JSONEncoder):
         return super().default(o)
 
 
-def _iter_pipe_metadata_rows(metadata_path: Path) -> Iterable[Tuple[int, List[str]]]:
+def _iter_ljspeech_metadata_rows(metadata_path: Path) -> Iterable[Tuple[int, List[str]]]:
+    """Yield LJSpeech-style metadata rows from parquet or pipe-delimited CSV.
+
+    Parquet is preferred because it avoids quote escaping issues and keeps the
+    manifest schema explicit. CSV remains a backward-compatible fallback for
+    older datasets.
+    """
+    if metadata_path.suffix.lower() == ".parquet":
+        table = pq.read_table(metadata_path)
+        for row_no, row in enumerate(table.to_pylist(), 1):
+            filename = str(row.get("filename") or row.get("utt_id") or row.get("id") or "").strip()
+            speaker = row.get("speaker")
+            speaker = str(speaker).strip() if speaker not in (None, "") else None
+            text = str(row.get("text") or "").strip()
+            if not filename or not text:
+                raise ValueError(f"Expected filename/text columns at {metadata_path}:{row_no}: {row!r}")
+            yield row_no, [filename, text] if speaker is None else [filename, speaker, text]
+        return
+
     with open(metadata_path, "r", encoding="utf-8") as metadata_file:
         for line_no, line in enumerate(metadata_file, 1):
             line = line.rstrip("\n")
@@ -1116,14 +1143,16 @@ def ljspeech_dataset(args: argparse.Namespace) -> Iterable[Utterance]:
 
     # filename|speaker|text
     # speaker is optional
-    metadata_path = dataset_dir / "metadata.csv"
+    metadata_path = dataset_dir / "metadata.parquet"
+    if not metadata_path.exists():
+        metadata_path = dataset_dir / "metadata.csv"
     assert metadata_path.exists(), f"Missing {metadata_path}"
 
     wav_dir = dataset_dir / "wav"
     if not wav_dir.is_dir():
         wav_dir = dataset_dir / "wavs"
 
-    for line_no, row in _iter_pipe_metadata_rows(metadata_path):
+    for line_no, row in _iter_ljspeech_metadata_rows(metadata_path):
         speaker: Optional[str] = None
         if is_single_speaker or (len(row) == 2):
             filename, text = row[0], row[-1]

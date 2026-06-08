@@ -48,17 +48,8 @@ DATA_DIR = Path("data")
 CONFIG_PATH = Path(os.environ.get("LZ_TTS_SERVER_CONFIG", "local/server.json"))
 DEFAULT_MODEL = "lzspeech-sparrow"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MATCHA_ROOT = PROJECT_ROOT / "local" / "Matcha-TTS"
-SEED_VC_ROOT = PROJECT_ROOT / "local" / "seed-vc"
+SEED_VC_ROOT = PROJECT_ROOT / "data" / "seed-vc"
 SEED_VC_RUNTIME_ROOT = PROJECT_ROOT / "src" / "seed_vc_runtime"
-MATCHA_DEFAULT_CHECKPOINT = (
-    MATCHA_ROOT
-    / "logs/train/lzspeech_multilingual_plus_fused_icbpe10000_semantic_mixed50_resume"
-    / "runs/2026-05-23_15-58-42/checkpoints/last.ckpt"
-)
-MATCHA_DEFAULT_ICBPE_VOCAB = MATCHA_ROOT / "data/flores200/tokenizers/unicode_codepoint_byte_fallback_10000/vocab.json"
-MATCHA_DEFAULT_PHONEME_VOCAB = MATCHA_ROOT / "data/lzspeech_multilingual_plus_22050/fused_phoneme_vocab.json"
-MATCHA_DEFAULT_FILELIST = MATCHA_ROOT / "data/lzspeech_multilingual_plus_22050/aligned_fused_test.txt"
 MATCHA_LANGUAGE_ID_MAP = {
     "en": 1,
     "ar": 2,
@@ -140,12 +131,10 @@ class MatchaConfig(BaseModel):
     enabled: bool = Field(default_factory=lambda: _env_bool("MATCHA_TTS_ENABLED", False))
     preload: bool = Field(default_factory=lambda: _env_bool("MATCHA_TTS_PRELOAD", True))
     device: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_DEVICE", "cuda:2"))
-    checkpoint: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_CHECKPOINT", str(MATCHA_DEFAULT_CHECKPOINT)))
-    icbpe_vocab_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_ICBPE_VOCAB", str(MATCHA_DEFAULT_ICBPE_VOCAB)))
-    phoneme_vocab_path: str = Field(
-        default_factory=lambda: os.environ.get("MATCHA_TTS_PHONEME_VOCAB", str(MATCHA_DEFAULT_PHONEME_VOCAB))
-    )
-    filelist_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_FILELIST", str(MATCHA_DEFAULT_FILELIST)))
+    checkpoint: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_CHECKPOINT", ""))
+    icbpe_vocab_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_ICBPE_VOCAB", ""))
+    phoneme_vocab_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_PHONEME_VOCAB", ""))
+    filelist_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_FILELIST", ""))
     max_batch_size: int = Field(default_factory=lambda: int(os.environ.get("MATCHA_TTS_MAX_BATCH_SIZE", "128")), ge=1)
     batch_wait_ms: float = Field(default_factory=lambda: float(os.environ.get("MATCHA_TTS_BATCH_WAIT_MS", "10")), ge=0)
     n_timesteps: int = Field(default_factory=lambda: int(os.environ.get("MATCHA_TTS_STEPS", "32")), ge=1)
@@ -174,14 +163,14 @@ class SeedVCConfig(BaseModel):
     preload: bool = Field(default_factory=lambda: _env_bool("SEED_VC_PRELOAD", False))
     device: str = Field(default_factory=lambda: os.environ.get("SEED_VC_DEVICE", "cuda:1"))
     runtime_root: str = Field(default_factory=lambda: os.environ.get("SEED_VC_RUNTIME_ROOT", "src/seed_vc_runtime"))
-    root: str = Field(default_factory=lambda: os.environ.get("SEED_VC_ROOT", "local/seed-vc"))
+    root: str = Field(default_factory=lambda: os.environ.get("SEED_VC_ROOT", "data/seed-vc"))
     embeddings_hdf5_path: str = Field(
-        default_factory=lambda: os.environ.get("SEED_VC_EMBEDDINGS_HDF5", "local/seed-vc/embeddings/vtts_embeddings.h5")
+        default_factory=lambda: os.environ.get("SEED_VC_EMBEDDINGS_HDF5", "data/seed-vc/embeddings/vtts_embeddings.h5")
     )
-    tmp_dir: str = Field(default_factory=lambda: os.environ.get("SEED_VC_TMP_DIR", "local/seed-vc/tmp"))
-    output_dir: str = Field(default_factory=lambda: os.environ.get("SEED_VC_OUTPUT_DIR", "local/seed-vc/output"))
+    tmp_dir: str = Field(default_factory=lambda: os.environ.get("SEED_VC_TMP_DIR", "data/seed-vc/tmp"))
+    output_dir: str = Field(default_factory=lambda: os.environ.get("SEED_VC_OUTPUT_DIR", "data/seed-vc/output"))
     voice_samples_dir: str = Field(
-        default_factory=lambda: os.environ.get("SEED_VC_VOICE_SAMPLES_DIR", "local/seed-vc/voice-samples")
+        default_factory=lambda: os.environ.get("SEED_VC_VOICE_SAMPLES_DIR", "data/seed-vc/voice-samples")
     )
     fp16: bool = Field(default_factory=lambda: _env_bool("SEED_VC_FP16", True))
     embedding_cache_size: int = Field(default_factory=lambda: int(os.environ.get("SEED_VC_EMBEDDING_CACHE_SIZE", "256")), ge=1)

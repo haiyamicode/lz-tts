@@ -3,7 +3,7 @@
 
 Usage:
     uv run python scripts/download_seed_vc_embeddings.py
-    uv run python scripts/download_seed_vc_embeddings.py --embeddings-dir local/seed-vc/embeddings
+    uv run python scripts/download_seed_vc_embeddings.py --embeddings-dir data/seed-vc/embeddings
 """
 
 import argparse
@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_EMBEDDINGS_DIR = Path("local/seed-vc/embeddings")
+DEFAULT_EMBEDDINGS_DIR = Path("data/seed-vc/embeddings")
 
 
 def resolve_repo_path(path: Path) -> Path:

@@ -220,6 +220,97 @@ class HeteronymResolver:
         self._load()
         return self._heretonyms
 
+    def _variants_for_word(self, word: str) -> Optional[List[str]]:
+        variants = self._heretonyms.get(word.lower())
+        if not variants:
+            return None
+
+        for variant in variants:
+            if variant not in self._variant_to_idx:
+                _LOGGER.debug(
+                    "Skipping heteronym '%s': variant '%s' not in trained model",
+                    word,
+                    variant,
+                )
+                return None
+        return variants
+
+    def _collect_matches(self, text_idx: int, text: str) -> List[Tuple[int, str, int, int, List[str]]]:
+        matches: List[Tuple[int, str, int, int, List[str]]] = []
+        for match in re.finditer(r"\b(\w+)\b", text):
+            word = match.group(1)
+            variants = self._variants_for_word(word)
+            if variants:
+                matches.append((text_idx, word, match.start(), match.end(), variants))
+        return matches
+
+    def _predict_matches(
+        self,
+        texts: List[str],
+        flat_matches: List[Tuple[int, str, int, int, List[str]]],
+    ) -> List[str]:
+        if not flat_matches:
+            return []
+
+        encoding = self._tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=_MAX_BERT_TOKENS,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+        )
+        input_ids = encoding["input_ids"].to(self.device)
+        attention_mask = encoding["attention_mask"].to(self.device).bool()
+        offset_mapping = encoding["offset_mapping"].tolist()
+
+        with torch.no_grad():
+            hidden = self._bert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+            batch_indices = torch.tensor(
+                [text_idx for text_idx, *_rest in flat_matches],
+                dtype=torch.long,
+                device=self.device,
+            )
+            context_hidden = hidden.index_select(0, batch_indices)
+            context_mask = attention_mask.index_select(0, batch_indices)
+            word_token_mask = torch.zeros(
+                (len(flat_matches), _MAX_BERT_TOKENS),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            max_variants = max(len(variants) for *_prefix, variants in flat_matches)
+            var_map = torch.zeros(
+                (len(flat_matches), max_variants),
+                dtype=torch.long,
+                device=self.device,
+            )
+            var_mask = torch.zeros_like(var_map, dtype=torch.bool)
+
+            for sample_idx, (text_idx, _word, word_start, word_end, variants) in enumerate(flat_matches):
+                token_indices = [
+                    token_idx
+                    for token_idx, (start, end) in enumerate(offset_mapping[text_idx])
+                    if start < word_end and end > word_start
+                ]
+                word_token_mask[sample_idx, token_indices or [0]] = True
+
+                variant_ids = [self._variant_to_idx[variant] for variant in variants]
+                var_map[sample_idx, : len(variant_ids)] = torch.tensor(
+                    variant_ids,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                var_mask[sample_idx, : len(variant_ids)] = True
+
+            logits = self._model(context_hidden, context_mask, word_token_mask, var_map, var_mask)
+            predictions = logits.argmax(dim=-1).detach().cpu().tolist()
+
+        return [
+            variants[int(pred_idx)]
+            for (*_prefix, variants), pred_idx in zip(flat_matches, predictions)
+        ]
+
     def resolve(self, text: str, word: str, word_start: int, word_end: int) -> Optional[str]:
         """Resolve a heteronym's pronunciation given its context.
 
@@ -234,64 +325,15 @@ class HeteronymResolver:
         """
         self._load()
 
-        word_lower = word.lower()
-        variants = self._heretonyms.get(word_lower)
+        variants = self._variants_for_word(word)
         if not variants:
             return None
 
-        encoding = self._tokenizer(
-            text,
-            padding="max_length",
-            truncation=True,
-            max_length=_MAX_BERT_TOKENS,
-            return_tensors="pt",
-            return_offsets_mapping=True,
+        predictions = self._predict_matches(
+            [text],
+            [(0, word, word_start, word_end, variants)],
         )
-        input_ids = encoding["input_ids"].to(self.device)
-        attention_mask = encoding["attention_mask"].to(self.device).bool()
-        offset_mapping = encoding["offset_mapping"].squeeze(0).tolist()
-
-        # Find token indices for the word
-        word_indices = []
-        for i, (start, end) in enumerate(offset_mapping):
-            if start < word_end and end > word_start:
-                word_indices.append(i)
-        word_token_mask = torch.zeros(1, _MAX_BERT_TOKENS, dtype=torch.bool, device=self.device)
-        if word_indices:
-            word_token_mask[0, word_indices] = True
-        else:
-            word_token_mask[0, 0] = True
-
-        # Check if all variants are in the trained model
-        # Skip words whose variants weren't included in training
-        for v in variants:
-            if v not in self._variant_to_idx:
-                _LOGGER.debug(
-                    "Skipping heteronym '%s': variant '%s' not in trained model",
-                    word, v
-                )
-                return None
-
-        with torch.no_grad():
-            hidden = self._bert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-
-            # Build variant map
-            var_map = torch.tensor(
-                [[self._variant_to_idx[v] for v in variants]], device=self.device
-            )
-            var_mask = torch.ones_like(var_map, dtype=torch.bool)
-
-            # Pad if needed
-            max_v = self._model.num_variants
-            if var_map.size(1) < max_v:
-                pad = torch.zeros(1, max_v - var_map.size(1), dtype=torch.long, device=self.device)
-                var_map = torch.cat([var_map, pad], dim=1)
-                var_mask = torch.cat([var_mask, torch.zeros_like(pad, dtype=torch.bool)], dim=1)
-
-            logits = self._model(hidden, attention_mask, word_token_mask, var_map, var_mask)
-            pred_idx = logits.argmax(dim=-1).item()
-
-        return variants[pred_idx]
+        return predictions[0] if predictions else None
 
     def resolve_all(self, text: str) -> List[Tuple[str, int, int, str]]:
         """Find and resolve all heteronyms in text.
@@ -304,16 +346,28 @@ class HeteronymResolver:
         """
         self._load()
 
-        results = []
-        # Find all words and check if they're heteronyms
-        for match in re.finditer(r"\b(\w+)\b", text):
-            word = match.group(1)
-            if word.lower() in self._heretonyms:
-                start, end = match.start(), match.end()
-                phoneme = self.resolve(text, word, start, end)
-                if phoneme:
-                    results.append((word, start, end, phoneme))
+        flat_matches = self._collect_matches(0, text)
+        predictions = self._predict_matches([text], flat_matches)
+        return [
+            (word, start, end, phoneme)
+            for (_text_idx, word, start, end, _variants), phoneme in zip(flat_matches, predictions)
+        ]
 
+    def resolve_all_many(self, texts: List[str]) -> List[List[Tuple[str, int, int, str]]]:
+        """Find and resolve heteronyms for multiple texts with one BERT pass."""
+        self._load()
+
+        flat_matches: List[Tuple[int, str, int, int, List[str]]] = []
+        for text_idx, text in enumerate(texts):
+            flat_matches.extend(self._collect_matches(text_idx, text))
+
+        if not flat_matches:
+            return [[] for _ in texts]
+
+        predictions = self._predict_matches(texts, flat_matches)
+        results: List[List[Tuple[str, int, int, str]]] = [[] for _ in texts]
+        for (text_idx, word, start, end, _variants), phoneme in zip(flat_matches, predictions):
+            results[text_idx].append((word, start, end, phoneme))
         return results
 
 

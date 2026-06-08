@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SEED_VC_ROOT = Path(os.environ.get("SEED_VC_ROOT", "local/seed-vc"))
+SEED_VC_ROOT = Path(os.environ.get("SEED_VC_ROOT", "data/seed-vc"))
 SEED_VC_ROOT = SEED_VC_ROOT if SEED_VC_ROOT.is_absolute() else PROJECT_ROOT / SEED_VC_ROOT
 SEED_VC_RUNTIME_ROOT = Path(os.environ.get("SEED_VC_RUNTIME_ROOT", "src/seed_vc_runtime"))
 SEED_VC_RUNTIME_ROOT = (

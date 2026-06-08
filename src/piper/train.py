@@ -173,7 +173,9 @@ def train_from_args(
         callbacks.append(
             ModelCheckpoint(
                 every_n_epochs=args.checkpoint_epochs,
-                save_top_k=-1,
+                monitor="val_loss",
+                mode="min",
+                save_top_k=20,
                 save_last=True,
             )
         )

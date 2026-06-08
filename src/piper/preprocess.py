@@ -976,6 +976,12 @@ def _map_cld2_to_espeak(lang_code: str, primary_voice: str = "en-us") -> str:
     if code in ("en-us", "en-us+f3", "en-us+f4"):
         return code
 
+    if code in ("en-gb", "en-uk"):
+        return "en-gb-x-rp"
+
+    if code.startswith("en-gb-"):
+        return code
+
     if code == "en":
         return primary_voice
 
@@ -1158,6 +1164,7 @@ def _phonemize_neural_with_spans(
     casing_fn,
     espeak_data: Optional[str] = None,
     voice: str = "en-us",
+    resolved_heteronyms: Optional[List[Tuple[str, int, int, str]]] = None,
 ) -> Tuple[list, Optional[List[List[int]]], str]:
     """Phonemize text using neural heteronym disambiguation with word spans.
 
@@ -1177,10 +1184,12 @@ def _phonemize_neural_with_spans(
     if not voice.startswith("en"):
         return _phonemize_espeak_for_voice_with_spans(text, voice, casing_fn, espeak_data)
 
-    resolver = _get_heteronym_resolver()
-
     # Find all heteronyms with their positions and correct pronunciations
-    heteronyms = resolver.resolve_all(processed_text)
+    if resolved_heteronyms is None:
+        resolver = _get_heteronym_resolver()
+        heteronyms = resolver.resolve_all(processed_text)
+    else:
+        heteronyms = resolved_heteronyms
 
     if not heteronyms:
         return _phonemize_espeak_for_voice_with_spans(text, voice, casing_fn, espeak_data)
@@ -1497,6 +1506,41 @@ def phonemize_spans_with_speakers(
     return results
 
 
+def _forced_speaker_context(config_path: "Path | str", speaker_label: str):
+    cfg = _load_model_config(config_path)
+
+    es_conf = cfg.get("espeak") or {}
+    primary = es_conf.get("primary") or "en-us"
+    spk_id_map: Dict[str, int] = cfg.get("speaker_id_map") or {}
+    lang_spk_map: Dict[str, str] = cfg.get("language_speakers") or {}
+
+    label = speaker_label
+    rev = {v: k for k, v in lang_spk_map.items()} if lang_spk_map else {}
+    base = rev.get(label, label)
+    voice = _map_cld2_to_espeak(base, primary)
+    spk_id = int(spk_id_map.get(label, 0))
+    return label, base, voice, primary, spk_id, get_text_casing("ignore")
+
+
+def _phonemize_forced_speaker_text(
+    text: str,
+    casing_fn,
+    espeak_data: Optional[str],
+    voice: str,
+    neural: bool,
+    resolved_heteronyms: Optional[List[Tuple[str, int, int, str]]] = None,
+) -> Tuple[list, Optional[List[List[int]]], str]:
+    if neural and _supports_neural_heteronyms(voice):
+        return _phonemize_neural_with_spans(
+            text,
+            casing_fn,
+            espeak_data,
+            voice,
+            resolved_heteronyms=resolved_heteronyms,
+        )
+    return _phonemize_espeak_for_voice_with_spans(text, voice, casing_fn, espeak_data)
+
+
 def phonemize_text_for_speaker(
     text: str,
     config_path: "Path | str",
@@ -1515,36 +1559,23 @@ def phonemize_text_for_speaker(
 
     Returns: {"phonemes": [...], "phoneme_ids": [...], "speaker_id": int, "text": str}
     """
-    cfg = _load_model_config(config_path)
-
-    es_conf = cfg.get("espeak") or {}
-    primary = es_conf.get("primary") or "en-us"
-    spk_id_map: Dict[str, int] = cfg.get("speaker_id_map") or {}
-    lang_spk_map: Dict[str, str] = cfg.get("language_speakers") or {}
-
-    label = speaker_label
-    rev = {v: k for k, v in lang_spk_map.items()} if lang_spk_map else {}
-    base = rev.get(label, label)
-    voice = _map_cld2_to_espeak(base, primary)
-
+    label, base, voice, primary, spk_id, casing = _forced_speaker_context(config_path, speaker_label)
     _LOGGER.debug("infer-forced: label=%s base=%s -> voice=%s primary=%s neural=%s", label, base, voice, primary, neural)
 
-    casing = get_text_casing("ignore")
-
-    if neural and _supports_neural_heteronyms(voice):
-        phonemes, word_spans, semantic_text = _phonemize_neural_with_spans(
-            text, casing, espeak_data, voice
-        )
-    else:
-        phonemes, word_spans, semantic_text = _phonemize_espeak_for_voice_with_spans(
-            text, voice, casing, espeak_data
-        )
+    use_neural = neural and _supports_neural_heteronyms(voice)
+    phonemes, word_spans, semantic_text = _phonemize_forced_speaker_text(
+        text,
+        casing,
+        espeak_data,
+        voice,
+        use_neural,
+    )
+    if not use_neural:
         _LOGGER.debug("infer-forced: text='%s'", _short_text(semantic_text, 120))
 
     _LOGGER.debug("infer-forced: phonemes=%s", _short_list(phonemes, 48))
 
     ids = phoneme_ids_espeak(phonemes)
-    spk_id = spk_id_map.get(label, 0)
     return {
         "phonemes": phonemes,
         "phoneme_ids": ids,
@@ -1552,3 +1583,49 @@ def phonemize_text_for_speaker(
         "text": semantic_text,
         "word_spans": word_spans,
     }
+
+
+def phonemize_texts_for_speaker(
+    texts: List[str],
+    config_path: "Path | str",
+    speaker_label: str,
+    espeak_data: Optional[str] = None,
+    neural: bool = False,
+) -> List[Dict[str, object]]:
+    """Phonemize a batch of texts for one forced speaker.
+
+    This keeps the output contract identical to ``phonemize_text_for_speaker``
+    while batching neural heteronym resolution for English voices.
+    """
+    _label, _base, voice, _primary, spk_id, casing = _forced_speaker_context(config_path, speaker_label)
+    use_neural = neural and _supports_neural_heteronyms(voice)
+
+    resolved_by_text: List[Optional[List[Tuple[str, int, int, str]]]] = [None for _ in texts]
+    if use_neural:
+        resolver = _get_heteronym_resolver()
+        processed_texts = [
+            casing(_normalize_text_for_voice(text, voice))
+            for text in texts
+        ]
+        resolved_by_text = resolver.resolve_all_many(processed_texts)
+
+    outputs: List[Dict[str, object]] = []
+    for text, resolved_heteronyms in zip(texts, resolved_by_text):
+        phonemes, word_spans, semantic_text = _phonemize_forced_speaker_text(
+            text,
+            casing,
+            espeak_data,
+            voice,
+            use_neural,
+            resolved_heteronyms=resolved_heteronyms,
+        )
+        outputs.append(
+            {
+                "phonemes": phonemes,
+                "phoneme_ids": phoneme_ids_espeak(phonemes),
+                "speaker_id": spk_id,
+                "text": semantic_text,
+                "word_spans": word_spans,
+            }
+        )
+    return outputs

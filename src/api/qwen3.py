@@ -107,7 +107,7 @@ class DpBudgetSettings(BaseModel):
     enabled: bool = True
     preload: bool = True
     use_bert: bool = False
-    checkpoint: str = "data/lzspeech-sparrow/lzspeech-sparrow-highplus-24k-epoch289.ckpt"
+    checkpoint: str = "data/lzspeech-sparrow/model.ckpt"
     config_path: Optional[str] = None
     device: str = "cuda"
     language: str = "multilingual"

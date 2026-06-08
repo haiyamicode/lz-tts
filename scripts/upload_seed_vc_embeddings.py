@@ -3,7 +3,7 @@
 
 Usage:
     uv run python scripts/upload_seed_vc_embeddings.py
-    uv run python scripts/upload_seed_vc_embeddings.py --file local/seed-vc/embeddings/vtts_embeddings.h5
+    uv run python scripts/upload_seed_vc_embeddings.py --file data/seed-vc/embeddings/vtts_embeddings.h5
 """
 
 import argparse
@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_EMBEDDINGS_FILE = Path("local/seed-vc/embeddings/vtts_embeddings.h5")
+DEFAULT_EMBEDDINGS_FILE = Path("data/seed-vc/embeddings/vtts_embeddings.h5")
 
 
 def resolve_repo_path(path: Path) -> Path:

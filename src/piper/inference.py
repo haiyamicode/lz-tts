@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -200,59 +201,138 @@ class PiperInference:
         phoneme_ids: list[int],
         word_spans,
     ) -> dict[str, torch.Tensor] | None:
-        if not self.use_bert or self.semantic_tokenizer is None or not span_text:
+        if not span_text:
+            return None
+        return self._semantic_input_for_span_batch(
+            [{"text": span_text, "word_spans": word_spans, "phoneme_ids": phoneme_ids}],
+            [len(phoneme_ids)],
+        )
+
+    def _inference_scales(
+        self,
+        noise_scale: Optional[float] = None,
+        length_scale: Optional[float] = None,
+        noise_w: Optional[float] = None,
+        sdp_ratio: Optional[float] = None,
+    ) -> list[float]:
+        return [
+            noise_scale if noise_scale is not None else self.inference_config.noise_scale,
+            length_scale if length_scale is not None else self.inference_config.length_scale,
+            noise_w if noise_w is not None else self.inference_config.noise_w,
+            sdp_ratio if sdp_ratio is not None else self.inference_config.sdp_ratio,
+        ]
+
+    def _semantic_input_for_span_batch(
+        self,
+        spans: list[dict],
+        phoneme_lengths: list[int],
+    ) -> dict[str, torch.Tensor] | None:
+        if not self.use_bert or self.semantic_tokenizer is None:
             return None
 
+        texts = [str(span.get("text", "")) for span in spans]
+        if not all(texts):
+            raise ValueError("Batched BERT inference requires non-empty span text")
+
         if self.semantic_fusion_mode == "legacy_cross_attention":
-            bert_dict = self._build_bert_input(
-                [span_text],
-                self.semantic_tokenizer,
-            )
+            bert_dict = self._build_bert_input(texts, self.semantic_tokenizer)
             if bert_dict is None:
                 return None
-            return {
-                key: value.to(self.device)
-                for key, value in bert_dict.items()
-            }
+            return {key: value.to(self.device) for key, value in bert_dict.items()}
 
-        phoneme_len = len(phoneme_ids)
+        word_spans = [span.get("word_spans") for span in spans]
         bert_dict = self._build_bert_input(
-            [span_text],
+            texts,
             self.semantic_tokenizer,
-            phoneme_lengths=[phoneme_len],
-            word_spans=[word_spans],
+            phoneme_lengths=phoneme_lengths,
+            word_spans=word_spans,
         )
         if bert_dict is None:
             return None
 
-        if self.bert_features_precomputed:
-            from .semantic import align_phone_features
+        if not self.bert_features_precomputed:
+            return {key: value.to(self.device) for key, value in bert_dict.items()}
 
-            semantic_model = self._load_semantic_model()
-            input_ids = bert_dict["input_ids"].to(self.device)
-            attention_mask = bert_dict["attention_mask"].to(self.device)
-            with torch.inference_mode():
-                hidden = semantic_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                ).last_hidden_state
-            features = align_phone_features(
-                hidden[0],
-                bert_dict["word2ph"][0],
-                phone_len=phoneme_len,
+        from .semantic import align_phone_features
+
+        semantic_model = self._load_semantic_model()
+        input_ids = bert_dict["input_ids"].to(self.device)
+        attention_mask = bert_dict["attention_mask"].to(self.device)
+        with torch.inference_mode():
+            hidden = semantic_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).last_hidden_state
+
+        dtype = torch.float16 if self.fp16 else torch.float32
+        feature_items = [
+            align_phone_features(
+                hidden[idx],
+                bert_dict["word2ph"][idx].to(device=hidden.device),
+                phone_len=phoneme_lengths[idx],
             )
-            dtype = torch.float16 if self.fp16 else torch.float32
-            return {
-                "features": features.unsqueeze(0).to(
-                    device=self.device,
-                    dtype=dtype,
-                )
-            }
+            for idx in range(len(spans))
+        ]
+        hidden_dim = feature_items[0].size(0)
+        max_len = max(phoneme_lengths)
+        features = torch.zeros(
+            (len(spans), hidden_dim, max_len),
+            device=self.device,
+            dtype=dtype,
+        )
+        for idx, item in enumerate(feature_items):
+            features[idx, :, : item.size(1)] = item.to(device=self.device, dtype=dtype)
+        return {"features": features}
 
-        return {
-            key: value.to(self.device)
-            for key, value in bert_dict.items()
-        }
+    def _infer_prepared_span_batch(
+        self,
+        spans: list[dict],
+        scales: list[float],
+    ) -> list[np.ndarray]:
+        if not spans:
+            return []
+
+        phoneme_ids = [span["phoneme_ids"] for span in spans]
+        phoneme_lengths = [len(ids) for ids in phoneme_ids]
+        max_len = max(phoneme_lengths)
+        text_tensor = torch.zeros((len(spans), max_len), dtype=torch.long, device=self.device)
+        text_lengths = torch.tensor(phoneme_lengths, dtype=torch.long, device=self.device)
+
+        for idx, ids in enumerate(phoneme_ids):
+            text_tensor[idx, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=self.device)
+
+        sid = None
+        if any(span.get("speaker_id") is not None for span in spans):
+            speaker_ids = [int(span.get("speaker_id", 0)) for span in spans]
+            sid = torch.tensor(speaker_ids, dtype=torch.long, device=self.device)
+
+        bert_input = self._semantic_input_for_span_batch(spans, phoneme_lengths)
+
+        with torch.inference_mode(), autocast(
+            device_type=self.device.type,
+            dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
+            enabled=self.fp16,
+        ):
+            audio, _attn, y_mask, _ = self.model.model_g.infer(
+                text_tensor,
+                text_lengths,
+                sid=sid,
+                noise_scale=scales[0],
+                length_scale=scales[1],
+                noise_scale_w=scales[2],
+                sdp_ratio=scales[3],
+                bert_input=bert_input,
+            )
+
+        hop_length = int(np.prod(getattr(self.model.model_g, "upsample_rates", (256,))))
+        frame_lengths = y_mask.squeeze(1).sum(dim=1).long().detach().cpu().numpy()
+        sample_lengths = frame_lengths * hop_length
+        audio_i16 = audio_float_to_int16(audio.detach().float().cpu().numpy())
+
+        outputs: list[np.ndarray] = []
+        for idx, sample_len in enumerate(sample_lengths):
+            outputs.append(audio_i16[idx].reshape(-1)[: int(sample_len)])
+        return outputs
 
     def phonemize(
         self,
@@ -313,48 +393,90 @@ class PiperInference:
         Returns:
             Audio waveform as int16 numpy array.
         """
-        from .preprocess import phonemize_text_for_speaker
+        return self.synthesize_batch(
+            [text],
+            speaker=speaker or "",
+            batch_size=1,
+            noise_scale=noise_scale,
+            length_scale=length_scale,
+            noise_w=noise_w,
+            sdp_ratio=sdp_ratio,
+            neural=neural,
+        )[0]
 
-        scales = [
-            noise_scale if noise_scale is not None else self.inference_config.noise_scale,
-            length_scale if length_scale is not None else self.inference_config.length_scale,
-            noise_w if noise_w is not None else self.inference_config.noise_w,
-            sdp_ratio if sdp_ratio is not None else self.inference_config.sdp_ratio,
-        ]
+    def synthesize_batch(
+        self,
+        texts: Sequence[str],
+        speaker: Optional[str] | Sequence[Optional[str]] = None,
+        batch_size: Optional[int] = None,
+        noise_scale: Optional[float] = None,
+        length_scale: Optional[float] = None,
+        noise_w: Optional[float] = None,
+        sdp_ratio: Optional[float] = None,
+        neural: bool = False,
+    ) -> list[np.ndarray]:
+        """Synthesize multiple texts with real batched model inference.
 
-        # For single-speaker models, speaker can be None - phonemize will use default speaker_id=0
-        span = phonemize_text_for_speaker(text, self.config, speaker or "", None, neural=neural)
-        phoneme_ids = span["phoneme_ids"]
-        speaker_id = span.get("speaker_id", 0)
+        For one forced speaker, neural heteronym resolution, semantic BERT, and
+        VITS inference are batched. Mixed-speaker or auto-routed calls keep the
+        existing per-text routing behavior before the model batch is formed.
+        """
+        text_items = list(texts)
+        if not text_items:
+            return []
 
-        _LOGGER.info("synthesize_span: phoneme_ids[:20]=%s, len=%d", phoneme_ids[:20], len(phoneme_ids))
+        if isinstance(speaker, str) or speaker is None:
+            speaker_items: list[Optional[str]] = [speaker for _ in text_items]
+        else:
+            speaker_items = list(speaker)
+            if len(speaker_items) != len(text_items):
+                raise ValueError("speaker sequence length must match texts length")
+
+        flat_spans: list[tuple[int, dict]] = []
+        unique_speakers = set(speaker_items)
+        only_speaker = next(iter(unique_speakers)) if len(unique_speakers) == 1 else None
+        if only_speaker is not None:
+            from .preprocess import phonemize_texts_for_speaker
+
+            batched_spans = phonemize_texts_for_speaker(
+                text_items,
+                self.config,
+                only_speaker,
+                None,
+                neural=neural,
+            )
+            flat_spans.extend((text_idx, span) for text_idx, span in enumerate(batched_spans))
+        else:
+            for text_idx, (text, item_speaker) in enumerate(zip(text_items, speaker_items)):
+                for span in self.phonemize(text, speaker=item_speaker, neural=neural):
+                    flat_spans.append((text_idx, span))
+
+        if not flat_spans:
+            return [np.zeros(0, dtype=np.int16) for _ in text_items]
+
+        scales = self._inference_scales(
+            noise_scale=noise_scale,
+            length_scale=length_scale,
+            noise_w=noise_w,
+            sdp_ratio=sdp_ratio,
+        )
+        effective_batch_size = batch_size or len(flat_spans)
+        segments: list[list[np.ndarray]] = [[] for _ in text_items]
 
         with torch.inference_mode():
-            text_tensor = torch.LongTensor(phoneme_ids).unsqueeze(0).to(self.device)
-            text_lengths = torch.LongTensor([len(phoneme_ids)]).to(self.device)
-            sid = torch.LongTensor([speaker_id]).to(self.device)
-
-            bert_input = self._semantic_input_for_span(
-                span.get("text", text),
-                phoneme_ids,
-                span.get("word_spans"),
-            )
-
-            with autocast(
-                device_type=self.device.type,
-                dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
-                enabled=self.fp16,
-            ):
-                audio = self.model(
-                    text_tensor, text_lengths, scales, sid=sid, bert_input=bert_input
+            for start in range(0, len(flat_spans), effective_batch_size):
+                chunk = flat_spans[start : start + effective_batch_size]
+                chunk_outputs = self._infer_prepared_span_batch(
+                    [span for _text_idx, span in chunk],
+                    scales,
                 )
-            audio = audio.detach().cpu().numpy()
-            audio = audio_float_to_int16(audio)
+                for (text_idx, _span), audio in zip(chunk, chunk_outputs):
+                    segments[text_idx].append(audio)
 
-            if audio.ndim > 1:
-                audio = audio.reshape(-1)
-
-        return audio
+        return [
+            parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+            for parts in segments
+        ]
 
     def synthesize(
         self,
@@ -379,64 +501,16 @@ class PiperInference:
         Returns:
             Audio waveform as int16 numpy array.
         """
-        # Get inference scales
-        scales = [
-            noise_scale if noise_scale is not None else self.inference_config.noise_scale,
-            length_scale if length_scale is not None else self.inference_config.length_scale,
-            noise_w if noise_w is not None else self.inference_config.noise_w,
-            sdp_ratio if sdp_ratio is not None else self.inference_config.sdp_ratio,
-        ]
-
-        # Phonemize text
-        spans = self.phonemize(text, speaker=speaker, neural=neural)
-
-        # Synthesize each span and concatenate
-        audio_segments = []
-
-        with torch.inference_mode():
-            for span in spans:
-                phoneme_ids = span["phoneme_ids"]
-                speaker_id = span.get("speaker_id")
-                span_text = span.get("text", "")
-
-                # Prepare input tensors
-                text_tensor = torch.LongTensor(phoneme_ids).unsqueeze(0).to(self.device)
-                text_lengths = torch.LongTensor([len(phoneme_ids)]).to(self.device)
-                sid = (
-                    torch.LongTensor([speaker_id]).to(self.device)
-                    if speaker_id is not None
-                    else None
-                )
-
-                # Prepare BERT input if enabled
-                bert_input = self._semantic_input_for_span(
-                    span_text,
-                    phoneme_ids,
-                    span.get("word_spans"),
-                )
-
-                # Run inference
-                with autocast(
-                    device_type=self.device.type,
-                    dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
-                    enabled=self.fp16,
-                ):
-                    audio = self.model(
-                        text_tensor, text_lengths, scales, sid=sid, bert_input=bert_input
-                    )
-                audio = audio.detach().cpu().numpy()
-                audio = audio_float_to_int16(audio)
-
-                # Ensure 1-D array
-                if audio.ndim > 1:
-                    audio = audio.reshape(-1)
-
-                audio_segments.append(audio)
-
-        # Concatenate all segments
-        if len(audio_segments) == 1:
-            return audio_segments[0]
-        return np.concatenate(audio_segments, axis=0)
+        return self.synthesize_batch(
+            [text],
+            speaker=speaker,
+            batch_size=1,
+            noise_scale=noise_scale,
+            length_scale=length_scale,
+            noise_w=noise_w,
+            sdp_ratio=sdp_ratio,
+            neural=neural,
+        )[0]
 
     def synthesize_to_file(
         self,

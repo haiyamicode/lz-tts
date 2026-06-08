@@ -4,7 +4,7 @@
 Usage:
     uv run python scripts/upload_seed_vc_models.py
     uv run python scripts/upload_seed_vc_models.py --models reflow_v2
-    uv run python scripts/upload_seed_vc_models.py --models-dir local/seed-vc/models --filter reflow
+    uv run python scripts/upload_seed_vc_models.py --models-dir data/seed-vc/models --filter reflow
 """
 
 import argparse
@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODELS_DIR = Path("local/seed-vc/models")
+DEFAULT_MODELS_DIR = Path("data/seed-vc/models")
 
 
 def resolve_repo_path(path: Path) -> Path:
