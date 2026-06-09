@@ -774,6 +774,7 @@ class _SeedVCBackend:
 
     model_presets = {
         "default": {"diffusion_steps": 30},
+        "distilled": {"diffusion_steps": 30},
         "medium": {"diffusion_steps": 23},
         "fast": {"diffusion_steps": 15},
     }
@@ -947,15 +948,15 @@ class _SeedVCBackend:
         max_frames = max(length // 320 + 1 for length in lengths)
         return features[:, :max_frames], torch.LongTensor([length // 320 + 1 for length in lengths]).to(self.device)
 
-    def _fetch_sample(self, request: SeedVCRequest) -> Path:
+    async def _fetch_sample(self, request: SeedVCRequest) -> Path:
         sample_path = self.voice_samples_dir / f"{_safe_file_stem(request.id)}.mp3"
         if sample_path.exists():
             return sample_path
         if not request.reference_url:
             raise ValueError(f"No cached sample for voice {request.id!r} and no reference_url provided")
         _LOGGER.info("Fetching Seed-VC reference sample: id=%s url=%s", request.id, request.reference_url)
-        with httpx.Client(follow_redirects=True) as client:
-            resp = client.get(request.reference_url)
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp = await client.get(request.reference_url)
             resp.raise_for_status()
             sample_path.write_bytes(resp.content)
         return sample_path
@@ -1276,6 +1277,21 @@ class _SeedVCBackend:
             shutil.rmtree(glitch_temp_dir, ignore_errors=True)
 
     def convert_request(self, request: SeedVCRequest) -> bytes:
+        emb_key, emb = self._resolve_cached_embeddings(request)
+        reference_path = None if emb is not None else self._fetch_sample(request)
+        return self._convert_with_reference(
+            request, reference_path,
+            embedding_key=emb_key if emb is not None else None,
+            cached_embeddings=emb,
+        )
+
+    def _convert_with_reference(
+        self,
+        request: SeedVCRequest,
+        reference_path: Path | None,
+        embedding_key: str | None = None,
+        cached_embeddings: torch.Tensor | None = None,
+    ) -> bytes:
         preset = request.preset or "default"
         preset_config = self.model_presets.get(preset)
         if preset_config is None:
@@ -1285,14 +1301,9 @@ class _SeedVCBackend:
         wav_output_path: Path | None = None
         try:
             source_path.write_bytes(base64.b64decode(request.audio))
-            embedding_key, cached_embeddings = self._resolve_cached_embeddings(request)
-            reference_path = None if cached_embeddings is not None else self._fetch_sample(request)
             _LOGGER.info(
                 "Seed-VC convert: voice=%s preset=%s cached_embedding=%s reference=%s",
-                request.id,
-                preset,
-                bool(cached_embeddings),
-                reference_path,
+                request.id, preset, bool(cached_embeddings), reference_path,
             )
             with self.lock:
                 wav_output_path = self._convert_voice_v1(
@@ -1697,7 +1708,13 @@ curl -X POST "http://localhost:8000/synthesize" \\
         if not request.audio:
             raise HTTPException(status_code=400, detail="audio is required")
         try:
-            mp3_bytes = await asyncio.to_thread(lambda: _get_seed_vc_backend().convert_request(request))
+            backend = _get_seed_vc_backend()
+            # Resolve cached embedding check async; download reference in background
+            emb_key, emb = backend._resolve_cached_embeddings(request)
+            reference_path = None if emb is not None else await backend._fetch_sample(request)
+            mp3_bytes = await asyncio.to_thread(
+                backend._convert_with_reference, request, reference_path, emb_key if emb is not None else None, emb
+            )
         except HTTPException:
             raise
         except Exception as exc:
