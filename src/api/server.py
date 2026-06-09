@@ -1194,7 +1194,10 @@ class _SeedVCBackend:
             results.append(self._fade_seed_vc_start(result, self.sample_rate).astype(np.float32))
         return results
 
-    def convert_batch_request(self, request: SeedVCBatchRequest) -> dict[str, Any]:
+    def convert_batch_request(
+        self, request: SeedVCBatchRequest, reference_path: Path | None = None,
+        embedding_key: str | None = None, cached_embeddings=None,
+    ) -> dict[str, Any]:
         items = request.items
         first = items[0]
         for item in items[1:]:
@@ -1220,8 +1223,6 @@ class _SeedVCBackend:
             for item, source_path in zip(items, source_paths):
                 source_path.write_bytes(base64.b64decode(item.audio))
 
-            embedding_key, cached_embeddings = self._resolve_cached_embeddings(first)
-            reference_path = None if cached_embeddings is not None else self._fetch_sample(first)
             with self.lock, self.torch.no_grad(), _temporary_cwd(self.root):
                 waves = self._convert_voice_v1_batch(
                     source_paths,
@@ -1321,32 +1322,22 @@ class _SeedVCBackend:
             if wav_output_path is not None:
                 wav_output_path.unlink(missing_ok=True)
 
-    def find_voice(self, request: SeedVCFindVoiceRequest) -> str:
+    def find_voice(self, request: SeedVCFindVoiceRequest, reference_path: Path) -> str:
         if self.find_base_voice is None:
             raise RuntimeError("Seed-VC find_voice support is unavailable")
-        sample_request = SeedVCRequest(audio="", reference_url=request.reference_url, id=request.id)
-        reference_path = self._fetch_sample(sample_request)
         with self.lock, _temporary_cwd(self.root):
             return str(self.find_base_voice(str(reference_path)))
 
-    def enhance(self, request: SeedVCEnhanceRequest) -> bytes:
+    def enhance(self, request: SeedVCEnhanceRequest, raw_path: Path) -> bytes:
         import subprocess
-        from pathlib import Path as _Path
-        enhance_dir = self.tmp_dir / request.id
+        enhance_dir = raw_path.parent
         sample_dir = enhance_dir / "sample"
         sample_dir.mkdir(parents=True, exist_ok=True)
-        raw_path = enhance_dir / "sample_raw.mp3"
         wav_path = enhance_dir / "sample_raw.wav"
-
-        _LOGGER.info("Seed-VC enhance: fetching sample for %s", request.id)
-        with httpx.Client(follow_redirects=True) as client:
-            resp = client.get(request.reference_url)
-            resp.raise_for_status()
-            raw_path.write_bytes(resp.content)
 
         subprocess.run(["ffmpeg", "-i", str(raw_path), "-t", "120", str(wav_path), "-y"],
                        capture_output=True, check=True)
-        subprocess.run(["ffmpeg-normalize", str(wav_path), "-o", str(sample_dir / "sample.wav"), "-f"],
+        subprocess.run(["uv", "tool", "run", "ffmpeg-normalize", str(wav_path), "-o", str(sample_dir / "sample.wav"), "-f"],
                        capture_output=True, check=True)
         sample_wav = sample_dir / "sample.wav"
         enhanced_dir = enhance_dir / "enhanced"
@@ -1729,7 +1720,14 @@ curl -X POST "http://localhost:8000/synthesize" \\
             raise HTTPException(status_code=400, detail="all items require audio")
         try:
             started = time.perf_counter()
-            result = await asyncio.to_thread(lambda: _get_seed_vc_backend().convert_batch_request(request))
+            backend = _get_seed_vc_backend()
+            first = request.items[0]
+            emb_key, emb = backend._resolve_cached_embeddings(first)
+            reference_path = None if emb is not None else await backend._fetch_sample(first)
+            result = await asyncio.to_thread(
+                backend.convert_batch_request, request, reference_path,
+                emb_key if emb is not None else None, emb,
+            )
             result["wall_time_sec"] = time.perf_counter() - started
         except HTTPException:
             raise
@@ -1742,7 +1740,10 @@ curl -X POST "http://localhost:8000/synthesize" \\
     async def seed_vc_find_voice(request: SeedVCFindVoiceRequest):
         """Seed-VC compatible voice lookup endpoint."""
         try:
-            voice_id = await asyncio.to_thread(lambda: _get_seed_vc_backend().find_voice(request))
+            backend = _get_seed_vc_backend()
+            sample_request = SeedVCRequest(audio="", reference_url=request.reference_url, id=request.id)
+            reference_path = await backend._fetch_sample(sample_request)
+            voice_id = await asyncio.to_thread(backend.find_voice, request, reference_path)
         except HTTPException:
             raise
         except Exception as exc:
@@ -1754,7 +1755,14 @@ curl -X POST "http://localhost:8000/synthesize" \\
     async def seed_vc_enhance(request: SeedVCEnhanceRequest):
         """Seed-VC compatible audio enhancement endpoint."""
         try:
-            mp3_bytes = await asyncio.to_thread(lambda: _get_seed_vc_backend().enhance(request))
+            backend = _get_seed_vc_backend()
+            raw_path = backend.tmp_dir / request.id / "sample_raw.mp3"
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                resp = await client.get(request.reference_url)
+                resp.raise_for_status()
+                raw_path.write_bytes(resp.content)
+            mp3_bytes = await asyncio.to_thread(backend.enhance, request, raw_path)
         except HTTPException:
             raise
         except Exception as exc:
