@@ -1444,10 +1444,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             _matcha_batcher.start()
             _LOGGER.info("Matcha backend ready")
 
-        if _engine_enabled("seed_vc") and _server_config.seed_vc.preload:
-            _LOGGER.info("Preloading Seed-VC backend on %s...", _server_config.seed_vc.device)
-            _seed_vc_backend = await asyncio.to_thread(_SeedVCBackend, _server_config.seed_vc)
-            _LOGGER.info("Seed-VC backend ready")
+        if _engine_enabled("seed_vc") and not _seed_vc_backend:
+            _LOGGER.warning("Seed-VC backend not preloaded (will load on first use)")
 
         _LOGGER.info("Server ready")
 
@@ -2003,6 +2001,18 @@ def run():
     import os
 
     import uvicorn
+
+    # Preload Seed-VC before server starts (avoids race on first /vc request)
+    _config = _load_config()
+    if _engine_enabled("seed_vc", _config) and _config.seed_vc.preload:
+        _LOGGER.info("Preloading Seed-VC backend before server start...")
+        global _seed_vc_backend, _server_config
+        _server_config = _config
+        try:
+            _seed_vc_backend = _SeedVCBackend(_config.seed_vc)
+            _LOGGER.info("Seed-VC backend ready")
+        except Exception:
+            _LOGGER.exception("Seed-VC preload failed (server will start without it)")
 
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
