@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -40,6 +41,25 @@ def get_s3_client():
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
         region_name=os.getenv("AWS_REGION", "us-east-1"),
     )
+
+
+def _multipart_md5(file_path: str, part_size: int = 8 * 1024 * 1024) -> tuple[str, int]:
+    file_size = os.path.getsize(file_path)
+    part_count = max(1, (file_size + part_size - 1) // part_size)
+    part_md5s = []
+    with open(file_path, "rb") as f:
+        for _ in range(part_count):
+            part_md5s.append(hashlib.md5(f.read(part_size)).digest())
+    if part_count == 1:
+        return part_md5s[0].hex(), 1
+    return hashlib.md5(b"".join(part_md5s)).hexdigest(), part_count
+
+
+def _local_etag(file_path: str) -> str:
+    md5_hex, part_count = _multipart_md5(file_path)
+    if part_count == 1:
+        return md5_hex
+    return f"{md5_hex}-{part_count}"
 
 
 def parse_args():
@@ -126,10 +146,13 @@ def sync_models_from_s3(models_dir: Path, name_filter: str | None, force: bool) 
             local_path = seed_vc_root / Path(s3_key).name
         file_size_mb = obj["Size"] / (1024 * 1024)
 
-        if local_path.exists() and not force and local_path.stat().st_size == obj["Size"]:
-            print(f"Skipping {local_path.name} (already exists, same size)")
-            skipped += 1
-            continue
+        if local_path.exists() and not force:
+            local_etag = _local_etag(str(local_path))
+            s3_etag = obj.get("ETag", "").strip('"')
+            if local_etag == s3_etag:
+                print(f"Skipping {local_path.name} (same content)")
+                skipped += 1
+                continue
 
         print(f"Downloading {local_path.name} ({file_size_mb:.2f} MB)...", end=" ", flush=True)
         try:

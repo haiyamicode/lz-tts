@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -41,6 +42,25 @@ def get_s3_client():
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
         region_name=os.getenv("AWS_REGION", "us-east-1"),
     )
+
+
+def _multipart_md5(file_path: str, part_size: int = 8 * 1024 * 1024) -> tuple[str, int]:
+    file_size = os.path.getsize(file_path)
+    part_count = max(1, (file_size + part_size - 1) // part_size)
+    part_md5s = []
+    with open(file_path, "rb") as f:
+        for _ in range(part_count):
+            part_md5s.append(hashlib.md5(f.read(part_size)).digest())
+    if part_count == 1:
+        return part_md5s[0].hex(), 1
+    return hashlib.md5(b"".join(part_md5s)).hexdigest(), part_count
+
+
+def _local_etag(file_path: str) -> str:
+    md5_hex, part_count = _multipart_md5(file_path)
+    if part_count == 1:
+        return md5_hex
+    return f"{md5_hex}-{part_count}"
 
 
 def parse_args():
@@ -151,14 +171,14 @@ def sync_models_to_s3(
             s3_key = f"seed-vc/{meta_rel.name}"
         else:
             s3_key = f"{s3_models_path}/{target_name}"
-        local_size = local_file.stat().st_size
-        file_size_mb = local_size / (1024 * 1024)
+        file_size_mb = local_file.stat().st_size / (1024 * 1024)
 
         if skip_existing:
             try:
                 response = s3_client.head_object(Bucket=bucket, Key=s3_key)
-                if response.get("ContentLength") == local_size:
-                    print(f"Skipping {target_name} (already exists, same size)")
+                s3_etag = response.get("ETag", "").strip('"')
+                if _local_etag(str(local_file)) == s3_etag:
+                    print(f"Skipping {target_name} (same content)")
                     skipped += 1
                     continue
             except ClientError as e:

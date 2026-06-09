@@ -106,6 +106,8 @@ class VitsModel(pl.LightningModule):
         semantic_fusion_mode: Optional[str] = None,
         use_spk_conditioned_encoder: bool = False,
         speaker_condition_layer: int = 2,
+        # inference-only (no discriminator, no datasets)
+        inference_only: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -160,15 +162,19 @@ class VitsModel(pl.LightningModule):
             use_spk_conditioned_encoder=use_spk_conditioned_encoder,
             speaker_condition_layer=speaker_condition_layer,
         )
-        self.model_d = MultiPeriodDiscriminator(
-            use_spectral_norm=self.hparams.use_spectral_norm
-        )
+        if inference_only:
+            self.model_d = None
+        else:
+            self.model_d = MultiPeriodDiscriminator(
+                use_spectral_norm=self.hparams.use_spectral_norm
+            )
 
         # Dataset splits
         self._train_dataset: Optional[Dataset] = None
         self._val_dataset: Optional[Dataset] = None
         self._test_dataset: Optional[Dataset] = None
-        self._load_datasets(validation_split, num_test_examples, max_phoneme_ids)
+        if not inference_only:
+            self._load_datasets(validation_split, num_test_examples, max_phoneme_ids)
 
         # State kept between training optimizers
         self._y = None

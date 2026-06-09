@@ -10,6 +10,7 @@ Usage:
     uv run python scripts/download_data.py --data-dir ./data
 """
 import argparse
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -23,14 +24,32 @@ load_dotenv()
 
 
 def get_s3_client():
-    """Create and return S3 client with Wasabi configuration"""
     return boto3.client(
-        's3',
+        "s3",
         endpoint_url=f"https://{os.getenv('AWS_S3_ENDPOINT')}",
-        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-        region_name=os.getenv('AWS_REGION', 'us-east-1')
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("AWS_REGION", "us-east-1"),
     )
+
+
+def _multipart_md5(file_path: str, part_size: int = 8 * 1024 * 1024) -> tuple[str, int]:
+    file_size = os.path.getsize(file_path)
+    part_count = max(1, (file_size + part_size - 1) // part_size)
+    part_md5s = []
+    with open(file_path, "rb") as f:
+        for _ in range(part_count):
+            part_md5s.append(hashlib.md5(f.read(part_size)).digest())
+    if part_count == 1:
+        return part_md5s[0].hex(), 1
+    return hashlib.md5(b"".join(part_md5s)).hexdigest(), part_count
+
+
+def _local_etag(file_path: str) -> str:
+    md5_hex, part_count = _multipart_md5(file_path)
+    if part_count == 1:
+        return md5_hex
+    return f"{md5_hex}-{part_count}"
 
 
 def parse_args():
@@ -51,6 +70,11 @@ def parse_args():
         action="store_true",
         help="Re-download even if local file exists with same size.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without actually downloading.",
+    )
     return parser.parse_args()
 
 
@@ -68,6 +92,7 @@ def sync_data_from_s3(
     data_dir: Path | None = None,
     name_filter: str | None = None,
     force: bool = False,
+    dry_run: bool = False,
 ):
     """Sync model data files from S3 to local"""
     # Get configuration
@@ -141,13 +166,14 @@ def sync_data_from_s3(
             s3_key = obj['Key']
             local_path = local_data_dir / relative_path
 
-            # Exclude very large artifacts handled by separate download scripts
+            # Exclude files handled by separate scripts
             _EXCLUDE_PREFIXES = (
                 "seed-vc/embeddings/",
                 "seed-vc/checkpoints/",
             )
-            if any(relative_path.startswith(p) for p in _EXCLUDE_PREFIXES):
-                print(f"Skipping {relative_path} (handled by separate script)")
+            _EXCLUDE_NAMES = {"server.json"}
+            if any(relative_path.startswith(p) for p in _EXCLUDE_PREFIXES) or relative_path in _EXCLUDE_NAMES:
+                print(f"Skipping {relative_path} (handled separately)")
                 skipped += 1
                 continue
 
@@ -156,13 +182,29 @@ def sync_data_from_s3(
             # Create parent directories
             local_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Check if file already exists with same size
+            # Compare local ETag vs S3 ETag (multipart-aware)
             if local_path.exists() and not force:
-                local_size = local_path.stat().st_size
-                if local_size == obj['Size']:
-                    print(f"Skipping {relative_path} (already exists, same size)")
+                s3_etag = obj.get("ETag", "").strip('"')
+                local_etag = _local_etag(str(local_path))
+                if s3_etag and local_etag == s3_etag:
+                    if dry_run:
+                        print(f"  SKIP {relative_path} (same content)")
+                    else:
+                        print(f"Skipping {relative_path} (same content)")
                     skipped += 1
                     continue
+                if dry_run:
+                    print(f"  WOULD DOWNLOAD {relative_path} ({file_size:.1f} MB) — local ETag {local_etag} != S3 {s3_etag}")
+                    downloaded += 1
+                    continue
+
+            if dry_run:
+                if not local_path.exists():
+                    print(f"  WOULD DOWNLOAD {relative_path} ({file_size:.1f} MB) — missing locally")
+                else:
+                    print(f"  WOULD DOWNLOAD {relative_path} ({file_size:.1f} MB) — force mode")
+                downloaded += 1
+                continue
 
             print(f"Downloading {relative_path} ({file_size:.2f} MB)...", end=" ", flush=True)
 
@@ -211,5 +253,6 @@ if __name__ == "__main__":
             data_dir=data_dir,
             name_filter=args.filter,
             force=args.force,
+            dry_run=args.dry_run,
         )
     )

@@ -10,6 +10,7 @@ Usage:
     uv run python scripts/upload_data.py --data-dir ./data
 """
 import argparse
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -53,17 +54,37 @@ def parse_args():
     return parser.parse_args()
 
 
+def _multipart_md5(file_path: str, part_size: int = 8 * 1024 * 1024) -> tuple[str, int]:
+    file_size = os.path.getsize(file_path)
+    part_count = max(1, (file_size + part_size - 1) // part_size)
+    part_md5s = []
+    with open(file_path, "rb") as f:
+        for _ in range(part_count):
+            part_md5s.append(hashlib.md5(f.read(part_size)).digest())
+    if part_count == 1:
+        return part_md5s[0].hex(), 1
+    return hashlib.md5(b"".join(part_md5s)).hexdigest(), part_count
+
+
+def _local_etag(file_path: str) -> str:
+    """Compute the S3-equivalent ETag for a local file."""
+    md5_hex, part_count = _multipart_md5(str(file_path))
+    if part_count == 1:
+        return md5_hex
+    return f"{md5_hex}-{part_count}"
+
+
 def upload_file(s3_client, local_path, bucket, s3_key, display_path, force=False):
     """Upload a single file to S3"""
-    local_size = local_path.stat().st_size
-    file_size_mb = local_size / (1024 * 1024)
+    file_size_mb = local_path.stat().st_size / (1024 * 1024)
 
-    # Check if file already exists with same size
+    # Compare local ETag vs S3 ETag (multipart-aware)
     if not force:
         try:
             response = s3_client.head_object(Bucket=bucket, Key=s3_key)
-            if response["ContentLength"] == local_size:
-                print(f"Skipping {display_path} (already exists, same size)")
+            s3_etag = response.get("ETag", "").strip('"')
+            if s3_etag and _local_etag(str(local_path)) == s3_etag:
+                print(f"Skipping {display_path} (same content)")
                 return "skipped"
         except ClientError as e:
             if e.response["Error"]["Code"] != "404":
@@ -126,15 +147,6 @@ def upload_data_to_s3(
         # Find all files in this model directory
         files = list(model_dir.rglob("*"))
         files = [f for f in files if f.is_file()]
-
-        # Exclude very large artifacts handled by separate upload scripts
-        _EXCLUDE_PREFIXES = (
-            "seed-vc/embeddings/",
-            "seed-vc/checkpoints/",
-        )
-        files = [f for f in files if not any(
-            str(f.relative_to(data_dir)).startswith(p) for p in _EXCLUDE_PREFIXES
-        )]
 
         if not files:
             print(f"No files found in {model_dir.name}")
