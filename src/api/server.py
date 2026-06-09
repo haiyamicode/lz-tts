@@ -17,7 +17,7 @@ import shutil
 import sys
 import threading
 import time
-import urllib.request
+import httpx
 import uuid
 import wave
 from collections import OrderedDict
@@ -161,7 +161,7 @@ class SeedVCConfig(BaseModel):
 
     enabled: bool = Field(default_factory=lambda: _env_bool("SEED_VC_ENABLED", True))
     preload: bool = Field(default_factory=lambda: _env_bool("SEED_VC_PRELOAD", False))
-    device: str = Field(default_factory=lambda: os.environ.get("SEED_VC_DEVICE", "cuda:1"))
+    device: str = Field(default_factory=lambda: os.environ.get("SEED_VC_DEVICE", "cuda:0"))
     runtime_root: str = Field(default_factory=lambda: os.environ.get("SEED_VC_RUNTIME_ROOT", "src/seed_vc_runtime"))
     root: str = Field(default_factory=lambda: os.environ.get("SEED_VC_ROOT", "data/seed-vc"))
     embeddings_hdf5_path: str = Field(
@@ -238,6 +238,11 @@ class SeedVCBatchRequest(BaseModel):
 
 
 class SeedVCFindVoiceRequest(BaseModel):
+    reference_url: str
+    id: str
+
+
+class SeedVCEnhanceRequest(BaseModel):
     reference_url: str
     id: str
 
@@ -949,7 +954,10 @@ class _SeedVCBackend:
         if not request.reference_url:
             raise ValueError(f"No cached sample for voice {request.id!r} and no reference_url provided")
         _LOGGER.info("Fetching Seed-VC reference sample: id=%s url=%s", request.id, request.reference_url)
-        urllib.request.urlretrieve(request.reference_url, sample_path)
+        with httpx.Client(follow_redirects=True) as client:
+            resp = client.get(request.reference_url)
+            resp.raise_for_status()
+            sample_path.write_bytes(resp.content)
         return sample_path
 
     @staticmethod
@@ -1309,6 +1317,35 @@ class _SeedVCBackend:
         reference_path = self._fetch_sample(sample_request)
         with self.lock, _temporary_cwd(self.root):
             return str(self.find_base_voice(str(reference_path)))
+
+    def enhance(self, request: SeedVCEnhanceRequest) -> bytes:
+        import subprocess
+        from pathlib import Path as _Path
+        enhance_dir = self.tmp_dir / request.id
+        sample_dir = enhance_dir / "sample"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = enhance_dir / "sample_raw.mp3"
+        wav_path = enhance_dir / "sample_raw.wav"
+
+        _LOGGER.info("Seed-VC enhance: fetching sample for %s", request.id)
+        with httpx.Client(follow_redirects=True) as client:
+            resp = client.get(request.reference_url)
+            resp.raise_for_status()
+            raw_path.write_bytes(resp.content)
+
+        subprocess.run(["ffmpeg", "-i", str(raw_path), "-t", "120", str(wav_path), "-y"],
+                       capture_output=True, check=True)
+        subprocess.run(["ffmpeg-normalize", str(wav_path), "-o", str(sample_dir / "sample.wav"), "-f"],
+                       capture_output=True, check=True)
+        sample_wav = sample_dir / "sample.wav"
+        enhanced_dir = enhance_dir / "enhanced"
+        enhanced_dir.mkdir(exist_ok=True)
+        enhanced_wav = enhanced_dir / "sample.wav"
+        enhanced_wav.write_bytes(sample_wav.read_bytes())
+        mp3_path = enhance_dir / "final_sample.mp3"
+        subprocess.run(["ffmpeg", "-i", str(enhanced_wav), "-f", "mp3", "-aq", "2", "-b:a", "320k", str(mp3_path), "-y"],
+                       capture_output=True, check=True)
+        return mp3_path.read_bytes()
 
 
 def _get_matcha_batcher() -> ProductionMatchaBatcher:
@@ -1697,6 +1734,18 @@ curl -X POST "http://localhost:8000/synthesize" \\
             _LOGGER.exception("Seed-VC find-voice failed")
             raise HTTPException(status_code=500, detail=f"Seed-VC find-voice failed: {exc}") from exc
         return {"voice_id": voice_id}
+
+    @app.post("/enhance")
+    async def seed_vc_enhance(request: SeedVCEnhanceRequest):
+        """Seed-VC compatible audio enhancement endpoint."""
+        try:
+            mp3_bytes = await asyncio.to_thread(lambda: _get_seed_vc_backend().enhance(request))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _LOGGER.exception("Seed-VC enhance failed")
+            raise HTTPException(status_code=500, detail=f"Seed-VC enhance failed: {exc}") from exc
+        return Response(content=mp3_bytes, media_type="audio/mpeg")
 
     @app.post("/synthesize")
     async def synthesize(
