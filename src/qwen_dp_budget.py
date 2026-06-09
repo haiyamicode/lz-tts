@@ -381,7 +381,8 @@ class QwenDpBudget:
             g = None
 
         if model.use_sdp:
-            logw = model.dp(x_encoded, x_mask, g=g, reverse=True, noise_scale=self.config.noise_scale)
+            dp = model.sdp if model.use_duration_blend else model.dp
+            logw = dp(x_encoded, x_mask, g=g, reverse=True, noise_scale=self.config.noise_scale)
         else:
             logw = model.dp(x_encoded, x_mask, g=g)
         w = torch.exp(logw) * x_mask * self.config.length_scale
