@@ -82,6 +82,7 @@ dependencies = [
     "gruut[de,es,fr]==2.2.3",
     "vocos>=0.1.0",
     "httpx>=0.28.1",
+    "ffmpeg-normalize>=1.37.8",
 ]
 
 [build-system]
