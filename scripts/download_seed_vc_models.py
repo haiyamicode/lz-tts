@@ -21,6 +21,12 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODELS_DIR = Path("data/seed-vc/models")
 
+# Non-model Seed-VC artifacts that must also be downloaded alongside the models
+DEFAULT_METAFILES: list[Path] = [
+    Path("data/seed-vc/voices_final.pkl"),
+    Path("data/seed-vc/voice-samples/andrew.mp3"),
+]
+
 
 def resolve_repo_path(path: Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
@@ -82,17 +88,42 @@ def sync_models_from_s3(models_dir: Path, name_filter: str | None, force: bool) 
         and (name_filter is None or name_filter in Path(obj["Key"]).name)
     ]
 
-    if not model_files:
-        print("No matching .pth model files found in S3")
+    # Also list non-model metafiles (.pkl, .mp3) from the seed-vc prefix
+    meta_objects = [
+        obj for obj in objects
+        if not obj["Key"].endswith(".pth")
+        and not obj["Key"] == f"{s3_models_path}/"
+        and Path(obj["Key"]).suffix in (".pkl", ".mp3")
+    ]
+    # Also list metafiles from seed-vc/ prefix (uploaded by separate path)
+    try:
+        meta_response = s3_client.list_objects_v2(Bucket=bucket, Prefix="seed-vc/")
+        meta_objects += [
+            obj for obj in meta_response.get("Contents", [])
+            if obj["Key"] != "seed-vc/" and Path(obj["Key"]).suffix in (".pkl", ".mp3")
+        ]
+    except ClientError:
+        pass
+
+    all_objects = model_files + meta_objects
+
+    if not all_objects:
+        print("No files found in S3")
         return 0
 
-    print(f"Found {len(model_files)} model file(s)")
-    print(f"Target: {models_dir}/")
+    print(f"Found {len(model_files)} model(s) + {len(meta_objects)} metafile(s)")
+    print(f"Target: {models_dir}/.. (models go to models/, metafiles to seed-vc root)")
+
+    seed_vc_root = models_dir.parent  # data/seed-vc/
 
     downloaded = skipped = failed = 0
-    for obj in model_files:
+    for obj in all_objects:
         s3_key = obj["Key"]
-        local_path = models_dir / Path(s3_key).name
+        # Models go to models/, metafiles go to seed-vc root
+        if s3_key.endswith(".pth"):
+            local_path = models_dir / Path(s3_key).name
+        else:
+            local_path = seed_vc_root / Path(s3_key).name
         file_size_mb = obj["Size"] / (1024 * 1024)
 
         if local_path.exists() and not force and local_path.stat().st_size == obj["Size"]:

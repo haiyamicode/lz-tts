@@ -140,6 +140,17 @@ def sync_data_from_s3(
         for obj, relative_path in filtered_objects:
             s3_key = obj['Key']
             local_path = local_data_dir / relative_path
+
+            # Exclude very large artifacts handled by separate download scripts
+            _EXCLUDE_PREFIXES = (
+                "seed-vc/embeddings/",
+                "seed-vc/checkpoints/",
+            )
+            if any(relative_path.startswith(p) for p in _EXCLUDE_PREFIXES):
+                print(f"Skipping {relative_path} (handled by separate script)")
+                skipped += 1
+                continue
+
             file_size = obj['Size'] / (1024 * 1024)  # MB
 
             # Create parent directories

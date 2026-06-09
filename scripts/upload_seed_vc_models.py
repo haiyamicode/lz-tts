@@ -22,6 +22,12 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODELS_DIR = Path("data/seed-vc/models")
 
+# Non-model Seed-VC artifacts that must also be uploaded alongside the models
+DEFAULT_METAFILES: list[Path] = [
+    Path("data/seed-vc/voices_final.pkl"),
+    Path("data/seed-vc/voice-samples/andrew.mp3"),
+]
+
 
 def resolve_repo_path(path: Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
@@ -113,8 +119,19 @@ def sync_models_to_s3(
     for missing_file in missing:
         print(f"Warning: model not found locally: {missing_file}")
 
-    if not model_files:
-        print("No .pth files found to upload")
+    # Also include required non-model metafiles
+    meta_files: list[Path] = []
+    for meta_rel in DEFAULT_METAFILES:
+        meta_path = resolve_repo_path(meta_rel)
+        if meta_path.exists():
+            meta_files.append(meta_path)
+        else:
+            print(f"Warning: metafile not found locally: {meta_rel}")
+
+    all_files = model_files + meta_files
+
+    if not all_files:
+        print("No files found to upload")
         return 0
 
     if rename and len(model_files) > 1:
@@ -122,31 +139,36 @@ def sync_models_to_s3(
         return 1
 
     s3_client = get_s3_client()
-    print(f"Found {len(model_files)} model file(s)")
+    print(f"Found {len(model_files)} model file(s) + {len(meta_files)} metafile(s)")
     print(f"Target: s3://{bucket}/{s3_models_path}/")
 
     uploaded = skipped = failed = 0
-    for model_file in model_files:
-        target_name = rename or model_file.name
-        s3_key = f"{s3_models_path}/{target_name}"
-        local_size = model_file.stat().st_size
+    for local_file in all_files:
+        target_name = rename or local_file.name
+        # Models go under seed-vc/models/, metafiles go under seed-vc/
+        if local_file in meta_files:
+            meta_rel = local_file.relative_to(PROJECT_ROOT)
+            s3_key = f"seed-vc/{meta_rel.name}"
+        else:
+            s3_key = f"{s3_models_path}/{target_name}"
+        local_size = local_file.stat().st_size
         file_size_mb = local_size / (1024 * 1024)
 
         if skip_existing:
             try:
                 response = s3_client.head_object(Bucket=bucket, Key=s3_key)
-                if response["ContentLength"] == local_size:
-                    print(f"Skipping {model_file.name} (already exists, same size)")
+                if response.get("ContentLength") == local_size:
+                    print(f"Skipping {target_name} (already exists, same size)")
                     skipped += 1
                     continue
             except ClientError as e:
                 if e.response["Error"]["Code"] != "404":
-                    print(f"Error checking {model_file.name}: {e}")
+                    print(f"Error checking {target_name}: {e}")
 
-        display_name = f"{model_file.name} -> {target_name}" if rename else model_file.name
+        display_name = f"{target_name}" if not rename else f"{local_file.name} -> {target_name}"
         print(f"Uploading {display_name} ({file_size_mb:.2f} MB)...", end=" ", flush=True)
         try:
-            s3_client.upload_file(str(model_file), bucket, s3_key)
+            s3_client.upload_file(str(local_file), bucket, s3_key)
             print("done")
             uploaded += 1
         except ClientError as e:

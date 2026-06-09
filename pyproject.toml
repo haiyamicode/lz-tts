@@ -80,6 +80,7 @@ dependencies = [
     "unidic-lite==1.0.8",
     "cached-path>=1.8.10",
     "gruut[de,es,fr]==2.2.3",
+    "vocos>=0.1.0",
 ]
 
 [build-system]

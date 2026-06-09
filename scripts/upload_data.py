@@ -127,6 +127,15 @@ def upload_data_to_s3(
         files = list(model_dir.rglob("*"))
         files = [f for f in files if f.is_file()]
 
+        # Exclude very large artifacts handled by separate upload scripts
+        _EXCLUDE_PREFIXES = (
+            "seed-vc/embeddings/",
+            "seed-vc/checkpoints/",
+        )
+        files = [f for f in files if not any(
+            str(f.relative_to(data_dir)).startswith(p) for p in _EXCLUDE_PREFIXES
+        )]
+
         if not files:
             print(f"No files found in {model_dir.name}")
             continue

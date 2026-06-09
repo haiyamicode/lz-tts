@@ -291,31 +291,55 @@ def main() -> None:
     for proc in processes:
         proc.start()
 
+    import threading
+
     _LOGGER.info(
         "Processing %s utterance(s) with %s worker(s)", num_utterances, args.max_workers
     )
-    for utt_batch in batched(
-        make_dataset(args),
-        batch_size,
-    ):
-        queue_in.put(utt_batch)
 
-    _LOGGER.debug("Waiting for jobs to finish")
+    # Drain results in a background thread to avoid queue buffer deadlock.
     missing_phonemes: "Counter[str]" = Counter()
     dataset_rows: List[dict] = []
-    for _ in range(num_utterances):
-        utt = queue_out.get()
-        if utt is not None:
-            if utt.speaker is not None and utt.speaker in speaker_ids:
-                utt.speaker_id = speaker_ids[utt.speaker]
+    results_done = threading.Event()
+    drain_error: Optional[Exception] = None
+    progress_counter = [0]  # mutable for closure
 
-            utt_dict = dataclasses.asdict(utt)
-            utt_dict.pop("missing_phonemes")
-            dataset_rows.append(
-                json.loads(json.dumps(utt_dict, ensure_ascii=False, cls=PathEncoder))
-            )
+    def _drain_results():
+        nonlocal drain_error
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(total=num_utterances, desc="Preprocessing", unit="utt", dynamic_ncols=True)
+            got = 0
+            while got < num_utterances:
+                utt = queue_out.get()
+                got += 1
+                if utt is not None:
+                    if utt.speaker is not None and utt.speaker in speaker_ids:
+                        utt.speaker_id = speaker_ids[utt.speaker]
+                    utt_dict = dataclasses.asdict(utt)
+                    utt_dict.pop("missing_phonemes")
+                    dataset_rows.append(
+                        json.loads(json.dumps(utt_dict, ensure_ascii=False, cls=PathEncoder))
+                    )
+                    missing_phonemes.update(utt.missing_phonemes)
+                pbar.update(1)
+                progress_counter[0] = got
+            pbar.close()
+        except Exception as exc:
+            drain_error = exc
+        finally:
+            results_done.set()
 
-            missing_phonemes.update(utt.missing_phonemes)
+    drain_thread = threading.Thread(target=_drain_results, daemon=True)
+    drain_thread.start()
+
+    for utt_batch in batched(make_dataset(args), batch_size):
+        queue_in.put(utt_batch)
+
+    results_done.wait()
+    drain_thread.join()
+    if drain_error:
+        raise drain_error
 
     dataset_path = args.output_dir / "dataset.parquet"
     pq.write_table(pa.Table.from_pylist(dataset_rows), dataset_path, compression="zstd")
@@ -1018,6 +1042,7 @@ def phonemize_batch_espeak(
                     queue_out.put(utt)
                 except TimeoutError:
                     _LOGGER.error("Skipping utterance due to timeout: %s", utt)
+                    queue_out.put(None)
                 except Exception:
                     _LOGGER.exception("Failed to process utterance: %s", utt)
                     queue_out.put(None)
@@ -1064,9 +1089,9 @@ def phonemize_batch_text(
                             silence_detector,
                             args.sample_rate,
                         )
-                    queue_out.put(utt)
                 except TimeoutError:
                     _LOGGER.error("Skipping utterance due to timeout: %s", utt)
+                    queue_out.put(None)
                 except Exception:
                     _LOGGER.exception("Failed to process utterance: %s", utt)
                     queue_out.put(None)

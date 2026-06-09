@@ -33,8 +33,11 @@ DEFAULT_FILES = [
     (Path("data/lzspeech-sparrow/config.json"), Path("lzspeech-sparrow/config.json")),
     (Path("data/lzspeech-sparrow-en-GB/model.ckpt"), Path("lzspeech-sparrow-en-GB/model.ckpt")),
     (Path("data/lzspeech-sparrow-en-GB/config.json"), Path("lzspeech-sparrow-en-GB/config.json")),
-    (Path("data/seed-vc/voices_final.pkl"), Path("seed-vc/voices_final.pkl")),
-    (Path("data/seed-vc/voice-samples/andrew.mp3"), Path("seed-vc/voice-samples/andrew.mp3")),
+    (Path("data/lzspeech-starling/model.ckpt"), Path("lzspeech-starling/model.ckpt")),
+    (Path("data/lzspeech-bert-en-GB/model.ckpt"), Path("lzspeech-bert-en-GB/model.ckpt")),
+    (Path("data/lzspeech-bert-en-GB/config.json"), Path("lzspeech-bert-en-GB/config.json")),
+    (Path("data/heteronyms/best.pt"), Path("heteronyms/best.pt")),
+    (Path("data/heteronyms/heretonyms.jsonl"), Path("heteronyms/heretonyms.jsonl")),
 ]
 
 
