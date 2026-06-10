@@ -1263,6 +1263,11 @@ def synthesize(req: SynthesizeRequest):
         flush=True,
     )
 
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return StreamingResponse(io.BytesIO(mp3_bytes), media_type="audio/mpeg")
 
 
@@ -1310,6 +1315,8 @@ def synthesize_batch(req: BatchSynthesizeRequest):
                     dp_language=settings.dp_language,
                 )
             )
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
 
     wall_seconds = time.perf_counter() - started

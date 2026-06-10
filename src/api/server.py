@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 import numpy as np
+import torch
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, Response
 from dotenv import load_dotenv
@@ -302,6 +303,19 @@ _matcha_batcher: "ProductionMatchaBatcher | None" = None
 _seed_vc_backend: "_SeedVCBackend | None" = None
 _rvc_backend: "RVCBackend | None" = None
 
+_inference_counter = 0
+_CLEANUP_EVERY = 3
+
+
+def _maybe_cleanup_gpu() -> None:
+    """Call torch.cuda.empty_cache() + gc.collect() every N inference requests."""
+    global _inference_counter
+    _inference_counter += 1
+    if _inference_counter % _CLEANUP_EVERY == 0:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
 
 def _normalize_locale(lang: str) -> str:
     """Normalize locale code to canonical BCP 47 format (e.g., en-us -> en-US)."""
@@ -386,13 +400,8 @@ def _enforce_cache_limit() -> None:
         evicted, _ = _inference_cache.popitem(last=False)
         _LOGGER.info("Evicted model from cache: %s", evicted)
         gc.collect()
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def _load_model(model: str) -> PiperInference:
@@ -1741,6 +1750,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
                 "text": result.text,
                 "phoneme": result.phoneme_text,
             }
+        _maybe_cleanup_gpu()
         return Response(content=_audio_to_wav_bytes(result.audio, result.sample_rate), media_type="audio/wav", headers=headers)
 
     @app.get("/seed-vc/status")
@@ -1774,6 +1784,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
         except Exception as exc:
             _LOGGER.exception("Seed-VC conversion failed")
             raise HTTPException(status_code=500, detail=f"Seed-VC conversion failed: {exc}") from exc
+        _maybe_cleanup_gpu()
         return Response(content=mp3_bytes, media_type="audio/mpeg")
 
     @app.post("/vc-batch")
@@ -1799,6 +1810,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
         except Exception as exc:
             _LOGGER.exception("Seed-VC batch conversion failed")
             raise HTTPException(status_code=500, detail=f"Seed-VC batch conversion failed: {exc}") from exc
+        _maybe_cleanup_gpu()
         return result
 
     @app.post("/find-voice")
@@ -1833,6 +1845,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
         except Exception as exc:
             _LOGGER.exception("Seed-VC enhance failed")
             raise HTTPException(status_code=500, detail=f"Seed-VC enhance failed: {exc}") from exc
+        _maybe_cleanup_gpu()
         return Response(content=mp3_bytes, media_type="audio/mpeg")
 
     @app.get("/rvc/status")
@@ -1886,6 +1899,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
             raise HTTPException(status_code=500, detail=f"RVC conversion failed: {exc}") from exc
 
         media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
+        _maybe_cleanup_gpu()
         return Response(content=result_bytes, media_type=media_type)
 
     @app.post("/synthesize")
@@ -1956,6 +1970,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
             audio_bytes = _audio_to_wav_bytes(audio, sample_rate)
             media_type = "audio/wav"
 
+        _maybe_cleanup_gpu()
         return Response(content=audio_bytes, media_type=media_type)
 
     @app.get("/synthesize")
@@ -2033,6 +2048,7 @@ curl -X POST "http://localhost:8000/synthesize" \\
             audio_bytes = _audio_to_wav_bytes(audio, sample_rate)
             media_type = "audio/wav"
 
+        _maybe_cleanup_gpu()
         return Response(content=audio_bytes, media_type=media_type)
 
     return app
