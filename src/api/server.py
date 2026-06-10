@@ -38,6 +38,7 @@ from ..matcha_inference import MatchaBackend as ProductionMatchaBackend
 from ..matcha_inference import MatchaBatcher as ProductionMatchaBatcher
 from . import qwen3
 from .qwen3 import router as qwen3_router
+from .rvc import RVCBackend, RVCSettings
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
 _LOGGER = logging.getLogger(__name__)
@@ -104,6 +105,7 @@ class EngineEnableConfig(BaseModel):
     qwen3: bool = Field(default_factory=lambda: _env_bool("QWEN_TTS_ENABLED", True))
     matcha: bool = Field(default_factory=lambda: _env_bool("MATCHA_TTS_ENABLED", False))
     seed_vc: bool = Field(default_factory=lambda: _env_bool("SEED_VC_ENABLED", True))
+    rvc: bool = Field(default_factory=lambda: _env_bool("RVC_ENABLED", False))
 
 
 class PiperTTSConfig(BaseModel):
@@ -176,6 +178,19 @@ class SeedVCConfig(BaseModel):
     embedding_cache_size: int = Field(default_factory=lambda: int(os.environ.get("SEED_VC_EMBEDDING_CACHE_SIZE", "256")), ge=1)
 
 
+class RVCConfig(BaseModel):
+    """RVC voice conversion engine configuration."""
+
+    enabled: bool = Field(default_factory=lambda: _env_bool("RVC_ENABLED", False))
+    preload: bool = Field(default_factory=lambda: _env_bool("RVC_PRELOAD", False))
+    default_model: str = Field(default_factory=lambda: os.environ.get("RVC_DEFAULT_MODEL", "mrbeast.pth"))
+    default_f0_method: str = Field(default_factory=lambda: os.environ.get("RVC_F0_METHOD", "rmvpe"))
+    default_pitch: int = Field(default_factory=lambda: int(os.environ.get("RVC_PITCH", "0")))
+    default_index_rate: float = Field(default_factory=lambda: float(os.environ.get("RVC_INDEX_RATE", "0.0")))
+    default_rms_mix_rate: float = Field(default_factory=lambda: float(os.environ.get("RVC_RMS_MIX_RATE", "0.25")))
+    default_protect: float = Field(default_factory=lambda: float(os.environ.get("RVC_PROTECT", "0.33")))
+
+
 class ServerConfig(BaseModel):
     """Server configuration."""
 
@@ -184,6 +199,7 @@ class ServerConfig(BaseModel):
     qwen: QwenTTSConfig = Field(default_factory=QwenTTSConfig)
     matcha: MatchaConfig = Field(default_factory=MatchaConfig)
     seed_vc: SeedVCConfig = Field(default_factory=SeedVCConfig)
+    rvc: RVCConfig = Field(default_factory=RVCConfig)
 
 
 class SynthesizeRequest(BaseModel):
@@ -247,6 +263,19 @@ class SeedVCEnhanceRequest(BaseModel):
     id: str
 
 
+class RVCConvertRequest(BaseModel):
+    """Request body for RVC voice conversion."""
+
+    audio: str = Field(..., description="Base64 encoded source audio")
+    model: str = Field("mrbeast.pth", description="RVC model filename (e.g., 'mrbeast.pth')")
+    f0_method: str = Field("rmvpe", description="Pitch extraction method (pm, harvest, crepe, rmvpe)")
+    pitch: int = Field(0, description="Pitch shift in semitones")
+    index_rate: float = Field(0.0, description="FAISS index blending rate 0-1 (0 = no index)")
+    rms_mix_rate: float = Field(0.25, description="Volume envelope mix rate 0-1")
+    protect: float = Field(0.33, description="Protect voiceless consonants 0-0.5")
+    format: Literal["wav", "mp3"] = Field("wav", description="Output audio format (wav or mp3)")
+
+
 class SpeakerInfo(BaseModel):
     """Speaker information."""
 
@@ -271,6 +300,7 @@ _splitter: MultilingualSplitter | None = None
 _matcha_backend: "ProductionMatchaBackend | None" = None
 _matcha_batcher: "ProductionMatchaBatcher | None" = None
 _seed_vc_backend: "_SeedVCBackend | None" = None
+_rvc_backend: "RVCBackend | None" = None
 
 
 def _normalize_locale(lang: str) -> str:
@@ -299,7 +329,7 @@ def _load_config() -> ServerConfig:
     return config
 
 
-def _engine_enabled(engine: Literal["pipertts", "qwen3", "matcha", "seed_vc"], config: ServerConfig | None = None) -> bool:
+def _engine_enabled(engine: Literal["pipertts", "qwen3", "matcha", "seed_vc", "rvc"], config: ServerConfig | None = None) -> bool:
     cfg = config or _server_config
     return bool(getattr(cfg.engines, engine))
 
@@ -1371,6 +1401,27 @@ def _get_seed_vc_backend() -> _SeedVCBackend:
     return _seed_vc_backend
 
 
+def _get_rvc_backend() -> RVCBackend:
+    global _rvc_backend
+    if not _engine_enabled("rvc"):
+        raise HTTPException(status_code=503, detail="RVC backend is disabled")
+    if _rvc_backend is None:
+        try:
+            _rvc_backend = RVCBackend(RVCSettings(
+                enabled=True,
+                default_model=_server_config.rvc.default_model,
+                default_f0_method=_server_config.rvc.default_f0_method,
+                default_pitch=_server_config.rvc.default_pitch,
+                default_index_rate=_server_config.rvc.default_index_rate,
+                default_rms_mix_rate=_server_config.rvc.default_rms_mix_rate,
+                default_protect=_server_config.rvc.default_protect,
+            ))
+        except Exception as exc:
+            _LOGGER.exception("Failed to load RVC backend")
+            raise HTTPException(status_code=503, detail=f"Failed to load RVC backend: {exc}") from exc
+    return _rvc_backend
+
+
 def create_app(config: ServerConfig | None = None) -> FastAPI:
     """Create the FastAPI application."""
     global _server_config, _speaker_routes
@@ -1438,6 +1489,14 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if _engine_enabled("seed_vc") and not _seed_vc_backend:
             _LOGGER.warning("Seed-VC backend not preloaded (will load on first use)")
 
+        if _engine_enabled("rvc") and _server_config.rvc.preload:
+            _LOGGER.info("Preloading RVC backend...")
+            try:
+                _get_rvc_backend()
+                _LOGGER.info("RVC backend ready")
+            except Exception:
+                _LOGGER.exception("RVC preload failed (will load on first use)")
+
         _LOGGER.info("Server ready")
 
     @app.get("/")
@@ -1477,6 +1536,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 "qwen3": _engine_enabled("qwen3"),
                 "matcha": _engine_enabled("matcha"),
                 "seed_vc": _engine_enabled("seed_vc"),
+                "rvc": _engine_enabled("rvc"),
             },
             "pipertts": {
                 "enabled": _engine_enabled("pipertts"),
@@ -1508,6 +1568,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 "root": _server_config.seed_vc.root,
                 "runtime_root": _server_config.seed_vc.runtime_root,
                 "presets": sorted(_SeedVCBackend.model_presets),
+            },
+            "rvc": {
+                "enabled": _engine_enabled("rvc"),
+                "loaded": _rvc_backend is not None,
+                "default_model": _server_config.rvc.default_model,
             },
             "speakers": speakers,
         }
@@ -1770,6 +1835,59 @@ curl -X POST "http://localhost:8000/synthesize" \\
             raise HTTPException(status_code=500, detail=f"Seed-VC enhance failed: {exc}") from exc
         return Response(content=mp3_bytes, media_type="audio/mpeg")
 
+    @app.get("/rvc/status")
+    async def rvc_status():
+        """RVC voice conversion backend status."""
+        backend = _rvc_backend
+        if backend is None:
+            return {
+                "enabled": _engine_enabled("rvc"),
+                "loaded": False,
+                "default_model": _server_config.rvc.default_model,
+                "available_models": [],
+            }
+        return backend.status()
+
+    @app.get("/rvc/models", response_model=list[str])
+    async def rvc_models():
+        """List available RVC model weights."""
+        backend = _get_rvc_backend()
+        return backend.list_models()
+
+    @app.post("/rvc/convert")
+    async def rvc_convert(request: RVCConvertRequest):
+        """Convert audio through an RVC voice model.
+
+        Provide ``audio`` as base64-encoded source audio.
+        Returns converted audio in the requested ``format``.
+        """
+        if not request.audio:
+            raise HTTPException(status_code=400, detail="audio is required")
+        try:
+            audio_bytes = base64.b64decode(request.audio)
+            backend = _get_rvc_backend()
+            result_bytes, sr = await asyncio.to_thread(
+                backend.convert,
+                audio_bytes=audio_bytes,
+                model=request.model,
+                f0_method=request.f0_method,
+                pitch=request.pitch,
+                index_rate=request.index_rate,
+                rms_mix_rate=request.rms_mix_rate,
+                protect=request.protect,
+                output_format=request.format,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _LOGGER.exception("RVC conversion failed")
+            raise HTTPException(status_code=500, detail=f"RVC conversion failed: {exc}") from exc
+
+        media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
+        return Response(content=result_bytes, media_type=media_type)
+
     @app.post("/synthesize")
     async def synthesize(
         request: SynthesizeRequest,
@@ -2021,6 +2139,24 @@ def run():
             _LOGGER.info("Seed-VC backend ready")
         except Exception:
             _LOGGER.exception("Seed-VC preload failed (server will start without it)")
+
+    if _engine_enabled("rvc", _config) and _config.rvc.preload:
+        _LOGGER.info("Preloading RVC backend before server start...")
+        global _rvc_backend
+        _server_config = _config
+        try:
+            _rvc_backend = RVCBackend(RVCSettings(
+                enabled=True,
+                default_model=_config.rvc.default_model,
+                default_f0_method=_config.rvc.default_f0_method,
+                default_pitch=_config.rvc.default_pitch,
+                default_index_rate=_config.rvc.default_index_rate,
+                default_rms_mix_rate=_config.rvc.default_rms_mix_rate,
+                default_protect=_config.rvc.default_protect,
+            ))
+            _LOGGER.info("RVC backend ready")
+        except Exception:
+            _LOGGER.exception("RVC preload failed (server will start without it)")
 
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))

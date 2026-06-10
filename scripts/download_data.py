@@ -2,12 +2,14 @@
 """
 Download (sync) data files from Wasabi S3
 
-Downloads model data and server configuration (local/server.json) from S3.
+Downloads model data, server configuration (local/server.json), and RVC assets from S3.
 
 Usage:
     uv run python scripts/download_data.py
     uv run python scripts/download_data.py --filter lzspeech
     uv run python scripts/download_data.py --data-dir ./data
+    uv run python scripts/download_data.py --skip-rvc
+    uv run python scripts/download_data.py --dry-run
 """
 import argparse
 import hashlib
@@ -16,10 +18,10 @@ import sys
 from pathlib import Path
 
 import boto3
+import boto3.s3.transfer
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 
@@ -32,6 +34,10 @@ def get_s3_client():
         region_name=os.getenv("AWS_REGION", "us-east-1"),
     )
 
+
+# ---------------------------------------------------------------------------
+# ETag / skip helpers
+# ---------------------------------------------------------------------------
 
 def _multipart_md5(file_path: str, part_size: int = 8 * 1024 * 1024) -> tuple[str, int]:
     file_size = os.path.getsize(file_path)
@@ -52,40 +58,75 @@ def _local_etag(file_path: str) -> str:
     return f"{md5_hex}-{part_count}"
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Download LZ-TTS data (models and server config) from Wasabi S3."
-    )
-    parser.add_argument(
-        "--data-dir",
-        default=None,
-        help="Destination directory for data files (default: ./data)",
-    )
-    parser.add_argument(
-        "--filter",
-        help="Substring filter applied to model names (e.g., 'lzspeech'). Only matching models are downloaded.",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-download even if local file exists with same size.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be done without actually downloading.",
-    )
-    return parser.parse_args()
+def _should_skip(local_path: Path, s3_obj: dict, force: bool) -> bool:
+    if force or not local_path.exists():
+        return False
+    s3_etag = s3_obj.get("ETag", "").strip('"')
+    if not s3_etag:
+        return local_path.stat().st_size == s3_obj["Size"]
+    return _local_etag(str(local_path)) == s3_etag
+
+
+# ---------------------------------------------------------------------------
+# Download with progress
+# ---------------------------------------------------------------------------
+
+class _Progress:
+    def __init__(self, label: str, total: int):
+        self._label = label
+        self._total = total
+        self._seen = 0
+
+    def __call__(self, nbytes: int):
+        self._seen += nbytes
+        done_mb = self._seen / (1024 * 1024)
+        total_mb = self._total / (1024 * 1024)
+        pct = (self._seen / self._total * 100) if self._total else 0
+        print(f"\r  {self._label}  {done_mb:.1f}/{total_mb:.1f} MB ({pct:.0f}%)", end="", flush=True)
 
 
 def download_file(s3_client, bucket, s3_key, local_path):
-    """Download a single file from S3"""
+    """Download a single file from S3 with progress output."""
     try:
-        s3_client.download_file(bucket, s3_key, str(local_path))
+        local_path = Path(local_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cfg = boto3.s3.transfer.TransferConfig(
+            multipart_threshold=64 * 1024 * 1024,
+            multipart_chunksize=8 * 1024 * 1024,
+            max_concurrency=1,
+            use_threads=False,
+        )
+
+        label = local_path.name
+        if len(label) > 30:
+            label = label[:27] + "..."
+        seen = {"n": 0}
+
+        def _cb(nbytes):
+            seen["n"] += nbytes
+            mb = seen["n"] / (1024 * 1024)
+            print(f"\r  {label}  {mb:.1f} MB", end="", flush=True)
+
+        s3_client.download_file(
+            bucket, s3_key, str(local_path), Config=cfg, Callback=_cb
+        )
+        print()
         return True
     except ClientError as e:
-        print(f"Error downloading {s3_key}: {e}")
+        print(f"\n  Error downloading {s3_key}: {e}")
         return False
+
+
+# ---------------------------------------------------------------------------
+# Sync from lz-tts data prefix
+# ---------------------------------------------------------------------------
+
+_EXCLUDE_PREFIXES = (
+    "seed-vc/embeddings/",
+    "seed-vc/checkpoints/",
+)
+_EXCLUDE_NAMES = {"server.json"}
 
 
 def sync_data_from_s3(
@@ -94,8 +135,6 @@ def sync_data_from_s3(
     force: bool = False,
     dry_run: bool = False,
 ):
-    """Sync model data files from S3 to local"""
-    # Get configuration
     bucket = os.getenv('AWS_S3_BUCKET_NAME')
     s3_data_path = os.getenv('S3_DATA_PATH', 'lz-tts/data')
     local_data_dir = data_dir or Path('./data')
@@ -104,155 +143,198 @@ def sync_data_from_s3(
         print("Error: AWS_S3_BUCKET_NAME not set in .env")
         return 1
 
-    # Create local directory if it doesn't exist
     local_data_dir.mkdir(parents=True, exist_ok=True)
+    s3 = get_s3_client()
 
-    # Initialize S3 client
-    print(f"Connecting to Wasabi S3...")
-    s3_client = get_s3_client()
-
-    # List all objects in S3
     try:
-        print(f"Listing files from s3://{bucket}/{s3_data_path}/")
+        print(f"Connecting to Wasabi S3...")
+        print(f"Listing s3://{bucket}/{s3_data_path}/")
 
-        # Use paginator to handle large number of objects
-        paginator = s3_client.get_paginator('list_objects_v2')
+        paginator = s3.get_paginator('list_objects_v2')
         pages = paginator.paginate(Bucket=bucket, Prefix=f"{s3_data_path}/")
-
-        all_objects = []
-        for page in pages:
-            if 'Contents' in page:
-                all_objects.extend(page['Contents'])
+        all_objects = [o for page in pages for o in page.get('Contents', [])]
 
         if not all_objects:
-            print(f"No files found in s3://{bucket}/{s3_data_path}/")
+            print("No files found.")
             return 0
 
-        # Filter model directories if filter is specified
-        filtered_objects = []
+        filtered = []
         for obj in all_objects:
             key = obj['Key']
-            # Skip the root prefix itself
             if key == f"{s3_data_path}/":
                 continue
-
-            # Extract model name (first directory after prefix)
-            relative_path = key[len(s3_data_path)+1:]
-            if not relative_path:
+            rel = key[len(s3_data_path) + 1:]
+            if not rel:
                 continue
-
-            model_name = relative_path.split('/')[0]
-
-            # Apply filter if specified
+            model_name = rel.split('/')[0]
             if name_filter and name_filter not in model_name:
                 continue
+            filtered.append((obj, rel))
 
-            filtered_objects.append((obj, relative_path))
-
-        if not filtered_objects:
-            print(f"No matching files found (filter: {name_filter})")
+        if not filtered:
+            print(f"No matching files (filter: {name_filter})")
             return 0
 
-        print(f"Found {len(filtered_objects)} files to sync")
-        print(f"Target: {local_data_dir}/")
-        print()
+        print(f"Found {len(filtered)} files → {local_data_dir}/\n")
 
-        # Download each file
-        downloaded = 0
-        skipped = 0
-        failed = 0
+        downloaded = skipped = failed = 0
 
-        for obj, relative_path in filtered_objects:
-            s3_key = obj['Key']
-            local_path = local_data_dir / relative_path
-
-            # Exclude files handled by separate scripts
-            _EXCLUDE_PREFIXES = (
-                "seed-vc/embeddings/",
-                "seed-vc/checkpoints/",
-            )
-            _EXCLUDE_NAMES = {"server.json"}
-            if any(relative_path.startswith(p) for p in _EXCLUDE_PREFIXES) or relative_path in _EXCLUDE_NAMES:
-                print(f"Skipping {relative_path} (handled separately)")
+        for obj, rel in filtered:
+            if any(rel.startswith(p) for p in _EXCLUDE_PREFIXES) or rel in _EXCLUDE_NAMES:
+                print(f"Skipping {rel} (handled separately)")
                 skipped += 1
                 continue
 
-            file_size = obj['Size'] / (1024 * 1024)  # MB
+            local_path = local_data_dir / rel
+            size_mb = obj['Size'] / (1024 * 1024)
 
-            # Create parent directories
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-
-            # Compare local ETag vs S3 ETag (multipart-aware)
-            if local_path.exists() and not force:
-                s3_etag = obj.get("ETag", "").strip('"')
-                local_etag = _local_etag(str(local_path))
-                if s3_etag and local_etag == s3_etag:
-                    if dry_run:
-                        print(f"  SKIP {relative_path} (same content)")
-                    else:
-                        print(f"Skipping {relative_path} (same content)")
-                    skipped += 1
-                    continue
-                if dry_run:
-                    print(f"  WOULD DOWNLOAD {relative_path} ({file_size:.1f} MB) — local ETag {local_etag} != S3 {s3_etag}")
-                    downloaded += 1
-                    continue
+            if _should_skip(local_path, obj, force):
+                print(f"Skipping {rel} (same content)")
+                skipped += 1
+                continue
 
             if dry_run:
-                if not local_path.exists():
-                    print(f"  WOULD DOWNLOAD {relative_path} ({file_size:.1f} MB) — missing locally")
-                else:
-                    print(f"  WOULD DOWNLOAD {relative_path} ({file_size:.1f} MB) — force mode")
+                print(f"  WOULD DOWNLOAD {rel} ({size_mb:.1f} MB)")
                 downloaded += 1
                 continue
 
-            print(f"Downloading {relative_path} ({file_size:.2f} MB)...", end=" ", flush=True)
-
-            if download_file(s3_client, bucket, s3_key, local_path):
-                print("done")
+            print(f"Downloading {rel} ({size_mb:.1f} MB)")
+            if download_file(s3, bucket, obj['Key'], local_path):
                 downloaded += 1
             else:
-                print("FAILED")
                 failed += 1
 
-        print()
-        print(f"Download complete: {downloaded} downloaded, {skipped} skipped, {failed} failed")
+        print(f"\nDone: {downloaded} downloaded, {skipped} skipped, {failed} failed")
 
-        # Download server.json configuration file
-        print("\n=== Downloading server configuration ===")
-        server_config_s3_key = f"{s3_data_path}/server.json"
-        local_server_config = Path("local/server.json")
-        local_server_config.parent.mkdir(parents=True, exist_ok=True)
-
+        # server.json
+        print("\n=== Server configuration ===")
+        s3_key = f"{s3_data_path}/server.json"
+        local_cfg = Path("local/server.json")
         try:
-            # Check if server.json exists in S3
-            s3_client.head_object(Bucket=bucket, Key=server_config_s3_key)
-            print(f"Downloading server.json...", end=" ", flush=True)
-            if download_file(s3_client, bucket, server_config_s3_key, local_server_config):
-                print("done")
+            s3.head_object(Bucket=bucket, Key=s3_key)
+            if dry_run:
+                print("  WOULD DOWNLOAD server.json")
             else:
-                print("FAILED (non-fatal)")
+                print("server.json")
+                download_file(s3, bucket, s3_key, local_cfg)
         except ClientError as e:
             if e.response["Error"]["Code"] == "404":
-                print("server.json not found in S3 (skipping)")
+                print("server.json not in S3 (skipping)")
             else:
-                print(f"Error checking server.json: {e}")
+                print(f"Error: {e}")
 
         return 0 if failed == 0 else 1
 
     except ClientError as e:
-        print(f"Error listing S3 objects: {e}")
+        print(f"S3 error: {e}")
         return 1
+
+
+# ---------------------------------------------------------------------------
+# RVC assets
+# ---------------------------------------------------------------------------
+
+def sync_rvc_assets(data_dir: Path, force: bool = False, dry_run: bool = False):
+    rvc_dir = data_dir / "rvc"
+    failed = 0
+
+    bucket = os.getenv('AWS_S3_BUCKET_NAME')
+    if not bucket:
+        print("Error: AWS_S3_BUCKET_NAME not set in .env")
+        return 1
+
+    s3 = get_s3_client()
+
+    try:
+        # Foundation models: rvc/hubert/, rvc/rmvpe/
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix="rvc/")
+        hubert_rmvpe = resp.get("Contents", [])
+
+        # Model weights: weights/*.pth
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix="weights/")
+        weights = [o for o in resp.get("Contents", []) if o["Key"].endswith(".pth")]
+
+        print("=== RVC: foundation models ===")
+        for obj in hubert_rmvpe:
+            name = Path(obj["Key"]).name
+            subdir = Path(obj["Key"]).parts[1]
+            local_path = rvc_dir / subdir / name
+            size_mb = obj["Size"] / (1024 * 1024)
+
+            if _should_skip(local_path, obj, force):
+                print(f"  Skipping {subdir}/{name} (same content)")
+                continue
+
+            if dry_run:
+                print(f"  WOULD DOWNLOAD {subdir}/{name} ({size_mb:.0f} MB)")
+                continue
+
+            print(f"  {subdir}/{name} ({size_mb:.0f} MB)")
+            if download_file(s3, bucket, obj["Key"], local_path):
+                pass
+            else:
+                failed += 1
+
+        print(f"\n=== RVC: model weights ({len(weights)}) ===")
+        weights_dir = rvc_dir / "weights"
+        weights_dir.mkdir(parents=True, exist_ok=True)
+
+        for obj in weights:
+            name = Path(obj["Key"]).name
+            local_path = weights_dir / name
+            size_mb = obj["Size"] / (1024 * 1024)
+
+            if _should_skip(local_path, obj, force):
+                print(f"  Skipping {name} (same content)")
+                continue
+
+            if dry_run:
+                print(f"  WOULD DOWNLOAD {name} ({size_mb:.1f} MB)")
+                continue
+
+            print(f"  {name} ({size_mb:.1f} MB)")
+            if download_file(s3, bucket, obj["Key"], local_path):
+                pass
+            else:
+                failed += 1
+
+    except ClientError as e:
+        print(f"S3 error: {e}")
+        failed += 1
+
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Download LZ-TTS data from Wasabi S3."
+    )
+    parser.add_argument("--data-dir", default=None, help="Destination directory (default: ./data)")
+    parser.add_argument("--filter", help="Substring filter for model names.")
+    parser.add_argument("--force", action="store_true", help="Re-download even if unchanged.")
+    parser.add_argument("--dry-run", action="store_true", help="Show plan without downloading.")
+    parser.add_argument("--skip-rvc", action="store_true", help="Skip RVC asset downloads.")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     data_dir = Path(args.data_dir) if args.data_dir else None
-    sys.exit(
-        sync_data_from_s3(
-            data_dir=data_dir,
-            name_filter=args.filter,
+    rc = sync_data_from_s3(
+        data_dir=data_dir,
+        name_filter=args.filter,
+        force=args.force,
+        dry_run=args.dry_run,
+    )
+    if not args.skip_rvc:
+        rvc_rc = sync_rvc_assets(
+            data_dir=data_dir or Path("./data"),
             force=args.force,
             dry_run=args.dry_run,
         )
-    )
+        rc = rc or rvc_rc
+    sys.exit(rc)
