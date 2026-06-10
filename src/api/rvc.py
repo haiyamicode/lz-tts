@@ -54,7 +54,6 @@ except Exception:
 class RVCSettings:
     enabled: bool = True
     preload: bool = False
-    default_model: str = "mrbeast.pth"
     default_f0_method: str = "rmvpe"
     default_pitch: int = 0
     default_index_rate: float = 0.0
@@ -129,7 +128,7 @@ class RVCBackend:
     def convert(
         self,
         audio_bytes: bytes,
-        model: str = "mrbeast.pth",
+        model: str,
         f0_method: str = "rmvpe",
         pitch: int = 0,
         index_rate: float = 0.0,

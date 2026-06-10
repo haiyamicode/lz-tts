@@ -184,7 +184,6 @@ class RVCConfig(BaseModel):
 
     enabled: bool = Field(default_factory=lambda: _env_bool("RVC_ENABLED", False))
     preload: bool = Field(default_factory=lambda: _env_bool("RVC_PRELOAD", False))
-    default_model: str = Field(default_factory=lambda: os.environ.get("RVC_DEFAULT_MODEL", "mrbeast.pth"))
     default_f0_method: str = Field(default_factory=lambda: os.environ.get("RVC_F0_METHOD", "rmvpe"))
     default_pitch: int = Field(default_factory=lambda: int(os.environ.get("RVC_PITCH", "0")))
     default_index_rate: float = Field(default_factory=lambda: float(os.environ.get("RVC_INDEX_RATE", "0.0")))
@@ -267,8 +266,10 @@ class SeedVCEnhanceRequest(BaseModel):
 class RVCConvertRequest(BaseModel):
     """Request body for RVC voice conversion."""
 
+    model_config = {"populate_by_name": True}
+
     audio: str = Field(..., description="Base64 encoded source audio")
-    model: str = Field("mrbeast.pth", description="RVC model filename (e.g., 'mrbeast.pth')")
+    model: str = Field(..., alias="model_name", description="RVC model filename (e.g., 'mrbeast.pth', 'trump.pth')")
     f0_method: str = Field("rmvpe", description="Pitch extraction method (pm, harvest, crepe, rmvpe)")
     pitch: int = Field(0, description="Pitch shift in semitones")
     index_rate: float = Field(0.0, description="FAISS index blending rate 0-1 (0 = no index)")
@@ -1418,7 +1419,6 @@ def _get_rvc_backend() -> RVCBackend:
         try:
             _rvc_backend = RVCBackend(RVCSettings(
                 enabled=True,
-                default_model=_server_config.rvc.default_model,
                 default_f0_method=_server_config.rvc.default_f0_method,
                 default_pitch=_server_config.rvc.default_pitch,
                 default_index_rate=_server_config.rvc.default_index_rate,
