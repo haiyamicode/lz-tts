@@ -2,7 +2,7 @@
 """
 Download (sync) data files from Wasabi S3
 
-Downloads model data, server configuration (local/server.json), and RVC assets from S3.
+Downloads model data and RVC assets from S3.
 
 Usage:
     uv run python scripts/download_data.py
@@ -210,23 +210,6 @@ def sync_data_from_s3(
                 failed += 1
 
         print(f"\nDone: {downloaded} downloaded, {skipped} skipped, {failed} failed")
-
-        # server.json
-        print("\n=== Server configuration ===")
-        s3_key = f"{s3_data_path}/server.json"
-        local_cfg = Path("local/server.json")
-        try:
-            s3.head_object(Bucket=bucket, Key=s3_key)
-            if dry_run:
-                print("  WOULD DOWNLOAD server.json")
-            else:
-                print("server.json")
-                download_file(s3, bucket, s3_key, local_cfg)
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                print("server.json not in S3 (skipping)")
-            else:
-                print(f"Error: {e}")
 
         return 0 if failed == 0 else 1
 
