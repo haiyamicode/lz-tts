@@ -26,12 +26,18 @@ load_dotenv()
 
 
 def get_s3_client():
+    import botocore.config
     return boto3.client(
         "s3",
         endpoint_url=f"https://{os.getenv('AWS_S3_ENDPOINT')}",
         aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
         region_name=os.getenv("AWS_REGION", "us-east-1"),
+        config=botocore.config.Config(
+            connect_timeout=10,
+            read_timeout=30,
+            retries={"max_attempts": 3, "mode": "standard"},
+        ),
     )
 
 
@@ -92,10 +98,9 @@ def download_file(s3_client, bucket, s3_key, local_path):
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
         cfg = boto3.s3.transfer.TransferConfig(
-            multipart_threshold=64 * 1024 * 1024,
+            multipart_threshold=8 * 1024 * 1024,
             multipart_chunksize=8 * 1024 * 1024,
-            max_concurrency=1,
-            use_threads=False,
+            max_concurrency=8,
         )
 
         label = local_path.name
