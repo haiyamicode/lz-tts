@@ -1,0 +1,175 @@
+# LZ-TTS API Documentation for LLMs
+
+This is a text-to-speech API that converts text to audio using the configured LZ-TTS synthesis pipeline.
+
+## Base URL
+{{BASE_URL}}
+
+## Authentication
+Every endpoint requires the server API key.
+
+Send it either as a query parameter:
+```bash
+?api_key=YOUR_KEY
+```
+
+Or as a header:
+```bash
+X-Api-Key: YOUR_KEY
+```
+
+## Main Endpoints
+
+### POST /synthesize
+Synthesize one text or SSML input to binary speech audio.
+
+Request Body (JSON):
+```json
+{
+  "text": "Text to synthesize",
+  "ssml": "<speak>SSML content</speak>",
+  "voice_id": "msa.en-US.AvaMultilingual",
+  "sample_url": "https://example.com/ref.mp3",
+  "language": "en-GB",
+  "style": "empathetic",
+  "styleIntensity": 0.5,
+  "format": "mp3",
+  "neural": true,
+  "options": {
+    "acoustic_noise_scale": 0.667,
+    "length_scale": 1.0,
+    "duration_noise_scale": 0.8,
+    "duration_sdp_ratio": 0.2
+  }
+}
+```
+
+Response: Binary audio data (`audio/wav` or `audio/mpeg`).
+
+Rules:
+- Provide exactly one of `text` or `ssml`.
+- Use `voice_id` for configured voices. Supported ids are listed by `GET /synthesize/voices`.
+- Use `sample_url` to synthesize normally with Sparrow, then convert the result to the sample voice with Seed-VC. Do not combine with `voice_id`, `style`, or `styleIntensity`.
+- Use `language` with a full locale such as `en-US`, `en-GB`, `ja-JP`, or `zh-CN` to force the whole input into that locale. Unsupported locales are rejected.
+- Without `language`, multilingual auto-routing is used.
+- `style` and `styleIntensity` require `voice_id` and must exactly match a cached Seed-VC embedding.
+- `options` contains only Sparrow/VITS controls. Unknown option keys are rejected.
+
+### POST /synthesize/batch
+Batched synthesis. With `voice_id`, this runs the full configured pipeline: one or more grouped batched Sparrow calls plus one batched Seed-VC call for items that need conversion. With `sample_url`, it runs direct batched Sparrow synthesis followed by one batched Seed-VC call to the sample voice. Without `voice_id` or `sample_url`, it runs direct batched Sparrow synthesis and requires either `language` or `model`.
+
+Request Body (JSON):
+```json
+{
+  "texts": ["First text", "Second text"],
+  "voice_id": "msa.en-US.AvaMultilingual",
+  "sample_url": "https://example.com/ref.mp3",
+  "language": "en-US",
+  "model": "sparrow",
+  "style": "empathetic",
+  "styleIntensity": 0.5,
+  "format": "mp3",
+  "neural": true,
+  "options": {
+    "length_scale": 1.0,
+    "duration_sdp_ratio": 0.2
+  }
+}
+```
+
+Response Body (JSON):
+```json
+{
+  "items": [
+    {
+      "text": "First text",
+      "audio_base64": "...",
+      "sample_rate": 24000,
+      "audio_seconds": 1.23
+    }
+  ],
+  "count": 1,
+  "model": "sparrow",
+  "speaker": null,
+  "wall_seconds": 0.5,
+  "audio_seconds_total": 1.23,
+  "rtf": 0.41
+}
+```
+
+### GET /synthesize
+Same as POST but with query parameters for easy testing.
+
+Query Parameters:
+- `text`: Plain text to synthesize.
+- `ssml`: SSML to synthesize.
+- `voice_id`: Configured voice id.
+- `sample_url`: Reference sample URL for Seed-VC conversion.
+- `language`: Full locale used for forced routing of entire input.
+- `style`: Seed-VC style for `voice_id` synthesis.
+- `styleIntensity`: Seed-VC style intensity for `voice_id` synthesis.
+- `options`: Sparrow options as JSON.
+- `format`: `wav` or `mp3`.
+- `neural`: `true` or `false`.
+- `model`: Specific model to use.
+
+### GET /synthesize/voices
+List supported voice IDs and supported full locales for `/synthesize` APIs.
+
+Response:
+- `locales`: Full locale codes, for example `["en-GB","en-US","ja-JP","zh-CN"]`.
+- `voices`: Voice entries with `voice_id` and `locale`.
+
+## Other Endpoints
+
+- `GET /`: Health check and server info.
+- `GET /llms.txt`: This documentation.
+- `GET /synthesize/voices`: Voices and locales supported by `/synthesize`.
+- `POST /vc`: Seed-VC single voice conversion.
+- `POST /vc-batch`: Seed-VC batched voice conversion.
+- `POST /find-voice`: Lookup voice ID from a reference URL.
+- `POST /enhance`: Download, normalize, enhance, and return a reference sample.
+- `GET /seed-vc/status`: Seed-VC backend status.
+- `GET /rvc/status`: RVC backend status.
+- `GET /rvc/models`: RVC model list.
+- `POST /rvc/convert`: RVC voice conversion.
+
+## Examples
+
+Simple text to MP3:
+```bash
+curl -X POST "{{BASE_URL}}/synthesize" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: YOUR_KEY" \
+  -d '{"text": "Hello world", "format": "mp3"}' \
+  -o output.mp3
+```
+
+GET request:
+```bash
+curl "{{BASE_URL}}/synthesize?api_key=YOUR_KEY&text=Hello+world&format=mp3" -o output.mp3
+```
+
+Reference sample conversion:
+```bash
+curl -X POST "{{BASE_URL}}/synthesize" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: YOUR_KEY" \
+  -d '{"text": "Hello world", "sample_url": "https://example.com/ref.mp3", "format": "mp3", "language": "en-US"}' \
+  -o output.mp3
+```
+
+Configured voice batch:
+```bash
+curl -X POST "{{BASE_URL}}/synthesize/batch" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: YOUR_KEY" \
+  -d '{"texts": ["Hello", "Good morning"], "voice_id": "msa.en-US.AvaMultilingual", "format": "mp3", "options": {"duration_sdp_ratio": 0.2}}'
+```
+
+## Notes
+
+- Default format is WAV.
+- MP3 output requires ffmpeg on the server.
+- `language` forces full-locale routing and model selection for the whole request.
+- Without `language`, automatic language detection and model routing are used.

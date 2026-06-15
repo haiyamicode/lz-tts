@@ -54,6 +54,7 @@ except Exception:
 class RVCSettings:
     enabled: bool = True
     preload: bool = False
+    default_model: str | None = None
     default_f0_method: str = "rmvpe"
     default_pitch: int = 0
     default_index_rate: float = 0.0

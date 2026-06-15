@@ -2,6 +2,7 @@ import base64
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -19,6 +20,8 @@ import torch
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+_LOGGER = logging.getLogger(__name__)
 
 CACHE_DIR = Path("cache/voice_samples")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -692,6 +695,10 @@ INCOMPLETE_PROMPT_ENDINGS = {
 }
 
 
+class EmptyVoiceTranscriptError(RuntimeError):
+    """Raised when transcription succeeds but produces no usable prompt text."""
+
+
 def download_and_cache(url: str) -> Path:
     d = get_cache_dir(url)
     metadata_file = d / "source.json"
@@ -804,21 +811,21 @@ def transcribe_voice_sample(audio_file: Path) -> str:
         if transcript:
             return transcript
 
-    import torch
-    import torchaudio
-
     parakeet = get_parakeet_model()
-    wav, sr = sf.read(audio_file, dtype="float32", always_2d=False)
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)
-    wav_t = torch.from_numpy(wav)
-    if sr != 16000:
-        wav_t = torchaudio.functional.resample(wav_t.unsqueeze(0), sr, 16000).squeeze(0)
-
     with torch.inference_mode():
-        text = parakeet.transcribe(wav_t.cuda()).strip()
+        text = parakeet.transcribe(str(audio_file)).strip()
     if not text:
-        raise RuntimeError("nano-parakeet transcript completed with empty text")
+        try:
+            audio_info = sf.info(audio_file)
+            debug = (
+                f"path={audio_file} format={audio_info.format} subtype={audio_info.subtype} "
+                f"samplerate={audio_info.samplerate} channels={audio_info.channels} "
+                f"frames={audio_info.frames} duration={audio_info.duration:.3f}s "
+                f"size_bytes={audio_file.stat().st_size}"
+            )
+        except Exception as e:
+            debug = f"path={audio_file} size_bytes={audio_file.stat().st_size} info_error={e}"
+        raise EmptyVoiceTranscriptError(f"nano-parakeet transcript completed with empty text ({debug})")
     transcript_file.write_text(text, encoding="utf-8")
     return text
 
@@ -1009,6 +1016,49 @@ class BatchSynthesizeResponse(BaseModel):
     audio_seconds_total: float
 
 
+def _log_qwen_synthesize_request(
+    *,
+    status: str,
+    started: float,
+    req: SynthesizeRequest,
+    settings: Any | None = None,
+    prompt_text: str | None = None,
+    xvec_only: bool | None = None,
+    info: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    log_data: dict[str, Any] = {
+        "route": "/qwen3/synthesize",
+        "method": "POST",
+        "status": status,
+        "wall_seconds": round(time.perf_counter() - started, 6),
+        "backend": "faster-qwen3-tts",
+        "input": req.model_dump(),
+        "xvec_only": xvec_only,
+        "prompt_text": prompt_text,
+    }
+    if settings is not None:
+        log_data["resolved_settings"] = {
+            "language": settings.language,
+            "dp_language": settings.dp_language,
+            "max_new_tokens": settings.max_new_tokens,
+            "temperature": settings.temperature,
+            "top_k": settings.top_k,
+            "top_p": settings.top_p,
+            "repetition_penalty": settings.repetition_penalty,
+            "xvec_only": xvec_only,
+            "non_streaming_mode": settings.non_streaming_mode,
+            "expressiveness_level": settings.expressiveness_level,
+            "dp_budget_enabled": settings.dp_budget_enabled,
+            "dp_budget_info": settings.dp_budget_info,
+        }
+    if info is not None:
+        log_data["result"] = info
+    if error is not None:
+        log_data["error"] = error
+    _LOGGER.info("Qwen3 synthesize request: %s", json.dumps(log_data, ensure_ascii=False))
+
+
 @dataclass(frozen=True)
 class _ResolvedGenerationSettings:
     language: str
@@ -1094,14 +1144,24 @@ def _resolve_voice_prompt(req: SynthesizeRequest) -> tuple[Path, str, bool]:
         raise HTTPException(400, f"Failed to download voice sample: {e}") from e
 
     xvec_only = req.xvec_only if req.xvec_only is not None else _qwen_settings.xvec_only
-    try:
-        prompt_text = (
-            req.voice_text.strip()
-            if req.voice_text and req.voice_text.strip()
-            else "" if xvec_only else transcribe_voice_sample(sample_path)
-        )
-    except Exception as e:
-        raise HTTPException(400, f"Failed to transcribe voice sample: {e}") from e
+    if req.voice_text and req.voice_text.strip():
+        prompt_text = req.voice_text.strip()
+    elif xvec_only:
+        prompt_text = ""
+    else:
+        try:
+            prompt_text = transcribe_voice_sample(sample_path)
+        except EmptyVoiceTranscriptError as e:
+            _LOGGER.warning(
+                "Qwen3 voice sample transcription was empty; falling back to xvec-only: voice_url=%s sample_path=%s error=%s",
+                req.voice_url,
+                sample_path,
+                e,
+            )
+            prompt_text = ""
+            xvec_only = True
+        except Exception as e:
+            raise HTTPException(500, f"Failed to transcribe voice sample: {e}") from e
     return sample_path, prompt_text, xvec_only
 
 
@@ -1204,71 +1264,61 @@ def _generate_qwen_batch_mp3(
 
 @router.post("/synthesize")
 def synthesize(req: SynthesizeRequest):
-    if not req.text.strip():
-        raise HTTPException(400, "text is required")
+    started = time.perf_counter()
+    _log_qwen_synthesize_request(status="received", started=started, req=req, xvec_only=req.xvec_only)
 
-    sample_path, prompt_text, xvec_only = _resolve_voice_prompt(req)
-    settings = _resolve_generation_settings(req)
+    prompt_text: str | None = None
+    xvec_only: bool | None = None
+    settings: _ResolvedGenerationSettings | None = None
+    try:
+        if not req.text.strip():
+            raise HTTPException(400, "text is required")
 
-    text_hash = hashlib.sha256(req.text.encode()).hexdigest()[:12]
-    prompt_hash = hashlib.sha256(prompt_text.encode()).hexdigest()[:12]
-    voice_hash = hashlib.sha256(req.voice_url.encode()).hexdigest()[:12]
-    print(
-        "synthesize request "
-        "backend=faster-qwen3-tts "
-        f"text_hash={text_hash} "
-        f"text_len={len(req.text)} "
-        f"prompt_hash={prompt_hash} "
-        f"voice_hash={voice_hash} "
-        f"voice_text_len={len(prompt_text)} "
-        f"voice_text_source={'request' if req.voice_text and req.voice_text.strip() else 'none' if xvec_only else 'nano-parakeet'} "
-        f"language={settings.language!r} "
-        f"dp_language={settings.dp_language!r} "
-        f"xvec_only={xvec_only} "
-        f"non_streaming_mode={settings.non_streaming_mode} "
-        f"expressiveness={req.expressiveness if req.expressiveness is not None else QWEN_DEFAULT_EXPRESSIVENESS} "
-        f"expressiveness_level={settings.expressiveness_level} "
-        f"temperature={settings.temperature} "
-        f"top_k={settings.top_k} "
-        f"top_p={settings.top_p} "
-        f"repetition_penalty={settings.repetition_penalty} "
-        f"max_new_tokens={settings.max_new_tokens} "
-        f"dp_budget={settings.dp_budget_enabled} "
-        f"dp_budget_info={json.dumps(settings.dp_budget_info, ensure_ascii=False) if settings.dp_budget_info else None} "
-        f"speed_ignored={req.speed != 1.0} "
-        f"prompt_preview={prompt_text[:180]!r} "
-        f"preview={req.text[:240]!r}",
-        file=sys.stderr,
-        flush=True,
-    )
+        sample_path, prompt_text, xvec_only = _resolve_voice_prompt(req)
+        settings = _resolve_generation_settings(req)
 
-    with inference_lock:
-        mp3_bytes, info = _generate_qwen_mp3(req, sample_path, prompt_text, xvec_only, settings)
-        torch.cuda.empty_cache()
+        with inference_lock:
+            mp3_bytes, info = _generate_qwen_mp3(req, sample_path, prompt_text, xvec_only, settings)
+            torch.cuda.empty_cache()
 
-    print(
-        "synthesize response "
-        f"text_hash={text_hash} "
-        f"raw_audio_seconds={info['raw_audio_seconds']:.2f} "
-        f"audio_seconds={info['audio_seconds']:.2f} "
-        f"cap_seconds={info['cap_seconds']:.2f} "
-        f"hit_token_cap={info['hit_token_cap']} "
-        f"deepfilter={info['postprocess'].get('deepfilter')} "
-        f"silence_trim={info['postprocess'].get('trim')} "
-        f"trim_head_seconds={info['postprocess'].get('trim_head_seconds', 0.0):.2f} "
-        f"trim_tail_seconds={info['postprocess'].get('trim_tail_seconds', 0.0):.2f} "
-        f"pad_head_seconds={info['postprocess'].get('pad_head_seconds', 0.0):.2f} "
-        f"pad_tail_seconds={info['postprocess'].get('pad_tail_seconds', 0.0):.2f}",
-        file=sys.stderr,
-        flush=True,
-    )
+        _log_qwen_synthesize_request(
+            status="ok",
+            started=started,
+            req=req,
+            settings=settings,
+            prompt_text=prompt_text,
+            xvec_only=xvec_only,
+            info=info,
+        )
 
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    return StreamingResponse(io.BytesIO(mp3_bytes), media_type="audio/mpeg")
+        return StreamingResponse(io.BytesIO(mp3_bytes), media_type="audio/mpeg")
+    except HTTPException as exc:
+        _log_qwen_synthesize_request(
+            status=f"http_{exc.status_code}",
+            started=started,
+            req=req,
+            settings=settings,
+            prompt_text=prompt_text,
+            xvec_only=xvec_only,
+            error=str(exc.detail),
+        )
+        raise
+    except Exception as exc:
+        _log_qwen_synthesize_request(
+            status="error",
+            started=started,
+            req=req,
+            settings=settings,
+            prompt_text=prompt_text,
+            xvec_only=xvec_only,
+            error=type(exc).__name__,
+        )
+        raise
 
 
 @router.post("/synthesize-batch", response_model=BatchSynthesizeResponse)

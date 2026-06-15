@@ -395,7 +395,7 @@ class PiperInference:
         """
         return self.synthesize_batch(
             [text],
-            speaker=speaker or "",
+            speaker=speaker,
             batch_size=1,
             noise_scale=noise_scale,
             length_scale=length_scale,
