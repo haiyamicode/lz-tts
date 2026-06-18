@@ -9,7 +9,6 @@ import subprocess
 import sys
 import threading
 import time
-import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -34,15 +33,26 @@ QWEN_DEFAULT_TEMPERATURE = 0.9
 QWEN_DEFAULT_TOP_K = 50
 QWEN_DEFAULT_TOP_P = 1.0
 QWEN_DEFAULT_REPETITION_PENALTY = 1.03
-QWEN_DEFAULT_XVEC_ONLY = False
+QWEN_DEFAULT_XVEC_ONLY = True
 QWEN_DEFAULT_NON_STREAMING_MODE = True
 QWEN_DEFAULT_EXPRESSIVENESS = 1.0
 QWEN_DP_BUDGET_DEFAULT = True
-ENABLE_DEEPFILTER_DEFAULT = True
+QWEN_BATCH_BUCKETS = (1, 3, 5)
+QWEN_MODEL_MAX_BATCH_SIZE = max(QWEN_BATCH_BUCKETS)
+QWEN_MAX_BATCH_SIZE = max(
+    QWEN_MODEL_MAX_BATCH_SIZE,
+    int(os.environ.get("QWEN_TTS_MAX_BATCH_SIZE", "64")),
+)
+QWEN_BATCH_DUMMY_TEXT = ""
 ENABLE_SILENCE_TRIM_DEFAULT = True
-SILENCE_TRIM_THRESHOLD_DB = -45.0
-SILENCE_TRIM_RELATIVE_THRESHOLD_DB = -35.0
-SILENCE_TRIM_PADDING_MS = 150
+SILERO_VAD_SAMPLE_RATE = 16000
+SILERO_VAD_CHUNK_SAMPLES = 480
+SILERO_VAD_THRESHOLD = 0.2
+SILERO_VAD_ONNX_PROVIDERS_DEFAULT = "CUDAExecutionProvider,CPUExecutionProvider"
+SILENCE_TRIM_PADDING_MS = 250
+SILENCE_TRIM_MIN_CHUNK_RMS = 0.003
+SILENCE_TRIM_RELATIVE_CHUNK_RMS = 0.03
+SILENCE_TRIM_EMPTY_OUTPUT_MS = 200
 EXPRESSIVENESS_PRESETS = {
     1.0: {"temperature": 0.90, "top_k": 50, "repetition_penalty": 1.03},
     0.8: {"temperature": 0.84, "top_k": 48, "repetition_penalty": 1.035},
@@ -55,11 +65,14 @@ EXPRESSIVENESS_PRESETS = {
 router = APIRouter(prefix="/qwen3", tags=["qwen3"])
 model: Optional[Any] = None
 parakeet_model: Optional[Any] = None
-deepfilter_model: Optional[Any] = None
-deepfilter_state: Optional[Any] = None
+parakeet_device: Optional[torch.device] = None
+silero_vad_detector: Optional[Any] = None
 dp_budget_model: Optional[Any] = None
 inference_lock = threading.Lock()
+parakeet_lock = threading.Lock()
 model_load_lock = threading.Lock()
+dp_budget_load_lock = threading.Lock()
+silero_vad_lock = threading.Lock()
 model_ready_event = threading.Event()
 model_loading = False
 model_load_error: Optional[str] = None
@@ -105,6 +118,14 @@ QWEN_NAME_TO_CODE = {
 class ResolvedQwenLanguage:
     qwen_language: str
     dp_language: str
+
+
+def _default_qwen_language() -> ResolvedQwenLanguage:
+    return ResolvedQwenLanguage("English", QWEN_LANGUAGE_LOCALES["en"])
+
+
+def _is_auto_language_value(value: str | None) -> bool:
+    return not value or not value.strip() or value.strip().lower() == "auto"
 
 
 class DpBudgetSettings(BaseModel):
@@ -381,7 +402,7 @@ def detect_qwen_language(text: str) -> ResolvedQwenLanguage:
         main_language = QWEN_LANGUAGE_NAMES.get(main_code)
         if main_language:
             return ResolvedQwenLanguage(main_language, QWEN_LANGUAGE_LOCALES.get(main_code, main_code))
-        return ResolvedQwenLanguage("Auto", "multilingual")
+        return _default_qwen_language()
 
     total_weight = sum(weights.values())
     prominence_threshold = max(4, int(total_weight * 0.20))
@@ -410,8 +431,8 @@ def normalize_qwen_language(language: str) -> str:
 
 def resolve_qwen_language_code(language_code: str) -> ResolvedQwenLanguage:
     requested = language_code.strip()
-    if not requested or requested.lower() == "auto":
-        return ResolvedQwenLanguage("Auto", "multilingual")
+    if _is_auto_language_value(requested):
+        return _default_qwen_language()
 
     locale = _canonical_locale(requested)
     if "-" not in locale:
@@ -429,11 +450,11 @@ def resolve_qwen_language(
     language: Optional[str],
     language_code: Optional[str] = None,
 ) -> ResolvedQwenLanguage:
-    if language_code is not None and language_code.strip():
+    if language_code is not None and language_code.strip() and not _is_auto_language_value(language_code):
         return resolve_qwen_language_code(language_code)
 
     requested = (language or _qwen_settings.language).strip()
-    if not requested or requested.lower() == "auto":
+    if _is_auto_language_value(requested):
         return detect_qwen_language(text)
 
     qwen_language = normalize_qwen_language(requested)
@@ -509,6 +530,13 @@ def _load_model_unlocked() -> Any:
     if _qwen_settings.warmup and hasattr(loaded_model, "_warmup"):
         print("Capturing CUDA graphs...", file=sys.stderr, flush=True)
         loaded_model._warmup(prefill_len=100)
+        if hasattr(loaded_model, "capture_batch_graphs"):
+            print(
+                f"Capturing Qwen batch CUDA graph buckets: {QWEN_BATCH_BUCKETS}...",
+                file=sys.stderr,
+                flush=True,
+            )
+            loaded_model.capture_batch_graphs(QWEN_BATCH_BUCKETS, prefill_len=100)
     if hasattr(loaded_model, "max_voice_prompt_cache_entries"):
         loaded_model.max_voice_prompt_cache_entries = _qwen_settings.voice_prompt_cache_entries
     print(f"FasterQwen3TTS loaded. Sample rate: {loaded_model.sample_rate}", file=sys.stderr, flush=True)
@@ -571,14 +599,30 @@ def preload_model(background: bool = False, include_dp_budget: bool = False) -> 
         get_dp_budget_model()
 
 
+def _wait_for_qwen_model_load_before_dp_budget() -> None:
+    if model is not None or not model_loading:
+        return
+    model_ready_event.wait()
+    if model_load_error:
+        raise RuntimeError(f"Qwen3 model load failed before DP budget load: {model_load_error}")
+
+
 def get_dp_budget_model() -> Any:
     global dp_budget_model
-    if dp_budget_model is None:
+    if dp_budget_model is not None:
+        return dp_budget_model
+
+    _wait_for_qwen_model_load_before_dp_budget()
+
+    with dp_budget_load_lock:
+        if dp_budget_model is not None:
+            return dp_budget_model
+
         from src.qwen_dp_budget import DpBudgetConfig, QwenDpBudget
 
         print("Loading Qwen DP budget model...", file=sys.stderr, flush=True)
         dp_settings = _qwen_settings.dp_budget
-        dp_budget_model = QwenDpBudget(
+        loaded_dp_budget_model = QwenDpBudget(
             DpBudgetConfig(
                 checkpoint=Path(dp_settings.checkpoint),
                 config_path=Path(dp_settings.config_path) if dp_settings.config_path else None,
@@ -597,7 +641,8 @@ def get_dp_budget_model() -> Any:
                 use_bert=dp_settings.use_bert,
             )
         )
-        dp_budget_model.load()
+        loaded_dp_budget_model.load()
+        dp_budget_model = loaded_dp_budget_model
         print("Qwen DP budget model ready.", file=sys.stderr, flush=True)
     return dp_budget_model
 
@@ -606,52 +651,73 @@ def predict_dp_budget(text: str, language: Optional[str] = None) -> dict[str, An
     return get_dp_budget_model().predict(text, language=language)
 
 
+def predict_dp_budget_batch(
+    texts: list[str],
+    languages: Optional[list[str | None]] = None,
+) -> list[dict[str, Any]]:
+    return get_dp_budget_model().predict_batch(texts, languages=languages)
+
+
 def get_parakeet_model() -> Any:
-    global parakeet_model
+    global parakeet_model, parakeet_device
     if parakeet_model is None:
         from nano_parakeet import from_pretrained as parakeet_from_pretrained
+        from nano_parakeet.model import ParakeetTDT
 
+        device = os.environ.get("NANO_PARAKEET_DEVICE", "cuda").strip() or "cuda"
+        if device == "cuda":
+            device = "cuda:0"
+        parakeet_device = torch.device(device)
+        disable_cuda_graph = env_bool("NANO_PARAKEET_DISABLE_CUDA_GRAPH", False)
+        original_build_decode_graph = None
+        if disable_cuda_graph and parakeet_device.type == "cuda":
+            original_build_decode_graph = ParakeetTDT._build_decode_graph
+            ParakeetTDT._build_decode_graph = lambda self, device: None
         print("Loading transcription model (nano-parakeet)...", file=sys.stderr, flush=True)
-        parakeet_model = parakeet_from_pretrained(device="cuda")
-        print("Transcription model ready.", file=sys.stderr, flush=True)
-    return parakeet_model
-
-
-def get_deepfilter() -> tuple[Any, Any]:
-    global deepfilter_model, deepfilter_state
-    if deepfilter_model is None or deepfilter_state is None:
-        ensure_torchaudio_backend_compat()
-        from df.enhance import init_df
-
-        print("Loading DeepFilterNet postprocessor...", file=sys.stderr, flush=True)
-        deepfilter_model, deepfilter_state, _ = init_df(log_level="ERROR", log_file=None)
+        try:
+            dtype = torch.float32 if disable_cuda_graph and parakeet_device.type == "cuda" else None
+            if parakeet_device.type == "cuda":
+                with torch.cuda.device(parakeet_device):
+                    parakeet_model = parakeet_from_pretrained(device=device, dtype=dtype)
+            else:
+                parakeet_model = parakeet_from_pretrained(device=device, dtype=dtype)
+            if disable_cuda_graph and parakeet_device.type == "cuda":
+                parakeet_model._build_decode_graph = lambda device: None
+        finally:
+            if original_build_decode_graph is not None:
+                ParakeetTDT._build_decode_graph = original_build_decode_graph
         print(
-            f"DeepFilterNet ready. Sample rate: {deepfilter_state.sr()}",
+            f"Transcription model ready on {device} "
+            f"(cuda_graph={'disabled' if disable_cuda_graph and parakeet_device.type == 'cuda' else 'enabled'}).",
             file=sys.stderr,
             flush=True,
         )
-    return deepfilter_model, deepfilter_state
+    return parakeet_model
 
 
-def ensure_torchaudio_backend_compat() -> None:
-    """Provide the torchaudio.backend.common import removed in newer torchaudio."""
-    if "torchaudio.backend.common" in sys.modules:
-        return
+def get_silero_vad_detector() -> Any:
+    global silero_vad_detector
+    if silero_vad_detector is None:
+        with silero_vad_lock:
+            if silero_vad_detector is None:
+                from ..piper.norm_audio import make_silence_detector
 
-    @dataclass
-    class AudioMetaData:
-        sample_rate: int
-        num_frames: int = 0
-        num_channels: int = 0
-        bits_per_sample: int = 0
-        encoding: str = "UNKNOWN"
-
-    backend = types.ModuleType("torchaudio.backend")
-    common = types.ModuleType("torchaudio.backend.common")
-    common.AudioMetaData = AudioMetaData
-    backend.common = common
-    sys.modules.setdefault("torchaudio.backend", backend)
-    sys.modules.setdefault("torchaudio.backend.common", common)
+                providers = [
+                    provider.strip()
+                    for provider in os.environ.get(
+                        "SILERO_VAD_ONNX_PROVIDERS",
+                        SILERO_VAD_ONNX_PROVIDERS_DEFAULT,
+                    ).split(",")
+                    if provider.strip()
+                ]
+                print("Loading Silero VAD postprocessor...", file=sys.stderr, flush=True)
+                silero_vad_detector = make_silence_detector(providers=providers)
+                print(
+                    f"Silero VAD ready. Providers: {silero_vad_detector.providers}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    return silero_vad_detector
 
 
 def get_cache_dir(url: str) -> Path:
@@ -812,8 +878,12 @@ def transcribe_voice_sample(audio_file: Path) -> str:
             return transcript
 
     parakeet = get_parakeet_model()
-    with torch.inference_mode():
-        text = parakeet.transcribe(str(audio_file)).strip()
+    with parakeet_lock, torch.inference_mode():
+        if parakeet_device is not None and parakeet_device.type == "cuda":
+            with torch.cuda.device(parakeet_device):
+                text = parakeet.transcribe(str(audio_file)).strip()
+        else:
+            text = parakeet.transcribe(str(audio_file)).strip()
     if not text:
         try:
             audio_info = sf.info(audio_file)
@@ -830,34 +900,73 @@ def transcribe_voice_sample(audio_file: Path) -> str:
     return text
 
 
-def _voiced_bounds(wav_data: np.ndarray, sample_rate: int) -> tuple[int, int] | None:
-    if wav_data.size == 0:
+def _silero_vad_bounds(wav_data: np.ndarray, sample_rate: int) -> tuple[int, int] | None:
+    import torchaudio
+
+    audio = np.asarray(wav_data, dtype=np.float32).flatten()
+    if audio.size == 0:
         return None
 
-    frame_size = max(1, int(sample_rate * 0.02))
-    hop_size = max(1, int(sample_rate * 0.01))
-    absolute_threshold = 10 ** (SILENCE_TRIM_THRESHOLD_DB / 20)
-    padded = np.pad(wav_data, (0, max(0, frame_size - wav_data.size % hop_size)))
-    starts = np.arange(0, max(1, padded.size - frame_size + 1), hop_size)
-    if starts.size == 0:
+    detector_audio = torch.from_numpy(audio).unsqueeze(0)
+    if sample_rate != SILERO_VAD_SAMPLE_RATE:
+        detector_audio = torchaudio.functional.resample(
+            detector_audio,
+            sample_rate,
+            SILERO_VAD_SAMPLE_RATE,
+        )
+    detector_audio_np = detector_audio.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
+    if detector_audio_np.size == 0:
         return None
 
-    frames = np.stack([padded[start : start + frame_size] for start in starts])
-    rms = np.sqrt(np.mean(np.square(frames), axis=1))
-    threshold = max(absolute_threshold, float(rms.max()) * 10 ** (SILENCE_TRIM_RELATIVE_THRESHOLD_DB / 20))
-    voiced = np.flatnonzero(rms > threshold)
-    if voiced.size == 0:
+    first_chunk: int | None = None
+    last_chunk: int | None = None
+    chunk_count = int(np.ceil(detector_audio_np.size / SILERO_VAD_CHUNK_SAMPLES))
+    detector = get_silero_vad_detector()
+    chunks: list[np.ndarray] = []
+    chunk_rms: list[float] = []
+    for chunk_index in range(chunk_count):
+        start = chunk_index * SILERO_VAD_CHUNK_SAMPLES
+        chunk = detector_audio_np[start : start + SILERO_VAD_CHUNK_SAMPLES]
+        if chunk.size < SILERO_VAD_CHUNK_SAMPLES:
+            chunk = np.pad(chunk, (0, SILERO_VAD_CHUNK_SAMPLES - chunk.size))
+        chunks.append(chunk)
+        chunk_rms.append(float(np.sqrt(np.mean(np.square(chunk)))))
+
+    if not chunks:
         return None
 
-    start = int(starts[voiced[0]])
-    end = min(wav_data.size, int(starts[voiced[-1]]) + frame_size)
-    return start, end
+    energy_threshold = max(
+        SILENCE_TRIM_MIN_CHUNK_RMS,
+        max(chunk_rms) * SILENCE_TRIM_RELATIVE_CHUNK_RMS,
+    )
+
+    with silero_vad_lock:
+        if hasattr(detector, "reset"):
+            detector.reset()
+        for chunk_index, chunk in enumerate(chunks):
+            prob = float(np.asarray(detector(chunk, sample_rate=SILERO_VAD_SAMPLE_RATE)).reshape(-1)[0])
+            if prob >= SILERO_VAD_THRESHOLD and chunk_rms[chunk_index] >= energy_threshold:
+                if first_chunk is None:
+                    first_chunk = chunk_index
+                last_chunk = chunk_index
+
+    if first_chunk is None or last_chunk is None:
+        return None
+
+    vad_start = first_chunk * SILERO_VAD_CHUNK_SAMPLES
+    vad_end = min(detector_audio_np.size, (last_chunk + 1) * SILERO_VAD_CHUNK_SAMPLES)
+    start = int(np.floor(vad_start * sample_rate / SILERO_VAD_SAMPLE_RATE))
+    end = int(np.ceil(vad_end * sample_rate / SILERO_VAD_SAMPLE_RATE))
+    return max(0, start), min(audio.size, max(start + 1, end))
 
 
 def trim_silence(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, float, float]:
-    bounds = _voiced_bounds(wav_data, sample_rate)
+    bounds = _silero_vad_bounds(wav_data, sample_rate)
     if bounds is None:
-        return wav_data, 0.0, 0.0
+        empty_samples = max(1, int(sample_rate * SILENCE_TRIM_EMPTY_OUTPUT_MS / 1000))
+        empty_audio = np.zeros(empty_samples, dtype=np.float32)
+        trimmed_tail_seconds = max(0.0, (wav_data.size - empty_samples) / sample_rate)
+        return empty_audio, 0.0, trimmed_tail_seconds
 
     voiced_start, voiced_end = bounds
     pad = int(sample_rate * SILENCE_TRIM_PADDING_MS / 1000)
@@ -867,79 +976,25 @@ def trim_silence(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, fl
     return trimmed, start / sample_rate, (wav_data.size - end) / sample_rate
 
 
-def ensure_edge_silence(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, float, float]:
-    target_samples = int(sample_rate * SILENCE_TRIM_PADDING_MS / 1000)
-    if target_samples <= 0 or wav_data.size == 0:
-        return wav_data, 0.0, 0.0
-
-    bounds = _voiced_bounds(wav_data, sample_rate)
-    if bounds is None:
-        return wav_data, 0.0, 0.0
-
-    voiced_start, voiced_end = bounds
-    head_pad = max(0, target_samples - voiced_start)
-    tail_pad = max(0, target_samples - (wav_data.size - voiced_end))
-    if head_pad == 0 and tail_pad == 0:
-        return wav_data, 0.0, 0.0
-
-    padded = np.pad(wav_data, (head_pad, tail_pad), mode="constant")
-    return padded, head_pad / sample_rate, tail_pad / sample_rate
-
-
-def deepfilter_audio(wav_data: np.ndarray, sample_rate: int) -> np.ndarray:
-    ensure_torchaudio_backend_compat()
-    import torch
-    import torchaudio
-    from df.enhance import enhance
-
-    df_model, df_state = get_deepfilter()
-    df_sample_rate = int(df_state.sr())
-    wav_tensor = torch.from_numpy(wav_data.astype(np.float32, copy=False)).unsqueeze(0)
-    if sample_rate != df_sample_rate:
-        wav_tensor = torchaudio.functional.resample(wav_tensor, sample_rate, df_sample_rate)
-
-    with torch.inference_mode():
-        enhanced = enhance(df_model, df_state, wav_tensor, pad=True)
-        if sample_rate != df_sample_rate:
-            enhanced = torchaudio.functional.resample(enhanced, df_sample_rate, sample_rate)
-        return enhanced.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
-
-
 def postprocess_audio(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, dict[str, Any]]:
     info: dict[str, Any] = {
-        "deepfilter": False,
+        "enabled": False,
+        "vad": "silero",
         "trim": False,
         "trim_head_seconds": 0.0,
         "trim_tail_seconds": 0.0,
-        "pad_head_seconds": 0.0,
-        "pad_tail_seconds": 0.0,
     }
-
-    if env_bool("ENABLE_DEEPFILTER", ENABLE_DEEPFILTER_DEFAULT):
-        try:
-            wav_data = deepfilter_audio(wav_data, sample_rate)
-            info["deepfilter"] = True
-        except Exception as e:
-            info["deepfilter_error"] = str(e)
-            print(f"DeepFilterNet postprocessor failed; continuing without it: {e}", file=sys.stderr, flush=True)
 
     if env_bool("ENABLE_SILENCE_TRIM", ENABLE_SILENCE_TRIM_DEFAULT):
         wav_data, head_seconds, tail_seconds = trim_silence(wav_data, sample_rate)
         info.update(
             {
-                "trim": True,
+                "enabled": bool(head_seconds or tail_seconds),
+                "trim": bool(head_seconds or tail_seconds),
                 "trim_head_seconds": head_seconds,
                 "trim_tail_seconds": tail_seconds,
             }
         )
-
-    wav_data, pad_head_seconds, pad_tail_seconds = ensure_edge_silence(wav_data, sample_rate)
-    info.update(
-        {
-            "pad_head_seconds": pad_head_seconds,
-            "pad_tail_seconds": pad_tail_seconds,
-        }
-    )
 
     return wav_data, info
 
@@ -978,23 +1033,7 @@ class SynthesizeRequest(BaseModel):
 
 
 class BatchSynthesizeRequest(BaseModel):
-    texts: list[str] = Field(..., min_length=1, max_length=64)
-    voice_url: str
-    voice_text: Optional[str] = None
-    speed: float = 1.0
-    language: Optional[str] = None
-    language_code: Optional[str] = None
-    max_new_tokens: Optional[int] = None
-    temperature: Optional[float] = None
-    top_k: Optional[int] = None
-    top_p: Optional[float] = None
-    repetition_penalty: Optional[float] = None
-    xvec_only: Optional[bool] = None
-    non_streaming_mode: Optional[bool] = None
-    expressiveness: Optional[float] = None
-    dp_budget: Optional[bool] = None
-    true_batch: bool = True
-    batch_backend: str = "cuda_graph"
+    items: list[SynthesizeRequest] = Field(..., min_length=1, max_length=QWEN_MAX_BATCH_SIZE)
 
 
 class BatchSynthesizeItem(BaseModel):
@@ -1014,6 +1053,10 @@ class BatchSynthesizeResponse(BaseModel):
     count: int
     wall_seconds: float
     audio_seconds_total: float
+
+
+def _is_qwen_batch_dummy(req: SynthesizeRequest) -> bool:
+    return req.max_new_tokens == 0 and not req.text.strip()
 
 
 def _log_qwen_synthesize_request(
@@ -1075,66 +1118,106 @@ class _ResolvedGenerationSettings:
 
 
 def _resolve_generation_settings(req: SynthesizeRequest) -> _ResolvedGenerationSettings:
-    resolved_language = resolve_qwen_language(req.text, req.language, req.language_code)
-    language = resolved_language.qwen_language
-    expressiveness_level, expressiveness_config = resolve_expressiveness(req.expressiveness)
-    dp_budget_enabled = (
-        req.dp_budget
-        if req.dp_budget is not None
-        else _qwen_settings.dp_budget.enabled
-    )
-    dp_budget_info = None
-    if req.max_new_tokens is not None:
-        max_new_tokens = req.max_new_tokens
-    elif dp_budget_enabled:
+    return _resolve_generation_settings_batch([req])[0]
+
+
+def _resolve_generation_settings_batch(
+    reqs: list[SynthesizeRequest],
+) -> list[_ResolvedGenerationSettings]:
+    if not reqs:
+        return []
+
+    dummy_mask = [_is_qwen_batch_dummy(req) for req in reqs]
+    resolved_languages = [
+        ResolvedQwenLanguage("English", "en-US")
+        if dummy_mask[index]
+        else resolve_qwen_language(req.text, req.language, req.language_code)
+        for index, req in enumerate(reqs)
+    ]
+    dp_budget_indices = [
+        index
+        for index, req in enumerate(reqs)
+        if not dummy_mask[index]
+        and req.max_new_tokens is None
+        and (req.dp_budget if req.dp_budget is not None else _qwen_settings.dp_budget.enabled)
+    ]
+    dp_budget_language_inputs: list[str] = []
+    dp_budget_texts: list[str] = []
+    for index in dp_budget_indices:
+        dp_budget_texts.append(reqs[index].text)
+        dp_budget_language_inputs.append(resolved_languages[index].dp_language)
+    dp_budget_info_list: list[dict[str, Any] | None] = [None] * len(reqs)
+    if dp_budget_indices:
         try:
-            dp_budget_info = predict_dp_budget(req.text, language=resolved_language.dp_language)
-            max_new_tokens = int(dp_budget_info["max_tokens"])
+            budgets = predict_dp_budget_batch(dp_budget_texts, languages=dp_budget_language_inputs)
         except Exception as e:
-            print(f"DP budget failed; falling back to default max_new_tokens: {e}", file=sys.stderr, flush=True)
+            raise HTTPException(500, f"DP budget failed: {e}") from e
+        for request_index, budget_info in zip(dp_budget_indices, budgets):
+            dp_budget_info_list[request_index] = budget_info
+
+    settings_list: list[_ResolvedGenerationSettings] = []
+    for index, req in enumerate(reqs):
+        resolved_language = resolved_languages[index]
+        language = resolved_language.qwen_language
+        expressiveness_level, expressiveness_config = resolve_expressiveness(req.expressiveness)
+        dp_budget_enabled = (
+            req.dp_budget
+            if req.dp_budget is not None
+            else _qwen_settings.dp_budget.enabled
+        )
+        dp_budget_info = dp_budget_info_list[index]
+        if dummy_mask[index]:
+            max_new_tokens = 0
+            dp_budget_enabled = False
+        elif req.max_new_tokens is not None:
+            max_new_tokens = req.max_new_tokens
+        elif dp_budget_enabled:
+            max_new_tokens = int(dp_budget_info["max_tokens"])  # type: ignore[index]
+        else:
             max_new_tokens = _qwen_settings.max_new_tokens
-    else:
-        max_new_tokens = _qwen_settings.max_new_tokens
-    temperature = (
-        req.temperature
-        if req.temperature is not None
-        else expressiveness_config["temperature"]
-        if req.expressiveness is not None
-        else _qwen_settings.temperature
-    )
-    top_k = (
-        req.top_k
-        if req.top_k is not None
-        else expressiveness_config["top_k"]
-        if req.expressiveness is not None
-        else _qwen_settings.top_k
-    )
-    top_p = req.top_p if req.top_p is not None else _qwen_settings.top_p
-    repetition_penalty = (
-        req.repetition_penalty
-        if req.repetition_penalty is not None
-        else expressiveness_config["repetition_penalty"]
-        if req.expressiveness is not None
-        else _qwen_settings.repetition_penalty
-    )
-    non_streaming_mode = (
-        req.non_streaming_mode
-        if req.non_streaming_mode is not None
-        else _qwen_settings.non_streaming_mode
-    )
-    return _ResolvedGenerationSettings(
-        language=language,
-        dp_language=resolved_language.dp_language,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        repetition_penalty=repetition_penalty,
-        non_streaming_mode=non_streaming_mode,
-        dp_budget_enabled=dp_budget_enabled,
-        dp_budget_info=dp_budget_info,
-        expressiveness_level=expressiveness_level,
-    )
+        temperature = (
+            req.temperature
+            if req.temperature is not None
+            else expressiveness_config["temperature"]
+            if req.expressiveness is not None
+            else _qwen_settings.temperature
+        )
+        top_k = (
+            req.top_k
+            if req.top_k is not None
+            else expressiveness_config["top_k"]
+            if req.expressiveness is not None
+            else _qwen_settings.top_k
+        )
+        top_p = req.top_p if req.top_p is not None else _qwen_settings.top_p
+        repetition_penalty = (
+            req.repetition_penalty
+            if req.repetition_penalty is not None
+            else expressiveness_config["repetition_penalty"]
+            if req.expressiveness is not None
+            else _qwen_settings.repetition_penalty
+        )
+        non_streaming_mode = (
+            req.non_streaming_mode
+            if req.non_streaming_mode is not None
+            else _qwen_settings.non_streaming_mode
+        )
+        settings_list.append(
+            _ResolvedGenerationSettings(
+                language=language,
+                dp_language=resolved_language.dp_language,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                non_streaming_mode=non_streaming_mode,
+                dp_budget_enabled=dp_budget_enabled,
+                dp_budget_info=dp_budget_info,
+                expressiveness_level=expressiveness_level,
+            )
+        )
+    return settings_list
 
 
 def _resolve_voice_prompt(req: SynthesizeRequest) -> tuple[Path, str, bool]:
@@ -1188,11 +1271,27 @@ def _generate_qwen_mp3(
         append_silence=True,
     )
 
-    if not audio_list:
+    wav_data = _concat_qwen_audio(audio_list)
+    if wav_data.size == 0:
         raise HTTPException(500, "Model produced no output")
 
-    wav_data = np.asarray(audio_list[0], dtype=np.float32).flatten()
     return _encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens)
+
+
+def _concat_qwen_audio(audio: Any) -> np.ndarray:
+    if isinstance(audio, np.ndarray):
+        return np.asarray(audio, dtype=np.float32).flatten()
+
+    parts = []
+    for chunk in audio or []:
+        chunk_data = np.asarray(chunk, dtype=np.float32).flatten()
+        if chunk_data.size:
+            parts.append(chunk_data)
+    if not parts:
+        return np.zeros(0, dtype=np.float32)
+    if len(parts) == 1:
+        return parts[0]
+    return np.concatenate(parts)
 
 
 def _encode_qwen_audio(
@@ -1201,7 +1300,9 @@ def _encode_qwen_audio(
     max_new_tokens: int,
 ) -> tuple[bytes, dict[str, Any]]:
     raw_audio_seconds = wav_data.size / sample_rate
+    raw_level = _qwen_audio_level(wav_data)
     wav_data, postprocess_info = postprocess_audio(wav_data, sample_rate)
+    output_level = _qwen_audio_level(wav_data)
     audio_seconds = wav_data.size / sample_rate
     cap_seconds = max_new_tokens / 12.0
     hit_token_cap = raw_audio_seconds >= max(0.0, cap_seconds - 0.25)
@@ -1212,36 +1313,50 @@ def _encode_qwen_audio(
         "audio_seconds": audio_seconds,
         "cap_seconds": cap_seconds,
         "hit_token_cap": hit_token_cap,
+        "raw_level": raw_level,
+        "output_level": output_level,
         "postprocess": postprocess_info,
     }
 
 
-def _generate_qwen_batch_mp3(
-    texts: list[str],
-    sample_path: Path,
-    prompt_text: str,
-    xvec_only: bool,
-    settings_list: list[_ResolvedGenerationSettings],
-    batch_backend: str = "hf",
-) -> list[tuple[bytes, dict[str, Any]]]:
-    if len(texts) != len(settings_list):
-        raise ValueError("texts and settings_list length mismatch")
+def _qwen_audio_level(wav_data: np.ndarray) -> dict[str, float]:
+    if wav_data.size == 0:
+        return {"rms": 0.0, "peak": 0.0}
+    samples = np.asarray(wav_data, dtype=np.float32).flatten()
+    return {
+        "rms": round(float(np.sqrt(np.mean(np.square(samples)))), 8),
+        "peak": round(float(np.max(np.abs(samples))), 8),
+    }
 
+
+def _generate_qwen_batch_mp3(
+    item_requests: list[SynthesizeRequest],
+    voice_clone_prompts: list[Any],
+    settings_list: list[_ResolvedGenerationSettings],
+    xvec_only: bool,
+) -> list[tuple[bytes, dict[str, Any]] | None]:
+    if len(item_requests) != len(settings_list) or len(item_requests) != len(voice_clone_prompts):
+        raise ValueError("item_requests, voice_clone_prompts, and settings_list length mismatch")
+
+    dummy_mask = [_is_qwen_batch_dummy(item) for item in item_requests]
     m = get_model()
     if not hasattr(m, "generate_voice_clone_batch"):
         raise HTTPException(500, "Loaded Qwen backend does not support true batch generation")
 
-    batch_max_new_tokens = max(settings.max_new_tokens for settings in settings_list)
-    first = settings_list[0]
-    backend = batch_backend.strip().lower().replace("-", "_")
-    if backend not in {"hf", "cuda_graph"}:
-        raise HTTPException(400, "batch_backend must be 'hf' or 'cuda_graph'")
+    first_real_index = next(
+        (index for index, is_dummy in enumerate(dummy_mask) if not is_dummy),
+        None,
+    )
+    if first_real_index is None:
+        raise HTTPException(400, "at least one non-dummy item is required")
+    first = settings_list[first_real_index]
+    texts = [item.text for item in item_requests]
     audio_list, sample_rate = m.generate_voice_clone_batch(
         texts=texts,
         language=[settings.language for settings in settings_list],
-        ref_audio=str(sample_path),
-        ref_text=prompt_text,
-        max_new_tokens=batch_max_new_tokens,
+        ref_audio=None,
+        ref_text="",
+        max_new_tokens=[settings.max_new_tokens for settings in settings_list],
         temperature=first.temperature,
         top_k=first.top_k,
         top_p=first.top_p,
@@ -1249,17 +1364,113 @@ def _generate_qwen_batch_mp3(
         xvec_only=xvec_only,
         non_streaming_mode=first.non_streaming_mode,
         append_silence=True,
-        use_cuda_graph_batch=backend == "cuda_graph",
+        voice_clone_prompt=voice_clone_prompts,
     )
 
     if len(audio_list) != len(texts):
         raise HTTPException(500, f"Model produced {len(audio_list)} outputs for {len(texts)} inputs")
 
     encoded = []
-    for audio, settings in zip(audio_list, settings_list):
+    for audio, settings, is_dummy in zip(audio_list, settings_list, dummy_mask):
+        if is_dummy:
+            encoded.append(None)
+            continue
         wav_data = np.asarray(audio, dtype=np.float32).flatten()
         encoded.append(_encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens))
     return encoded
+
+
+def _validate_qwen_batch_shared_settings(settings_list: list[_ResolvedGenerationSettings]) -> None:
+    if not settings_list:
+        return
+    first = settings_list[0]
+    shared_fields = (
+        "temperature",
+        "top_k",
+        "top_p",
+        "repetition_penalty",
+        "non_streaming_mode",
+    )
+    for idx, settings in enumerate(settings_list[1:], start=1):
+        mismatched = [
+            field
+            for field in shared_fields
+            if getattr(settings, field) != getattr(first, field)
+        ]
+        if mismatched:
+            raise HTTPException(
+                400,
+                "Qwen3 batch generation requires shared settings for "
+                f"{', '.join(shared_fields)}; item {idx} differs in {', '.join(mismatched)}",
+            )
+
+
+def _qwen_batch_bucket_size(count: int) -> int:
+    for bucket_size in QWEN_BATCH_BUCKETS:
+        if count <= bucket_size:
+            return bucket_size
+    raise ValueError(f"Qwen3 internal batch chunk size must be <= {QWEN_MODEL_MAX_BATCH_SIZE}; got {count}")
+
+
+def _qwen_batch_chunks(count: int) -> list[range]:
+    chunks: list[range] = []
+    start = 0
+    while start < count:
+        end = min(start + QWEN_MODEL_MAX_BATCH_SIZE, count)
+        chunks.append(range(start, end))
+        start = end
+    return chunks
+
+
+def _make_qwen_batch_dummy_request(template: SynthesizeRequest) -> SynthesizeRequest:
+    return template.model_copy(
+        update={
+            "text": QWEN_BATCH_DUMMY_TEXT,
+            "max_new_tokens": 0,
+            "dp_budget": False,
+        }
+    )
+
+
+def _make_qwen_batch_dummy_settings(
+    template: _ResolvedGenerationSettings,
+) -> _ResolvedGenerationSettings:
+    return _ResolvedGenerationSettings(
+        language=template.language,
+        dp_language=template.dp_language,
+        max_new_tokens=0,
+        temperature=template.temperature,
+        top_k=template.top_k,
+        top_p=template.top_p,
+        repetition_penalty=template.repetition_penalty,
+        non_streaming_mode=template.non_streaming_mode,
+        dp_budget_enabled=False,
+        dp_budget_info=None,
+        expressiveness_level=template.expressiveness_level,
+    )
+
+
+def _create_voice_clone_prompt_item(
+    sample_path: Path,
+    prompt_text: str,
+    xvec_only: bool,
+) -> Any:
+    m = get_model()
+    if xvec_only:
+        prompt_items = m.model.create_voice_clone_prompt(
+            ref_audio=str(sample_path),
+            ref_text="",
+            x_vector_only_mode=True,
+        )
+    else:
+        ref_audio_input = m._load_ref_audio_with_silence(sample_path, silence_secs=0.5)
+        prompt_items = m.model.create_voice_clone_prompt(
+            ref_audio=ref_audio_input,
+            ref_text=prompt_text,
+        )
+    if not prompt_items:
+        raise HTTPException(500, "Failed to create Qwen voice clone prompt")
+    return prompt_items[0]
 
 
 @router.post("/synthesize")
@@ -1321,50 +1532,86 @@ def synthesize(req: SynthesizeRequest):
         raise
 
 
+@router.post("/synthesize/batch", response_model=BatchSynthesizeResponse)
 @router.post("/synthesize-batch", response_model=BatchSynthesizeResponse)
 def synthesize_batch(req: BatchSynthesizeRequest):
-    texts = [text.strip() for text in req.texts]
-    if any(not text for text in texts):
-        raise HTTPException(400, "all texts must be non-empty")
+    if len(req.items) > QWEN_MAX_BATCH_SIZE:
+        raise HTTPException(400, f"Qwen3 batch size must be <= {QWEN_MAX_BATCH_SIZE}")
 
-    common_request = req.dict(exclude={"texts", "true_batch", "batch_backend"})
-    first_req = SynthesizeRequest(**common_request, text=texts[0])
-    sample_path, prompt_text, xvec_only = _resolve_voice_prompt(first_req)
-    item_requests = [SynthesizeRequest(**common_request, text=text) for text in texts]
-    settings_list = [_resolve_generation_settings(item_req) for item_req in item_requests]
+    item_requests = [
+        item.model_copy(update={"text": item.text.strip()})
+        for item in req.items
+    ]
+    texts = [item.text for item in item_requests]
+    for index, text in enumerate(texts):
+        if not text:
+            raise HTTPException(400, f"items[{index}].text is required")
+
+    settings_list = _resolve_generation_settings_batch(item_requests)
+    _validate_qwen_batch_shared_settings(settings_list)
+    resolved_prompts = [
+        _resolve_voice_prompt(item)
+        for item in item_requests
+    ]
+    xvec_modes = [xvec_only for _, _, xvec_only in resolved_prompts]
+    if any(mode != xvec_modes[0] for mode in xvec_modes):
+        raise HTTPException(
+            400,
+            "Qwen3 batch generation requires all items to share xvec_only mode",
+        )
 
     started = time.perf_counter()
     items: list[BatchSynthesizeItem] = []
     with inference_lock:
-        if req.true_batch:
-            generated = _generate_qwen_batch_mp3(
-                texts=texts,
+        prompt_items = [
+            _create_voice_clone_prompt_item(
                 sample_path=sample_path,
                 prompt_text=prompt_text,
                 xvec_only=xvec_only,
-                settings_list=settings_list,
-                batch_backend=req.batch_backend,
             )
-        else:
-            generated = [
-                _generate_qwen_mp3(item_req, sample_path, prompt_text, xvec_only, settings)
-                for item_req, settings in zip(item_requests, settings_list)
-            ]
+            for sample_path, prompt_text, xvec_only in resolved_prompts
+        ]
 
-        for text, settings, (mp3_bytes, info) in zip(texts, settings_list, generated):
-            items.append(
-                BatchSynthesizeItem(
-                    text=text,
-                    audio_base64=base64.b64encode(mp3_bytes).decode("ascii"),
-                    sample_rate=int(info["sample_rate"]),
-                    raw_audio_seconds=float(info["raw_audio_seconds"]),
-                    audio_seconds=float(info["audio_seconds"]),
-                    max_new_tokens=settings.max_new_tokens,
-                    hit_token_cap=bool(info["hit_token_cap"]),
-                    language=settings.language,
-                    dp_language=settings.dp_language,
-                )
+        for chunk in _qwen_batch_chunks(len(item_requests)):
+            chunk_indices = list(chunk)
+            chunk_requests = [item_requests[index] for index in chunk_indices]
+            chunk_settings = [settings_list[index] for index in chunk_indices]
+            chunk_prompts = [prompt_items[index] for index in chunk_indices]
+
+            bucket_size = _qwen_batch_bucket_size(len(chunk_requests))
+            padding_count = bucket_size - len(chunk_requests)
+            if padding_count:
+                dummy_request = _make_qwen_batch_dummy_request(chunk_requests[0])
+                dummy_settings = _make_qwen_batch_dummy_settings(chunk_settings[0])
+                dummy_prompt = chunk_prompts[0]
+                chunk_requests.extend(dummy_request for _ in range(padding_count))
+                chunk_settings.extend(dummy_settings for _ in range(padding_count))
+                chunk_prompts.extend(dummy_prompt for _ in range(padding_count))
+
+            generated = _generate_qwen_batch_mp3(
+                item_requests=chunk_requests,
+                voice_clone_prompts=chunk_prompts,
+                settings_list=chunk_settings,
+                xvec_only=xvec_modes[0],
             )
+
+            for index, settings, generated_item in zip(chunk_indices, chunk_settings, generated):
+                if generated_item is None:
+                    raise HTTPException(500, "Model did not produce audio for a non-dummy item")
+                mp3_bytes, info = generated_item
+                items.append(
+                    BatchSynthesizeItem(
+                        text=texts[index],
+                        audio_base64=base64.b64encode(mp3_bytes).decode("ascii"),
+                        sample_rate=int(info["sample_rate"]),
+                        raw_audio_seconds=float(info["raw_audio_seconds"]),
+                        audio_seconds=float(info["audio_seconds"]),
+                        max_new_tokens=settings.max_new_tokens,
+                        hit_token_cap=bool(info["hit_token_cap"]),
+                        language=settings.language,
+                        dp_language=settings.dp_language,
+                    )
+                )
         import gc
         gc.collect()
         torch.cuda.empty_cache()

@@ -29,6 +29,8 @@ SERVING_FILES = {
     "lzspeech-sparrow/config.json",
     "lzspeech-sparrow/model.ckpt",
     "lzspeech-starling/model.ckpt",
+    "seed-vc/manifest.json",
+    "seed-vc/embeddings/vtts_embeddings.h5",
     "seed-vc/models/reflow_v2.pth",
     "seed-vc/voice-samples/andrew.mp3",
     "seed-vc/voices_final.pkl",
@@ -78,7 +80,7 @@ def main() -> int:
         rel = key[len(s3_data_path) + 1 :]
         if not rel:
             continue
-        if rel not in SERVING_FILES and not rel.startswith("server.json"):
+        if rel not in SERVING_FILES:
             orphans.append((key, obj.get("Size", 0)))
 
     if not orphans:

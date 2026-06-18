@@ -3,7 +3,7 @@
 Non-streaming generation loop using CUDA graphs for both predictor and talker.
 """
 import time
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -12,86 +12,24 @@ from .sampling import apply_repetition_penalty, sample_logits
 from .talker_graph import TalkerGraph
 
 
-@torch.inference_mode()
-def hf_generate_batch(
-    talker,
-    talker_input_embeds: torch.Tensor,
-    attention_mask: torch.Tensor,
-    trailing_text_hiddens: torch.Tensor,
-    tts_pad_embed: torch.Tensor,
-    config,
-    max_new_tokens: int = 2048,
-    min_new_tokens: int = 2,
-    temperature: float = 0.9,
-    top_k: int = 50,
-    top_p: float = 1.0,
-    do_sample: bool = True,
-    repetition_penalty: float = 1.05,
-    subtalker_dosample: Optional[bool] = None,
-    subtalker_top_k: Optional[int] = None,
-    subtalker_top_p: Optional[float] = None,
-    subtalker_temperature: Optional[float] = None,
-) -> Tuple[list[torch.Tensor], dict]:
-    """Batched non-streaming generation using the model's HF generate path.
+def _normalize_batch_max_new_tokens(
+    max_new_tokens: Union[Sequence[int], torch.Tensor],
+    batch_size: int,
+) -> list[int]:
+    if isinstance(max_new_tokens, torch.Tensor):
+        values = [int(value) for value in max_new_tokens.flatten().tolist()]
+    else:
+        if isinstance(max_new_tokens, int):
+            raise ValueError("batched max_new_tokens must be specified per item")
+        values = [int(value) for value in max_new_tokens]
 
-    This intentionally bypasses the batch-1 CUDA graph path. It is slower per
-    token, but supports true batched prefill/decode and is useful for throughput
-    tests before implementing fixed-batch CUDA graph capture.
-    """
-    eos_id = config.codec_eos_token_id
-    suppress_start = max(0, config.vocab_size - 1024)
-    suppress_tokens = [i for i in range(suppress_start, config.vocab_size) if i != eos_id]
-
-    t_start = time.time()
-    talker_result = talker.generate(
-        inputs_embeds=talker_input_embeds,
-        attention_mask=attention_mask,
-        trailing_text_hidden=trailing_text_hiddens,
-        tts_pad_embed=tts_pad_embed,
-        max_new_tokens=max_new_tokens,
-        min_new_tokens=min_new_tokens,
-        do_sample=do_sample,
-        top_k=top_k,
-        top_p=top_p,
-        temperature=temperature,
-        repetition_penalty=repetition_penalty,
-        eos_token_id=eos_id,
-        suppress_tokens=suppress_tokens,
-        subtalker_dosample=subtalker_dosample if subtalker_dosample is not None else do_sample,
-        subtalker_top_k=subtalker_top_k if subtalker_top_k is not None else top_k,
-        subtalker_top_p=subtalker_top_p if subtalker_top_p is not None else top_p,
-        subtalker_temperature=subtalker_temperature if subtalker_temperature is not None else temperature,
-        output_hidden_states=True,
-        return_dict_in_generate=True,
-    )
-    talker_codes = torch.stack(
-        [hid[-1] for hid in talker_result.hidden_states if hid[-1] is not None],
-        dim=1,
-    )
-    first_codebook = talker_codes[:, :, 0]
-    is_stop_token = first_codebook == eos_id
-    stop_indices = torch.argmax(is_stop_token.int(), dim=1)
-    has_stop_token = is_stop_token.any(dim=1)
-    effective_lengths = torch.where(has_stop_token, stop_indices, talker_codes.shape[1])
-    talker_codes_list = [
-        talker_codes[i, : int(length.item()), :].contiguous()
-        for i, length in enumerate(effective_lengths)
-    ]
-
-    if talker_input_embeds.is_cuda:
-        torch.cuda.synchronize()
-    total_time = time.time() - t_start
-    max_steps = max((int(codes.shape[0]) for codes in talker_codes_list), default=0)
-    timing = {
-        "prefill_ms": 0.0,
-        "decode_s": total_time,
-        "steps": max_steps,
-        "ms_per_step": (total_time / max_steps * 1000) if max_steps > 0 else 0.0,
-        "steps_per_s": (max_steps / total_time) if total_time > 0 else 0.0,
-        "batch_size": int(talker_input_embeds.shape[0]),
-        "item_steps": [int(codes.shape[0]) for codes in talker_codes_list],
-    }
-    return talker_codes_list, timing
+    if len(values) != batch_size:
+        raise ValueError(
+            f"max_new_tokens length must match batch size ({batch_size}); got {len(values)}"
+        )
+    if any(value < 0 for value in values):
+        raise ValueError("max_new_tokens must be non-negative")
+    return values
 
 
 def _apply_repetition_penalty_batch(
@@ -122,7 +60,7 @@ def fast_generate_batch_graph(
     config,
     predictor_graph: PredictorGraph,
     talker_graph: TalkerGraph,
-    max_new_tokens: int = 2048,
+    max_new_tokens: Union[Sequence[int], torch.Tensor],
     min_new_tokens: int = 2,
     temperature: float = 0.9,
     top_k: int = 50,
@@ -136,6 +74,21 @@ def fast_generate_batch_graph(
     vocab_size = config.vocab_size
     device = talker_input_embeds.device
     batch_size = int(talker_input_embeds.shape[0])
+    max_new_tokens_values = _normalize_batch_max_new_tokens(max_new_tokens, batch_size)
+    max_new_tokens_tensor = torch.tensor(max_new_tokens_values, dtype=torch.long, device=device)
+    generation_max_new_tokens = max(max_new_tokens_values, default=0)
+
+    if generation_max_new_tokens <= 0:
+        timing = {
+            "prefill_ms": 0.0,
+            "decode_s": 0.0,
+            "steps": 0,
+            "ms_per_step": 0.0,
+            "steps_per_s": 0.0,
+            "batch_size": batch_size,
+            "item_steps": [0] * batch_size,
+        }
+        return [torch.empty((0, config.num_code_groups), dtype=torch.long, device=device) for _ in range(batch_size)], timing
 
     suppress_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
     suppress_start = max(0, vocab_size - 1024)
@@ -190,24 +143,26 @@ def fast_generate_batch_graph(
     first_eos_steps = torch.full((batch_size,), -1, dtype=torch.long, device=device)
     done = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    for step_idx in range(max_new_tokens):
+    for step_idx in range(generation_max_new_tokens):
+        cap_done = max_new_tokens_tensor <= step_idx
         newly_done = token == eos_id
         first_eos_steps = torch.where(
             (first_eos_steps < 0) & newly_done,
             torch.full_like(first_eos_steps, step_idx),
             first_eos_steps,
         )
-        done |= newly_done
+        done |= newly_done | cap_done
         if bool(done.all().item()):
             break
 
-        last_id_hidden = talker_codec_embed(token.unsqueeze(1))  # [B, 1, H]
+        token_for_step = torch.where(done, torch.full_like(token, eos_id), token)
+        last_id_hidden = talker_codec_embed(token_for_step.unsqueeze(1))  # [B, 1, H]
         pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)  # [B, 2, H]
         codebook_token_ids = predictor_graph.run(pred_input)  # [B, 15]
         if codebook_token_ids.dim() == 1:
             codebook_token_ids = codebook_token_ids.unsqueeze(0)
 
-        all_cb = torch.cat([token.view(batch_size, 1), codebook_token_ids], dim=1)  # [B, 16]
+        all_cb = torch.cat([token_for_step.view(batch_size, 1), codebook_token_ids], dim=1)  # [B, 16]
         all_codec_ids.append(all_cb.detach())
 
         codec_hiddens = [last_id_hidden]
@@ -268,6 +223,7 @@ def fast_generate_batch_graph(
         first_eos_steps,
         torch.full_like(first_eos_steps, total_steps),
     )
+    lengths = torch.minimum(lengths, torch.minimum(max_new_tokens_tensor, torch.full_like(lengths, total_steps)))
     codec_ids_list = [
         codec_stack[i, : int(length.item()), :].contiguous()
         for i, length in enumerate(lengths)

@@ -695,6 +695,8 @@ class MultilingualSplitter:
         # CLD2 loves to detect short code/keywords as obscure African languages
         if top_lang in self._BANNED_LATIN_LANGUAGES:
             return main_lang
+        if script == "Latin" and not self._is_common_latin_language(top_lang):
+            return main_lang
 
         # If detection matches main language, keep it
         if top_lang == main_lang:
@@ -831,6 +833,57 @@ class MultilingualSplitter:
             idx += 1
 
         return self._merge_adjacent_segments(merged)
+
+    def _merge_short_embedded_same_script_switches(
+        self,
+        segments: list[Segment],
+        main_lang: str,
+    ) -> list[Segment]:
+        """Reject tiny same-script code-switches embedded inside main language.
+
+        CLD2 is especially brittle on individual Latin tokens: Vietnamese "do"
+        can become English, English "faraway" can become an obscure language,
+        etc. If the surrounding text is the main language and the detected span
+        is too small to be a meaningful same-script switch, keep it in the main
+        language. Different-script switches are left untouched.
+        """
+        if len(segments) < 3:
+            return segments
+
+        adjusted: list[Segment] = []
+        for idx, seg in enumerate(segments):
+            if seg.language == main_lang or seg.script in {"Common", "Inherited", "Unknown"}:
+                adjusted.append(seg)
+                continue
+
+            prev_seg = segments[idx - 1] if idx > 0 else None
+            next_seg = segments[idx + 1] if idx + 1 < len(segments) else None
+            if not (
+                prev_seg
+                and next_seg
+                and prev_seg.language == main_lang
+                and next_seg.language == main_lang
+                and prev_seg.script == seg.script == next_seg.script
+            ):
+                adjusted.append(seg)
+                continue
+
+            words = regex.findall(r"\p{Letter}+", seg.text)
+            letters = "".join(words)
+            if len(words) <= 2 or len(letters) < 16:
+                adjusted.append(
+                    Segment(
+                        text=seg.text,
+                        start=seg.start,
+                        end=seg.end,
+                        script=seg.script,
+                        language=main_lang,
+                    )
+                )
+            else:
+                adjusted.append(seg)
+
+        return self._merge_adjacent_segments(adjusted)
 
     def split(self, text: str, main_lang: Optional[str] = None) -> SplitResult:
         """
@@ -980,6 +1033,10 @@ class MultilingualSplitter:
 
         # Final merge of adjacent same-language segments
         merged_segments = self._merge_adjacent_segments(segments)
+        merged_segments = self._merge_short_embedded_same_script_switches(
+            merged_segments,
+            main_lang,
+        )
         merged_segments = self._merge_embedded_main_language_tokens(
             merged_segments,
             main_lang,

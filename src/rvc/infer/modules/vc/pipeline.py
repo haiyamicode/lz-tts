@@ -278,6 +278,204 @@ class Pipeline(object):
         times[2] += t2 - t1
         return audio1
 
+    def vc_batch(
+        self,
+        model,
+        net_g,
+        sid,
+        audios0,
+        pitches,
+        pitchfs,
+        times,
+        index_rate,
+        version,
+        protect,
+        tgt_sr,
+    ):
+        if index_rate != 0:
+            raise ValueError("RVC real batch conversion does not support FAISS index blending")
+        if not audios0:
+            return []
+
+        feats_list = []
+        lengths = []
+        for audio0 in audios0:
+            feats = torch.from_numpy(audio0)
+            if self.is_half:
+                feats = feats.half()
+            else:
+                feats = feats.float()
+            if feats.dim() == 2:
+                feats = feats.mean(-1)
+            assert feats.dim() == 1, feats.dim()
+            feats_list.append(feats)
+            lengths.append(feats.shape[0])
+
+        batch_size = len(feats_list)
+        max_audio_len = max(lengths)
+        feats = torch.zeros((batch_size, max_audio_len), dtype=feats_list[0].dtype)
+        padding_mask = torch.ones((batch_size, max_audio_len), dtype=torch.bool)
+        for idx, item in enumerate(feats_list):
+            feats[idx, : item.shape[0]] = item
+            padding_mask[idx, : item.shape[0]] = False
+
+        inputs = {
+            "source": feats.to(self.device),
+            "padding_mask": padding_mask.to(self.device),
+            "output_layer": 9 if version == "v1" else 12,
+        }
+        t0 = ttime()
+        with torch.no_grad():
+            logits = model.extract_features(**inputs)
+            feats = model.final_proj(logits[0]) if version == "v1" else logits[0]
+        if protect < 0.5 and pitches is not None and pitchfs is not None:
+            feats0 = feats.clone()
+
+        feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
+        if protect < 0.5 and pitches is not None and pitchfs is not None:
+            feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(
+                0, 2, 1
+            )
+        t1 = ttime()
+
+        p_lens = [audio0.shape[0] // self.window for audio0 in audios0]
+        max_p_len = min(max(p_lens), feats.shape[1])
+        p_lens = [min(p_len, max_p_len) for p_len in p_lens]
+        feats = feats[:, :max_p_len]
+
+        pitch = pitchf = None
+        if pitches is not None and pitchfs is not None:
+            pitch = torch.ones((batch_size, max_p_len), device=self.device).long()
+            pitchf = torch.zeros((batch_size, max_p_len), device=self.device).float()
+            for idx, (item_pitch, item_pitchf, p_len) in enumerate(zip(pitches, pitchfs, p_lens)):
+                pitch[idx, :p_len] = item_pitch[:, :p_len].squeeze(0)
+                pitchf[idx, :p_len] = item_pitchf[:, :p_len].squeeze(0)
+
+        if protect < 0.5 and pitch is not None and pitchf is not None:
+            pitchff = pitchf.clone()
+            pitchff[pitchf > 0] = 1
+            pitchff[pitchf < 1] = protect
+            pitchff = pitchff.unsqueeze(-1)
+            feats = feats * pitchff + feats0[:, :max_p_len] * (1 - pitchff)
+            feats = feats.to(feats0.dtype)
+
+        p_len_tensor = torch.tensor(p_lens, device=self.device).long()
+        sid_batch = sid.expand(batch_size).long()
+        with torch.no_grad():
+            hasp = pitch is not None and pitchf is not None
+            arg = (feats, p_len_tensor, pitch, pitchf, sid_batch) if hasp else (feats, p_len_tensor, sid_batch)
+            audio_batch = net_g.infer(*arg)[0][:, 0].data.cpu().float().numpy()
+            del hasp, arg
+
+        outputs = []
+        for idx, p_len in enumerate(p_lens):
+            # Match the single-item path's decoded duration before external pad trimming.
+            target_len = int(audios0[idx].shape[0] / self.sr * tgt_sr)
+            outputs.append(audio_batch[idx, :target_len])
+
+        del feats, p_len_tensor, padding_mask
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        t2 = ttime()
+        times[0] += t1 - t0
+        times[2] += t2 - t1
+        return outputs
+
+    def pipeline_batch(
+        self,
+        model,
+        net_g,
+        sid,
+        audios,
+        input_audio_paths,
+        times,
+        f0_up_key,
+        f0_method,
+        index_rate,
+        if_f0,
+        filter_radius,
+        tgt_sr,
+        resample_sr,
+        rms_mix_rate,
+        version,
+        protect,
+    ):
+        if index_rate != 0:
+            raise ValueError("RVC real batch conversion does not support FAISS index blending")
+        if not audios:
+            return []
+
+        processed = []
+        audio_pads = []
+        p_lens = []
+        for audio in audios:
+            audio = signal.filtfilt(bh, ah, audio)
+            processed.append(audio)
+            audio_pad = np.pad(audio, (self.t_pad, self.t_pad), mode="reflect")
+            audio_pads.append(audio_pad)
+            p_lens.append(audio_pad.shape[0] // self.window)
+
+        sid = torch.tensor(sid, device=self.device).long()
+        pitches = pitchfs = None
+        if if_f0 == 1:
+            pitches = []
+            pitchfs = []
+            for input_audio_path, audio_pad, p_len in zip(input_audio_paths, audio_pads, p_lens):
+                pitch, pitchf = self.get_f0(
+                    input_audio_path,
+                    audio_pad,
+                    p_len,
+                    f0_up_key,
+                    f0_method,
+                    filter_radius,
+                    None,
+                )
+                pitch = pitch[:p_len]
+                pitchf = pitchf[:p_len]
+                if "mps" not in str(self.device) or "xpu" not in str(self.device):
+                    pitchf = pitchf.astype(np.float32)
+                pitches.append(torch.tensor(pitch, device=self.device).unsqueeze(0).long())
+                pitchfs.append(torch.tensor(pitchf, device=self.device).unsqueeze(0).float())
+
+        t2 = ttime()
+        converted = self.vc_batch(
+            model,
+            net_g,
+            sid,
+            audio_pads,
+            pitches,
+            pitchfs,
+            times,
+            index_rate,
+            version,
+            protect,
+            tgt_sr,
+        )
+        times[1] += ttime() - t2
+
+        outputs = []
+        for source_audio, converted_audio in zip(processed, converted):
+            audio_opt = converted_audio[self.t_pad_tgt : -self.t_pad_tgt]
+            if rms_mix_rate != 1:
+                audio_opt = change_rms(source_audio, 16000, audio_opt, tgt_sr, rms_mix_rate)
+            if tgt_sr != resample_sr >= 16000:
+                audio_opt = librosa.resample(
+                    audio_opt, orig_sr=tgt_sr, target_sr=resample_sr
+                )
+                out_sr = resample_sr
+            else:
+                out_sr = tgt_sr
+            audio_max = np.abs(audio_opt).max() / 0.99
+            max_int16 = 32768
+            if audio_max > 1:
+                max_int16 /= audio_max
+            outputs.append((out_sr, (audio_opt * max_int16).astype(np.int16)))
+
+        del pitches, pitchfs, sid
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return outputs
+
     def pipeline(
         self,
         model,

@@ -1423,12 +1423,20 @@ def phonemize_spans_with_speakers(
     primary = es_conf.get("primary") or "en-us"
     spk_id_map: Dict[str, int] = cfg.get("speaker_id_map") or {}
     lang_spk_map: Dict[str, str] = cfg.get("language_speakers") or {}
+    supported_langs = {
+        (label or "").lower().split("-")[0]
+        for label in set(spk_id_map.keys()) | set(lang_spk_map.keys()) | set(lang_spk_map.values())
+        if label
+    }
+    splitter = MultilingualSplitter(languages=sorted(supported_langs) if supported_langs else None)
 
     casing = get_text_casing("ignore")
-    splitter = MultilingualSplitter()
     split_result = splitter.split(text)
     segments = split_result.segments
     main_lang = split_result.main_language
+    if main_lang not in supported_langs:
+        primary_lang = primary.split("-")[0]
+        main_lang = primary_lang if primary_lang in supported_langs else next(iter(supported_langs), primary_lang)
 
     _LOGGER.debug(
         "infer-multispan: segments=%s (main=%s)",
@@ -1463,6 +1471,8 @@ def phonemize_spans_with_speakers(
             continue
 
         lang = (seg.language if seg.language and seg.language != "und" else main_lang or "en").lower()
+        if supported_langs and lang.split("-")[0] not in supported_langs:
+            lang = main_lang or primary.split("-")[0]
 
         speaker_info = _find_speaker_for_lang(lang)
         if speaker_info is None and main_lang and main_lang != lang:
@@ -1472,7 +1482,7 @@ def phonemize_spans_with_speakers(
             _LOGGER.debug("infer-multispan: main_lang=%s not available, trying primary=%s", main_lang, primary)
             speaker_info = _find_speaker_for_lang(primary.split("-")[0])
         if speaker_info is None:
-            _LOGGER.warning("infer-multispan: no speaker found for lang=%s, using speaker 0", lang)
+            _LOGGER.debug("infer-multispan: no speaker found for lang=%s, using speaker 0", lang)
             spk_label = list(spk_id_map.keys())[0] if spk_id_map else "en"
             spk_id = 0
             voice = _map_cld2_to_espeak(spk_label or "en", primary)

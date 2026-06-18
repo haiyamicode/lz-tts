@@ -2,13 +2,12 @@
 """
 Download (sync) data files from Wasabi S3
 
-Downloads model data and RVC assets from S3.
+Downloads model data from S3.
 
 Usage:
     uv run python scripts/download_data.py
     uv run python scripts/download_data.py --filter lzspeech
     uv run python scripts/download_data.py --data-dir ./data
-    uv run python scripts/download_data.py --skip-rvc
     uv run python scripts/download_data.py --dry-run
 """
 import argparse
@@ -128,10 +127,8 @@ def download_file(s3_client, bucket, s3_key, local_path):
 # ---------------------------------------------------------------------------
 
 _EXCLUDE_PREFIXES = (
-    "seed-vc/embeddings/",
     "seed-vc/checkpoints/",
 )
-_EXCLUDE_NAMES = {"server.json"}
 
 
 def sync_data_from_s3(
@@ -171,6 +168,8 @@ def sync_data_from_s3(
             rel = key[len(s3_data_path) + 1:]
             if not rel:
                 continue
+            if "/" not in rel:
+                continue
             model_name = rel.split('/')[0]
             if name_filter and name_filter not in model_name:
                 continue
@@ -185,7 +184,7 @@ def sync_data_from_s3(
         downloaded = skipped = failed = 0
 
         for obj, rel in filtered:
-            if any(rel.startswith(p) for p in _EXCLUDE_PREFIXES) or rel in _EXCLUDE_NAMES:
+            if any(rel.startswith(p) for p in _EXCLUDE_PREFIXES):
                 print(f"Skipping {rel} (handled separately)")
                 skipped += 1
                 continue
@@ -219,81 +218,6 @@ def sync_data_from_s3(
 
 
 # ---------------------------------------------------------------------------
-# RVC assets
-# ---------------------------------------------------------------------------
-
-def sync_rvc_assets(data_dir: Path, force: bool = False, dry_run: bool = False):
-    rvc_dir = data_dir / "rvc"
-    failed = 0
-
-    bucket = os.getenv('AWS_S3_BUCKET_NAME')
-    if not bucket:
-        print("Error: AWS_S3_BUCKET_NAME not set in .env")
-        return 1
-
-    s3 = get_s3_client()
-
-    try:
-        # Foundation models: rvc/hubert/, rvc/rmvpe/
-        resp = s3.list_objects_v2(Bucket=bucket, Prefix="rvc/")
-        hubert_rmvpe = resp.get("Contents", [])
-
-        # Model weights: weights/*.pth
-        resp = s3.list_objects_v2(Bucket=bucket, Prefix="weights/")
-        weights = [o for o in resp.get("Contents", []) if o["Key"].endswith(".pth")]
-
-        print("=== RVC: foundation models ===")
-        for obj in hubert_rmvpe:
-            name = Path(obj["Key"]).name
-            subdir = Path(obj["Key"]).parts[1]
-            local_path = rvc_dir / subdir / name
-            size_mb = obj["Size"] / (1024 * 1024)
-
-            if _should_skip(local_path, obj, force):
-                print(f"  Skipping {subdir}/{name} (same content)")
-                continue
-
-            if dry_run:
-                print(f"  WOULD DOWNLOAD {subdir}/{name} ({size_mb:.0f} MB)")
-                continue
-
-            print(f"  {subdir}/{name} ({size_mb:.0f} MB)")
-            if download_file(s3, bucket, obj["Key"], local_path):
-                pass
-            else:
-                failed += 1
-
-        print(f"\n=== RVC: model weights ({len(weights)}) ===")
-        weights_dir = rvc_dir / "weights"
-        weights_dir.mkdir(parents=True, exist_ok=True)
-
-        for obj in weights:
-            name = Path(obj["Key"]).name
-            local_path = weights_dir / name
-            size_mb = obj["Size"] / (1024 * 1024)
-
-            if _should_skip(local_path, obj, force):
-                print(f"  Skipping {name} (same content)")
-                continue
-
-            if dry_run:
-                print(f"  WOULD DOWNLOAD {name} ({size_mb:.1f} MB)")
-                continue
-
-            print(f"  {name} ({size_mb:.1f} MB)")
-            if download_file(s3, bucket, obj["Key"], local_path):
-                pass
-            else:
-                failed += 1
-
-    except ClientError as e:
-        print(f"S3 error: {e}")
-        failed += 1
-
-    return 1 if failed else 0
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -305,7 +229,6 @@ def parse_args():
     parser.add_argument("--filter", help="Substring filter for model names.")
     parser.add_argument("--force", action="store_true", help="Re-download even if unchanged.")
     parser.add_argument("--dry-run", action="store_true", help="Show plan without downloading.")
-    parser.add_argument("--skip-rvc", action="store_true", help="Skip RVC asset downloads.")
     return parser.parse_args()
 
 
@@ -318,11 +241,4 @@ if __name__ == "__main__":
         force=args.force,
         dry_run=args.dry_run,
     )
-    if not args.skip_rvc:
-        rvc_rc = sync_rvc_assets(
-            data_dir=data_dir or Path("./data"),
-            force=args.force,
-            dry_run=args.dry_run,
-        )
-        rc = rc or rvc_rc
     sys.exit(rc)

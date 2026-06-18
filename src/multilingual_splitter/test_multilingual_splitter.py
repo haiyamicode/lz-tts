@@ -346,6 +346,26 @@ class TestFalsePositivePrevention(unittest.TestCase):
                         )
                         break
 
+    def test_short_embedded_same_script_switches_stay_main_language(self):
+        """Tiny same-script false positives should not split the main language."""
+        cases = [
+            (
+                "She was wandering to faraway places.",
+                "en",
+                {"en"},
+            ),
+            (
+                "Không biết do tôi cầu toàn, khó tính hay hết duyên phận.",
+                "vi",
+                {"vi"},
+            ),
+        ]
+        for text, main_lang, expected_langs in cases:
+            with self.subTest(text=text):
+                result = self.splitter.split(text, main_lang=main_lang)
+                found_langs = {seg.language for seg in result.segments if seg.text.strip()}
+                self.assertEqual(found_langs, expected_langs)
+
 
 class TestSegmentStructure(unittest.TestCase):
     """Test segment data structure integrity."""

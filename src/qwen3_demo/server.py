@@ -312,14 +312,14 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         )
 
     def run():
-        wav, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=False)
-        if wav.ndim > 1:
-            wav = wav.mean(axis=1)
-        wav_t = torch.from_numpy(wav)
-        if sr != 16000:
-            wav_t = torchaudio.functional.resample(wav_t.unsqueeze(0), sr, 16000).squeeze(0)
-        with torch.inference_mode():
-            return parakeet.transcribe(wav_t.cuda())
+        suffix = Path(audio.filename or "").suffix or ".wav"
+        with tempfile.TemporaryDirectory(prefix="qwen3-demo-transcribe-") as tmp_dir:
+            audio_path = Path(tmp_dir) / f"reference{suffix}"
+            audio_path.write_bytes(content)
+            if EMBEDDED_IN_LZ_TTS:
+                return shared_qwen3.transcribe_voice_sample(audio_path)
+            with threading.Lock(), torch.inference_mode():
+                return parakeet.transcribe(str(audio_path)).strip()
 
     text = await asyncio.to_thread(run)
     return {"text": text}

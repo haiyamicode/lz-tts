@@ -13,6 +13,9 @@ wheels/
 local
 output
 data
+data/*
+!data/*/
+!data/*/manifest.json
 cache
 checkpoints
 

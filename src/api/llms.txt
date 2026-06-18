@@ -56,26 +56,37 @@ Rules:
 - `options` contains only Sparrow/VITS controls. Unknown option keys are rejected.
 
 ### POST /synthesize/batch
-Batched synthesis. With `voice_id`, this runs the full configured pipeline: one or more grouped batched Sparrow calls plus one batched Seed-VC call for items that need conversion. With `sample_url`, it runs direct batched Sparrow synthesis followed by one batched Seed-VC call to the sample voice. Without `voice_id` or `sample_url`, it runs direct batched Sparrow synthesis and requires either `language` or `model`.
+Batched synthesis. Each `items[]` entry uses the same input fields as `POST /synthesize`. Compatible items are grouped internally so Sparrow and Seed-VC still run through real batched calls, while allowing different voices, references, languages, formats, and options per item.
 
 Request Body (JSON):
 ```json
 {
-  "texts": ["First text", "Second text"],
-  "voice_id": "msa.en-US.AvaMultilingual",
-  "sample_url": "https://example.com/ref.mp3",
-  "language": "en-US",
-  "model": "sparrow",
-  "style": "empathetic",
-  "styleIntensity": 0.5,
-  "format": "mp3",
-  "neural": true,
-  "options": {
-    "length_scale": 1.0,
-    "duration_sdp_ratio": 0.2
-  }
+  "items": [
+    {
+      "text": "First text",
+      "voice_id": "msa.en-US.AvaMultilingual",
+      "language": "en-US",
+      "format": "mp3",
+      "neural": true,
+      "options": {
+        "length_scale": 1.0,
+        "duration_sdp_ratio": 0.2
+      }
+    },
+    {
+      "text": "Second text",
+      "voice_id": "msa.en-GB.AdaMultilingual",
+      "language": "en-GB",
+      "format": "mp3"
+    }
+  ]
 }
 ```
+
+Rules:
+- `ssml` is not supported in `/synthesize/batch`; use plain `text`.
+- Per item, use either `voice_id`, `sample_url`, or direct Sparrow routing, not conflicting combinations.
+- `style` and `styleIntensity` require `voice_id`.
 
 Response Body (JSON):
 ```json
@@ -164,7 +175,7 @@ Configured voice batch:
 curl -X POST "{{BASE_URL}}/synthesize/batch" \
   -H "Content-Type: application/json" \
   -H "X-Api-Key: YOUR_KEY" \
-  -d '{"texts": ["Hello", "Good morning"], "voice_id": "msa.en-US.AvaMultilingual", "format": "mp3", "options": {"duration_sdp_ratio": 0.2}}'
+  -d '{"items": [{"text": "Hello", "voice_id": "msa.en-US.AvaMultilingual", "format": "mp3", "options": {"duration_sdp_ratio": 0.2}}, {"text": "Good morning", "voice_id": "msa.en-US.AvaMultilingual", "format": "mp3", "options": {"duration_sdp_ratio": 0.2}}]}'
 ```
 
 ## Notes

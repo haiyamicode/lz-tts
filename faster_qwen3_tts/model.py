@@ -9,7 +9,7 @@ import os
 from collections import OrderedDict
 from pathlib import Path
 from types import MethodType
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import soundfile as sf
@@ -18,8 +18,8 @@ import torch
 from .utils import suppress_flash_attn_warning
 
 logger = logging.getLogger(__name__)
-
-
+CUDA_GRAPH_BATCH_SIZES = (1, 3, 5)
+MAX_CUDA_GRAPH_BATCH_SIZE = max(CUDA_GRAPH_BATCH_SIZES)
 
 
 class FasterQwen3TTS:
@@ -674,6 +674,11 @@ class FasterQwen3TTS:
 
     def _get_batch_graphs(self, batch_size: int, prefill_len: int):
         """Return CUDA graphs captured for a fixed batch size."""
+        if batch_size not in CUDA_GRAPH_BATCH_SIZES:
+            raise ValueError(
+                f"CUDA graph batch size must be one of {CUDA_GRAPH_BATCH_SIZES}; got {batch_size}"
+            )
+
         if batch_size == 1:
             if not self._warmed_up:
                 self._warmup(prefill_len)
@@ -727,6 +732,15 @@ class FasterQwen3TTS:
         self._batch_graphs[batch_size] = (predictor_graph, talker_graph)
         logger.info("CUDA graphs captured for batch_size=%s", batch_size)
         return predictor_graph, talker_graph
+
+    def capture_batch_graphs(
+        self,
+        batch_sizes: Sequence[int] = CUDA_GRAPH_BATCH_SIZES,
+        prefill_len: int = 100,
+    ) -> None:
+        """Eagerly capture the supported fixed-size CUDA graph batches."""
+        for batch_size in batch_sizes:
+            self._get_batch_graphs(batch_size=batch_size, prefill_len=prefill_len)
     
     def generate(
         self,
@@ -1513,7 +1527,7 @@ class FasterQwen3TTS:
         language: Union[str, List[str]],
         ref_audio: Optional[Union[str, Path]] = None,
         ref_text: str = "",
-        max_new_tokens: int = 2048,
+        max_new_tokens: Optional[List[int]] = None,
         min_new_tokens: int = 2,
         temperature: float = 0.9,
         top_k: int = 50,
@@ -1525,16 +1539,20 @@ class FasterQwen3TTS:
         append_silence: bool = True,
         instruct: Optional[Union[str, List[Optional[str]]]] = None,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
-        use_cuda_graph_batch: bool = False,
     ) -> Tuple[list, int]:
-        """Generate a batch of voice-cloned utterances in one model call.
+        """Generate a batch of voice-cloned utterances with the CUDA graph backend."""
+        from .generate import fast_generate_batch_graph
 
-        The default uses the dynamic HF generation path because it matches the
-        model's native batched generation behavior. The experimental CUDA graph
-        path is faster, but remains opt-in until its batched codec residual path
-        is fully validated.
-        """
-        from .generate import fast_generate_batch_graph, hf_generate_batch
+        if len(texts) not in CUDA_GRAPH_BATCH_SIZES:
+            raise ValueError(
+                f"Qwen3 batch size must be one of {CUDA_GRAPH_BATCH_SIZES}; got {len(texts)}"
+            )
+        if max_new_tokens is None:
+            raise ValueError("batched max_new_tokens must be specified per item")
+        if len(max_new_tokens) != len(texts):
+            raise ValueError(
+                f"max_new_tokens length must match texts length ({len(texts)}); got {len(max_new_tokens)}"
+            )
 
         non_streaming_mode = self._resolve_non_streaming_mode(
             non_streaming_mode,
@@ -1553,44 +1571,27 @@ class FasterQwen3TTS:
             instruct=instruct,
         )
 
-        if use_cuda_graph_batch:
-            predictor_graph, talker_graph = self._get_batch_graphs(
-                batch_size=len(texts),
-                prefill_len=tie.shape[1],
-            )
-            codec_ids_list, timing = fast_generate_batch_graph(
-                talker=talker,
-                talker_input_embeds=tie,
-                attention_mask=tam,
-                trailing_text_hiddens=tth,
-                tts_pad_embed=tpe,
-                config=config,
-                predictor_graph=predictor_graph,
-                talker_graph=talker_graph,
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=min_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                do_sample=do_sample,
-                repetition_penalty=repetition_penalty,
-            )
-        else:
-            codec_ids_list, timing = hf_generate_batch(
-                talker=talker,
-                talker_input_embeds=tie,
-                attention_mask=tam,
-                trailing_text_hiddens=tth,
-                tts_pad_embed=tpe,
-                config=config,
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=min_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                do_sample=do_sample,
-                repetition_penalty=repetition_penalty,
-            )
+        predictor_graph, talker_graph = self._get_batch_graphs(
+            batch_size=len(texts),
+            prefill_len=tie.shape[1],
+        )
+        codec_ids_list, timing = fast_generate_batch_graph(
+            talker=talker,
+            talker_input_embeds=tie,
+            attention_mask=tam,
+            trailing_text_hiddens=tth,
+            tts_pad_embed=tpe,
+            config=config,
+            predictor_graph=predictor_graph,
+            talker_graph=talker_graph,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+        )
 
         speech_tokenizer = m.speech_tokenizer
         audio_arrays = []

@@ -30,7 +30,7 @@ def main() -> int:
     args = parse_args()
     if not args.file.exists():
         print(f"Error: Embeddings file not found: {args.file}")
-        print("Run: uv run python scripts/download_seed_vc_embeddings.py")
+        print("Run: uv run python scripts/download_data.py --filter seed-vc")
         return 1
 
     loader = HDF5EmbeddingLoader(args.file)

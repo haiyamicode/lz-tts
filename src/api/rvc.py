@@ -189,3 +189,94 @@ class RVCBackend:
 
             finally:
                 tmp_in.unlink(missing_ok=True)
+
+    def convert_batch(
+        self,
+        audio_items: list[bytes],
+        model: str,
+        f0_method: str = "rmvpe",
+        pitch: int = 0,
+        index_rate: float = 0.0,
+        rms_mix_rate: float = 0.25,
+        protect: float = 0.33,
+        output_format: str = "wav",
+    ) -> list[tuple[bytes, int]]:
+        """Convert multiple audio items through one real RVC batch call."""
+        if not audio_items:
+            raise ValueError("audio_items must not be empty")
+        if index_rate != 0:
+            raise ValueError("RVC real batch conversion does not support index_rate != 0")
+
+        with self._lock:
+            self._ensure_loaded()
+
+            model_path = self._weights_dir / model
+            if not model_path.exists():
+                raise FileNotFoundError(f"Model not found: {model_path}")
+
+            from infer.lib.audio import load_audio
+            from infer.modules.vc.utils import load_hubert
+
+            tmp_paths = []
+            try:
+                for audio_bytes in audio_items:
+                    tmp_in = DATA_RVC / "tmp" / f"{uuid.uuid4().hex}.input"
+                    tmp_in.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_in.write_bytes(audio_bytes)
+                    tmp_paths.append(tmp_in)
+
+                self._vc.get_vc(model)
+                self._current_model = model
+
+                if self._vc.hubert_model is None:
+                    self._vc.hubert_model = load_hubert(self._vc.config)
+
+                audios = []
+                for tmp_path in tmp_paths:
+                    audio = load_audio(str(tmp_path), 16000)
+                    audio_max = np.abs(audio).max() / 0.95
+                    if audio_max > 1:
+                        audio = audio / audio_max
+                    audios.append(audio)
+
+                times = [0, 0, 0]
+                outputs = self._vc.pipeline.pipeline_batch(
+                    self._vc.hubert_model,
+                    self._vc.net_g,
+                    0,
+                    audios,
+                    [str(path) for path in tmp_paths],
+                    times,
+                    pitch,
+                    f0_method,
+                    index_rate,
+                    self._vc.if_f0,
+                    3,
+                    self._vc.tgt_sr,
+                    0,
+                    rms_mix_rate,
+                    self._vc.version,
+                    protect,
+                )
+
+                encoded = []
+                for sr, audio_data in outputs:
+                    buf = io.BytesIO()
+                    sf.write(buf, audio_data, sr, format="WAV")
+                    wav_bytes = buf.getvalue()
+
+                    if output_format == "mp3":
+                        from pydub import AudioSegment
+
+                        wav_buf = io.BytesIO(wav_bytes)
+                        seg = AudioSegment.from_wav(wav_buf)
+                        mp3_buf = io.BytesIO()
+                        seg.export(mp3_buf, format="mp3", bitrate="320k", parameters=["-q:a", "0"])
+                        encoded.append((mp3_buf.getvalue(), sr))
+                    else:
+                        encoded.append((wav_bytes, sr))
+
+                return encoded
+            finally:
+                for tmp_path in tmp_paths:
+                    tmp_path.unlink(missing_ok=True)

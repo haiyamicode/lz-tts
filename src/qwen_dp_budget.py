@@ -260,85 +260,150 @@ class QwenDpBudget:
 
     @torch.no_grad()
     def predict(self, text: str, language: str | None = None) -> dict[str, Any]:
+        return self.predict_batch([text], [language])[0]
+
+    @torch.no_grad()
+    def predict_batch(
+        self,
+        texts: list[str],
+        languages: list[str | None] | None = None,
+    ) -> list[dict[str, Any]]:
         self.load()
         assert self._model is not None
 
+        if languages is None:
+            languages = [None] * len(texts)
+        if len(texts) != len(languages):
+            raise ValueError("languages length must match texts length")
+
         from src.piper.preprocess import phonemize_text_for_infer
 
-        phoneme_result = phonemize_text_for_infer(
-            text,
-            self._phoneme_config(language),
-            neural=False,
-        )
-        phoneme_ids = phoneme_result["phoneme_ids"]
-        if not phoneme_ids:
-            return self._empty_budget(language)
+        phoneme_results: list[dict[str, Any]] = []
+        for text, language in zip(texts, languages):
+            phoneme_result = phonemize_text_for_infer(
+                text,
+                self._phoneme_config(language),
+                neural=False,
+            )
+            phoneme_results.append(phoneme_result)
 
-        frame_values = []
-        speaker_id = self._speaker_id_for_language(language)
-        x = torch.tensor([phoneme_ids], dtype=torch.long, device=self.device)
-        x_lengths = torch.tensor([len(phoneme_ids)], dtype=torch.long, device=self.device)
-        sid = torch.tensor([speaker_id], dtype=torch.long, device=self.device)
+        budgets = [self._empty_budget(language) for language in languages]
+        batch_entries: list[tuple[int, str | None, list[int], dict[str, Any]]] = []
+        for index, (text, language, phoneme_result) in enumerate(zip(texts, languages, phoneme_results)):
+            phoneme_ids = phoneme_result["phoneme_ids"]
+            if not phoneme_ids:
+                continue
+            phoneme_text = phoneme_result.get("text") or text
+            batch_entries.append(
+                (
+                    index,
+                    language,
+                    phoneme_ids,
+                    {
+                        "phoneme_text": phoneme_text,
+                        "phoneme_length": len(phoneme_ids),
+                        "word_spans": phoneme_result.get("word_spans"),
+                    },
+                )
+            )
+
+        if not batch_entries:
+            return budgets
+
+        batch_size = len(batch_entries)
+        max_len = max(len(phoneme_ids) for _, _, phoneme_ids, _ in batch_entries)
+        x = torch.zeros((batch_size, max_len), dtype=torch.long, device=self.device)
+        x_lengths = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        sid_values = []
+        batch_texts = []
+        batch_phoneme_lengths = []
+        batch_word_spans = []
+        for batch_idx, (input_index, language, phoneme_ids, payload) in enumerate(batch_entries):
+            x[batch_idx, : len(phoneme_ids)] = torch.tensor(
+                phoneme_ids,
+                dtype=torch.long,
+                device=self.device,
+            )
+            x_lengths[batch_idx] = len(phoneme_ids)
+            sid_values.append(self._speaker_id_for_language(language))
+            batch_texts.append(payload["phoneme_text"])
+            batch_phoneme_lengths.append(payload["phoneme_length"])
+            batch_word_spans.append(payload["word_spans"])
+
+        sid = torch.tensor(sid_values, dtype=torch.long, device=self.device)
         bert_input = self._bert_input(
-            phoneme_result.get("text") or text,
-            phoneme_length=len(phoneme_ids),
-            word_spans=phoneme_result.get("word_spans"),
+            batch_texts,
+            phoneme_length=batch_phoneme_lengths,
+            word_spans=batch_word_spans,
         )
+        frame_samples = []
         for _ in range(max(1, self.config.samples)):
-            frame_values.append(self._predict_frames(x, x_lengths, sid, bert_input))
-
-        frame_tensor = torch.tensor(frame_values, dtype=torch.float32)
+            frame_samples.append(self._predict_frames(x, x_lengths, sid, bert_input))
+        frame_tensor = torch.stack(frame_samples, dim=0).to(dtype=torch.float32)
         seconds_tensor = frame_tensor * (256.0 / 22050.0)
         token_tensor = seconds_tensor * self.config.token_rate
-
-        profile_language, profile = self._budget_profile(language)
-        min_margin = self._profile_float(profile, "min_margin", self.config.min_margin)
-        max_margin = self._profile_float(profile, "max_margin", self.config.max_margin)
-        min_extra_tokens = self._profile_int(profile, "min_extra_tokens", self.config.min_extra_tokens)
-        max_extra_tokens = self._profile_int(profile, "max_extra_tokens", self.config.max_extra_tokens)
         quantile = self.config.upper_quantile
-        mel_frames = int(torch.quantile(frame_tensor, quantile).ceil().item())
-        seconds = float(torch.quantile(seconds_tensor, quantile).item())
-        estimated_tokens = max(1, round(float(torch.quantile(token_tensor, quantile).item())))
-        min_tokens = max(1, round(estimated_tokens * min_margin) + min_extra_tokens)
-        max_tokens = max(min_tokens, round(estimated_tokens * max_margin) + max_extra_tokens)
 
-        return {
-            "mel_frames": mel_frames,
-            "seconds": seconds,
-            "estimated_tokens": estimated_tokens,
-            "min_tokens": min_tokens,
-            "max_tokens": max_tokens,
-            "token_rate": self.config.token_rate,
-            "samples": self.config.samples,
-            "upper_quantile": self.config.upper_quantile,
-            "budget_language": profile_language,
-            "budget_profile": profile,
-            "min_margin": min_margin,
-            "max_margin": max_margin,
-            "min_extra_tokens": min_extra_tokens,
-            "max_extra_tokens": max_extra_tokens,
-            "phoneme_count": len(phoneme_ids),
-            "phoneme_language": self._phoneme_config(language)["language"]["code"],
-            "speaker_id": speaker_id,
-            "sample_frames": frame_values,
-            "sample_seconds": [round(float(s), 3) for s in seconds_tensor.tolist()],
-            "mean_seconds": float(torch.mean(seconds_tensor).item()),
-            "p50_seconds": float(torch.quantile(seconds_tensor, 0.50).item()),
-            "p90_seconds": float(torch.quantile(seconds_tensor, 0.90).item()),
-            "length_scale": self.config.length_scale,
-            "noise_scale": self.config.noise_scale,
-        }
+        for batch_idx, (input_index, language, phoneme_ids, _payload) in enumerate(batch_entries):
+            profile_language, profile = self._budget_profile(language)
+            min_margin = self._profile_float(profile, "min_margin", self.config.min_margin)
+            max_margin = self._profile_float(profile, "max_margin", self.config.max_margin)
+            min_extra_tokens = self._profile_int(profile, "min_extra_tokens", self.config.min_extra_tokens)
+            max_extra_tokens = self._profile_int(profile, "max_extra_tokens", self.config.max_extra_tokens)
+
+            sample_frames = frame_tensor[:, batch_idx]
+            sample_seconds = seconds_tensor[:, batch_idx]
+            mel_frames = int(torch.quantile(sample_frames, quantile).ceil().item())
+            seconds = float(torch.quantile(sample_seconds, quantile).item())
+            estimated_tokens = max(1, round(float(torch.quantile(token_tensor[:, batch_idx], quantile).item())))
+            min_tokens = max(1, round(estimated_tokens * min_margin) + min_extra_tokens)
+            max_tokens = max(min_tokens, round(estimated_tokens * max_margin) + max_extra_tokens)
+
+            budgets[input_index] = {
+                "mel_frames": mel_frames,
+                "seconds": seconds,
+                "estimated_tokens": estimated_tokens,
+                "min_tokens": min_tokens,
+                "max_tokens": max_tokens,
+                "token_rate": self.config.token_rate,
+                "samples": self.config.samples,
+                "upper_quantile": self.config.upper_quantile,
+                "budget_language": profile_language,
+                "budget_profile": profile,
+                "min_margin": min_margin,
+                "max_margin": max_margin,
+                "min_extra_tokens": min_extra_tokens,
+                "max_extra_tokens": max_extra_tokens,
+                "phoneme_count": len(phoneme_ids),
+                "phoneme_language": self._phoneme_config(language)["language"]["code"],
+                "speaker_id": int(self._speaker_id_for_language(language)),
+                "sample_frames": [int(v) for v in sample_frames.tolist()],
+                "sample_seconds": [round(float(s), 3) for s in sample_seconds.tolist()],
+                "mean_seconds": float(torch.mean(sample_seconds).item()),
+                "p50_seconds": float(torch.quantile(sample_seconds, 0.50).item()),
+                "p90_seconds": float(torch.quantile(sample_seconds, 0.90).item()),
+                "length_scale": self.config.length_scale,
+                "noise_scale": self.config.noise_scale,
+            }
+
+        return budgets
 
     def _bert_input(
         self,
-        text: str,
-        phoneme_length: int | None = None,
-        word_spans: list[list[int]] | None = None,
+        text: str | list[str],
+        phoneme_length: int | list[int] | None = None,
+        word_spans: list[list[int] | None] | None = None,
     ) -> dict[str, torch.Tensor] | None:
         if self._semantic_tokenizer is None or self._build_bert_input is None or not text:
             return None
-        if phoneme_length is None:
+        if isinstance(text, list):
+            bert_dict = self._build_bert_input(
+                text,
+                self._semantic_tokenizer,
+                phoneme_lengths=phoneme_length if isinstance(phoneme_length, list) else None,
+                word_spans=word_spans,
+            )
+        elif phoneme_length is None:
             bert_dict = self._build_bert_input([text], self._semantic_tokenizer)
         else:
             bert_dict = self._build_bert_input(
@@ -363,7 +428,7 @@ class QwenDpBudget:
         x_lengths: torch.Tensor,
         sid: torch.Tensor,
         bert_input: dict[str, torch.Tensor] | None,
-    ) -> int:
+    ) -> torch.Tensor:
         assert self._model is not None
         model = self._model
         if bert_input is not None:
@@ -387,7 +452,7 @@ class QwenDpBudget:
             logw = model.dp(x_encoded, x_mask, g=g)
         w = torch.exp(logw) * x_mask * self.config.length_scale
         w_ceil = torch.ceil(w)
-        return int(torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).max().item())
+        return torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1)
 
     def _empty_budget(self, language: str | None = None) -> dict[str, Any]:
         profile_language, profile = self._budget_profile(language)

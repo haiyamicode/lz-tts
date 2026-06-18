@@ -13,9 +13,9 @@ from .vad import SileroVoiceActivityDetector
 _DIR = Path(__file__).parent
 
 
-def make_silence_detector() -> SileroVoiceActivityDetector:
+def make_silence_detector(providers=None) -> SileroVoiceActivityDetector:
     silence_model = _DIR / "models" / "silero_vad.onnx"
-    return SileroVoiceActivityDetector(silence_model)
+    return SileroVoiceActivityDetector(silence_model, providers=providers)
 
 
 def cache_norm_audio(

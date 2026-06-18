@@ -22,6 +22,7 @@ import httpx
 import uuid
 import wave
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, Optional
 from urllib.parse import parse_qsl, urlencode
@@ -102,6 +103,10 @@ def _configured_api_key() -> str:
 
 def _request_api_key(request: Request) -> str:
     return (request.headers.get("X-Api-Key") or request.query_params.get("api_key") or "").strip()
+
+
+def _is_browser_demo_path(path: str) -> bool:
+    return path == "/qwen3/demo" or path.startswith("/qwen3/demo/")
 
 
 def _render_llms_txt(request: Request) -> str:
@@ -277,21 +282,44 @@ class SynthesizeRequest(BaseModel):
     neural: bool = Field(True, description="Use neural heteronym disambiguation for more accurate pronunciation of ambiguous words")
 
 
-class BatchSynthesizeRequest(BaseModel):
-    """Request body for real batched Sparrow/VITS synthesis."""
+class BatchSynthesizeInputItem(BaseModel):
+    """One item in a /synthesize/batch request."""
 
     model_config = {"populate_by_name": True, "extra": "forbid"}
 
-    texts: list[str] = Field(..., min_length=1, max_length=64, description="Plain-text items to synthesize as one batch")
+    text: Optional[str] = Field(None, description="Plain text to synthesize")
+    ssml: Optional[str] = Field(None, description="SSML input is not supported for batched synthesis")
     voice_id: Optional[str] = Field(None, description="Public voice id from local/voices.json, e.g. msa.en-US.AvaMultilingual")
-    sample_url: Optional[str] = Field(None, description="Reference sample URL; outputs are converted to this voice with one Seed-VC batch")
-    language: Optional[str] = Field(None, description="Force full locale for all items, e.g. en-GB")
+    sample_url: Optional[str] = Field(None, description="Reference sample URL; output is converted to this voice with Seed-VC")
+    language: Optional[str] = Field(None, description="Force full locale for this item, e.g. en-GB")
     model: Optional[str] = Field(None, description="Model to use for direct Sparrow batching")
     style: Optional[str] = Field(None, description="Seed-VC speech style for voice_id synthesis")
     style_intensity: Optional[float] = Field(None, alias="styleIntensity", description="Seed-VC speech style intensity")
     options: Optional[SparrowSynthesizeOptions] = Field(None, description="Sparrow/VITS-specific synthesis options")
-    format: Literal["wav", "mp3"] = Field("wav", description="Per-item audio encoding")
+    format: Literal["wav", "mp3"] = Field("wav", description="Output audio encoding")
     neural: bool = Field(True, description="Use neural heteronym disambiguation")
+
+
+class BatchSynthesizeRequest(BaseModel):
+    """Request body for real batched synthesis with per-item /synthesize inputs."""
+
+    model_config = {"extra": "forbid"}
+
+    items: list[BatchSynthesizeInputItem] = Field(..., min_length=1, max_length=64, description="Synthesize inputs")
+
+
+@dataclass(frozen=True)
+class _SharedBatchSynthesizeRequest:
+    texts: list[str]
+    voice_id: str | None = None
+    sample_url: str | None = None
+    language: str | None = None
+    model: str | None = None
+    style: str | None = None
+    style_intensity: float | None = None
+    options: SparrowSynthesizeOptions | None = None
+    format: Literal["wav", "mp3"] = "wav"
+    neural: bool = True
 
 
 class BatchSynthesizeItem(BaseModel):
@@ -373,6 +401,37 @@ class RVCConvertRequest(BaseModel):
     format: Literal["wav", "mp3"] = Field("wav", description="Output audio format (wav or mp3)")
 
 
+class RVCBatchConvertItem(BaseModel):
+    """One source item for batched RVC conversion."""
+
+    audio: str = Field(..., description="Base64 encoded source audio")
+
+
+class RVCBatchConvertRequest(BaseModel):
+    """Request body for real batched RVC voice conversion."""
+
+    model_config = {"populate_by_name": True}
+
+    items: list[RVCBatchConvertItem] = Field(..., min_length=1, max_length=64)
+    model: str = Field(..., alias="model_name", description="RVC model filename (e.g., 'mrbeast.pth')")
+    f0_method: str = Field("rmvpe", description="Pitch extraction method (pm, harvest, crepe, rmvpe)")
+    pitch: int = Field(0, description="Pitch shift in semitones")
+    index_rate: float = Field(0.0, description="FAISS index blending rate 0-1 (0 = no index)")
+    rms_mix_rate: float = Field(0.25, description="Volume envelope mix rate 0-1")
+    protect: float = Field(0.33, description="Protect voiceless consonants 0-0.5")
+    format: Literal["wav", "mp3"] = Field("wav", description="Output audio format (wav or mp3)")
+
+
+class RVCBatchConvertResponseItem(BaseModel):
+    audio_base64: str
+    sample_rate: int
+
+
+class RVCBatchConvertResponse(BaseModel):
+    items: list[RVCBatchConvertResponseItem]
+    count: int
+
+
 class SynthesizeVoiceInfo(BaseModel):
     """Synthesize voice catalog entry."""
 
@@ -424,12 +483,27 @@ def _request_model_input(request: BaseModel, **query_fields: Any) -> dict[str, A
     return input_data
 
 
+def _log_synthesize_batch_stage(stage: str, **data: Any) -> None:
+    _LOGGER.debug(
+        "Synthesize batch stage: %s",
+        json.dumps({"stage": stage, **data}, ensure_ascii=False, default=str),
+    )
+
+
+def _log_synthesize_batch_summary(**data: Any) -> None:
+    _LOGGER.info(
+        "Synthesize batch summary: %s",
+        json.dumps(data, ensure_ascii=False, default=str),
+    )
+
+
 # Global state
 _inference_cache: OrderedDict[str, PiperInference] = OrderedDict()
 _server_config: ServerConfig = ServerConfig()
 _speaker_routes: dict[str, tuple[str, Optional[int]]] = {}  # speaker -> (model, speaker_id or None)
 _lang_speaker_map: dict[str, str] = {}  # canonical locale -> speaker
 _splitter: MultilingualSplitter | None = None
+_splitter_languages: tuple[str, ...] | None = None
 _matcha_backend: "ProductionMatchaBackend | None" = None
 _matcha_batcher: "ProductionMatchaBatcher | None" = None
 _seed_vc_backend: "_SeedVCBackend | None" = None
@@ -504,6 +578,40 @@ def _supported_sparrow_locales() -> set[str]:
             locales.add(normalized_speaker)
 
     return locales
+
+
+def _supported_sparrow_language_codes() -> set[str]:
+    """Return base language codes routable by the configured Sparrow models."""
+    languages: set[str] = set()
+    for locale in _supported_sparrow_locales():
+        languages.add(_get_base_language(locale))
+    for speaker in _speaker_routes.keys():
+        if speaker:
+            languages.add(_get_base_language(speaker))
+    return {language for language in languages if language and language != "und"}
+
+
+def _get_multilingual_splitter() -> MultilingualSplitter:
+    """Build a splitter constrained to languages supported by Sparrow routing."""
+    global _splitter, _splitter_languages
+    languages = tuple(sorted(_supported_sparrow_language_codes()))
+    if _splitter is None or _splitter_languages != languages:
+        _splitter = MultilingualSplitter(languages=list(languages) if languages else None)
+        _splitter_languages = languages
+    return _splitter
+
+
+def _routable_detected_language(language: str, main_lang: str) -> str:
+    """Clamp auto-detected language to a Sparrow-routable language."""
+    normalized = _normalize_locale_with_region(language)
+    if _is_supported_sparrow_locale(normalized):
+        return normalized
+    normalized_main = _normalize_locale_with_region(main_lang)
+    if _is_supported_sparrow_locale(normalized_main):
+        return normalized_main
+    if _is_supported_sparrow_locale("en"):
+        return "en"
+    return next(iter(_speaker_routes.keys()), "en")
 
 
 def _resolve_forced_language(locale: str) -> tuple[str, str, str]:
@@ -739,10 +847,6 @@ def _synthesize_multilingual(
 
     Returns (audio, sample_rate).
     """
-    global _splitter
-    if _splitter is None:
-        _splitter = MultilingualSplitter()
-
     if language is not None:
         _resolve_forced_language(language)
 
@@ -779,16 +883,7 @@ def _synthesize_multilingual(
         inference = _get_inference(model_name)
         sample_rate = inference.sample_rate
 
-        # Check if this speaker is configured via model_config (may have null speaker_id)
-        model_cfg = _server_config.pipertts.model_config_overrides.get(model_name)
-        if model_cfg and speaker in model_cfg.speakers:
-            # Use None for single-speaker models configured with null speaker_id
-            internal_speaker = None if model_cfg.speakers[speaker] is None else speaker
-        elif speaker in inference.speakers:
-            internal_speaker = speaker
-        else:
-            _LOGGER.warning("Speaker '%s' not in model '%s', using first available", speaker, model_name)
-            internal_speaker = next(iter(inference.speakers.keys()), None)
+        internal_speaker = _resolve_internal_speaker(model_name, speaker, inference)
 
         audio = inference.synthesize_span(seg_text, speaker=internal_speaker, neural=neural, **synth_kwargs)
         audio_parts.append(audio)
@@ -904,7 +999,7 @@ def _get_seed_vc_supported_voice_ids() -> set[str]:
     return _seed_vc_supported_voice_ids
 
 
-def _synth_kwargs_from_request(request: SynthesizeRequest | BatchSynthesizeRequest) -> dict[str, float]:
+def _synth_kwargs_from_request(request: SynthesizeRequest | BatchSynthesizeInputItem | _SharedBatchSynthesizeRequest) -> dict[str, float]:
     synth_kwargs: dict[str, float] = {}
     if request.options is None:
         return synth_kwargs
@@ -919,11 +1014,11 @@ def _synth_kwargs_from_request(request: SynthesizeRequest | BatchSynthesizeReque
     return synth_kwargs
 
 
-def _seed_vc_style_from_request(request: SynthesizeRequest | BatchSynthesizeRequest) -> tuple[str, float]:
+def _seed_vc_style_from_request(request: SynthesizeRequest | BatchSynthesizeInputItem | _SharedBatchSynthesizeRequest) -> tuple[str, float]:
     return request.style or "general", request.style_intensity if request.style_intensity is not None else 1.0
 
 
-def _seed_vc_style_requested(request: SynthesizeRequest | BatchSynthesizeRequest) -> bool:
+def _seed_vc_style_requested(request: SynthesizeRequest | BatchSynthesizeInputItem | _SharedBatchSynthesizeRequest) -> bool:
     style, intensity = _seed_vc_style_from_request(request)
     return style != "general" or intensity != 1.0
 
@@ -953,6 +1048,14 @@ async def _convert_generated_audio_to_sample_batch(
         _resample_audio(audio, source_rate, vc_source_rate)
         for audio, source_rate in zip(source_audios, source_sample_rates)
     ]
+    vc_started = time.perf_counter()
+    _log_synthesize_batch_stage(
+        "seed_vc_sample_batch_start",
+        count=len(vc_source_audios),
+        sample_url=sample_url,
+        output_format=output_format,
+        source_sample_rates=source_sample_rates,
+    )
     converted = await asyncio.to_thread(
         backend.convert_generated_audio_reference_batch,
         vc_source_audios,
@@ -961,15 +1064,21 @@ async def _convert_generated_audio_to_sample_batch(
         None,
         output_format,
     )
+    _log_synthesize_batch_stage(
+        "seed_vc_sample_batch_done",
+        count=len(converted),
+        wall_seconds=round(time.perf_counter() - vc_started, 6),
+        output_sample_rate=backend.sample_rate,
+    )
     return converted, backend.sample_rate
 
 
 def _resolve_internal_speaker(model_name: str, speaker: str | None, inference: PiperInference) -> str | None:
+    if speaker is None or not str(speaker).strip() or str(speaker).lower() == "und":
+        return None
     model_cfg = _server_config.pipertts.model_config_overrides.get(model_name)
     if model_cfg and speaker in model_cfg.speakers:
         return None if model_cfg.speakers[speaker] is None else speaker
-    if speaker is None:
-        return None
     if speaker in inference.speakers:
         return speaker
     _LOGGER.warning("Speaker '%s' not in model '%s', using first available", speaker, model_name)
@@ -983,14 +1092,12 @@ def _plan_text_segments(
     *,
     validate_primary_speaker: bool = False,
 ) -> tuple[list[dict[str, Any]], set[str]]:
-    global _splitter
-    if _splitter is None:
-        _splitter = MultilingualSplitter()
+    splitter = _get_multilingual_splitter()
 
     if forced_language is not None:
         forced_locale, forced_speaker, forced_model = _resolve_forced_language(forced_language)
 
-    result = _splitter.split(text)
+    result = splitter.split(text)
     main_lang = result.main_language or "en"
     primary_lang = _get_base_language(primary_speaker) if primary_speaker else None
     if primary_speaker is not None and validate_primary_speaker:
@@ -1015,7 +1122,8 @@ def _plan_text_segments(
         segment_text = segment.text.strip()
         if not segment_text:
             continue
-        language = (segment.language if segment.language and segment.language != "und" else main_lang) or "en"
+        detected_language = (segment.language if segment.language and segment.language != "und" else main_lang) or "en"
+        language = _routable_detected_language(detected_language, main_lang)
         languages.add(language)
         if primary_speaker and _get_base_language(language) == primary_lang:
             speaker, model_name = _resolve_speaker_and_model(
@@ -1036,7 +1144,7 @@ def _plan_text_segments(
     return segments, languages or {main_lang}
 
 
-async def synthesize_configured_voice_batch(request: BatchSynthesizeRequest) -> BatchSynthesizeResponse:
+async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeRequest) -> BatchSynthesizeResponse:
     if not _engine_enabled("pipertts"):
         raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
     if request.voice_id is None:
@@ -1106,21 +1214,22 @@ async def synthesize_configured_voice_batch(request: BatchSynthesizeRequest) -> 
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    _LOGGER.info(
-        "Configured voice batch routing: voice_id=%s convert_count=%d groups=%s",
-        request.voice_id,
-        sum(1 for value in convert_item if value),
-        json.dumps(
-            [
-                {
-                    "model": model_name,
-                    "count": len(records),
-                    "speakers": sorted({str(record["speaker"]) for record in records}),
-                }
-                for model_name, records in segment_groups.items()
-            ],
-            ensure_ascii=False,
-        ),
+    _log_synthesize_batch_stage(
+        "configured_voice_routing",
+        voice_id=request.voice_id,
+        item_count=len(texts),
+        item_segment_counts=[len(segments) for segments in item_segments],
+        convert_indices=[idx for idx, value in enumerate(convert_item) if value],
+        model_groups=[
+            {
+                "model": model_name,
+                "segment_count": len(records),
+                "item_indices": sorted({int(record["item_idx"]) for record in records}),
+                "speakers": sorted({str(record["speaker"]) for record in records}),
+                "languages": sorted({str(record["lang"]) for record in records}),
+            }
+            for model_name, records in segment_groups.items()
+        ],
     )
 
     generated_segments: list[list[tuple[np.ndarray, int] | None]] = [
@@ -1136,6 +1245,19 @@ async def synthesize_configured_voice_batch(request: BatchSynthesizeRequest) -> 
             _resolve_internal_speaker(model_name, record["speaker"], inference)
             for record in records
         ]
+        batch_started = time.perf_counter()
+        _log_synthesize_batch_stage(
+            "sparrow_batch_start",
+            pipeline="configured_voice",
+            voice_id=request.voice_id,
+            model=model_name,
+            item_count=len(texts),
+            segment_count=len(batch_texts),
+            batch_size=len(batch_texts),
+            speakers=sorted({str(speaker) for speaker in batch_speakers}),
+            neural=request.neural,
+            synth_kwargs=synth_kwargs,
+        )
         batch_audios = await asyncio.to_thread(
             inference.synthesize_batch,
             batch_texts,
@@ -1143,6 +1265,19 @@ async def synthesize_configured_voice_batch(request: BatchSynthesizeRequest) -> 
             batch_size=len(batch_texts),
             neural=request.neural,
             **synth_kwargs,
+        )
+        audio_seconds = sum(float(len(audio)) / model_sample_rate for audio in batch_audios) if model_sample_rate else 0.0
+        elapsed = time.perf_counter() - batch_started
+        _log_synthesize_batch_stage(
+            "sparrow_batch_done",
+            pipeline="configured_voice",
+            voice_id=request.voice_id,
+            model=model_name,
+            output_count=len(batch_audios),
+            audio_seconds=round(audio_seconds, 6),
+            wall_seconds=round(elapsed, 6),
+            rtf=round(elapsed / audio_seconds, 6) if audio_seconds else 0.0,
+            sample_rate=model_sample_rate,
         )
         for record, audio in zip(records, batch_audios):
             generated_segments[record["item_idx"]][record["segment_idx"]] = (audio, model_sample_rate)
@@ -1185,6 +1320,17 @@ async def synthesize_configured_voice_batch(request: BatchSynthesizeRequest) -> 
             _resample_audio(item_audios[idx], item_source_sample_rates[idx], vc_source_rate)
             for idx in convert_indices
         ]
+        vc_started = time.perf_counter()
+        _log_synthesize_batch_stage(
+            "seed_vc_voice_batch_start",
+            pipeline="configured_voice",
+            voice_id=request.voice_id,
+            count=len(vc_source_audios),
+            item_indices=convert_indices,
+            style=style,
+            style_intensity=style_intensity,
+            output_format=request.format,
+        )
         converted = await asyncio.to_thread(
             backend.convert_generated_audio_batch,
             vc_source_audios,
@@ -1195,6 +1341,14 @@ async def synthesize_configured_voice_batch(request: BatchSynthesizeRequest) -> 
             None,
             request.format,
             strict_embedding=True,
+        )
+        _log_synthesize_batch_stage(
+            "seed_vc_voice_batch_done",
+            pipeline="configured_voice",
+            voice_id=request.voice_id,
+            output_count=len(converted),
+            wall_seconds=round(time.perf_counter() - vc_started, 6),
+            output_sample_rate=backend.sample_rate,
         )
         for item_idx, (audio_bytes, audio_seconds) in zip(convert_indices, converted):
             encoded_items[item_idx] = audio_bytes
@@ -1241,7 +1395,7 @@ async def _synthesize_configured_voice(request: SynthesizeRequest) -> Response:
     if not request.text:
         raise HTTPException(status_code=400, detail="text is required for voice-id synthesis")
     batch_result = await synthesize_configured_voice_batch(
-        BatchSynthesizeRequest(
+        _SharedBatchSynthesizeRequest(
             texts=[request.text],
             voice_id=request.voice_id,
             language=request.language,
@@ -1276,9 +1430,7 @@ def _synthesize_ssml(
 
     Returns (audio, sample_rate).
     """
-    global _splitter
-    if _splitter is None:
-        _splitter = MultilingualSplitter()
+    splitter = _get_multilingual_splitter()
 
     if language is not None:
         forced_locale, forced_speaker, forced_model = _resolve_forced_language(language)
@@ -1341,7 +1493,7 @@ def _synthesize_ssml(
                     })
                     continue
 
-                result = _splitter.split(seg_text)
+                result = splitter.split(seg_text)
                 main_lang = result.main_language or "en"
 
                 for lang_seg in result.segments:
@@ -1349,7 +1501,8 @@ def _synthesize_ssml(
                     if not lang_text:
                         continue
 
-                    lang = (lang_seg.language if lang_seg.language and lang_seg.language != "und" else main_lang) or "en"
+                    detected_lang = (lang_seg.language if lang_seg.language and lang_seg.language != "und" else main_lang) or "en"
+                    lang = _routable_detected_language(detected_lang, main_lang)
 
                     # Use primary_speaker if language matches, otherwise normal resolution
                     if primary_speaker and _get_base_language(lang) == primary_lang:
@@ -1392,9 +1545,7 @@ def _synthesize_ssml(
             inference = _get_inference(model_name)
             sample_rate = inference.sample_rate
 
-            if speaker not in inference.speakers:
-                _LOGGER.warning("Speaker '%s' not in model '%s', using first available", speaker, model_name)
-                speaker = next(iter(inference.speakers.keys()))
+            speaker = _resolve_internal_speaker(model_name, speaker, inference)
 
             _LOGGER.info("Synthesizing: speaker=%s, text=%r, synth_kwargs=%s", speaker, plan["text"], synth_kwargs)
             audio = inference.synthesize_span(plan["text"], speaker=speaker, **synth_kwargs)
@@ -2285,7 +2436,7 @@ def _get_rvc_backend() -> RVCBackend:
 
 
 async def synthesize_sparrow_batch(
-    request: BatchSynthesizeRequest,
+    request: _SharedBatchSynthesizeRequest,
     *,
     speaker: str | None = None,
     model: str | None = None,
@@ -2330,6 +2481,19 @@ async def synthesize_sparrow_batch(
 
     synth_kwargs = _synth_kwargs_from_request(request)
     started = time.perf_counter()
+    _log_synthesize_batch_stage(
+        "sparrow_batch_start",
+        pipeline="direct_sparrow",
+        model=model_name,
+        speaker=resolved_speaker,
+        internal_speaker=internal_speaker,
+        item_count=len(texts),
+        segment_count=len(texts),
+        batch_size=len(texts),
+        neural=request.neural,
+        synth_kwargs=synth_kwargs,
+        sample_url=bool(request.sample_url),
+    )
     audios = await asyncio.to_thread(
         inference.synthesize_batch,
         texts,
@@ -2341,6 +2505,17 @@ async def synthesize_sparrow_batch(
     wall_seconds = time.perf_counter() - started
 
     sample_rate = inference.sample_rate
+    audio_seconds = sum(float(len(audio)) / sample_rate for audio in audios) if sample_rate else 0.0
+    _log_synthesize_batch_stage(
+        "sparrow_batch_done",
+        pipeline="direct_sparrow",
+        model=model_name,
+        output_count=len(audios),
+        audio_seconds=round(audio_seconds, 6),
+        wall_seconds=round(wall_seconds, 6),
+        rtf=round(wall_seconds / audio_seconds, 6) if audio_seconds else 0.0,
+        sample_rate=sample_rate,
+    )
     if request.sample_url is not None:
         converted, converted_sample_rate = await _convert_generated_audio_to_sample_batch(
             source_audios=audios,
@@ -2400,6 +2575,333 @@ async def synthesize_sparrow_batch(
     )
 
 
+async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeRequest) -> BatchSynthesizeResponse:
+    """Run real batched Sparrow synthesis for auto-routed multilingual text items."""
+    if not _engine_enabled("pipertts"):
+        raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
+    if request.voice_id is not None:
+        raise HTTPException(status_code=400, detail="voice_id requests must use configured voice synthesis")
+    if request.model is not None:
+        raise HTTPException(status_code=400, detail="model-specific requests must use direct Sparrow batching")
+    if request.sample_url is not None and _seed_vc_style_requested(request):
+        raise HTTPException(status_code=400, detail="'style' and 'styleIntensity' require 'voice_id'")
+
+    texts = [text.strip() for text in request.texts]
+    if any(not text for text in texts):
+        raise HTTPException(status_code=400, detail="all texts must be non-empty")
+
+    started = time.perf_counter()
+    synth_kwargs = _synth_kwargs_from_request(request)
+    item_segments: list[list[dict[str, Any]]] = []
+    segment_groups: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+
+    for item_idx, text in enumerate(texts):
+        segments, _ = _plan_text_segments(text, primary_speaker=None, forced_language=None)
+        item_segments.append(segments)
+        for segment_idx, segment in enumerate(segments):
+            record = {**segment, "item_idx": item_idx, "segment_idx": segment_idx}
+            segment_groups.setdefault(segment["model"], []).append(record)
+
+    generated_segments: list[list[tuple[np.ndarray, int] | None]] = [
+        [None for _ in segments]
+        for segments in item_segments
+    ]
+
+    for model_name, records in segment_groups.items():
+        inference = _get_inference(model_name)
+        model_sample_rate = inference.sample_rate
+        batch_texts = [record["text"] for record in records]
+        batch_speakers = [
+            _resolve_internal_speaker(model_name, record["speaker"], inference)
+            for record in records
+        ]
+        batch_started = time.perf_counter()
+        _log_synthesize_batch_stage(
+            "sparrow_batch_start",
+            pipeline="auto_multilingual",
+            model=model_name,
+            item_count=len(texts),
+            segment_count=len(batch_texts),
+            batch_size=len(batch_texts),
+            speakers=sorted({str(speaker) for speaker in batch_speakers}),
+            neural=request.neural,
+            synth_kwargs=synth_kwargs,
+            sample_url=bool(request.sample_url),
+        )
+        batch_audios = await asyncio.to_thread(
+            inference.synthesize_batch,
+            batch_texts,
+            speaker=batch_speakers,
+            batch_size=len(batch_texts),
+            neural=request.neural,
+            **synth_kwargs,
+        )
+        audio_seconds = sum(float(len(audio)) / model_sample_rate for audio in batch_audios) if model_sample_rate else 0.0
+        elapsed = time.perf_counter() - batch_started
+        _log_synthesize_batch_stage(
+            "sparrow_batch_done",
+            pipeline="auto_multilingual",
+            model=model_name,
+            output_count=len(batch_audios),
+            audio_seconds=round(audio_seconds, 6),
+            wall_seconds=round(elapsed, 6),
+            rtf=round(elapsed / audio_seconds, 6) if audio_seconds else 0.0,
+            sample_rate=model_sample_rate,
+        )
+        for record, audio in zip(records, batch_audios):
+            generated_segments[record["item_idx"]][record["segment_idx"]] = (audio, model_sample_rate)
+
+    item_audios: list[np.ndarray] = []
+    item_sample_rates: list[int] = []
+    for segments in generated_segments:
+        parts = [segment for segment in segments if segment is not None]
+        if not parts:
+            item_audios.append(np.zeros(0, dtype=np.int16))
+            item_sample_rates.append(22050)
+        elif len(parts) == 1:
+            audio, source_rate = parts[0]
+            item_audios.append(audio)
+            item_sample_rates.append(source_rate)
+        else:
+            target_rate = parts[0][1]
+            item_audios.append(np.concatenate([
+                _resample_audio(audio, source_rate, target_rate)
+                for audio, source_rate in parts
+            ], axis=0))
+            item_sample_rates.append(target_rate)
+
+    if request.sample_url is not None:
+        converted, converted_sample_rate = await _convert_generated_audio_to_sample_batch(
+            source_audios=item_audios,
+            source_sample_rates=item_sample_rates,
+            sample_url=request.sample_url,
+            output_format=request.format,
+        )
+        items = []
+        audio_seconds_total = 0.0
+        for text, (encoded, audio_seconds) in zip(texts, converted):
+            audio_seconds_total += audio_seconds
+            items.append(
+                BatchSynthesizeItem(
+                    text=text,
+                    audio_base64=base64.b64encode(encoded).decode("ascii"),
+                    sample_rate=converted_sample_rate,
+                    audio_seconds=audio_seconds,
+                )
+            )
+        wall_seconds = time.perf_counter() - started
+        return BatchSynthesizeResponse(
+            items=items,
+            count=len(items),
+            model="auto",
+            speaker=None,
+            wall_seconds=wall_seconds,
+            audio_seconds_total=audio_seconds_total,
+            rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
+        )
+
+    items: list[BatchSynthesizeItem] = []
+    audio_seconds_total = 0.0
+    for text, audio, sample_rate in zip(texts, item_audios, item_sample_rates):
+        audio_seconds = float(len(audio)) / sample_rate if sample_rate else 0.0
+        audio_seconds_total += audio_seconds
+        encoded = (
+            _audio_to_mp3_bytes(audio, sample_rate)
+            if request.format == "mp3"
+            else _audio_to_wav_bytes(audio, sample_rate)
+        )
+        items.append(
+            BatchSynthesizeItem(
+                text=text,
+                audio_base64=base64.b64encode(encoded).decode("ascii"),
+                sample_rate=sample_rate,
+                audio_seconds=audio_seconds,
+            )
+        )
+
+    wall_seconds = time.perf_counter() - started
+    return BatchSynthesizeResponse(
+        items=items,
+        count=len(items),
+        model="auto",
+        speaker=None,
+        wall_seconds=wall_seconds,
+        audio_seconds_total=audio_seconds_total,
+        rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
+    )
+
+
+def _batch_item_group_key(item: BatchSynthesizeInputItem) -> tuple[Any, ...]:
+    options_key = None
+    if item.options is not None:
+        options_key = json.dumps(item.options.model_dump(mode="json"), sort_keys=True)
+    kind = "voice" if item.voice_id is not None else "sparrow"
+    return (
+        kind,
+        item.voice_id,
+        item.sample_url,
+        item.language,
+        item.model,
+        item.style,
+        item.style_intensity,
+        options_key,
+        item.format,
+        item.neural,
+    )
+
+
+def _validate_batch_item(item: BatchSynthesizeInputItem, item_idx: int) -> str:
+    if item.text and item.ssml:
+        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: Provide either 'text' or 'ssml', not both")
+    if item.ssml is not None:
+        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: SSML is not supported in /synthesize/batch")
+    if item.text is None or not item.text.strip():
+        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: text is required")
+    if item.sample_url is not None and item.voice_id is not None:
+        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: Use either 'voice_id' or 'sample_url', not both")
+    if item.voice_id is not None and item.model is not None:
+        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: Use either 'voice_id' or 'model', not both")
+    if item.language is not None and item.model is not None:
+        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: Use either 'language' or 'model', not both")
+    if item.sample_url is not None and _seed_vc_style_requested(item):
+        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'style' and 'styleIntensity' require 'voice_id'")
+    if item.voice_id is None and _seed_vc_style_requested(item):
+        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'style' and 'styleIntensity' require 'voice_id'")
+    return item.text.strip()
+
+
+def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, str]]) -> _SharedBatchSynthesizeRequest:
+    first = records[0][1]
+    return _SharedBatchSynthesizeRequest(
+        texts=[text for _, _, text in records],
+        voice_id=first.voice_id,
+        sample_url=first.sample_url,
+        language=first.language,
+        model=first.model,
+        style=first.style,
+        style_intensity=first.style_intensity,
+        options=first.options,
+        format=first.format,
+        neural=first.neural,
+    )
+
+
+async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthesizeResponse:
+    """Group independent /synthesize-shaped inputs and run compatible real batches."""
+    started = time.perf_counter()
+    groups: OrderedDict[tuple[Any, ...], list[tuple[int, BatchSynthesizeInputItem, str]]] = OrderedDict()
+    for item_idx, item in enumerate(request.items):
+        text = _validate_batch_item(item, item_idx)
+        groups.setdefault(_batch_item_group_key(item), []).append((item_idx, item, text))
+
+    _log_synthesize_batch_stage(
+        "request_grouping",
+        item_count=len(request.items),
+        group_count=len(groups),
+        groups=[
+            {
+                "group_index": group_idx,
+                "item_indices": [item_idx for item_idx, _, _ in records],
+                "count": len(records),
+                "voice_id": records[0][1].voice_id,
+                "sample_url": bool(records[0][1].sample_url),
+                "language": records[0][1].language,
+                "model": records[0][1].model,
+                "style": records[0][1].style,
+                "styleIntensity": records[0][1].style_intensity,
+                "format": records[0][1].format,
+                "neural": records[0][1].neural,
+            }
+            for group_idx, records in enumerate(groups.values())
+        ],
+    )
+
+    output_items: list[BatchSynthesizeItem | None] = [None for _ in request.items]
+    group_results: list[BatchSynthesizeResponse] = []
+
+    for group_idx, records in enumerate(groups.values()):
+        shared_request = _shared_batch_from_items(records)
+        group_started = time.perf_counter()
+        _log_synthesize_batch_stage(
+            "group_start",
+            group_index=group_idx,
+            item_indices=[item_idx for item_idx, _, _ in records],
+            item_count=len(records),
+            voice_id=shared_request.voice_id,
+            sample_url=bool(shared_request.sample_url),
+            language=shared_request.language,
+            model=shared_request.model,
+            format=shared_request.format,
+        )
+        if shared_request.voice_id is not None:
+            group_result = await synthesize_configured_voice_batch(shared_request)
+        elif shared_request.language is not None:
+            _, forced_speaker, forced_model = _resolve_forced_language(shared_request.language)
+            group_result = await synthesize_sparrow_batch(
+                _SharedBatchSynthesizeRequest(
+                    texts=shared_request.texts,
+                    sample_url=shared_request.sample_url,
+                    model=forced_model,
+                    options=shared_request.options,
+                    format=shared_request.format,
+                    neural=shared_request.neural,
+                ),
+                speaker=forced_speaker,
+            )
+        elif shared_request.model is not None:
+            group_result = await synthesize_sparrow_batch(shared_request)
+        else:
+            group_result = await synthesize_multilingual_sparrow_batch(shared_request)
+
+        _log_synthesize_batch_stage(
+            "group_done",
+            group_index=group_idx,
+            item_count=len(records),
+            output_count=len(group_result.items),
+            model=group_result.model,
+            speaker=group_result.speaker,
+            audio_seconds=round(group_result.audio_seconds_total, 6),
+            wall_seconds=round(time.perf_counter() - group_started, 6),
+            group_rtf=round(group_result.rtf, 6),
+        )
+        _log_synthesize_batch_summary(
+            group_index=group_idx,
+            item_indices=[item_idx for item_idx, _, _ in records],
+            item_count=len(records),
+            output_count=len(group_result.items),
+            voice_id=shared_request.voice_id,
+            sample_url=bool(shared_request.sample_url),
+            language=shared_request.language,
+            model=group_result.model,
+            speaker=group_result.speaker,
+            format=shared_request.format,
+            audio_seconds=round(group_result.audio_seconds_total, 6),
+            wall_seconds=round(time.perf_counter() - group_started, 6),
+            rtf=round(group_result.rtf, 6),
+        )
+        group_results.append(group_result)
+        for (item_idx, _, _), result_item in zip(records, group_result.items):
+            output_items[item_idx] = result_item
+
+    items = [item for item in output_items if item is not None]
+    if len(items) != len(request.items):
+        raise RuntimeError("internal batch response ordering error")
+
+    audio_seconds_total = sum(item.audio_seconds for item in items)
+    wall_seconds = time.perf_counter() - started
+    models = {result.model for result in group_results}
+    speakers = {result.speaker for result in group_results}
+    return BatchSynthesizeResponse(
+        items=items,
+        count=len(items),
+        model=next(iter(models)) if len(models) == 1 else "mixed",
+        speaker=next(iter(speakers)) if len(speakers) == 1 else None,
+        wall_seconds=wall_seconds,
+        audio_seconds_total=audio_seconds_total,
+        rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
+    )
+
+
 def create_app(config: ServerConfig | None = None) -> FastAPI:
     """Create the FastAPI application."""
     global _server_config, _speaker_routes
@@ -2418,19 +2920,23 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def api_key_auth_middleware(request: Request, call_next):
+        provided_api_key = _request_api_key(request)
+        _scrub_api_key_query_param(request)
+
+        if _is_browser_demo_path(request.url.path):
+            return await call_next(request)
+
         expected_api_key = _configured_api_key()
         if not expected_api_key:
             return JSONResponse(
                 status_code=503,
                 content={"detail": "API_KEY is not configured"},
             )
-        provided_api_key = _request_api_key(request)
         if not provided_api_key or not secrets.compare_digest(provided_api_key, expected_api_key):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid or missing API key"},
             )
-        _scrub_api_key_query_param(request)
         return await call_next(request)
 
     if _engine_enabled("qwen3", config):
@@ -2797,6 +3303,52 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         _maybe_cleanup_gpu()
         return Response(content=result_bytes, media_type=media_type)
 
+    @app.post("/rvc/convert/batch", response_model=RVCBatchConvertResponse)
+    async def rvc_convert_batch(request: RVCBatchConvertRequest):
+        """Convert multiple audio items through one real RVC batch call."""
+        if any(not item.audio for item in request.items):
+            raise HTTPException(status_code=400, detail="all items must include audio")
+        if request.index_rate != 0:
+            raise HTTPException(
+                status_code=400,
+                detail="RVC real batch conversion does not support index_rate != 0",
+            )
+        try:
+            audio_items = [base64.b64decode(item.audio) for item in request.items]
+            backend = _get_rvc_backend()
+            converted = await asyncio.to_thread(
+                backend.convert_batch,
+                audio_items=audio_items,
+                model=request.model,
+                f0_method=request.f0_method,
+                pitch=request.pitch,
+                index_rate=request.index_rate,
+                rms_mix_rate=request.rms_mix_rate,
+                protect=request.protect,
+                output_format=request.format,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _LOGGER.exception("RVC batch conversion failed")
+            raise HTTPException(status_code=500, detail=f"RVC batch conversion failed: {exc}") from exc
+
+        _maybe_cleanup_gpu()
+        return RVCBatchConvertResponse(
+            items=[
+                RVCBatchConvertResponseItem(
+                    audio_base64=base64.b64encode(audio_bytes).decode("ascii"),
+                    sample_rate=sample_rate,
+                )
+                for audio_bytes, sample_rate in converted
+            ],
+            count=len(converted),
+        )
+
     async def _handle_synthesize(
         request: SynthesizeRequest,
         model: str | None = None,
@@ -2932,38 +3484,19 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     @app.post("/synthesize/batch", response_model=BatchSynthesizeResponse)
     async def synthesize_batch(request: BatchSynthesizeRequest, fastapi_request: Request):
-        """Batched synthesis, including configured voice-id pipelines."""
+        """Batched synthesis with independent /synthesize-shaped inputs."""
         started = time.perf_counter()
         try:
-            if request.voice_id is not None:
-                result = await synthesize_configured_voice_batch(request)
-            elif _seed_vc_style_requested(request):
-                raise HTTPException(status_code=400, detail="'style' and 'styleIntensity' require 'voice_id'")
-            elif request.language is not None:
-                if request.model is not None:
-                    raise HTTPException(status_code=400, detail="Use either 'language' or 'model', not both")
-                _, forced_speaker, forced_model = _resolve_forced_language(request.language)
-                result = await synthesize_sparrow_batch(
-                    BatchSynthesizeRequest(
-                        texts=request.texts,
-                        model=forced_model,
-                        sample_url=request.sample_url,
-                        options=request.options,
-                        format=request.format,
-                        neural=request.neural,
-                    ),
-                    speaker=forced_speaker,
-                )
-            else:
-                result = await synthesize_sparrow_batch(request)
+            result = await synthesize_mixed_batch(request)
         except HTTPException as exc:
             _log_synthesize_request(
                 route=fastapi_request.url.path,
                 method=fastapi_request.method,
                 status=f"http_{exc.status_code}",
                 started=started,
-                count=len(request.texts),
-                text_chars=sum(_text_length(text) for text in request.texts),
+                count=len(request.items),
+                text_chars=sum(_text_length(item.text) for item in request.items),
+                ssml_chars=sum(_text_length(item.ssml) for item in request.items),
                 input_data=_request_model_input(request),
                 error=str(exc.detail),
             )
@@ -2974,8 +3507,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 method=fastapi_request.method,
                 status="error",
                 started=started,
-                count=len(request.texts),
-                text_chars=sum(_text_length(text) for text in request.texts),
+                count=len(request.items),
+                text_chars=sum(_text_length(item.text) for item in request.items),
+                ssml_chars=sum(_text_length(item.ssml) for item in request.items),
                 input_data=_request_model_input(request),
                 error=type(exc).__name__,
             )
@@ -2985,8 +3519,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             method=fastapi_request.method,
             status="ok",
             started=started,
-            count=len(request.texts),
-            text_chars=sum(_text_length(text) for text in request.texts),
+            count=len(request.items),
+            text_chars=sum(_text_length(item.text) for item in request.items),
+            ssml_chars=sum(_text_length(item.ssml) for item in request.items),
             input_data=_request_model_input(request),
         )
         _maybe_cleanup_gpu()
