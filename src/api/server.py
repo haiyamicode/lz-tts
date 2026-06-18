@@ -85,6 +85,22 @@ MATCHA_LANGUAGE_ID_MAP = {
 }
 
 
+@contextlib.contextmanager
+def _logged_startup_step(name: str, **details: Any):
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items() if value is not None)
+    if detail_text:
+        _LOGGER.info("Loading %s %s", name, detail_text)
+    else:
+        _LOGGER.info("Loading %s", name)
+    started = time.perf_counter()
+    try:
+        yield
+    except Exception:
+        _LOGGER.exception("Failed loading %s elapsed=%.2fs", name, time.perf_counter() - started)
+        raise
+    _LOGGER.info("Loaded %s elapsed=%.2fs", name, time.perf_counter() - started)
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -243,7 +259,8 @@ class RVCConfig(BaseModel):
 
     enabled: bool = Field(default_factory=lambda: _env_bool("RVC_ENABLED", False))
     preload: bool = Field(default_factory=lambda: _env_bool("RVC_PRELOAD", False))
-    default_model: Optional[str] = Field(default_factory=lambda: os.environ.get("RVC_DEFAULT_MODEL"))
+    cache_size: int = Field(default_factory=lambda: int(os.environ.get("RVC_CACHE_SIZE", "5")), ge=1)
+    preload_models: list[str] = Field(default_factory=list)
     default_f0_method: str = Field(default_factory=lambda: os.environ.get("RVC_F0_METHOD", "rmvpe"))
     default_pitch: int = Field(default_factory=lambda: int(os.environ.get("RVC_PITCH", "0")))
     default_index_rate: float = Field(default_factory=lambda: float(os.environ.get("RVC_INDEX_RATE", "0.0")))
@@ -657,16 +674,6 @@ def _engine_enabled(engine: Literal["pipertts", "qwen3", "matcha", "seed_vc", "r
     return bool(getattr(cfg.engines, engine))
 
 
-def _qwen_background_preload_allowed(config: ServerConfig) -> bool:
-    """Avoid concurrent CUDA graph capture with other live GPU engines."""
-    if not config.qwen.preload_background:
-        return False
-    return not any(
-        _engine_enabled(engine, config)
-        for engine in ("pipertts", "matcha", "seed_vc", "rvc")
-    )
-
-
 def _find_checkpoint(model_dir: Path) -> Path | None:
     """Find the most recent checkpoint in a model directory."""
     if not model_dir.exists():
@@ -690,15 +697,42 @@ def _list_available_models() -> list[str]:
 
 
 def _allowed_models() -> list[str]:
-    """Configured models that may be loaded on demand."""
+    """Configured Sparrow/VITS models."""
     if not _engine_enabled("pipertts"):
         return []
     return _server_config.pipertts.models or _list_available_models()
 
 
 def _is_model_allowed(model: str) -> bool:
-    """Check whether a model is allowed to be loaded on demand."""
+    """Check whether a model is configured for this server."""
     return model in _allowed_models()
+
+
+def _append_unique(items: list[str], value: str | None) -> None:
+    if value and value not in items:
+        items.append(value)
+
+
+def _required_piper_models() -> list[str]:
+    """All Sparrow/VITS models that must be resident after startup."""
+    if not _engine_enabled("pipertts"):
+        return []
+
+    models: list[str] = []
+    for model in _server_config.pipertts.preload_models:
+        _append_unique(models, model)
+    for model in _server_config.pipertts.model_priority:
+        _append_unique(models, model)
+    for model in _server_config.pipertts.models:
+        _append_unique(models, model)
+    _append_unique(models, _server_config.pipertts.default_model)
+
+    if not models:
+        models = _allowed_models()
+    else:
+        for model in _allowed_models():
+            _append_unique(models, model)
+    return models
 
 
 def _get_model_speakers(model: str) -> dict[str, int]:
@@ -715,7 +749,11 @@ def _get_model_speakers(model: str) -> dict[str, int]:
 
 def _enforce_cache_limit() -> None:
     """Evict least-recently-used models until the cache is within its limit."""
-    while len(_inference_cache) > _server_config.pipertts.max_models_in_cache:
+    # Startup loads every configured Sparrow model. The historical cache limit is
+    # kept as a lower bound for compatibility, not as permission to evict models
+    # that the process is expected to serve without lazy reloads.
+    limit = max(_server_config.pipertts.max_models_in_cache, len(_required_piper_models()))
+    while len(_inference_cache) > limit:
         evicted, _ = _inference_cache.popitem(last=False)
         _LOGGER.info("Evicted model from cache: %s", evicted)
         gc.collect()
@@ -728,7 +766,7 @@ def _load_model(model: str) -> PiperInference:
     if not _engine_enabled("pipertts"):
         raise ValueError("PiperTTS backend is disabled")
     if not _is_model_allowed(model):
-        raise ValueError(f"Model is not configured for on-demand use: {model}")
+        raise ValueError(f"Model is not configured for this server: {model}")
 
     model_dir = DATA_DIR / model
     config_path = model_dir / "config.json"
@@ -739,32 +777,48 @@ def _load_model(model: str) -> PiperInference:
     if checkpoint_path is None:
         raise ValueError(f"No checkpoint found for model: {model}")
 
-    inference = PiperInference(
-        checkpoint_path=checkpoint_path,
-        config_path=config_path,
+    _LOGGER.info(
+        "Loading Sparrow model model=%s checkpoint=%s config=%s",
+        model,
+        checkpoint_path,
+        config_path,
     )
+    started = time.perf_counter()
+    try:
+        inference = PiperInference(
+            checkpoint_path=checkpoint_path,
+            config_path=config_path,
+        )
+    except Exception:
+        _LOGGER.exception("Failed loading Sparrow model model=%s elapsed=%.2fs", model, time.perf_counter() - started)
+        raise
     _inference_cache[model] = inference
     _enforce_cache_limit()
+    _LOGGER.info(
+        "Loaded Sparrow model model=%s speakers=%d elapsed=%.2fs",
+        model,
+        len(getattr(inference, "speakers", {}) or {}),
+        time.perf_counter() - started,
+    )
     return inference
 
 
 def _get_inference(model: str) -> PiperInference:
-    """Get or create an inference instance for a model."""
+    """Get an already loaded inference instance for a model."""
     if not _engine_enabled("pipertts"):
         raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
     if model in _inference_cache:
         inference = _inference_cache.pop(model)
         _inference_cache[model] = inference
         return inference
-
-    try:
-        return _load_model(model)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    if _is_model_allowed(model):
+        raise HTTPException(status_code=503, detail=f"Model was not loaded at startup: {model}")
+    raise HTTPException(status_code=404, detail=f"Model is not configured for this server: {model}")
 
 
-def _preload_models(models: list[str]) -> None:
+def _preload_models(models: list[str], *, strict: bool = False) -> None:
     """Preload specified models into the cache."""
+    errors: list[str] = []
     for model in models:
         if model in _inference_cache:
             _LOGGER.info("Model already loaded: %s", model)
@@ -774,7 +828,37 @@ def _preload_models(models: list[str]) -> None:
             _load_model(model)
             _LOGGER.info("Loaded model: %s", model)
         except ValueError as e:
-            _LOGGER.warning("Failed to preload model %s: %s", model, e)
+            message = f"{model}: {e}"
+            if strict:
+                errors.append(message)
+            else:
+                _LOGGER.warning("Failed to preload model %s: %s", model, e)
+    if errors:
+        raise RuntimeError("Failed to preload Sparrow models: " + "; ".join(errors))
+
+
+def _preload_piper_text_models() -> None:
+    """Load Sparrow text-side runtime models required by normal synthesis."""
+    semantic_count = 0
+    for inference in _inference_cache.values():
+        if getattr(inference, "use_bert", False):
+            inference.warmup_semantic()
+            semantic_count += 1
+
+    device = None
+    if _inference_cache:
+        first_inference = next(iter(_inference_cache.values()))
+        device = str(first_inference.device)
+
+    from ..piper.heteronym import get_resolver
+
+    resolver = get_resolver(device=device)
+    resolver.load()
+    _LOGGER.info(
+        "Loaded Sparrow text models semantic_models=%d heteronym_device=%s",
+        semantic_count,
+        device or "auto",
+    )
 
 
 def _build_speaker_routes(model_priority: list[str]) -> dict[str, tuple[str, Optional[int]]]:
@@ -787,8 +871,7 @@ def _build_speaker_routes(model_priority: list[str]) -> dict[str, tuple[str, Opt
 
     for model_name in model_priority:
         if not _is_model_allowed(model_name):
-            _LOGGER.warning("Model %s in priority list but not configured for on-demand use, skipping", model_name)
-            continue
+            raise RuntimeError(f"Model {model_name!r} is in priority list but not configured for this server")
 
         # Check for config override first (useful for single-speaker models with empty labels)
         model_cfg = _server_config.pipertts.model_config_overrides.get(model_name)
@@ -799,11 +882,7 @@ def _build_speaker_routes(model_priority: list[str]) -> dict[str, tuple[str, Opt
                     _LOGGER.debug("Routing speaker '%s' -> model '%s' (id=%s) [config override]", speaker, model_name, speaker_id)
         else:
             # Use model's native speaker map
-            try:
-                speakers = _get_model_speakers(model_name)
-            except ValueError as e:
-                _LOGGER.warning("Failed to read speakers for model %s: %s", model_name, e)
-                continue
+            speakers = _get_model_speakers(model_name)
 
             for speaker, speaker_id in speakers.items():
                 if speaker and speaker not in routes:  # Skip empty speaker labels
@@ -946,9 +1025,7 @@ def _load_seed_vc_voice_ids() -> set[str]:
         return _seed_vc_voice_ids
 
     if not SEED_VC_VOICE_IDS_PATH.exists():
-        _LOGGER.warning("Seed-VC voice id list not found at %s", SEED_VC_VOICE_IDS_PATH)
-        _seed_vc_voice_ids = set()
-        return _seed_vc_voice_ids
+        raise RuntimeError(f"Seed-VC voice id list not found: {SEED_VC_VOICE_IDS_PATH}")
 
     try:
         _seed_vc_voice_ids = {
@@ -957,8 +1034,9 @@ def _load_seed_vc_voice_ids() -> set[str]:
             if line.strip()
         }
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        _LOGGER.warning("Failed to load %s: %s", SEED_VC_VOICE_IDS_PATH, exc)
-        _seed_vc_voice_ids = set()
+        raise RuntimeError(f"Failed to load Seed-VC voice id list {SEED_VC_VOICE_IDS_PATH}: {exc}") from exc
+    if not _seed_vc_voice_ids:
+        raise RuntimeError(f"Seed-VC voice id list is empty: {SEED_VC_VOICE_IDS_PATH}")
     return _seed_vc_voice_ids
 
 
@@ -966,10 +1044,7 @@ def _build_synthesize_voices_catalog() -> tuple[list[str], list[SynthesizeVoiceI
     supported_voice_ids = set(cfg.voice_id for cfg in _server_config.pipertts.root_voices.values())
 
     if _engine_enabled("seed_vc"):
-        try:
-            supported_voice_ids.update(_get_seed_vc_supported_voice_ids())
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            _LOGGER.warning("Unable to include all Seed-VC voice ids in synthesize catalog: %s", exc)
+        supported_voice_ids.update(_get_seed_vc_supported_voice_ids())
 
     supported_locales = _supported_sparrow_locales()
     locales = sorted({
@@ -999,23 +1074,31 @@ def _get_seed_vc_supported_voice_ids() -> set[str]:
         return _seed_vc_supported_voice_ids
 
     supported = {cfg.voice_id for cfg in _server_config.pipertts.root_voices.values()}
-    try:
-        backend = _get_seed_vc_backend()
-        emb_ids = {_seed_vc_base_id(key) for key in backend.cached_embeddings.keys()} if backend.cached_embeddings else set()
-        if emb_ids:
-            all_seed_vc_ids = _load_seed_vc_voice_ids() & emb_ids
-            supported.update(
-                {
-                    voice_id
-                    for voice_id in all_seed_vc_ids
-                    if (locale := _extract_locale_from_voice_id(voice_id))
-                    and _is_supported_sparrow_locale(locale)
-                }
-            )
-    except HTTPException as exc:
-        _LOGGER.warning("Unable to load Seed-VC embedding-backed voice ids: %s", exc.detail)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        _LOGGER.warning("Unable to resolve Seed-VC embedding-backed voice ids: %s", exc)
+    backend = _get_seed_vc_backend()
+    emb_ids = {_seed_vc_base_id(key) for key in backend.cached_embeddings.keys()} if backend.cached_embeddings else set()
+    if not emb_ids:
+        raise RuntimeError("Seed-VC backend loaded without cached embeddings")
+
+    configured_ids = _load_seed_vc_voice_ids()
+    all_seed_vc_ids = configured_ids & emb_ids
+    missing_embeddings = configured_ids - emb_ids
+    if missing_embeddings:
+        raise RuntimeError(
+            "Seed-VC voice id manifest contains id(s) without cached embeddings: "
+            f"count={len(missing_embeddings)} first={sorted(missing_embeddings)[:10]}"
+        )
+    seed_vc_supported = {
+        voice_id
+        for voice_id in all_seed_vc_ids
+        if (locale := _extract_locale_from_voice_id(voice_id))
+        and _is_supported_sparrow_locale(locale)
+    }
+    if not seed_vc_supported:
+        raise RuntimeError(
+            "Seed-VC voice catalog resolved to zero supported embedding-backed voices "
+            f"(manifest={SEED_VC_VOICE_IDS_PATH}, embeddings={len(emb_ids)})"
+        )
+    supported.update(seed_vc_supported)
 
     _seed_vc_supported_voice_ids = supported
     return _seed_vc_supported_voice_ids
@@ -1108,8 +1191,7 @@ def _resolve_internal_speaker(model_name: str, speaker: str | None, inference: P
         return None if model_cfg.speakers[speaker] is None else speaker
     if speaker in inference.speakers:
         return speaker
-    _LOGGER.warning("Speaker '%s' not in model '%s', using first available", speaker, model_name)
-    return next(iter(inference.speakers.keys()), None)
+    raise HTTPException(status_code=500, detail=f"Speaker {speaker!r} is not available in loaded model {model_name!r}")
 
 
 def _plan_text_segments(
@@ -1785,8 +1867,7 @@ class _SeedVCBackend:
             if embeddings_path.exists():
                 self.cached_embeddings = HDF5EmbeddingLoader(embeddings_path, cache_size=self.settings.embedding_cache_size)
             else:
-                self.cached_embeddings = {}
-                _LOGGER.warning("Seed-VC embeddings file not found: %s", embeddings_path)
+                raise RuntimeError(f"Seed-VC embeddings file not found: {embeddings_path}")
 
             try:
                 from find_voice import find_base_voice  # pylint: disable=import-outside-toplevel
@@ -2452,35 +2533,34 @@ def _get_matcha_batcher() -> ProductionMatchaBatcher:
 
 
 def _get_seed_vc_backend() -> _SeedVCBackend:
-    global _seed_vc_backend
     if not _engine_enabled("seed_vc"):
         raise HTTPException(status_code=503, detail="Seed-VC backend is disabled")
     if _seed_vc_backend is None:
-        try:
-            _seed_vc_backend = _SeedVCBackend(_server_config.seed_vc)
-        except Exception as exc:
-            _LOGGER.exception("Failed to load Seed-VC backend")
-            raise HTTPException(status_code=503, detail=f"Failed to load Seed-VC backend: {exc}") from exc
+        raise HTTPException(status_code=503, detail="Seed-VC backend was not loaded at startup")
     return _seed_vc_backend
 
 
+def _build_rvc_backend(settings: RVCConfig) -> RVCBackend:
+    backend = RVCBackend(RVCSettings(
+        enabled=True,
+        preload=settings.preload,
+        cache_size=settings.cache_size,
+        preload_models=settings.preload_models,
+        default_f0_method=settings.default_f0_method,
+        default_pitch=settings.default_pitch,
+        default_index_rate=settings.default_index_rate,
+        default_rms_mix_rate=settings.default_rms_mix_rate,
+        default_protect=settings.default_protect,
+    ))
+    backend.preload_models(settings.preload_models)
+    return backend
+
+
 def _get_rvc_backend() -> RVCBackend:
-    global _rvc_backend
     if not _engine_enabled("rvc"):
         raise HTTPException(status_code=503, detail="RVC backend is disabled")
     if _rvc_backend is None:
-        try:
-            _rvc_backend = RVCBackend(RVCSettings(
-                enabled=True,
-                default_f0_method=_server_config.rvc.default_f0_method,
-                default_pitch=_server_config.rvc.default_pitch,
-                default_index_rate=_server_config.rvc.default_index_rate,
-                default_rms_mix_rate=_server_config.rvc.default_rms_mix_rate,
-                default_protect=_server_config.rvc.default_protect,
-            ))
-        except Exception as exc:
-            _LOGGER.exception("Failed to load RVC backend")
-            raise HTTPException(status_code=503, detail=f"Failed to load RVC backend: {exc}") from exc
+        raise HTTPException(status_code=503, detail="RVC backend was not loaded at startup")
     return _rvc_backend
 
 
@@ -3013,66 +3093,107 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     @app.on_event("startup")
     async def startup_event():
-        """Preload models and build routing table on startup."""
-        global _speaker_routes, _lang_speaker_map, _matcha_backend, _matcha_batcher, _seed_vc_backend
+        """Load enabled engines in one deterministic startup sequence."""
+        global _speaker_routes, _lang_speaker_map, _splitter, _splitter_languages
+        global _matcha_backend, _matcha_batcher, _seed_vc_backend, _rvc_backend
+        global _seed_vc_supported_voice_ids, _seed_vc_voice_ids
 
-        _lang_speaker_map.clear()
-        _speaker_routes.clear()
+        startup_started = time.perf_counter()
+        _LOGGER.info("Loading server startup order=pipertts,qwen3,matcha,seed_vc,rvc config=%s", CONFIG_PATH)
+        with _logged_startup_step("reset_runtime_state"):
+            _inference_cache.clear()
+            _lang_speaker_map.clear()
+            _speaker_routes.clear()
+            _splitter = None
+            _splitter_languages = None
+            _matcha_backend = None
+            _matcha_batcher = None
+            _seed_vc_backend = None
+            _rvc_backend = None
+            _seed_vc_supported_voice_ids = None
+            _seed_vc_voice_ids = None
+
         if _engine_enabled("pipertts"):
-            # Build canonical lookup for lang_speaker_map
-            for locale, speaker in _server_config.pipertts.lang_speaker_map.items():
-                canonical = _normalize_locale(locale)
-                _lang_speaker_map[canonical] = speaker
+            with _logged_startup_step("pipertts"):
+                required_models = _required_piper_models()
+                if not required_models:
+                    raise RuntimeError("PiperTTS is enabled but no Sparrow models are configured or available")
 
-            if _server_config.pipertts.preload_models:
-                _LOGGER.info("Preloading %d PiperTTS models...", len(_server_config.pipertts.preload_models))
-                _preload_models(_server_config.pipertts.preload_models)
-                _LOGGER.info("PiperTTS preload complete. Loaded models: %s", list(_inference_cache.keys()))
+                for locale, speaker in _server_config.pipertts.lang_speaker_map.items():
+                    canonical = _normalize_locale(locale)
+                    _lang_speaker_map[canonical] = speaker
 
-            route_models = _server_config.pipertts.model_priority or _allowed_models()
-            if route_models:
-                _speaker_routes = _build_speaker_routes(route_models)
-                _LOGGER.info("Built PiperTTS speaker routes for %d speakers", len(_speaker_routes))
+                _LOGGER.info("Sparrow required models count=%d models=%s", len(required_models), required_models)
+                _preload_models(required_models, strict=True)
+                _LOGGER.info("Sparrow loaded models=%s", list(_inference_cache.keys()))
+                _preload_piper_text_models()
+
+                route_models = _server_config.pipertts.model_priority or _allowed_models()
+                if route_models:
+                    _LOGGER.info("Loading PiperTTS speaker routes models=%s", route_models)
+                    _speaker_routes = _build_speaker_routes(route_models)
+                    _LOGGER.info("Loaded PiperTTS speaker routes speakers=%d locales=%d", len(_speaker_routes), len(_lang_speaker_map))
         else:
             _LOGGER.info("PiperTTS backend disabled")
 
-        if _engine_enabled("qwen3") and _server_config.qwen.preload:
-            if _qwen_background_preload_allowed(_server_config):
-                _LOGGER.info("Starting Qwen3 TTS preload in background...")
-                qwen3.start_preload_background(
-                    include_dp_budget=_server_config.qwen.dp_budget.preload
-                )
-            else:
-                if _server_config.qwen.preload_background:
-                    _LOGGER.info(
-                        "Disabling background Qwen3 preload because other GPU engines are enabled; "
-                        "preloading Qwen3 synchronously to avoid CUDA graph capture races"
-                    )
-                _LOGGER.info("Preloading Qwen3 TTS...")
+        if _engine_enabled("qwen3"):
+            with _logged_startup_step(
+                "qwen3",
+                model=_server_config.qwen.model,
+                device=_server_config.qwen.device,
+                dtype=_server_config.qwen.dtype,
+                dp_budget=_server_config.qwen.dp_budget.enabled,
+            ):
                 qwen3.preload_model(
-                    include_dp_budget=_server_config.qwen.dp_budget.preload
+                    background=False,
+                    include_dp_budget=_server_config.qwen.dp_budget.enabled,
                 )
-                _LOGGER.info("Qwen3 TTS preload complete")
+        else:
+            _LOGGER.info("Qwen3 TTS backend disabled")
 
-        if _engine_enabled("matcha") and _server_config.matcha.preload:
-            _LOGGER.info("Preloading Matcha backend on %s...", _server_config.matcha.device)
-            _matcha_backend = await asyncio.to_thread(ProductionMatchaBackend, _server_config.matcha)
-            _matcha_batcher = ProductionMatchaBatcher(_matcha_backend, _server_config.matcha)
-            _matcha_batcher.start()
-            _LOGGER.info("Matcha backend ready")
+        if _engine_enabled("matcha"):
+            with _logged_startup_step(
+                "matcha",
+                device=_server_config.matcha.device,
+                checkpoint=_server_config.matcha.checkpoint,
+                vocoder=_server_config.matcha.vocoder,
+            ):
+                _matcha_backend = await asyncio.to_thread(ProductionMatchaBackend, _server_config.matcha)
+                _matcha_batcher = ProductionMatchaBatcher(_matcha_backend, _server_config.matcha)
+                _matcha_batcher.start()
+        else:
+            _LOGGER.info("Matcha backend disabled")
 
-        if _engine_enabled("seed_vc") and not _seed_vc_backend:
-            _LOGGER.warning("Seed-VC backend not preloaded (will load on first use)")
+        if _engine_enabled("seed_vc"):
+            with _logged_startup_step(
+                "seed_vc",
+                device=_server_config.seed_vc.device,
+                root=_server_config.seed_vc.root,
+                embeddings=_server_config.seed_vc.embeddings_hdf5_path,
+            ):
+                _seed_vc_backend = await asyncio.to_thread(_SeedVCBackend, _server_config.seed_vc)
+                _LOGGER.info("Loading Seed-VC voice catalog manifest=%s", SEED_VC_VOICE_IDS_PATH)
+                catalog_started = time.perf_counter()
+                _seed_vc_supported_voice_ids = _get_seed_vc_supported_voice_ids()
+                _LOGGER.info(
+                    "Loaded Seed-VC voice catalog voices=%d elapsed=%.2fs",
+                    len(_seed_vc_supported_voice_ids),
+                    time.perf_counter() - catalog_started,
+                )
+        else:
+            _LOGGER.info("Seed-VC backend disabled")
 
-        if _engine_enabled("rvc") and _server_config.rvc.preload:
-            _LOGGER.info("Preloading RVC backend...")
-            try:
-                _get_rvc_backend()
-                _LOGGER.info("RVC backend ready")
-            except Exception:
-                _LOGGER.exception("RVC preload failed (will load on first use)")
+        if _engine_enabled("rvc"):
+            with _logged_startup_step(
+                "rvc",
+                cache_size=_server_config.rvc.cache_size,
+                preload_models=_server_config.rvc.preload_models,
+            ):
+                _rvc_backend = await asyncio.to_thread(_build_rvc_backend, _server_config.rvc)
+        else:
+            _LOGGER.info("RVC backend disabled")
 
-        _LOGGER.info("Server ready")
+        _LOGGER.info("Loaded server startup elapsed=%.2fs", time.perf_counter() - startup_started)
 
     @app.get("/")
     async def health():
@@ -3139,7 +3260,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 "enabled": _engine_enabled("seed_vc"),
                 "loaded": _seed_vc_backend is not None,
                 "device": _server_config.seed_vc.device,
-                "preload": _server_config.seed_vc.preload,
                 "root": _server_config.seed_vc.root,
                 "runtime_root": _server_config.seed_vc.runtime_root,
                 "presets": sorted(_SeedVCBackend.model_presets),
@@ -3147,7 +3267,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "rvc": {
                 "enabled": _engine_enabled("rvc"),
                 "loaded": _rvc_backend is not None,
-                "default_model": _server_config.rvc.default_model,
             },
             "speakers": speakers,
         }
@@ -3215,7 +3334,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "enabled": _engine_enabled("seed_vc"),
             "loaded": _seed_vc_backend is not None,
             "device": _server_config.seed_vc.device,
-            "preload": _server_config.seed_vc.preload,
             "root": _server_config.seed_vc.root,
             "runtime_root": _server_config.seed_vc.runtime_root,
             "presets": sorted(_SeedVCBackend.model_presets),
@@ -3311,7 +3429,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             return {
                 "enabled": _engine_enabled("rvc"),
                 "loaded": False,
-                "default_model": _server_config.rvc.default_model,
                 "available_models": [],
             }
         return backend.status()
@@ -3783,36 +3900,6 @@ def run():
     import os
 
     import uvicorn
-
-    # Preload Seed-VC before server starts (avoids race on first /vc request)
-    _config = _load_config()
-    if _engine_enabled("seed_vc", _config) and _config.seed_vc.preload:
-        _LOGGER.info("Preloading Seed-VC backend before server start...")
-        global _seed_vc_backend, _server_config
-        _server_config = _config
-        try:
-            _seed_vc_backend = _SeedVCBackend(_config.seed_vc)
-            _LOGGER.info("Seed-VC backend ready")
-        except Exception:
-            _LOGGER.exception("Seed-VC preload failed (server will start without it)")
-
-    if _engine_enabled("rvc", _config) and _config.rvc.preload:
-        _LOGGER.info("Preloading RVC backend before server start...")
-        global _rvc_backend
-        _server_config = _config
-        try:
-            _rvc_backend = RVCBackend(RVCSettings(
-                enabled=True,
-                default_model=_config.rvc.default_model,
-                default_f0_method=_config.rvc.default_f0_method,
-                default_pitch=_config.rvc.default_pitch,
-                default_index_rate=_config.rvc.default_index_rate,
-                default_rms_mix_rate=_config.rvc.default_rms_mix_rate,
-                default_protect=_config.rvc.default_protect,
-            ))
-            _LOGGER.info("RVC backend ready")
-        except Exception:
-            _LOGGER.exception("RVC preload failed (server will start without it)")
 
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))

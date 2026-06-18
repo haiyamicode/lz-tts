@@ -195,6 +195,18 @@ class PiperInference:
         self.semantic_model = model
         return model
 
+    def warmup_semantic(self) -> None:
+        """Load semantic runtime components needed by this model."""
+        if not self.use_bert:
+            return
+        if self.bert_features_precomputed:
+            self._load_semantic_model()
+            return
+
+        encoder = getattr(self.model.model_g, "enc_p", None)
+        if getattr(encoder, "bert", None) is not None:
+            _LOGGER.info("BERT feature model already loaded inside VITS text encoder")
+
     def _semantic_input_for_span(
         self,
         span_text: str,

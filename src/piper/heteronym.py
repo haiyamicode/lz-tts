@@ -215,6 +215,10 @@ class HeteronymResolver:
         self._loaded = True
         _LOGGER.info("Heteronym model loaded successfully")
 
+    def load(self) -> None:
+        """Explicitly load the resolver and context BERT model."""
+        self._load()
+
     def get_heteronyms(self) -> Dict[str, List[str]]:
         """Return the heteronyms dictionary."""
         self._load()

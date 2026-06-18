@@ -21,7 +21,7 @@ import os
 import sys
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +54,8 @@ except Exception:
 class RVCSettings:
     enabled: bool = True
     preload: bool = False
-    default_model: str | None = None
+    cache_size: int = 5
+    preload_models: list[str] = field(default_factory=list)
     default_f0_method: str = "rmvpe"
     default_pitch: int = 0
     default_index_rate: float = 0.0
@@ -101,9 +102,12 @@ class RVCBackend:
             from infer.modules.vc.cached_vc import CachedVC
 
             config = Config()
-            self._vc = CachedVC(config, max_cache_size=5)
+            self._vc = CachedVC(config, max_cache_size=self.settings.cache_size)
             _LOGGER.info(
-                "RVC backend ready: device=%s is_half=%s", config.device, config.is_half
+                "RVC backend ready: device=%s is_half=%s cache_size=%d",
+                config.device,
+                config.is_half,
+                self.settings.cache_size,
             )
         finally:
             sys.argv = saved_argv
@@ -117,11 +121,38 @@ class RVCBackend:
             return []
         return sorted(p.name for p in self._weights_dir.glob("*.pth"))
 
+    def preload_models(self, models: list[str]) -> None:
+        """Load selected RVC voice models into the LRU cache."""
+        if not models:
+            return
+        if len(models) > self.settings.cache_size:
+            raise ValueError(
+                f"RVC preload model count ({len(models)}) exceeds cache_size ({self.settings.cache_size})"
+            )
+
+        with self._lock:
+            self._ensure_loaded()
+            for model in models:
+                model_path = self._weights_dir / model
+                if not model_path.exists():
+                    raise FileNotFoundError(f"Model not found: {model_path}")
+
+                _LOGGER.info("Loading RVC model model=%s", model)
+                self._vc.get_vc(model)
+                self._current_model = model
+                _LOGGER.info("Loaded RVC model model=%s", model)
+
     def status(self) -> dict[str, Any]:
+        cache = None
+        if self._vc is not None and hasattr(self._vc, "get_cache_stats"):
+            cache = self._vc.get_cache_stats()
         return {
             "enabled": self.settings.enabled,
             "loaded": self._vc is not None,
             "current_model": self._current_model,
+            "cache_size": self.settings.cache_size,
+            "preload_models": self.settings.preload_models,
+            "cache": cache,
             "available_models": self.list_models(),
             "data_dir": str(DATA_RVC),
         }
