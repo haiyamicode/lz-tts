@@ -35,7 +35,7 @@ class SemanticBatch:
 class SemanticTokenizer:
     """Thin wrapper around a HuggingFace tokenizer with simple caching."""
 
-    def __init__(self, model_name: Optional[str] = None, max_length: int = 128):
+    def __init__(self, model_name: Optional[str] = None, max_length: Optional[int] = None):
         self.model_name = model_name or _get_model_name()
         self.max_length = max_length
         local_files_only = any(
@@ -60,15 +60,19 @@ class SemanticTokenizer:
             return None
 
         needs_word2ph = phoneme_lengths is not None
-        enc = self._tokenizer(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-            return_offsets_mapping=needs_word2ph,
-            return_special_tokens_mask=needs_word2ph,
-        )
+        tokenizer_kwargs = {
+            "padding": True,
+            "truncation": False,
+            "return_tensors": "pt",
+            "return_offsets_mapping": needs_word2ph,
+            "return_special_tokens_mask": needs_word2ph,
+        }
+        if self.max_length is not None:
+            tokenizer_kwargs["padding"] = "max_length"
+            tokenizer_kwargs["truncation"] = True
+            tokenizer_kwargs["max_length"] = self.max_length
+
+        enc = self._tokenizer(texts, **tokenizer_kwargs)
         offsets = enc.pop("offset_mapping") if needs_word2ph else None
         special_tokens_mask = enc.pop("special_tokens_mask") if needs_word2ph else None
 
