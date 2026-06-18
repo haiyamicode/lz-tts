@@ -223,6 +223,19 @@ class SeedVCConfig(BaseModel):
     )
     fp16: bool = Field(default_factory=lambda: _env_bool("SEED_VC_FP16", True))
     embedding_cache_size: int = Field(default_factory=lambda: int(os.environ.get("SEED_VC_EMBEDDING_CACHE_SIZE", "256")), ge=1)
+    estimator_cache_batch_size: int = Field(
+        default_factory=lambda: int(os.environ.get("SEED_VC_ESTIMATOR_CACHE_BATCH_SIZE", "8")),
+        ge=1,
+    )
+    estimator_cache_seq_length: int = Field(
+        default_factory=lambda: int(os.environ.get("SEED_VC_ESTIMATOR_CACHE_SEQ_LENGTH", "4096")),
+        ge=1,
+    )
+    max_chunk_batch_size: int = Field(
+        default_factory=lambda: int(os.environ.get("SEED_VC_MAX_CHUNK_BATCH_SIZE", "1")),
+        ge=1,
+        le=64,
+    )
 
 
 class RVCConfig(BaseModel):
@@ -373,7 +386,7 @@ class SeedVCBatchRequest(BaseModel):
     """
 
     items: list[SeedVCRequest] = Field(..., min_length=1)
-    max_chunk_batch_size: int = Field(16, ge=1, le=64)
+    max_chunk_batch_size: int = Field(1, ge=1, le=64)
 
 
 class SeedVCFindVoiceRequest(BaseModel):
@@ -642,6 +655,16 @@ def _load_config() -> ServerConfig:
 def _engine_enabled(engine: Literal["pipertts", "qwen3", "matcha", "seed_vc", "rvc"], config: ServerConfig | None = None) -> bool:
     cfg = config or _server_config
     return bool(getattr(cfg.engines, engine))
+
+
+def _qwen_background_preload_allowed(config: ServerConfig) -> bool:
+    """Avoid concurrent CUDA graph capture with other live GPU engines."""
+    if not config.qwen.preload_background:
+        return False
+    return not any(
+        _engine_enabled(engine, config)
+        for engine in ("pipertts", "matcha", "seed_vc", "rvc")
+    )
 
 
 def _find_checkpoint(model_dir: Path) -> Path | None:
@@ -1026,6 +1049,10 @@ def _seed_vc_sample_id(sample_url: str) -> str:
     return f"synthesize-sample-{hashlib.sha256(sample_url.encode()).hexdigest()[:16]}"
 
 
+def _seed_vc_chunk_batch_size(backend: SeedVCBackend) -> int:
+    return max(1, int(backend.settings.max_chunk_batch_size))
+
+
 async def _convert_generated_audio_to_sample_batch(
     *,
     source_audios: list[np.ndarray],
@@ -1062,6 +1089,7 @@ async def _convert_generated_audio_to_sample_batch(
         reference_path,
         None,
         output_format,
+        _seed_vc_chunk_batch_size(backend),
     )
     _log_synthesize_batch_stage(
         "seed_vc_sample_batch_done",
@@ -1339,6 +1367,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
             style_intensity,
             None,
             request.format,
+            _seed_vc_chunk_batch_size(backend),
             strict_embedding=True,
         )
         _log_synthesize_batch_stage(
@@ -1780,7 +1809,10 @@ class _SeedVCBackend:
             model_dict[key].to(self.device)
         estimator = getattr(model_dict.cfm, "estimator", None)
         if estimator is not None and hasattr(estimator, "setup_caches"):
-            estimator.setup_caches(max_batch_size=64, max_seq_length=8192)
+            estimator.setup_caches(
+                max_batch_size=self.settings.estimator_cache_batch_size,
+                max_seq_length=self.settings.estimator_cache_seq_length,
+            )
 
     def get_semantic_features(self, waves_16k):
         torch = self.torch
@@ -2023,17 +2055,16 @@ class _SeedVCBackend:
 
         style, mel_ref, prompt_condition = self._prepare_seed_vc_reference(target_path, cached_embeddings, model)
         source_audios = [
-            torch.tensor(librosa.load(path, sr=self.sample_rate)[0]).unsqueeze(0).float().to(self.device)
+            np.asarray(librosa.load(path, sr=self.sample_rate)[0], dtype=np.float32)
             for path in source_paths
         ]
-        chunk_records: list[tuple[int, int, int, Any]] = []
+        chunk_records: list[tuple[int, int, int, np.ndarray]] = []
         generated_wave_chunks: list[list[np.ndarray]] = [[] for _ in source_audios]
         crossfade_samples = int(self.sample_rate * 0.05)
 
         for item_idx, source_audio in enumerate(source_audios):
-            source_audio_np = source_audio.squeeze(0).cpu().numpy()
             chunks = self.find_silence_boundaries(
-                source_audio_np,
+                source_audio,
                 self.sample_rate,
                 min_silence_duration=0.15,
                 silence_threshold=0.02,
@@ -2041,11 +2072,21 @@ class _SeedVCBackend:
                 min_chunk_duration=3.0,
             )
             for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
-                chunk_records.append((item_idx, chunk_idx, chunk_start, source_audio[:, chunk_start:chunk_end]))
+                chunk_records.append(
+                    (
+                        item_idx,
+                        chunk_idx,
+                        chunk_start,
+                        source_audio[chunk_start:chunk_end],
+                    )
+                )
 
         for batch_start in range(0, len(chunk_records), max_chunk_batch_size):
             records = chunk_records[batch_start : batch_start + max_chunk_batch_size]
-            chunk_audios = [record[3] for record in records]
+            chunk_audios = [
+                torch.from_numpy(record[3]).unsqueeze(0).to(self.device, dtype=torch.float32)
+                for record in records
+            ]
             chunk_16k = [
                 self.torchaudio.functional.resample(chunk_audio, self.sample_rate, 16000)
                 for chunk_audio in chunk_audios
@@ -2066,9 +2107,9 @@ class _SeedVCBackend:
             )
 
             batch_size = len(records)
-            prompt_batch = prompt_condition.repeat(batch_size, 1, 1)
-            mel_ref_batch = mel_ref.repeat(batch_size, 1, 1)
-            style_batch = style.repeat(batch_size, 1)
+            prompt_batch = prompt_condition.expand(batch_size, -1, -1)
+            mel_ref_batch = mel_ref.expand(batch_size, -1, -1)
+            style_batch = style.expand(batch_size, -1)
             cat_condition = torch.cat([prompt_batch, cond_chunk], dim=1)
             x_lens = torch.LongTensor([prompt_condition.size(1) + length for length in target_lengths]).to(self.device)
 
@@ -2100,6 +2141,9 @@ class _SeedVCBackend:
                         generated_wave_chunks[item_idx][-1] = prev_chunk[:-crossfade_samples]
                 generated_wave_chunks[item_idx].append(chunk_output)
 
+            del chunk_audios, chunk_16k, semantic_batch, chunk_target_lengths, cond_chunk
+            del prompt_batch, mel_ref_batch, style_batch, cat_condition, x_lens, vc_target, vc_wave_batch
+
         results = []
         for chunks in generated_wave_chunks:
             result = np.concatenate(chunks) if chunks else np.zeros(1, dtype=np.float32)
@@ -2126,6 +2170,10 @@ class _SeedVCBackend:
         preset_config = self.model_presets.get(preset)
         if preset_config is None:
             raise ValueError(f"Unknown Seed-VC preset {preset!r}; expected one of {sorted(self.model_presets)}")
+        chunk_batch_size = min(
+            max(1, int(request.max_chunk_batch_size)),
+            max(1, int(self.settings.max_chunk_batch_size)),
+        )
 
         import soundfile as sf  # pylint: disable=import-outside-toplevel
 
@@ -2141,7 +2189,7 @@ class _SeedVCBackend:
                     reference_path,
                     preset_config,
                     cached_embeddings=cached_embeddings,
-                    max_chunk_batch_size=request.max_chunk_batch_size,
+                    max_chunk_batch_size=chunk_batch_size,
                 )
                 encoded = []
                 for idx, (item, wave_data) in enumerate(zip(items, waves)):
@@ -2207,7 +2255,7 @@ class _SeedVCBackend:
         intensity: float,
         preset: str | None,
         output_format: Literal["wav", "mp3"],
-        max_chunk_batch_size: int = 16,
+        max_chunk_batch_size: int | None = None,
         strict_embedding: bool = False,
     ) -> list[tuple[bytes, float]]:
         if not source_audios:
@@ -2231,6 +2279,7 @@ class _SeedVCBackend:
         preset_config = self.model_presets.get(preset_name)
         if preset_config is None:
             raise ValueError(f"Unknown Seed-VC preset {preset_name!r}; expected one of {sorted(self.model_presets)}")
+        chunk_batch_size = max_chunk_batch_size or self.settings.max_chunk_batch_size
 
         import soundfile as sf  # pylint: disable=import-outside-toplevel
 
@@ -2252,7 +2301,7 @@ class _SeedVCBackend:
                     None,
                     preset_config,
                     cached_embeddings=emb,
-                    max_chunk_batch_size=max_chunk_batch_size,
+                    max_chunk_batch_size=chunk_batch_size,
                 )
 
             encoded: list[tuple[bytes, float]] = []
@@ -2279,7 +2328,7 @@ class _SeedVCBackend:
         reference_path: Path,
         preset: str | None,
         output_format: Literal["wav", "mp3"],
-        max_chunk_batch_size: int = 16,
+        max_chunk_batch_size: int | None = None,
     ) -> list[tuple[bytes, float]]:
         if not source_audios:
             return []
@@ -2288,6 +2337,7 @@ class _SeedVCBackend:
         preset_config = self.model_presets.get(preset_name)
         if preset_config is None:
             raise ValueError(f"Unknown Seed-VC preset {preset_name!r}; expected one of {sorted(self.model_presets)}")
+        chunk_batch_size = max_chunk_batch_size or self.settings.max_chunk_batch_size
 
         import soundfile as sf  # pylint: disable=import-outside-toplevel
 
@@ -2309,7 +2359,7 @@ class _SeedVCBackend:
                     reference_path,
                     preset_config,
                     cached_embeddings=None,
-                    max_chunk_batch_size=max_chunk_batch_size,
+                    max_chunk_batch_size=chunk_batch_size,
                 )
 
             encoded: list[tuple[bytes, float]] = []
@@ -2987,12 +3037,17 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             _LOGGER.info("PiperTTS backend disabled")
 
         if _engine_enabled("qwen3") and _server_config.qwen.preload:
-            if _server_config.qwen.preload_background:
+            if _qwen_background_preload_allowed(_server_config):
                 _LOGGER.info("Starting Qwen3 TTS preload in background...")
                 qwen3.start_preload_background(
                     include_dp_budget=_server_config.qwen.dp_budget.preload
                 )
             else:
+                if _server_config.qwen.preload_background:
+                    _LOGGER.info(
+                        "Disabling background Qwen3 preload because other GPU engines are enabled; "
+                        "preloading Qwen3 synchronously to avoid CUDA graph capture races"
+                    )
                 _LOGGER.info("Preloading Qwen3 TTS...")
                 qwen3.preload_model(
                     include_dp_budget=_server_config.qwen.dp_budget.preload
