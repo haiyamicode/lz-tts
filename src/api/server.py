@@ -542,7 +542,7 @@ _seed_vc_supported_voice_ids: set[str] | None = None
 _seed_vc_voice_ids: set[str] | None = None
 
 _inference_counter = 0
-_CLEANUP_EVERY = 3
+_CLEANUP_EVERY = 1
 
 
 def _maybe_cleanup_gpu() -> None:
