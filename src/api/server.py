@@ -53,12 +53,12 @@ load_dotenv()
 # Default paths
 DATA_DIR = Path("data")
 CONFIG_PATH = Path(os.environ.get("LZ_TTS_SERVER_CONFIG", "local/server.json"))
-VOICES_JSON_PATH = Path("local/voices.json")
 LLMS_TEMPLATE_PATH = Path(__file__).with_name("llms.txt")
 DEFAULT_MODEL = "lzspeech-sparrow"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SEED_VC_ROOT = PROJECT_ROOT / "data" / "seed-vc"
 SEED_VC_RUNTIME_ROOT = PROJECT_ROOT / "src" / "seed_vc_runtime"
+SEED_VC_VOICE_IDS_PATH = SEED_VC_ROOT / "voice_ids.txt"
 MATCHA_LANGUAGE_ID_MAP = {
     "en": 1,
     "ar": 2,
@@ -272,7 +272,7 @@ class SynthesizeRequest(BaseModel):
 
     text: Optional[str] = Field(None, description="Plain text to synthesize (mutually exclusive with ssml)")
     ssml: Optional[str] = Field(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)")
-    voice_id: Optional[str] = Field(None, description="Public voice id from local/voices.json, e.g. msa.en-US.AvaMultilingual")
+    voice_id: Optional[str] = Field(None, description="Public voice id from data/seed-vc/voice_ids.txt, e.g. msa.en-US.AvaMultilingual")
     sample_url: Optional[str] = Field(None, description="Reference sample URL; output is converted to this voice with Seed-VC")
     language: Optional[str] = Field(None, description="Force full locale for the entire input, e.g. en-GB")
     style: Optional[str] = Field(None, description="Seed-VC speech style for voice_id synthesis")
@@ -289,7 +289,7 @@ class BatchSynthesizeInputItem(BaseModel):
 
     text: Optional[str] = Field(None, description="Plain text to synthesize")
     ssml: Optional[str] = Field(None, description="SSML input is not supported for batched synthesis")
-    voice_id: Optional[str] = Field(None, description="Public voice id from local/voices.json, e.g. msa.en-US.AvaMultilingual")
+    voice_id: Optional[str] = Field(None, description="Public voice id from data/seed-vc/voice_ids.txt, e.g. msa.en-US.AvaMultilingual")
     sample_url: Optional[str] = Field(None, description="Reference sample URL; output is converted to this voice with Seed-VC")
     language: Optional[str] = Field(None, description="Force full locale for this item, e.g. en-GB")
     model: Optional[str] = Field(None, description="Model to use for direct Sparrow batching")
@@ -509,7 +509,7 @@ _matcha_batcher: "ProductionMatchaBatcher | None" = None
 _seed_vc_backend: "_SeedVCBackend | None" = None
 _rvc_backend: "RVCBackend | None" = None
 _seed_vc_supported_voice_ids: set[str] | None = None
-_voices_json_ids: set[str] | None = None
+_seed_vc_voice_ids: set[str] | None = None
 
 _inference_counter = 0
 _CLEANUP_EVERY = 3
@@ -917,27 +917,26 @@ def _seed_vc_base_id(embedding_key: str) -> str:
     return ".".join(parts[:3])
 
 
-def _load_voices_json_ids() -> set[str]:
-    global _voices_json_ids
-    if _voices_json_ids is not None:
-        return _voices_json_ids
+def _load_seed_vc_voice_ids() -> set[str]:
+    global _seed_vc_voice_ids
+    if _seed_vc_voice_ids is not None:
+        return _seed_vc_voice_ids
 
-    if not VOICES_JSON_PATH.exists():
-        _LOGGER.warning("voices.json not found at %s", VOICES_JSON_PATH)
-        _voices_json_ids = set()
-        return _voices_json_ids
+    if not SEED_VC_VOICE_IDS_PATH.exists():
+        _LOGGER.warning("Seed-VC voice id list not found at %s", SEED_VC_VOICE_IDS_PATH)
+        _seed_vc_voice_ids = set()
+        return _seed_vc_voice_ids
 
     try:
-        raw = json.loads(VOICES_JSON_PATH.read_text(encoding="utf-8"))
-        voices = raw.get("voices", [])
-        _voices_json_ids = {
-            voice["id"] for voice in voices
-            if isinstance(voice, dict) and isinstance(voice.get("id"), str) and voice["id"].strip()
+        _seed_vc_voice_ids = {
+            line.strip()
+            for line in SEED_VC_VOICE_IDS_PATH.read_text(encoding="utf-8").splitlines()
+            if line.strip()
         }
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        _LOGGER.warning("Failed to load %s: %s", VOICES_JSON_PATH, exc)
-        _voices_json_ids = set()
-    return _voices_json_ids
+        _LOGGER.warning("Failed to load %s: %s", SEED_VC_VOICE_IDS_PATH, exc)
+        _seed_vc_voice_ids = set()
+    return _seed_vc_voice_ids
 
 
 def _build_synthesize_voices_catalog() -> tuple[list[str], list[SynthesizeVoiceInfo]]:
@@ -981,7 +980,7 @@ def _get_seed_vc_supported_voice_ids() -> set[str]:
         backend = _get_seed_vc_backend()
         emb_ids = {_seed_vc_base_id(key) for key in backend.cached_embeddings.keys()} if backend.cached_embeddings else set()
         if emb_ids:
-            all_seed_vc_ids = _load_voices_json_ids() & emb_ids
+            all_seed_vc_ids = _load_seed_vc_voice_ids() & emb_ids
             supported.update(
                 {
                     voice_id
@@ -3533,7 +3532,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         text: Optional[str] = Query(None, description="Plain text to synthesize (mutually exclusive with ssml)"),
         ssml: Optional[str] = Query(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)"),
         model: str = Query(None, description="Model to use (overrides auto routing)"),
-        voice_id: Optional[str] = Query(None, description="Public voice id from local/voices.json"),
+        voice_id: Optional[str] = Query(None, description="Public voice id from data/seed-vc/voice_ids.txt"),
         sample_url: Optional[str] = Query(None, description="Reference sample URL; output is converted to this voice with Seed-VC"),
         language: Optional[str] = Query(None, description="Force full locale for the entire text, e.g. en-GB"),
         style: Optional[str] = Query(None, description="Seed-VC speech style for voice_id synthesis"),
