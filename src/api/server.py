@@ -29,6 +29,7 @@ from urllib.parse import parse_qsl, urlencode
 
 import numpy as np
 import torch
+from asgi_compression import BrotliAlgorithm, CompressionMiddleware, GzipAlgorithm, ZstdAlgorithm
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -44,6 +45,7 @@ from ..matcha_inference import MatchaBackend as ProductionMatchaBackend
 from ..matcha_inference import MatchaBatcher as ProductionMatchaBatcher
 from . import qwen3
 from .qwen3 import router as qwen3_router
+from .request_decompression import RequestDecompressionMiddleware
 from .rvc import RVCBackend, RVCSettings
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
@@ -3046,6 +3048,16 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         description="Piper TTS inference API",
         version="0.1.0",
     )
+    app.add_middleware(
+        CompressionMiddleware,
+        algorithms=[
+            ZstdAlgorithm(level=3),
+            BrotliAlgorithm(quality=4),
+            GzipAlgorithm(compresslevel=5),
+        ],
+        minimum_size=1024,
+    )
+    app.add_middleware(RequestDecompressionMiddleware)
 
     @app.middleware("http")
     async def api_key_auth_middleware(request: Request, call_next):

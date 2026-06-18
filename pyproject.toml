@@ -91,6 +91,8 @@ dependencies = [
     "fairseq==0.12.2",
     "soxr>=1.1.0",
     "onnxruntime-gpu>=1.23.2",
+    "zstandard>=0.25.0",
+    "asgi-compression>=0.1.1",
 ]
 
 [build-system]
