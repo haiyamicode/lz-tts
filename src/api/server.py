@@ -57,6 +57,15 @@ logging.basicConfig(
 _LOGGER = logging.getLogger(__name__)
 load_dotenv()
 
+BINARY_RESPONSE_HEADERS = {"Content-Encoding": "identity"}
+
+
+def _binary_response(content: bytes, media_type: str, headers: dict[str, str] | None = None) -> Response:
+    response_headers = dict(BINARY_RESPONSE_HEADERS)
+    response_headers.update(headers or {})
+    response_headers.setdefault("Content-Encoding", "identity")
+    return Response(content=content, media_type=media_type, headers=response_headers)
+
 # Default paths
 DATA_DIR = Path("data")
 CONFIG_PATH = Path(os.environ.get("LZ_TTS_SERVER_CONFIG", "local/server.json"))
@@ -1525,7 +1534,7 @@ async def _synthesize_configured_voice(request: SynthesizeRequest) -> Response:
     )
     audio_bytes = base64.b64decode(batch_result.items[0].audio_base64)
     media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
-    return Response(content=audio_bytes, media_type=media_type)
+    return _binary_response(audio_bytes, media_type)
 
 
 def _synthesize_ssml(
@@ -3342,7 +3351,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 "phoneme": result.phoneme_text,
             }
         _maybe_cleanup_gpu()
-        return Response(content=_audio_to_wav_bytes(result.audio, result.sample_rate), media_type="audio/wav", headers=headers)
+        return _binary_response(_audio_to_wav_bytes(result.audio, result.sample_rate), "audio/wav", headers=headers)
 
     @app.get("/seed-vc/status")
     async def seed_vc_status():
@@ -3375,7 +3384,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             _LOGGER.exception("Seed-VC conversion failed")
             raise HTTPException(status_code=500, detail=f"Seed-VC conversion failed: {exc}") from exc
         _maybe_cleanup_gpu()
-        return Response(content=mp3_bytes, media_type="audio/mpeg")
+        return _binary_response(mp3_bytes, "audio/mpeg")
 
     @app.post("/vc-batch")
     async def seed_vc_convert_batch(request: SeedVCBatchRequest):
@@ -3436,7 +3445,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             _LOGGER.exception("Seed-VC enhance failed")
             raise HTTPException(status_code=500, detail=f"Seed-VC enhance failed: {exc}") from exc
         _maybe_cleanup_gpu()
-        return Response(content=mp3_bytes, media_type="audio/mpeg")
+        return _binary_response(mp3_bytes, "audio/mpeg")
 
     @app.get("/rvc/status")
     async def rvc_status():
@@ -3489,7 +3498,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
         media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
         _maybe_cleanup_gpu()
-        return Response(content=result_bytes, media_type=media_type)
+        return _binary_response(result_bytes, media_type)
 
     @app.post("/rvc/convert/batch", response_model=RVCBatchConvertResponse)
     async def rvc_convert_batch(request: RVCBatchConvertRequest):
@@ -3603,7 +3612,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
             sample_rate = converted_sample_rate
             _maybe_cleanup_gpu()
-            return Response(content=audio_bytes, media_type=media_type)
+            return _binary_response(audio_bytes, media_type)
 
         # Convert to requested format
         if request.format == "mp3":
@@ -3614,7 +3623,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             media_type = "audio/wav"
 
         _maybe_cleanup_gpu()
-        return Response(content=audio_bytes, media_type=media_type)
+        return _binary_response(audio_bytes, media_type)
 
     @app.post("/synthesize")
     async def synthesize(

@@ -16,13 +16,19 @@ import numpy as np
 import soundfile as sf
 import torch
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 _LOGGER = logging.getLogger(__name__)
 
 CACHE_DIR = Path("cache/voice_samples")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+BINARY_RESPONSE_HEADERS = {"Content-Encoding": "identity"}
+
+
+def _binary_response(content: bytes, media_type: str) -> Response:
+    return Response(content=content, media_type=media_type, headers=dict(BINARY_RESPONSE_HEADERS))
 
 QWEN_DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 QWEN_DEFAULT_DTYPE = "bfloat16"
@@ -1484,7 +1490,6 @@ def synthesize(req: SynthesizeRequest):
 
         with inference_lock:
             mp3_bytes, info = _generate_qwen_mp3(req, sample_path, prompt_text, xvec_only, settings)
-            torch.cuda.empty_cache()
 
         _log_qwen_synthesize_request(
             status="ok",
@@ -1496,12 +1501,7 @@ def synthesize(req: SynthesizeRequest):
             info=info,
         )
 
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        return StreamingResponse(io.BytesIO(mp3_bytes), media_type="audio/mpeg")
+        return _binary_response(mp3_bytes, "audio/mpeg")
     except HTTPException as exc:
         _log_qwen_synthesize_request(
             status=f"http_{exc.status_code}",
@@ -1606,10 +1606,6 @@ def synthesize_batch(req: BatchSynthesizeRequest):
                         dp_language=settings.dp_language,
                     )
                 )
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-
     wall_seconds = time.perf_counter() - started
     return BatchSynthesizeResponse(
         items=items,
