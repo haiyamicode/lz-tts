@@ -48,7 +48,12 @@ from .qwen3 import router as qwen3_router
 from .request_decompression import RequestDecompressionMiddleware
 from .rvc import RVCBackend, RVCSettings
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s: %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 _LOGGER = logging.getLogger(__name__)
 load_dotenv()
 

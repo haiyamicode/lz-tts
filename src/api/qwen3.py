@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -498,20 +497,24 @@ def _load_model_unlocked() -> Any:
     audio_dtype = _qwen_settings.audio_dtype
     attn_implementation = _qwen_settings.attn
     max_seq_len = _qwen_settings.max_seq_len
-    print(
-        "Loading FasterQwen3TTS "
-        f"precision_mode={_qwen_settings.precision_mode} "
-        f"model={model_name} device={device} dtype={dtype_name} "
-        f"audio_dtype={audio_dtype} attn={attn_implementation} "
-        f"layer_precision={_qwen_settings.layer_precision} "
-        f"predictor_layer_precision={_qwen_settings.predictor_layer_precision} "
-        f"audio_decoder_precision={_qwen_settings.audio_decoder_precision} "
-        f"large_block_precision={_qwen_settings.large_block_precision} "
-        f"extra_precision={_qwen_settings.extra_precision} "
-        f"linear_precision={_qwen_settings.linear_precision} "
-        f"max_seq_len={max_seq_len}...",
-        file=sys.stderr,
-        flush=True,
+    _LOGGER.info(
+        "Loading FasterQwen3TTS precision_mode=%s model=%s device=%s dtype=%s "
+        "audio_dtype=%s attn=%s layer_precision=%s predictor_layer_precision=%s "
+        "audio_decoder_precision=%s large_block_precision=%s extra_precision=%s "
+        "linear_precision=%s max_seq_len=%s",
+        _qwen_settings.precision_mode,
+        model_name,
+        device,
+        dtype_name,
+        audio_dtype,
+        attn_implementation,
+        _qwen_settings.layer_precision,
+        _qwen_settings.predictor_layer_precision,
+        _qwen_settings.audio_decoder_precision,
+        _qwen_settings.large_block_precision,
+        _qwen_settings.extra_precision,
+        _qwen_settings.linear_precision,
+        max_seq_len,
     )
     loaded_model = FasterQwen3TTS.from_pretrained(
         model_name,
@@ -528,18 +531,14 @@ def _load_model_unlocked() -> Any:
         max_seq_len=max_seq_len,
     )
     if _qwen_settings.warmup and hasattr(loaded_model, "_warmup"):
-        print("Capturing CUDA graphs...", file=sys.stderr, flush=True)
+        _LOGGER.info("Capturing CUDA graphs...")
         loaded_model._warmup(prefill_len=100)
         if hasattr(loaded_model, "capture_batch_graphs"):
-            print(
-                f"Capturing Qwen batch CUDA graph buckets: {QWEN_BATCH_BUCKETS}...",
-                file=sys.stderr,
-                flush=True,
-            )
+            _LOGGER.info("Capturing Qwen batch CUDA graph buckets: %s...", QWEN_BATCH_BUCKETS)
             loaded_model.capture_batch_graphs(QWEN_BATCH_BUCKETS, prefill_len=100)
     if hasattr(loaded_model, "max_voice_prompt_cache_entries"):
         loaded_model.max_voice_prompt_cache_entries = _qwen_settings.voice_prompt_cache_entries
-    print(f"FasterQwen3TTS loaded. Sample rate: {loaded_model.sample_rate}", file=sys.stderr, flush=True)
+    _LOGGER.info("FasterQwen3TTS loaded. Sample rate: %s", loaded_model.sample_rate)
     return loaded_model
 
 
@@ -574,8 +573,8 @@ def _preload_worker(include_dp_budget: bool) -> None:
         get_model()
         if include_dp_budget:
             get_dp_budget_model()
-    except Exception as e:
-        print(f"Qwen3 preload failed: {e}", file=sys.stderr, flush=True)
+    except Exception:
+        _LOGGER.exception("Qwen3 preload failed")
 
 
 def start_preload_background(include_dp_budget: bool = False) -> None:
@@ -620,7 +619,7 @@ def get_dp_budget_model() -> Any:
 
         from src.qwen_dp_budget import DpBudgetConfig, QwenDpBudget
 
-        print("Loading Qwen DP budget model...", file=sys.stderr, flush=True)
+        _LOGGER.info("Loading Qwen DP budget model...")
         dp_settings = _qwen_settings.dp_budget
         loaded_dp_budget_model = QwenDpBudget(
             DpBudgetConfig(
@@ -643,7 +642,7 @@ def get_dp_budget_model() -> Any:
         )
         loaded_dp_budget_model.load()
         dp_budget_model = loaded_dp_budget_model
-        print("Qwen DP budget model ready.", file=sys.stderr, flush=True)
+        _LOGGER.info("Qwen DP budget model ready.")
     return dp_budget_model
 
 
@@ -673,7 +672,7 @@ def get_parakeet_model() -> Any:
         if disable_cuda_graph and parakeet_device.type == "cuda":
             original_build_decode_graph = ParakeetTDT._build_decode_graph
             ParakeetTDT._build_decode_graph = lambda self, device: None
-        print("Loading transcription model (nano-parakeet)...", file=sys.stderr, flush=True)
+        _LOGGER.info("Loading transcription model (nano-parakeet)...")
         try:
             dtype = torch.float32 if disable_cuda_graph and parakeet_device.type == "cuda" else None
             if parakeet_device.type == "cuda":
@@ -686,11 +685,10 @@ def get_parakeet_model() -> Any:
         finally:
             if original_build_decode_graph is not None:
                 ParakeetTDT._build_decode_graph = original_build_decode_graph
-        print(
-            f"Transcription model ready on {device} "
-            f"(cuda_graph={'disabled' if disable_cuda_graph and parakeet_device.type == 'cuda' else 'enabled'}).",
-            file=sys.stderr,
-            flush=True,
+        _LOGGER.info(
+            "Transcription model ready on %s (cuda_graph=%s).",
+            device,
+            "disabled" if disable_cuda_graph and parakeet_device.type == "cuda" else "enabled",
         )
     return parakeet_model
 
@@ -710,13 +708,9 @@ def get_silero_vad_detector() -> Any:
                     ).split(",")
                     if provider.strip()
                 ]
-                print("Loading Silero VAD postprocessor...", file=sys.stderr, flush=True)
+                _LOGGER.info("Loading Silero VAD postprocessor...")
                 silero_vad_detector = make_silence_detector(providers=providers)
-                print(
-                    f"Silero VAD ready. Providers: {silero_vad_detector.providers}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                _LOGGER.info("Silero VAD ready. Providers: %s", silero_vad_detector.providers)
     return silero_vad_detector
 
 
