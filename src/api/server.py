@@ -320,6 +320,7 @@ class SynthesizeRequest(BaseModel):
     ssml: Optional[str] = Field(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)")
     voice_id: Optional[str] = Field(None, description="Public voice id from data/seed-vc/voice_ids.txt, e.g. msa.en-US.AvaMultilingual")
     sample_url: Optional[str] = Field(None, description="Reference sample URL; output is converted to this voice with Seed-VC")
+    rvc_model: Optional[str] = Field(None, alias="rvcModel", description="Optional RVC model filename to apply as the final conversion step")
     language: Optional[str] = Field(None, description="Force full locale for the entire input, e.g. en-GB")
     style: Optional[str] = Field(None, description="Seed-VC speech style for voice_id synthesis")
     style_intensity: Optional[float] = Field(None, alias="styleIntensity", description="Seed-VC speech style intensity")
@@ -337,6 +338,7 @@ class BatchSynthesizeInputItem(BaseModel):
     ssml: Optional[str] = Field(None, description="SSML input is not supported for batched synthesis")
     voice_id: Optional[str] = Field(None, description="Public voice id from data/seed-vc/voice_ids.txt, e.g. msa.en-US.AvaMultilingual")
     sample_url: Optional[str] = Field(None, description="Reference sample URL; output is converted to this voice with Seed-VC")
+    rvc_model: Optional[str] = Field(None, alias="rvcModel", description="Optional RVC model filename to apply as the final conversion step")
     language: Optional[str] = Field(None, description="Force full locale for this item, e.g. en-GB")
     model: Optional[str] = Field(None, description="Model to use for direct Sparrow batching")
     style: Optional[str] = Field(None, description="Seed-VC speech style for voice_id synthesis")
@@ -359,6 +361,7 @@ class _SharedBatchSynthesizeRequest:
     texts: list[str]
     voice_id: str | None = None
     sample_url: str | None = None
+    rvc_model: str | None = None
     language: str | None = None
     model: str | None = None
     style: str | None = None
@@ -1199,6 +1202,126 @@ async def _convert_generated_audio_to_sample_batch(
     return converted, backend.sample_rate
 
 
+def _encoded_audio_duration_seconds(audio_bytes: bytes, output_format: Literal["wav", "mp3"], fallback: float) -> float:
+    try:
+        if output_format == "mp3":
+            return float(AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3").duration_seconds)
+        import soundfile as sf  # pylint: disable=import-outside-toplevel
+
+        info = sf.info(io.BytesIO(audio_bytes))
+        return float(info.frames) / float(info.samplerate) if info.samplerate else fallback
+    except Exception:
+        return fallback
+
+
+async def _convert_encoded_audio_rvc_batch(
+    *,
+    audio_items: list[bytes],
+    rvc_model: str | None,
+    output_format: Literal["wav", "mp3"],
+) -> list[tuple[bytes, int]]:
+    if rvc_model is None:
+        raise ValueError("rvc_model is required")
+    if not audio_items:
+        return []
+
+    backend = _get_rvc_backend()
+    started = time.perf_counter()
+    _log_synthesize_batch_stage(
+        "rvc_batch_start",
+        model=rvc_model,
+        count=len(audio_items),
+        output_format=output_format,
+    )
+    try:
+        converted = await asyncio.to_thread(
+            backend.convert_batch,
+            audio_items=audio_items,
+            model=rvc_model,
+            f0_method=backend.settings.default_f0_method,
+            pitch=backend.settings.default_pitch,
+            index_rate=backend.settings.default_index_rate,
+            rms_mix_rate=backend.settings.default_rms_mix_rate,
+            protect=backend.settings.default_protect,
+            output_format=output_format,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _log_synthesize_batch_stage(
+        "rvc_batch_done",
+        model=rvc_model,
+        count=len(converted),
+        wall_seconds=round(time.perf_counter() - started, 6),
+    )
+    return converted
+
+
+async def _apply_rvc_to_synthesize_response(
+    response: BatchSynthesizeResponse,
+    *,
+    rvc_model: str | None,
+    output_format: Literal["wav", "mp3"],
+) -> BatchSynthesizeResponse:
+    if rvc_model is None:
+        return response
+
+    audio_items = [base64.b64decode(item.audio_base64) for item in response.items]
+    started = time.perf_counter()
+    converted = await _convert_encoded_audio_rvc_batch(
+        audio_items=audio_items,
+        rvc_model=rvc_model,
+        output_format=output_format,
+    )
+    if len(converted) != len(response.items):
+        raise RuntimeError("internal RVC batch response count mismatch")
+
+    items: list[BatchSynthesizeItem] = []
+    audio_seconds_total = 0.0
+    for original, (audio_bytes, sample_rate) in zip(response.items, converted):
+        audio_seconds = _encoded_audio_duration_seconds(audio_bytes, output_format, original.audio_seconds)
+        audio_seconds_total += audio_seconds
+        items.append(
+            BatchSynthesizeItem(
+                text=original.text,
+                audio_base64=base64.b64encode(audio_bytes).decode("ascii"),
+                sample_rate=sample_rate,
+                audio_seconds=audio_seconds,
+            )
+        )
+
+    wall_seconds = response.wall_seconds + (time.perf_counter() - started)
+    return response.model_copy(
+        update={
+            "items": items,
+            "wall_seconds": wall_seconds,
+            "audio_seconds_total": audio_seconds_total,
+            "rtf": (wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
+            "model": f"{response.model}+rvc:{rvc_model}",
+        }
+    )
+
+
+async def _apply_rvc_to_encoded_audio(
+    *,
+    audio_bytes: bytes,
+    rvc_model: str | None,
+    output_format: Literal["wav", "mp3"],
+) -> tuple[bytes, int] | None:
+    if rvc_model is None:
+        return None
+    converted = await _convert_encoded_audio_rvc_batch(
+        audio_items=[audio_bytes],
+        rvc_model=rvc_model,
+        output_format=output_format,
+    )
+    if len(converted) != 1:
+        raise RuntimeError("internal RVC response count mismatch")
+    return converted[0]
+
+
 def _resolve_internal_speaker(model_name: str, speaker: str | None, inference: PiperInference) -> str | None:
     if speaker is None or not str(speaker).strip() or str(speaker).lower() == "und":
         return None
@@ -1504,7 +1627,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         )
 
     wall_seconds = time.perf_counter() - started
-    return BatchSynthesizeResponse(
+    response = BatchSynthesizeResponse(
         items=items,
         count=len(items),
         model=f"voice_id:{request.voice_id}",
@@ -1512,6 +1635,11 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         wall_seconds=wall_seconds,
         audio_seconds_total=audio_seconds_total,
         rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
+    )
+    return await _apply_rvc_to_synthesize_response(
+        response,
+        rvc_model=request.rvc_model,
+        output_format=request.format,
     )
 
 
@@ -1527,6 +1655,7 @@ async def _synthesize_configured_voice(request: SynthesizeRequest) -> Response:
             language=request.language,
             style=request.style,
             style_intensity=request.style_intensity,
+            rvc_model=request.rvc_model,
             options=request.options,
             format=request.format,
             neural=request.neural,
@@ -2681,7 +2810,7 @@ async def synthesize_sparrow_batch(
                 )
             )
         total_wall_seconds = time.perf_counter() - started
-        return BatchSynthesizeResponse(
+        response = BatchSynthesizeResponse(
             items=items,
             count=len(items),
             model=model_name,
@@ -2689,6 +2818,11 @@ async def synthesize_sparrow_batch(
             wall_seconds=total_wall_seconds,
             audio_seconds_total=audio_seconds_total,
             rtf=(total_wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
+        )
+        return await _apply_rvc_to_synthesize_response(
+            response,
+            rvc_model=request.rvc_model,
+            output_format=request.format,
         )
 
     items: list[BatchSynthesizeItem] = []
@@ -2709,7 +2843,7 @@ async def synthesize_sparrow_batch(
             )
         )
 
-    return BatchSynthesizeResponse(
+    response = BatchSynthesizeResponse(
         items=items,
         count=len(items),
         model=model_name,
@@ -2717,6 +2851,11 @@ async def synthesize_sparrow_batch(
         wall_seconds=wall_seconds,
         audio_seconds_total=audio_seconds_total,
         rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
+    )
+    return await _apply_rvc_to_synthesize_response(
+        response,
+        rvc_model=request.rvc_model,
+        output_format=request.format,
     )
 
 
@@ -2835,7 +2974,7 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
                 )
             )
         wall_seconds = time.perf_counter() - started
-        return BatchSynthesizeResponse(
+        response = BatchSynthesizeResponse(
             items=items,
             count=len(items),
             model="auto",
@@ -2843,6 +2982,11 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
             wall_seconds=wall_seconds,
             audio_seconds_total=audio_seconds_total,
             rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
+        )
+        return await _apply_rvc_to_synthesize_response(
+            response,
+            rvc_model=request.rvc_model,
+            output_format=request.format,
         )
 
     items: list[BatchSynthesizeItem] = []
@@ -2865,7 +3009,7 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
         )
 
     wall_seconds = time.perf_counter() - started
-    return BatchSynthesizeResponse(
+    response = BatchSynthesizeResponse(
         items=items,
         count=len(items),
         model="auto",
@@ -2873,6 +3017,11 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
         wall_seconds=wall_seconds,
         audio_seconds_total=audio_seconds_total,
         rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
+    )
+    return await _apply_rvc_to_synthesize_response(
+        response,
+        rvc_model=request.rvc_model,
+        output_format=request.format,
     )
 
 
@@ -2885,6 +3034,7 @@ def _batch_item_group_key(item: BatchSynthesizeInputItem) -> tuple[Any, ...]:
         kind,
         item.voice_id,
         item.sample_url,
+        item.rvc_model,
         item.language,
         item.model,
         item.style,
@@ -2921,6 +3071,7 @@ def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, 
         texts=[text for _, _, text in records],
         voice_id=first.voice_id,
         sample_url=first.sample_url,
+        rvc_model=first.rvc_model,
         language=first.language,
         model=first.model,
         style=first.style,
@@ -2950,6 +3101,7 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
                 "count": len(records),
                 "voice_id": records[0][1].voice_id,
                 "sample_url": bool(records[0][1].sample_url),
+                "rvcModel": records[0][1].rvc_model,
                 "language": records[0][1].language,
                 "model": records[0][1].model,
                 "style": records[0][1].style,
@@ -2974,6 +3126,7 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
             item_count=len(records),
             voice_id=shared_request.voice_id,
             sample_url=bool(shared_request.sample_url),
+            rvcModel=shared_request.rvc_model,
             language=shared_request.language,
             model=shared_request.model,
             format=shared_request.format,
@@ -2986,6 +3139,7 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
                 _SharedBatchSynthesizeRequest(
                     texts=shared_request.texts,
                     sample_url=shared_request.sample_url,
+                    rvc_model=shared_request.rvc_model,
                     model=forced_model,
                     options=shared_request.options,
                     format=shared_request.format,
@@ -3016,6 +3170,7 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
             output_count=len(group_result.items),
             voice_id=shared_request.voice_id,
             sample_url=bool(shared_request.sample_url),
+            rvcModel=shared_request.rvc_model,
             language=shared_request.language,
             model=group_result.model,
             speaker=group_result.speaker,
@@ -3611,6 +3766,13 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             audio_bytes, _ = converted[0]
             media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
             sample_rate = converted_sample_rate
+            rvc_result = await _apply_rvc_to_encoded_audio(
+                audio_bytes=audio_bytes,
+                rvc_model=request.rvc_model,
+                output_format=request.format,
+            )
+            if rvc_result is not None:
+                audio_bytes, sample_rate = rvc_result
             _maybe_cleanup_gpu()
             return _binary_response(audio_bytes, media_type)
 
@@ -3621,6 +3783,14 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         else:
             audio_bytes = _audio_to_wav_bytes(audio, sample_rate)
             media_type = "audio/wav"
+
+        rvc_result = await _apply_rvc_to_encoded_audio(
+            audio_bytes=audio_bytes,
+            rvc_model=request.rvc_model,
+            output_format=request.format,
+        )
+        if rvc_result is not None:
+            audio_bytes, sample_rate = rvc_result
 
         _maybe_cleanup_gpu()
         return _binary_response(audio_bytes, media_type)
@@ -3732,6 +3902,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         model: str = Query(None, description="Model to use (overrides auto routing)"),
         voice_id: Optional[str] = Query(None, description="Public voice id from data/seed-vc/voice_ids.txt"),
         sample_url: Optional[str] = Query(None, description="Reference sample URL; output is converted to this voice with Seed-VC"),
+        rvc_model: Annotated[
+            Optional[str],
+            Query(alias="rvcModel", description="Optional RVC model filename to apply as the final conversion step"),
+        ] = None,
         language: Optional[str] = Query(None, description="Force full locale for the entire text, e.g. en-GB"),
         style: Optional[str] = Query(None, description="Seed-VC speech style for voice_id synthesis"),
         style_intensity: Annotated[
@@ -3758,6 +3932,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "model": model,
             "voice_id": voice_id,
             "sample_url": sample_url,
+            "rvcModel": rvc_model,
             "language": language,
             "style": style,
             "styleIntensity": style_intensity,
@@ -3787,6 +3962,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             ssml=ssml,
             voice_id=voice_id,
             sample_url=sample_url,
+            rvc_model=rvc_model,
             language=language,
             style=style,
             style_intensity=style_intensity,
