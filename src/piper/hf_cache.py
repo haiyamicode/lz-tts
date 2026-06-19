@@ -6,8 +6,14 @@ import os
 from pathlib import Path
 
 
+_HF_MODEL_ALIASES = {
+    "distilbert-base-multilingual-cased": "distilbert/distilbert-base-multilingual-cased",
+}
+
+
 def resolve_hf_model_path(model_name: str) -> str:
     """Return a local cached snapshot path for a Hugging Face model id if present."""
+    model_name = _HF_MODEL_ALIASES.get(model_name, model_name)
     path = Path(model_name)
     if path.exists():
         return str(path)

@@ -95,7 +95,7 @@ class ModelConfig:
     use_bert: bool = False
     """Enable semantic encoder branch."""
 
-    bert_model: str = "distilbert-base-multilingual-cased"
+    bert_model: str = "distilbert/distilbert-base-multilingual-cased"
     """HuggingFace model identifier for the semantic encoder."""
 
     bert_hidden_size: int = 768

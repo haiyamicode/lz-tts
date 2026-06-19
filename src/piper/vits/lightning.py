@@ -126,7 +126,7 @@ class VitsModel(pl.LightningModule):
 
         # Determine semantic encoder model name (if enabled)
         bert_model = bert_model_name or os.environ.get(
-            "PIPER_SEMANTIC_MODEL_NAME", "distilbert-base-multilingual-cased"
+            "PIPER_SEMANTIC_MODEL_NAME", "distilbert/distilbert-base-multilingual-cased"
         )
 
         # Set up models

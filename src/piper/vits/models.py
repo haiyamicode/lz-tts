@@ -246,7 +246,7 @@ class BertTextEncoder(nn.Module):
         n_layers: int,
         kernel_size: int,
         p_dropout: float,
-        bert_model: str = "distilbert-base-multilingual-cased",
+        bert_model: str = "distilbert/distilbert-base-multilingual-cased",
         bert_hidden_size: int = 768,
         freeze_bert: bool = True,
         bert_features_precomputed: bool = False,
@@ -292,11 +292,12 @@ class BertTextEncoder(nn.Module):
             # === Semantic branch (BERT encoder) ===
             # The model is loaded by identifier so it can be swapped easily.
             from transformers import AutoModel  # lazy import to avoid hard dependency when unused
+            from ..hf_cache import resolve_hf_model_path
 
             if _DEBUG_SEMANTIC:
                 print(f"[BertTextEncoder] Loading semantic model: {bert_model}")
 
-            self.bert = AutoModel.from_pretrained(bert_model)
+            self.bert = AutoModel.from_pretrained(resolve_hf_model_path(bert_model))
 
             if self.freeze_bert:
                 for param in self.bert.parameters():
@@ -855,7 +856,7 @@ class SynthesizerTrn(nn.Module):
         duration_blend_sdp_ratio: float = 0.2,
         # Semantic options
         use_bert: bool = False,
-        bert_model: str = "distilbert-base-multilingual-cased",
+        bert_model: str = "distilbert/distilbert-base-multilingual-cased",
         bert_hidden_size: int = 768,
         freeze_bert: bool = True,
         bert_features_precomputed: bool = False,

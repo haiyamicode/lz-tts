@@ -181,7 +181,7 @@ def main() -> None:
     parser.add_argument("--input-dataset", help="Input dataset.jsonl or dataset.parquet")
     parser.add_argument("--output-dataset", help="Output dataset.parquet")
     parser.add_argument("--features-dir", help="Directory for sidecar .bert.pt feature tensors")
-    parser.add_argument("--model-name", default="distilbert-base-multilingual-cased")
+    parser.add_argument("--model-name", default="distilbert/distilbert-base-multilingual-cased")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-tokens", type=int, default=256)

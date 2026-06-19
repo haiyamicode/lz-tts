@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 from .hf_cache import resolve_hf_model_path
 
 
-_DEFAULT_MODEL_NAME = "distilbert-base-multilingual-cased"
+_DEFAULT_MODEL_NAME = "distilbert/distilbert-base-multilingual-cased"
 _LOGGER = logging.getLogger("vits.semantic")
 _DEBUG_SEMANTIC = bool(int(os.environ.get("PIPER_SEMANTIC_DEBUG", "0")))
 

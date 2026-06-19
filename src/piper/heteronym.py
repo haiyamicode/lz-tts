@@ -18,7 +18,7 @@ from .hf_cache import resolve_hf_model_path
 _LOGGER = logging.getLogger(__name__)
 
 # Model architecture constants (must match training)
-_DEFAULT_CONTEXT_MODEL = "distilbert-base-multilingual-cased"
+_DEFAULT_CONTEXT_MODEL = "distilbert/distilbert-base-multilingual-cased"
 _DEFAULT_CONTEXT_HIDDEN = 768
 _EMBED_DIM = 256
 _DROPOUT = 0.1
