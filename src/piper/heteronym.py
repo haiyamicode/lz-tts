@@ -196,13 +196,14 @@ class HeteronymResolver:
         # Load frozen context encoder
         from transformers import AutoModel, AutoTokenizer
 
-        model_path = resolve_hf_model_path(self._context_model_name)
+        tokenizer_path = resolve_hf_model_path(self._context_model_name)
+        model_path = resolve_hf_model_path(self._context_model_name, require_weights=True)
         local_files_only = any(
             os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
             for name in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE")
         )
         self._tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
+            tokenizer_path,
             local_files_only=local_files_only,
             use_fast=True,
         )

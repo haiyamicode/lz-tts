@@ -117,6 +117,9 @@ class PiperInference:
                 build_bert_input,
             )
 
+            if self.bert_features_precomputed:
+                self._load_semantic_model()
+
             _LOGGER.info("Loading BERT tokenizer: %s", self.bert_model_name or "default")
             self.semantic_tokenizer = SemanticTokenizer(model_name=self.bert_model_name)
             self._build_bert_input = build_bert_input
@@ -179,7 +182,7 @@ class PiperInference:
 
         from .hf_cache import resolve_hf_model_path
 
-        model_path = resolve_hf_model_path(self.bert_model_name)
+        model_path = resolve_hf_model_path(self.bert_model_name, require_weights=True)
         local_files_only = any(
             os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
             for name in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE")
@@ -271,10 +274,19 @@ class PiperInference:
         input_ids = bert_dict["input_ids"].to(self.device)
         attention_mask = bert_dict["attention_mask"].to(self.device)
         with torch.inference_mode():
-            hidden = semantic_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            ).last_hidden_state
+            if self.device.type == "cuda":
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+
+                with sdpa_kernel(backends=[SDPBackend.MATH]):
+                    hidden = semantic_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                    ).last_hidden_state
+            else:
+                hidden = semantic_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                ).last_hidden_state
 
         dtype = torch.float16 if self.fp16 else torch.float32
         feature_items = [

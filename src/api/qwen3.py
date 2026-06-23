@@ -42,6 +42,7 @@ QWEN_DEFAULT_XVEC_ONLY = True
 QWEN_DEFAULT_NON_STREAMING_MODE = True
 QWEN_DEFAULT_EXPRESSIVENESS = 1.0
 QWEN_DP_BUDGET_DEFAULT = True
+QWEN_CONTEXT_REPLACEMENTS_ENABLED = True
 QWEN_BATCH_BUCKETS = (1, 3, 5)
 QWEN_MODEL_MAX_BATCH_SIZE = max(QWEN_BATCH_BUCKETS)
 QWEN_MAX_BATCH_SIZE = max(
@@ -96,6 +97,7 @@ QWEN_LANGUAGE_NAMES = {
     "pt": "Portuguese",
     "es": "Spanish",
     "it": "Italian",
+    "vi": "Vietnamese",
 }
 QWEN_LANGUAGE_LOCALES = {
     "zh": "zh-CN",
@@ -108,6 +110,7 @@ QWEN_LANGUAGE_LOCALES = {
     "pt": "pt-PT",
     "es": "es-ES",
     "it": "it-IT",
+    "vi": "vi-VN",
 }
 QWEN_LANGUAGE_CODES = {
     language_name.lower(): language_name
@@ -407,7 +410,7 @@ def detect_qwen_language(text: str) -> ResolvedQwenLanguage:
         main_language = QWEN_LANGUAGE_NAMES.get(main_code)
         if main_language:
             return ResolvedQwenLanguage(main_language, QWEN_LANGUAGE_LOCALES.get(main_code, main_code))
-        return _default_qwen_language()
+        return ResolvedQwenLanguage("Auto", "multilingual")
 
     total_weight = sum(weights.values())
     prominence_threshold = max(4, int(total_weight * 0.20))
@@ -572,6 +575,45 @@ def get_model() -> Any:
             model_loading = False
             model_load_finished_at = time.time()
             model_ready_event.set()
+
+
+def _apply_context_replacements(text: str, dp_language: str) -> str:
+    """Apply context-aware text replacements (e.g. AI -> ây ai) if enabled."""
+    if not QWEN_CONTEXT_REPLACEMENTS_ENABLED:
+        return text
+    try:
+        from ..piper.context_replacer import get_replacer
+        replacer = get_replacer()
+        return replacer.apply_replacements(text, language=dp_language)
+    except FileNotFoundError:
+        return text
+    except Exception:
+        _LOGGER.debug("Context replacer not available, skipping", exc_info=True)
+        return text
+
+
+def _apply_context_replacements_batch(texts: list[str], dp_languages: list[str]) -> list[str]:
+    """Apply context-aware text replacements for a batch of texts."""
+    if not QWEN_CONTEXT_REPLACEMENTS_ENABLED:
+        return texts
+    try:
+        from ..piper.context_replacer import get_replacer
+        replacer = get_replacer()
+        # Group by language for efficient batch processing
+        unique_langs = set(dp_languages)
+        results = list(texts)
+        for lang in unique_langs:
+            indices = [i for i, l in enumerate(dp_languages) if l == lang]
+            lang_texts = [texts[i] for i in indices]
+            replaced = replacer.apply_replacements_many(lang_texts, language=lang)
+            for i, new_text in zip(indices, replaced):
+                results[i] = new_text
+        return results
+    except FileNotFoundError:
+        return texts
+    except Exception:
+        _LOGGER.debug("Context replacer not available, skipping", exc_info=True)
+        return texts
 
 
 def _preload_worker(include_dp_budget: bool) -> None:
@@ -1256,8 +1298,9 @@ def _generate_qwen_mp3(
     settings: _ResolvedGenerationSettings,
 ) -> tuple[bytes, dict[str, Any]]:
     m = get_model()
+    text = _apply_context_replacements(req.text, settings.dp_language)
     audio_list, sample_rate = m.generate_voice_clone(
-        text=req.text,
+        text=text,
         language=settings.language,
         ref_audio=str(sample_path),
         ref_text=prompt_text,
@@ -1350,7 +1393,10 @@ def _generate_qwen_batch_mp3(
     if first_real_index is None:
         raise HTTPException(400, "at least one non-dummy item is required")
     first = settings_list[first_real_index]
-    texts = [item.text for item in item_requests]
+    texts = _apply_context_replacements_batch(
+        [item.text for item in item_requests],
+        [settings.dp_language for settings in settings_list],
+    )
     audio_list, sample_rate = m.generate_voice_clone_batch(
         texts=texts,
         language=[settings.language for settings in settings_list],

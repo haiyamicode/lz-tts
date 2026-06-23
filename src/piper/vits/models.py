@@ -297,7 +297,9 @@ class BertTextEncoder(nn.Module):
             if _DEBUG_SEMANTIC:
                 print(f"[BertTextEncoder] Loading semantic model: {bert_model}")
 
-            self.bert = AutoModel.from_pretrained(resolve_hf_model_path(bert_model))
+            self.bert = AutoModel.from_pretrained(
+                resolve_hf_model_path(bert_model, require_weights=True)
+            )
 
             if self.freeze_bert:
                 for param in self.bert.parameters():

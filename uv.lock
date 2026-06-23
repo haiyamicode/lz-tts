@@ -1026,6 +1026,16 @@ wheels = [
 ]
 
 [[package]]
+name = "flash-attn"
+version = "2.8.3.post1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "einops" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/01/7a/92a46e7cd6bbb4d7b2855a457c3b855df54a97af5656d98fc92e58e61065/flash_attn-2.8.3.post1.tar.gz", hash = "sha256:55d5103ed846da8b56e0797acf4bde07dee4b1c7e8907fcfc6699c203030c348", size = 8451657, upload-time = "2026-06-11T04:35:21.318Z" }
+
+[[package]]
 name = "flatbuffers"
 version = "25.12.19"
 source = { registry = "https://pypi.org/simple" }
@@ -2085,6 +2095,13 @@ dependencies = [
     { name = "zstandard" },
 ]
 
+[package.optional-dependencies]
+qwen-flash = [
+    { name = "flash-attn" },
+    { name = "ninja" },
+    { name = "packaging" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "anyascii", specifier = "==0.3.2" },
@@ -2105,6 +2122,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0,<0.116" },
     { name = "ffmpeg-normalize", specifier = ">=1.37.8" },
     { name = "ffmpeg-python", specifier = ">=0.2.0" },
+    { name = "flash-attn", marker = "extra == 'qwen-flash'", specifier = ">=2.8.3.post1" },
     { name = "fugashi", specifier = ">=1.5.0,<1.6" },
     { name = "funasr", specifier = ">=1.3.3" },
     { name = "g2p-en", specifier = "==2.1.0" },
@@ -2129,9 +2147,11 @@ requires-dist = [
     { name = "monotonic-align", specifier = ">=1.0.0" },
     { name = "munch", specifier = ">=4.0.0" },
     { name = "nano-parakeet", specifier = ">=0.2.1" },
+    { name = "ninja", marker = "extra == 'qwen-flash'", specifier = ">=1.13.0" },
     { name = "num2words", specifier = "==0.5.12" },
     { name = "numpy", specifier = "==1.23.5" },
     { name = "onnxruntime-gpu", specifier = ">=1.23.2" },
+    { name = "packaging", marker = "extra == 'qwen-flash'", specifier = ">=23.2" },
     { name = "peft", specifier = ">=0.19.1" },
     { name = "phonemizer", specifier = ">=3.3.0" },
     { name = "piper-phonemize", directory = "src/phonemizer" },
@@ -2172,6 +2192,7 @@ requires-dist = [
     { name = "wordfreq", specifier = ">=3.1.0,<3.2" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
+provides-extras = ["qwen-flash"]
 
 [[package]]
 name = "markdown"

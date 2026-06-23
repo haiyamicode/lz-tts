@@ -15,6 +15,11 @@ When running long tasks in tmux:
 - Do not use `tee`, manual log redirection, or capture loops unless explicitly requested.
 - For debugging, inspect the tmux session directly or use the real framework logs/TensorBoard artifacts.
 
+# Qwen3 TTS precision on V100
+- V100 can run Qwen3 TTS inference with `bf16`; it is simulated and slower, but works correctly.
+- Do not use `fp16` for Qwen3 TTS inference on V100; it produces broken audio.
+- Use the RTX 3090 for Qwen3 TTS training. V100 `bf16` is acceptable for inference checks only.
+
 # Building piper-phonemize C++ extension
 After modifying C++ code in `src/phonemizer/src/`:
 ```bash

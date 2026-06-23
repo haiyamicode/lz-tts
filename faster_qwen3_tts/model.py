@@ -6,20 +6,42 @@ CUDA graphs for 6-10x speedup.
 """
 import logging
 import os
+import json
 from collections import OrderedDict
 from pathlib import Path
 from types import MethodType
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple, Union
 
+import librosa
 import numpy as np
 import soundfile as sf
 import torch
+from peft import PeftModel
 
 from .utils import suppress_flash_attn_warning
 
 logger = logging.getLogger(__name__)
 CUDA_GRAPH_BATCH_SIZES = (1, 3, 5)
 MAX_CUDA_GRAPH_BATCH_SIZE = max(CUDA_GRAPH_BATCH_SIZES)
+VIETNAMESE_CODEC_LANGUAGE_ID = 2072
+
+
+def ensure_vietnamese_codec_language_id(base_model, language_id: int = VIETNAMESE_CODEC_LANGUAGE_ID) -> None:
+    """Register the custom Vietnamese codec language marker without resizing embeddings."""
+    model = getattr(base_model, "model", base_model)
+    talker_config = getattr(getattr(model, "config", None), "talker_config", None)
+    if talker_config is None:
+        return
+    codec_language_id = getattr(talker_config, "codec_language_id", None)
+    if codec_language_id is None:
+        codec_language_id = {}
+        talker_config.codec_language_id = codec_language_id
+    existing = codec_language_id.get("vietnamese")
+    if existing is not None and int(existing) != int(language_id):
+        raise ValueError(
+            f"Vietnamese codec language id mismatch: config has {existing}, expected {language_id}"
+        )
+    codec_language_id["vietnamese"] = int(language_id)
 
 
 class FasterQwen3TTS:
@@ -517,6 +539,10 @@ class FasterQwen3TTS:
         if not device.startswith("cuda") or not torch.cuda.is_available():
             raise ValueError("CUDA graphs require CUDA device")
 
+        model_path = Path(model_name)
+        if (model_path.is_absolute() or model_name.startswith((".", "~"))) and not model_path.exists():
+            raise FileNotFoundError(f"checkpoint not found: {model_path}")
+
         dtype, audio_dtype = cls._resolve_dtypes(dtype, audio_dtype, device)
         attn_implementation = cls._resolve_attn_implementation(attn_implementation, device)
         
@@ -533,13 +559,37 @@ class FasterQwen3TTS:
             from qwen_tts import Qwen3TTSModel
         from .predictor_graph import PredictorGraph
         from .talker_graph import TalkerGraph
-        # Load base model using qwen-tts library
-        base_model = Qwen3TTSModel.from_pretrained(
-            model_name,
-            device_map=device,
-            torch_dtype=dtype,
-            attn_implementation=attn_implementation,
-        )
+        adapter_config_path = model_path / "adapter_config.json" if model_path.is_dir() else None
+        if adapter_config_path is not None and adapter_config_path.exists():
+            adapter_config = json.loads(adapter_config_path.read_text(encoding="utf-8"))
+            base_model_name = adapter_config.get("base_model_name_or_path")
+            meta_path = model_path / "lora_training_meta.json"
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                base_model_name = meta.get("init_model_path") or meta.get("base_model") or base_model_name
+            if not base_model_name:
+                raise ValueError(
+                    f"LoRA checkpoint at {model_path} is missing base_model_name_or_path"
+                )
+            logger.info("Detected LoRA adapter checkpoint; loading base model %s", base_model_name)
+            base_model = Qwen3TTSModel.from_pretrained(
+                base_model_name,
+                device_map=device,
+                torch_dtype=dtype,
+                attn_implementation=attn_implementation,
+            )
+            ensure_vietnamese_codec_language_id(base_model)
+            merged = PeftModel.from_pretrained(base_model.model, str(model_path), is_trainable=False).merge_and_unload()
+            base_model.model = merged
+        else:
+            # Load base model using qwen-tts library
+            base_model = Qwen3TTSModel.from_pretrained(
+                model_name,
+                device_map=device,
+                torch_dtype=dtype,
+                attn_implementation=attn_implementation,
+            )
+        ensure_vietnamese_codec_language_id(base_model)
         cls._patch_audio_frontend_dtype(base_model, audio_dtype)
         fp16_layer_indices = cls._apply_layer_precision(
             base_model,
@@ -816,7 +866,7 @@ class FasterQwen3TTS:
             if len(voice_clone_prompt) != len(input_ids):
                 raise ValueError(
                     f"voice_clone_prompt must have length {len(input_ids)}, got {len(voice_clone_prompt)}"
-                )
+            )
 
             vcp = self.model._prompt_items_to_voice_clone_prompt(voice_clone_prompt)
             ref_ids = []
@@ -915,12 +965,19 @@ class FasterQwen3TTS:
             return vcp, ref_ids, using_icl_mode
 
         if xvec_only:
-            prompt_items = self.model.create_voice_clone_prompt(
-                ref_audio=str(ref_audio),
-                ref_text="",
-                x_vector_only_mode=True,
-            )
-            spk_emb = prompt_items[0].ref_spk_embedding
+            normalized = self.model._normalize_audio_inputs(str(ref_audio))
+            wav, sr = normalized[0]
+            base_model = getattr(self.model, "model", None)
+            if base_model is None:
+                raise AttributeError("Underlying Qwen3TTSModel does not expose .model")
+            target_sr = int(base_model.speaker_encoder_sample_rate)
+            if int(sr) != target_sr:
+                wav = librosa.resample(
+                    y=wav.astype(np.float32),
+                    orig_sr=int(sr),
+                    target_sr=target_sr,
+                )
+            spk_emb = base_model.extract_speaker_embedding(audio=wav, sr=target_sr)
             vcp = dict(
                 ref_code=[None],
                 ref_spk_embedding=[spk_emb],

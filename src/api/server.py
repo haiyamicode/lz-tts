@@ -873,6 +873,17 @@ def _preload_piper_text_models() -> None:
 
     resolver = get_resolver(device=device)
     resolver.load()
+
+    try:
+        from ..piper.context_replacer import get_replacer
+        replacer = get_replacer(device=device)
+        replacer.load()
+        _LOGGER.info("Loaded context replacer")
+    except FileNotFoundError:
+        _LOGGER.info("Context replacer checkpoint not found, skipping")
+    except Exception:
+        _LOGGER.debug("Context replacer not available", exc_info=True)
+
     _LOGGER.info(
         "Loaded Sparrow text models semantic_models=%d heteronym_device=%s",
         semantic_count,

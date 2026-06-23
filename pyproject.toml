@@ -109,8 +109,21 @@ packages = ["src", "faster_qwen3_tts"]
 lz-tts = "src.cli:main"
 lz-tts-server = "src.api.server:run"
 
+[project.optional-dependencies]
+qwen-flash = [
+    "flash-attn>=2.8.3.post1",
+    "ninja>=1.13.0",
+    "packaging>=23.2",
+]
+
 [tool.uv]
 override-dependencies = ["hydra-core>=1.3.2", "omegaconf>=2.2"]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["packaging", { requirement = "torch", match-runtime = true }]
+
+[tool.uv.extra-build-variables]
+flash-attn = { MAX_JOBS = "24" }
 
 [tool.uv.sources]
 piper-phonemize = { path = "./src/phonemizer" }
