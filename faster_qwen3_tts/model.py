@@ -92,6 +92,50 @@ class FasterQwen3TTS:
         while len(self._voice_prompt_cache) > self.max_voice_prompt_cache_entries:
             self._voice_prompt_cache.popitem(last=False)
 
+    def rebuild_graph_wrappers(self) -> None:
+        """Rebuild generation wrappers after mutating the underlying talker model."""
+        from .predictor_graph import PredictorGraph
+        from .talker_graph import TalkerGraph
+
+        predictor_cache_dtypes = list(getattr(self.predictor_graph, "layer_cache_dtypes", ()))
+        talker_cache_dtypes = list(getattr(self.talker_graph, "layer_cache_dtypes", ()))
+
+        talker = self.model.model.talker
+        talker_config = self.model.model.config.talker_config
+        predictor = talker.code_predictor
+        pred_config = predictor.model.config
+
+        predictor_graph = PredictorGraph(
+            predictor,
+            pred_config,
+            talker_config.hidden_size,
+            device=self.device,
+            dtype=self.dtype,
+            do_sample=True,
+            top_k=50,
+            temperature=0.9,
+        )
+        for layer_idx, cache_dtype in enumerate(predictor_cache_dtypes):
+            if cache_dtype != self.dtype:
+                predictor_graph.set_layer_cache_dtype(layer_idx, cache_dtype)
+
+        talker_graph = TalkerGraph(
+            talker.model,
+            talker_config,
+            device=self.device,
+            dtype=self.dtype,
+            max_seq_len=self.max_seq_len,
+        )
+        for layer_idx, cache_dtype in enumerate(talker_cache_dtypes):
+            if cache_dtype != self.dtype:
+                talker_graph.set_layer_cache_dtype(layer_idx, cache_dtype)
+
+        self.predictor_graph = predictor_graph
+        self.talker_graph = talker_graph
+        self._batch_graphs.clear()
+        self._warmed_up = False
+        logger.info("Rebuilt FasterQwen3TTS graph wrappers after model mutation")
+
     @staticmethod
     def _get_speech_tokenizer(base_model):
         """Return the nested qwen-tts speech tokenizer when available."""
@@ -1596,6 +1640,7 @@ class FasterQwen3TTS:
         append_silence: bool = True,
         instruct: Optional[Union[str, List[Optional[str]]]] = None,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
+        parity_mode: bool = False,
     ) -> Tuple[list, int]:
         """Generate a batch of voice-cloned utterances with the CUDA graph backend."""
         from .generate import fast_generate_batch_graph

@@ -32,7 +32,6 @@ _DEFAULT_CONTEXT_HIDDEN = 768
 _EMBED_DIM = 256
 _DROPOUT = 0.1
 _MAX_BERT_TOKENS = 128
-_ARCHITECTURE = "context_replacer_v1"
 
 
 @dataclass
@@ -50,19 +49,19 @@ def _get_num2words(lang: str) -> Callable:
     """Get a num2words function for a specific language, cached."""
     key = f"num2words:{lang}"
     if key not in _TRANSFORMS:
-        try:
-            from num2words import num2words as _n2w
+        from num2words import num2words as _n2w
 
-            def _convert(s: str, _lang: str = lang) -> str:
-                try:
-                    num = float(s) if "." in s else int(s)
-                    return _n2w(num, lang=_lang)
-                except Exception:
-                    return s
+        def _convert(s: str, _lang: str = lang) -> str:
+            normalized = s.strip()
+            if re.fullmatch(r"\d{1,3}(?:[.,]\d{3}){1,}", normalized):
+                value = int(re.sub(r"[.,]", "", normalized))
+            elif re.fullmatch(r"\d+[.,]\d+", normalized):
+                value = float(normalized.replace(",", "."))
+            else:
+                value = int(normalized)
+            return _n2w(value, lang=_lang)
 
-            _TRANSFORMS[key] = _convert
-        except ImportError:
-            _TRANSFORMS[key] = lambda s: s
+        _TRANSFORMS[key] = _convert
     return _TRANSFORMS[key]
 
 
@@ -219,9 +218,7 @@ def _segment_and_find_matches(
             sub_end = sub_start + len(sub_piece)
             entry = lookup.get(sub_piece.lower())
             if entry is not None:
-                if language and entry.language and entry.language != language:
-                    pass
-                else:
+                if not (language and entry.language and entry.language != language):
                     matches.append(_Match(
                         start=sub_start,
                         end=sub_end,
@@ -344,7 +341,7 @@ class ContextReplacer:
                             always_replace=rule.get("always_replace", False),
                         )
 
-        if not self._lookup:
+        if not self._lookup and not self._pattern_rules:
             _LOGGER.warning("No replacement rules loaded")
 
         self._model = ContextReplacerClassifier(

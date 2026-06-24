@@ -71,7 +71,6 @@ dependencies = [
     "g2pkk>=0.1.1",
     "jamo==0.4.1",
     "langid==1.1.6",
-    "num2words==0.5.12",
     "pypinyin==0.50.0",
     "txtsplit>=1.0.0",
     "unidic==1.1.0",
@@ -93,6 +92,9 @@ dependencies = [
     "onnxruntime-gpu>=1.23.2",
     "zstandard>=0.25.0",
     "asgi-compression>=0.1.1",
+    "semantic-text-splitter>=0.32.0",
+    "datasets>=5.0.0",
+    "tiktoken>=0.13.0",
 ]
 
 [build-system]

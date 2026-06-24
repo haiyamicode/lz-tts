@@ -8,6 +8,7 @@ import re
 import subprocess
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -38,11 +39,12 @@ QWEN_DEFAULT_TEMPERATURE = 0.9
 QWEN_DEFAULT_TOP_K = 50
 QWEN_DEFAULT_TOP_P = 1.0
 QWEN_DEFAULT_REPETITION_PENALTY = 1.03
-QWEN_DEFAULT_XVEC_ONLY = True
+QWEN_DEFAULT_XVEC_ONLY = False
 QWEN_DEFAULT_NON_STREAMING_MODE = True
 QWEN_DEFAULT_EXPRESSIVENESS = 1.0
 QWEN_DP_BUDGET_DEFAULT = True
 QWEN_CONTEXT_REPLACEMENTS_ENABLED = True
+QWEN_DEFAULT_VIETNAMESE_LORA_MODEL = ""
 QWEN_BATCH_BUCKETS = (1, 3, 5)
 QWEN_MODEL_MAX_BATCH_SIZE = max(QWEN_BATCH_BUCKETS)
 QWEN_MAX_BATCH_SIZE = max(
@@ -70,20 +72,29 @@ EXPRESSIVENESS_PRESETS = {
 
 router = APIRouter(prefix="/qwen3", tags=["qwen3"])
 model: Optional[Any] = None
-parakeet_model: Optional[Any] = None
-parakeet_device: Optional[torch.device] = None
+vietnamese_model: Optional[Any] = None
+reference_transcription_model: Optional[Any] = None
+reference_transcription_processor: Optional[Any] = None
+reference_transcription_device: Optional[torch.device] = None
+reference_transcription_dtype: Optional[torch.dtype] = None
 silero_vad_detector: Optional[Any] = None
 dp_budget_model: Optional[Any] = None
 inference_lock = threading.Lock()
-parakeet_lock = threading.Lock()
+vietnamese_model_load_lock = threading.Lock()
+reference_transcription_lock = threading.Lock()
 model_load_lock = threading.Lock()
 dp_budget_load_lock = threading.Lock()
 silero_vad_lock = threading.Lock()
 model_ready_event = threading.Event()
+vietnamese_model_ready_event = threading.Event()
 model_loading = False
+vietnamese_model_loading = False
 model_load_error: Optional[str] = None
+vietnamese_model_load_error: Optional[str] = None
 model_load_started_at: Optional[float] = None
 model_load_finished_at: Optional[float] = None
+vietnamese_model_load_started_at: Optional[float] = None
+vietnamese_model_load_finished_at: Optional[float] = None
 _qwen_language_splitter: Optional[Any] = None
 
 QWEN_LANGUAGE_NAMES = {
@@ -160,6 +171,7 @@ class QwenSettings(BaseModel):
     preload: bool = True
     preload_background: bool = True
     model: str = QWEN_DEFAULT_MODEL
+    viet_lora_model: str = QWEN_DEFAULT_VIETNAMESE_LORA_MODEL
     device: str = "cuda"
     precision_mode: str = "config"
     dtype: str = QWEN_DEFAULT_DTYPE
@@ -177,6 +189,7 @@ class QwenSettings(BaseModel):
     max_new_tokens: int = QWEN_DEFAULT_MAX_NEW_TOKENS
     xvec_only: bool = QWEN_DEFAULT_XVEC_ONLY
     non_streaming_mode: bool = QWEN_DEFAULT_NON_STREAMING_MODE
+    disable_cuda_graph: bool = False
     temperature: float = QWEN_DEFAULT_TEMPERATURE
     top_k: int = QWEN_DEFAULT_TOP_K
     top_p: float = QWEN_DEFAULT_TOP_P
@@ -256,6 +269,7 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
 
     string_overrides = {
         "QWEN_TTS_MODEL": "model",
+        "QWEN_TTS_VIETNAMESE_LORA_MODEL": "viet_lora_model",
         "QWEN_TTS_DEVICE": "device",
         "QWEN_TTS_DTYPE": "dtype",
         "QWEN_TTS_AUDIO_DTYPE": "audio_dtype",
@@ -300,6 +314,7 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
         "QWEN_TTS_WARMUP": "warmup",
         "QWEN_TTS_XVEC_ONLY": "xvec_only",
         "QWEN_TTS_NON_STREAMING_MODE": "non_streaming_mode",
+        "QWEN_TTS_DISABLE_CUDA_GRAPH": "disable_cuda_graph",
     }
     for env_name, attr in bool_overrides.items():
         if os.environ.get(env_name) is not None:
@@ -309,9 +324,23 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
 
 
 def configure(settings: QwenSettings) -> None:
-    global _qwen_settings, dp_budget_model
+    global _qwen_settings, dp_budget_model, model, vietnamese_model
+    global model_loading, vietnamese_model_loading, model_load_error, vietnamese_model_load_error
+    global model_load_started_at, model_load_finished_at, vietnamese_model_load_started_at, vietnamese_model_load_finished_at
     _qwen_settings = settings
     dp_budget_model = None
+    model = None
+    vietnamese_model = None
+    model_loading = False
+    vietnamese_model_loading = False
+    model_load_error = None
+    vietnamese_model_load_error = None
+    model_load_started_at = None
+    model_load_finished_at = None
+    vietnamese_model_load_started_at = None
+    vietnamese_model_load_finished_at = None
+    model_ready_event.clear()
+    vietnamese_model_ready_event.clear()
 
 
 def demo_defaults() -> dict[str, Any]:
@@ -323,6 +352,7 @@ def demo_defaults() -> dict[str, Any]:
         "repetition_penalty": _qwen_settings.repetition_penalty,
         "xvec_only": _qwen_settings.xvec_only,
         "non_streaming_mode": _qwen_settings.non_streaming_mode,
+        "disable_cuda_graph": _qwen_settings.disable_cuda_graph,
         "dp_budget": _qwen_settings.dp_budget.enabled,
         "precision_mode": _qwen_settings.precision_mode,
     }
@@ -437,6 +467,30 @@ def normalize_qwen_language(language: str) -> str:
     return QWEN_LANGUAGE_NAMES.get(requested_lower) or QWEN_LANGUAGE_CODES.get(requested_lower) or requested
 
 
+def _is_vietnamese_qwen_language(language: str) -> bool:
+    return language.strip().lower() == "vietnamese"
+
+
+def _qwen_model_key_for_language(language: str) -> str:
+    if _is_vietnamese_qwen_language(language) and _qwen_settings.viet_lora_model.strip():
+        return "vietnamese"
+    return "base"
+
+
+def _qwen_model_label_for_key(key: str) -> str:
+    return "Vietnamese LoRA" if key == "vietnamese" else "base"
+
+
+def _qwen_model_context(model_obj: Any, use_vietnamese_lora: bool):
+    if use_vietnamese_lora:
+        return nullcontext()
+    adapter_owner = getattr(getattr(model_obj, "model", None), "model", None)
+    adapter = getattr(adapter_owner, "disable_adapter", None)
+    if callable(adapter):
+        return adapter()
+    return nullcontext()
+
+
 def resolve_qwen_language_code(language_code: str) -> ResolvedQwenLanguage:
     requested = language_code.strip()
     if _is_auto_language_value(requested):
@@ -474,12 +528,18 @@ def resolve_qwen_language(
 def model_status() -> dict[str, Any]:
     return {
         "model_loaded": model is not None,
+        "vietnamese_model_loaded": model is not None and bool(_qwen_settings.viet_lora_model.strip()),
         "model_loading": model_loading,
+        "vietnamese_model_loading": model_loading,
         "model_load_error": model_load_error,
+        "vietnamese_model_load_error": model_load_error,
         "model_load_started_at": model_load_started_at,
         "model_load_finished_at": model_load_finished_at,
+        "vietnamese_model_load_started_at": model_load_started_at,
+        "vietnamese_model_load_finished_at": model_load_finished_at,
         "precision_mode": _qwen_settings.precision_mode,
         "model": _qwen_settings.model,
+        "viet_lora_model": _qwen_settings.viet_lora_model,
         "dtype": _qwen_settings.dtype,
         "audio_dtype": _qwen_settings.audio_dtype,
         "attn": _qwen_settings.attn,
@@ -492,11 +552,10 @@ def model_status() -> dict[str, Any]:
     }
 
 
-def _load_model_unlocked() -> Any:
+def _load_model_unlocked(model_name: str) -> Any:
     import torch
     from faster_qwen3_tts import FasterQwen3TTS
 
-    model_name = _qwen_settings.model
     device = _qwen_settings.device
     dtype_name = _qwen_settings.dtype
     if dtype_name.lower() == "auto":
@@ -539,16 +598,52 @@ def _load_model_unlocked() -> Any:
         attn_implementation=attn_implementation,
         max_seq_len=max_seq_len,
     )
-    if _qwen_settings.warmup and hasattr(loaded_model, "_warmup"):
+    if not _qwen_settings.disable_cuda_graph and _qwen_settings.warmup and hasattr(loaded_model, "_warmup"):
         _LOGGER.info("Capturing CUDA graphs...")
         loaded_model._warmup(prefill_len=100)
         if hasattr(loaded_model, "capture_batch_graphs"):
             _LOGGER.info("Capturing Qwen batch CUDA graph buckets: %s...", QWEN_BATCH_BUCKETS)
             loaded_model.capture_batch_graphs(QWEN_BATCH_BUCKETS, prefill_len=100)
+    elif _qwen_settings.disable_cuda_graph:
+        _LOGGER.info("CUDA graph capture disabled by configuration; using eager/dynamic-cache path.")
     if hasattr(loaded_model, "max_voice_prompt_cache_entries"):
         loaded_model.max_voice_prompt_cache_entries = _qwen_settings.voice_prompt_cache_entries
     _LOGGER.info("FasterQwen3TTS loaded. Sample rate: %s", loaded_model.sample_rate)
     return loaded_model
+
+
+def _load_base_model_unlocked() -> Any:
+    loaded_model = _load_model_unlocked(_qwen_settings.model)
+    viet_lora_model = _qwen_settings.viet_lora_model.strip()
+    if viet_lora_model:
+        adapter_path = Path(viet_lora_model)
+        if not adapter_path.exists():
+            raise FileNotFoundError(f"Vietnamese LoRA checkpoint not found: {adapter_path}")
+        _LOGGER.info("Attaching Vietnamese LoRA adapter checkpoint: %s", viet_lora_model)
+        from peft import PeftModel
+
+        loaded_model.model.model = PeftModel.from_pretrained(
+            loaded_model.model.model,
+            str(adapter_path),
+            is_trainable=False,
+        )
+        loaded_model.model.model.eval()
+        rebuild_graph_wrappers = getattr(loaded_model, "rebuild_graph_wrappers", None)
+        if callable(rebuild_graph_wrappers):
+            rebuild_graph_wrappers()
+        active_adapters = getattr(loaded_model.model.model, "active_adapters", None)
+        if callable(active_adapters):
+            active_adapters = active_adapters()
+        _LOGGER.info(
+            "Vietnamese LoRA adapter attached: model_type=%s active_adapters=%s",
+            type(loaded_model.model.model).__name__,
+            active_adapters or getattr(loaded_model.model.model, "active_adapter", None),
+        )
+    return loaded_model
+
+
+def _load_vietnamese_model_unlocked() -> Any:
+    return get_model()
 
 
 def get_model() -> Any:
@@ -565,7 +660,7 @@ def get_model() -> Any:
         model_load_finished_at = None
         model_ready_event.clear()
         try:
-            model = _load_model_unlocked()
+            model = _load_base_model_unlocked()
             model_load_error = None
             return model
         except Exception as e:
@@ -577,43 +672,42 @@ def get_model() -> Any:
             model_ready_event.set()
 
 
+def get_vietnamese_model() -> Any | None:
+    return get_model()
+
+
+def get_qwen_model_for_language(language: str) -> Any:
+    if _qwen_model_key_for_language(language) == "vietnamese":
+        viet_model = get_vietnamese_model()
+        if viet_model is not None:
+            return viet_model
+    return get_model()
+
+
 def _apply_context_replacements(text: str, dp_language: str) -> str:
     """Apply context-aware text replacements (e.g. AI -> ây ai) if enabled."""
     if not QWEN_CONTEXT_REPLACEMENTS_ENABLED:
         return text
-    try:
-        from ..piper.context_replacer import get_replacer
-        replacer = get_replacer()
-        return replacer.apply_replacements(text, language=dp_language)
-    except FileNotFoundError:
-        return text
-    except Exception:
-        _LOGGER.debug("Context replacer not available, skipping", exc_info=True)
-        return text
+    from ..piper.context_replacer import get_replacer
+    replacer = get_replacer()
+    return replacer.apply_replacements(text, language=dp_language)
 
 
 def _apply_context_replacements_batch(texts: list[str], dp_languages: list[str]) -> list[str]:
     """Apply context-aware text replacements for a batch of texts."""
     if not QWEN_CONTEXT_REPLACEMENTS_ENABLED:
         return texts
-    try:
-        from ..piper.context_replacer import get_replacer
-        replacer = get_replacer()
-        # Group by language for efficient batch processing
-        unique_langs = set(dp_languages)
-        results = list(texts)
-        for lang in unique_langs:
-            indices = [i for i, l in enumerate(dp_languages) if l == lang]
-            lang_texts = [texts[i] for i in indices]
-            replaced = replacer.apply_replacements_many(lang_texts, language=lang)
-            for i, new_text in zip(indices, replaced):
-                results[i] = new_text
-        return results
-    except FileNotFoundError:
-        return texts
-    except Exception:
-        _LOGGER.debug("Context replacer not available, skipping", exc_info=True)
-        return texts
+    from ..piper.context_replacer import get_replacer
+    replacer = get_replacer()
+    unique_langs = set(dp_languages)
+    results = list(texts)
+    for lang in unique_langs:
+        indices = [i for i, l in enumerate(dp_languages) if l == lang]
+        lang_texts = [texts[i] for i in indices]
+        replaced = replacer.apply_replacements_many(lang_texts, language=lang)
+        for i, new_text in zip(indices, replaced):
+            results[i] = new_text
+    return results
 
 
 def _preload_worker(include_dp_budget: bool) -> None:
@@ -705,40 +799,55 @@ def predict_dp_budget_batch(
     return get_dp_budget_model().predict_batch(texts, languages=languages)
 
 
-def get_parakeet_model() -> Any:
-    global parakeet_model, parakeet_device
-    if parakeet_model is None:
-        from nano_parakeet import from_pretrained as parakeet_from_pretrained
-        from nano_parakeet.model import ParakeetTDT
+def _resolve_reference_transcription_dtype() -> torch.dtype:
+    dtype_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_DTYPE", "bf16").strip().lower()
+    if dtype_name in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if dtype_name in {"fp16", "float16"}:
+        return torch.float16
+    if dtype_name in {"fp32", "float32"}:
+        return torch.float32
+    raise RuntimeError(f"Unsupported QWEN_TTS_REFERENCE_TRANSCRIPTION_DTYPE={dtype_name!r}")
 
-        device = os.environ.get("NANO_PARAKEET_DEVICE", "cuda").strip() or "cuda"
-        if device == "cuda":
-            device = "cuda:0"
-        parakeet_device = torch.device(device)
-        disable_cuda_graph = env_bool("NANO_PARAKEET_DISABLE_CUDA_GRAPH", False)
-        original_build_decode_graph = None
-        if disable_cuda_graph and parakeet_device.type == "cuda":
-            original_build_decode_graph = ParakeetTDT._build_decode_graph
-            ParakeetTDT._build_decode_graph = lambda self, device: None
-        _LOGGER.info("Loading transcription model (nano-parakeet)...")
-        try:
-            dtype = torch.float32 if disable_cuda_graph and parakeet_device.type == "cuda" else None
-            if parakeet_device.type == "cuda":
-                with torch.cuda.device(parakeet_device):
-                    parakeet_model = parakeet_from_pretrained(device=device, dtype=dtype)
-            else:
-                parakeet_model = parakeet_from_pretrained(device=device, dtype=dtype)
-            if disable_cuda_graph and parakeet_device.type == "cuda":
-                parakeet_model._build_decode_graph = lambda device: None
-        finally:
-            if original_build_decode_graph is not None:
-                ParakeetTDT._build_decode_graph = original_build_decode_graph
+
+def get_reference_transcription_model() -> tuple[Any, Any, torch.device, torch.dtype]:
+    global reference_transcription_model
+    global reference_transcription_processor
+    global reference_transcription_device
+    global reference_transcription_dtype
+
+    if reference_transcription_model is None:
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        model_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_MODEL", "openai/whisper-base").strip()
+        device_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_DEVICE", "cuda").strip() or "cuda"
+        if device_name == "cuda":
+            device_name = "cuda:0"
+        reference_transcription_device = torch.device(device_name)
+        reference_transcription_dtype = _resolve_reference_transcription_dtype()
+
         _LOGGER.info(
-            "Transcription model ready on %s (cuda_graph=%s).",
-            device,
-            "disabled" if disable_cuda_graph and parakeet_device.type == "cuda" else "enabled",
+            "Loading reference transcription model: model=%s device=%s dtype=%s",
+            model_name,
+            reference_transcription_device,
+            reference_transcription_dtype,
         )
-    return parakeet_model
+        reference_transcription_processor = WhisperProcessor.from_pretrained(model_name)
+        reference_transcription_model = WhisperForConditionalGeneration.from_pretrained(model_name).eval()
+        reference_transcription_model.to(reference_transcription_device)
+        if reference_transcription_dtype != torch.float32:
+            reference_transcription_model.to(dtype=reference_transcription_dtype)
+        _LOGGER.info("Reference transcription model ready.")
+
+    assert reference_transcription_processor is not None
+    assert reference_transcription_device is not None
+    assert reference_transcription_dtype is not None
+    return (
+        reference_transcription_model,
+        reference_transcription_processor,
+        reference_transcription_device,
+        reference_transcription_dtype,
+    )
 
 
 def get_silero_vad_detector() -> Any:
@@ -913,19 +1022,54 @@ def sanitize_prompt_text(text: str) -> str:
 
 
 def transcribe_voice_sample(audio_file: Path) -> str:
-    transcript_file = audio_file.with_suffix(".parakeet.txt")
+    model_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_MODEL", "openai/whisper-base").strip()
+    language = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_LANGUAGE", "vi").strip() or "vi"
+    safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", model_name).strip("_") or "whisper"
+    transcript_file = audio_file.with_suffix(f".{safe_model_name}.{language}.txt")
     if transcript_file.exists():
         transcript = transcript_file.read_text(encoding="utf-8").strip()
         if transcript:
             return transcript
 
-    parakeet = get_parakeet_model()
-    with parakeet_lock, torch.inference_mode():
-        if parakeet_device is not None and parakeet_device.type == "cuda":
-            with torch.cuda.device(parakeet_device):
-                text = parakeet.transcribe(str(audio_file)).strip()
+    transcriber, processor, device, dtype = get_reference_transcription_model()
+    audio, sample_rate = sf.read(audio_file, dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    audio = np.asarray(audio, dtype=np.float32)
+    if sample_rate != 16000:
+        import torchaudio
+
+        audio_tensor = torch.from_numpy(audio).unsqueeze(0)
+        audio = (
+            torchaudio.functional.resample(audio_tensor, sample_rate, 16000)
+            .squeeze(0)
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+
+    inputs = processor(
+        audio,
+        sampling_rate=16000,
+        return_tensors="pt",
+        return_attention_mask=True,
+    )
+    input_features = inputs.input_features.to(device=device, dtype=dtype)
+    generate_kwargs: dict[str, Any] = {
+        "task": "transcribe",
+        "language": language,
+    }
+    attention_mask = getattr(inputs, "attention_mask", None)
+    if attention_mask is not None:
+        generate_kwargs["attention_mask"] = attention_mask.to(device=device)
+
+    with reference_transcription_lock, torch.inference_mode():
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                predicted_ids = transcriber.generate(input_features, **generate_kwargs)
         else:
-            text = parakeet.transcribe(str(audio_file)).strip()
+            predicted_ids = transcriber.generate(input_features, **generate_kwargs)
+    text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
     if not text:
         try:
             audio_info = sf.info(audio_file)
@@ -937,8 +1081,9 @@ def transcribe_voice_sample(audio_file: Path) -> str:
             )
         except Exception as e:
             debug = f"path={audio_file} size_bytes={audio_file.stat().st_size} info_error={e}"
-        raise EmptyVoiceTranscriptError(f"nano-parakeet transcript completed with empty text ({debug})")
+        raise EmptyVoiceTranscriptError(f"Whisper transcript completed with empty text ({debug})")
     transcript_file.write_text(text, encoding="utf-8")
+    _LOGGER.info("Reference audio transcribed with Whisper: path=%s text=%s", audio_file, text)
     return text
 
 
@@ -1291,28 +1436,30 @@ def _resolve_voice_prompt(req: SynthesizeRequest) -> tuple[Path, str, bool]:
 
 
 def _generate_qwen_mp3(
+    model_obj: Any,
     req: SynthesizeRequest,
     sample_path: Path,
     prompt_text: str,
     xvec_only: bool,
+    use_vietnamese_lora: bool,
     settings: _ResolvedGenerationSettings,
 ) -> tuple[bytes, dict[str, Any]]:
-    m = get_model()
     text = _apply_context_replacements(req.text, settings.dp_language)
-    audio_list, sample_rate = m.generate_voice_clone(
-        text=text,
-        language=settings.language,
-        ref_audio=str(sample_path),
-        ref_text=prompt_text,
-        max_new_tokens=settings.max_new_tokens,
-        temperature=settings.temperature,
-        top_k=settings.top_k,
-        top_p=settings.top_p,
-        repetition_penalty=settings.repetition_penalty,
-        xvec_only=xvec_only,
-        non_streaming_mode=settings.non_streaming_mode,
-        append_silence=True,
-    )
+    with _qwen_model_context(model_obj, use_vietnamese_lora):
+        audio_list, sample_rate = model_obj.generate_voice_clone(
+            text=text,
+            language=settings.language,
+            ref_audio=str(sample_path),
+            ref_text=prompt_text,
+            max_new_tokens=settings.max_new_tokens,
+            temperature=settings.temperature,
+            top_k=settings.top_k,
+            top_p=settings.top_p,
+            repetition_penalty=settings.repetition_penalty,
+            xvec_only=xvec_only,
+            non_streaming_mode=settings.non_streaming_mode,
+            append_silence=True,
+        )
 
     wav_data = _concat_qwen_audio(audio_list)
     if wav_data.size == 0:
@@ -1373,17 +1520,18 @@ def _qwen_audio_level(wav_data: np.ndarray) -> dict[str, float]:
 
 
 def _generate_qwen_batch_mp3(
+    model_obj: Any,
     item_requests: list[SynthesizeRequest],
     voice_clone_prompts: list[Any],
     settings_list: list[_ResolvedGenerationSettings],
     xvec_only: bool,
+    use_vietnamese_lora: bool,
 ) -> list[tuple[bytes, dict[str, Any]] | None]:
     if len(item_requests) != len(settings_list) or len(item_requests) != len(voice_clone_prompts):
         raise ValueError("item_requests, voice_clone_prompts, and settings_list length mismatch")
 
     dummy_mask = [_is_qwen_batch_dummy(item) for item in item_requests]
-    m = get_model()
-    if not hasattr(m, "generate_voice_clone_batch"):
+    if not hasattr(model_obj, "generate_voice_clone_batch"):
         raise HTTPException(500, "Loaded Qwen backend does not support true batch generation")
 
     first_real_index = next(
@@ -1397,21 +1545,22 @@ def _generate_qwen_batch_mp3(
         [item.text for item in item_requests],
         [settings.dp_language for settings in settings_list],
     )
-    audio_list, sample_rate = m.generate_voice_clone_batch(
-        texts=texts,
-        language=[settings.language for settings in settings_list],
-        ref_audio=None,
-        ref_text="",
-        max_new_tokens=[settings.max_new_tokens for settings in settings_list],
-        temperature=first.temperature,
-        top_k=first.top_k,
-        top_p=first.top_p,
-        repetition_penalty=first.repetition_penalty,
-        xvec_only=xvec_only,
-        non_streaming_mode=first.non_streaming_mode,
-        append_silence=True,
-        voice_clone_prompt=voice_clone_prompts,
-    )
+    with _qwen_model_context(model_obj, use_vietnamese_lora):
+        audio_list, sample_rate = model_obj.generate_voice_clone_batch(
+            texts=texts,
+            language=[settings.language for settings in settings_list],
+            ref_audio=None,
+            ref_text="",
+            max_new_tokens=[settings.max_new_tokens for settings in settings_list],
+            temperature=first.temperature,
+            top_k=first.top_k,
+            top_p=first.top_p,
+            repetition_penalty=first.repetition_penalty,
+            xvec_only=xvec_only,
+            non_streaming_mode=first.non_streaming_mode,
+            append_silence=True,
+            voice_clone_prompt=voice_clone_prompts,
+        )
 
     if len(audio_list) != len(texts):
         raise HTTPException(500, f"Model produced {len(audio_list)} outputs for {len(texts)} inputs")
@@ -1497,23 +1646,25 @@ def _make_qwen_batch_dummy_settings(
 
 
 def _create_voice_clone_prompt_item(
+    model_obj: Any,
     sample_path: Path,
     prompt_text: str,
     xvec_only: bool,
+    use_vietnamese_lora: bool,
 ) -> Any:
-    m = get_model()
-    if xvec_only:
-        prompt_items = m.model.create_voice_clone_prompt(
-            ref_audio=str(sample_path),
-            ref_text="",
-            x_vector_only_mode=True,
-        )
-    else:
-        ref_audio_input = m._load_ref_audio_with_silence(sample_path, silence_secs=0.5)
-        prompt_items = m.model.create_voice_clone_prompt(
-            ref_audio=ref_audio_input,
-            ref_text=prompt_text,
-        )
+    with _qwen_model_context(model_obj, use_vietnamese_lora):
+        if xvec_only:
+            prompt_items = model_obj.model.create_voice_clone_prompt(
+                ref_audio=str(sample_path),
+                ref_text="",
+                x_vector_only_mode=True,
+            )
+        else:
+            ref_audio_input = model_obj._load_ref_audio_with_silence(sample_path, silence_secs=0.5)
+            prompt_items = model_obj.model.create_voice_clone_prompt(
+                ref_audio=ref_audio_input,
+                ref_text=prompt_text,
+            )
     if not prompt_items:
         raise HTTPException(500, "Failed to create Qwen voice clone prompt")
     return prompt_items[0]
@@ -1533,9 +1684,21 @@ def synthesize(req: SynthesizeRequest):
 
         sample_path, prompt_text, xvec_only = _resolve_voice_prompt(req)
         settings = _resolve_generation_settings(req)
+        backend_key = _qwen_model_key_for_language(settings.language)
+        qwen_model = get_qwen_model_for_language(settings.language)
+        use_vietnamese_lora = backend_key == "vietnamese"
 
         with inference_lock:
-            mp3_bytes, info = _generate_qwen_mp3(req, sample_path, prompt_text, xvec_only, settings)
+            mp3_bytes, info = _generate_qwen_mp3(
+                qwen_model,
+                req,
+                sample_path,
+                prompt_text,
+                xvec_only,
+                use_vietnamese_lora,
+                settings,
+            )
+            info["backend"] = backend_key
 
         _log_qwen_synthesize_request(
             status="ok",
@@ -1601,46 +1764,57 @@ def synthesize_batch(req: BatchSynthesizeRequest):
         )
 
     started = time.perf_counter()
-    items: list[BatchSynthesizeItem] = []
+    items: list[BatchSynthesizeItem | None] = [None] * len(item_requests)
     with inference_lock:
-        prompt_items = [
-            _create_voice_clone_prompt_item(
-                sample_path=sample_path,
-                prompt_text=prompt_text,
-                xvec_only=xvec_only,
-            )
-            for sample_path, prompt_text, xvec_only in resolved_prompts
-        ]
+        backend_keys = [_qwen_model_key_for_language(settings.language) for settings in settings_list]
+        grouped_indices: dict[str, list[int]] = {}
+        for index, backend_key in enumerate(backend_keys):
+            grouped_indices.setdefault(backend_key, []).append(index)
 
-        for chunk in _qwen_batch_chunks(len(item_requests)):
-            chunk_indices = list(chunk)
-            chunk_requests = [item_requests[index] for index in chunk_indices]
-            chunk_settings = [settings_list[index] for index in chunk_indices]
-            chunk_prompts = [prompt_items[index] for index in chunk_indices]
+        for backend_key, indices in grouped_indices.items():
+            model_obj = get_qwen_model_for_language(settings_list[indices[0]].language)
+            use_vietnamese_lora = backend_key == "vietnamese"
+            prompt_items_by_index = {
+                index: _create_voice_clone_prompt_item(
+                    model_obj=model_obj,
+                    sample_path=resolved_prompts[index][0],
+                    prompt_text=resolved_prompts[index][1],
+                    xvec_only=resolved_prompts[index][2],
+                    use_vietnamese_lora=use_vietnamese_lora,
+                )
+                for index in indices
+            }
 
-            bucket_size = _qwen_batch_bucket_size(len(chunk_requests))
-            padding_count = bucket_size - len(chunk_requests)
-            if padding_count:
-                dummy_request = _make_qwen_batch_dummy_request(chunk_requests[0])
-                dummy_settings = _make_qwen_batch_dummy_settings(chunk_settings[0])
-                dummy_prompt = chunk_prompts[0]
-                chunk_requests.extend(dummy_request for _ in range(padding_count))
-                chunk_settings.extend(dummy_settings for _ in range(padding_count))
-                chunk_prompts.extend(dummy_prompt for _ in range(padding_count))
+            for chunk_start in range(0, len(indices), QWEN_MODEL_MAX_BATCH_SIZE):
+                chunk_indices = indices[chunk_start : chunk_start + QWEN_MODEL_MAX_BATCH_SIZE]
+                chunk_requests = [item_requests[index] for index in chunk_indices]
+                chunk_settings = [settings_list[index] for index in chunk_indices]
+                chunk_prompts = [prompt_items_by_index[index] for index in chunk_indices]
 
-            generated = _generate_qwen_batch_mp3(
-                item_requests=chunk_requests,
-                voice_clone_prompts=chunk_prompts,
-                settings_list=chunk_settings,
-                xvec_only=xvec_modes[0],
-            )
+                bucket_size = _qwen_batch_bucket_size(len(chunk_requests))
+                padding_count = bucket_size - len(chunk_requests)
+                if padding_count:
+                    dummy_request = _make_qwen_batch_dummy_request(chunk_requests[0])
+                    dummy_settings = _make_qwen_batch_dummy_settings(chunk_settings[0])
+                    dummy_prompt = chunk_prompts[0]
+                    chunk_requests.extend(dummy_request for _ in range(padding_count))
+                    chunk_settings.extend(dummy_settings for _ in range(padding_count))
+                    chunk_prompts.extend(dummy_prompt for _ in range(padding_count))
 
-            for index, settings, generated_item in zip(chunk_indices, chunk_settings, generated):
-                if generated_item is None:
-                    raise HTTPException(500, "Model did not produce audio for a non-dummy item")
-                mp3_bytes, info = generated_item
-                items.append(
-                    BatchSynthesizeItem(
+                generated = _generate_qwen_batch_mp3(
+                    model_obj=model_obj,
+                    item_requests=chunk_requests,
+                    voice_clone_prompts=chunk_prompts,
+                    settings_list=chunk_settings,
+                    xvec_only=xvec_modes[0],
+                    use_vietnamese_lora=use_vietnamese_lora,
+                )
+
+                for index, settings, generated_item in zip(chunk_indices, chunk_settings, generated):
+                    if generated_item is None:
+                        raise HTTPException(500, "Model did not produce audio for a non-dummy item")
+                    mp3_bytes, info = generated_item
+                    items[index] = BatchSynthesizeItem(
                         text=texts[index],
                         audio_base64=base64.b64encode(mp3_bytes).decode("ascii"),
                         sample_rate=int(info["sample_rate"]),
@@ -1651,11 +1825,11 @@ def synthesize_batch(req: BatchSynthesizeRequest):
                         language=settings.language,
                         dp_language=settings.dp_language,
                     )
-                )
     wall_seconds = time.perf_counter() - started
+    final_items = [item for item in items if item is not None]
     return BatchSynthesizeResponse(
-        items=items,
-        count=len(items),
+        items=final_items,
+        count=len(final_items),
         wall_seconds=wall_seconds,
-        audio_seconds_total=sum(item.audio_seconds for item in items),
+        audio_seconds_total=sum(item.audio_seconds for item in final_items),
     )
