@@ -95,6 +95,7 @@ dependencies = [
     "semantic-text-splitter>=0.32.0",
     "datasets>=5.0.0",
     "tiktoken>=0.13.0",
+    "azure-cognitiveservices-speech>=1.50.0",
 ]
 
 [build-system]

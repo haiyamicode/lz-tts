@@ -174,6 +174,7 @@ class RootVoiceConfig(BaseModel):
     voice_id: str
     model: str
     speaker: Optional[str] = None
+    languages: Optional[list[str]] = None
 
 
 class EngineEnableConfig(BaseModel):
@@ -1029,17 +1030,41 @@ def _synthesize_multilingual(
     return np.concatenate(audio_parts, axis=0), sample_rate
 
 
-def _configured_root_voice(name: str) -> RootVoiceConfig | None:
-    return _server_config.pipertts.root_voices.get(name)
-
-
-def _root_voice_name(voice_id: str | None) -> str | None:
+def _configured_root_voice_for_voice_id(voice_id: str | None) -> RootVoiceConfig | None:
     if not voice_id:
         return None
-    for name, config in _server_config.pipertts.root_voices.items():
+    for config in _server_config.pipertts.root_voices.values():
         if config.voice_id == voice_id:
-            return name
+            return config
     return None
+
+
+def _default_root_voice() -> RootVoiceConfig | None:
+    for config in _server_config.pipertts.root_voices.values():
+        if config.languages is None:
+            return config
+    return None
+
+
+def _root_voice_can_synthesize_language(config: RootVoiceConfig, language: str | None) -> bool:
+    if config.languages is None:
+        return True
+    if language is None:
+        return False
+
+    normalized = _normalize_locale_with_region(language)
+    base_language = _get_base_language(normalized)
+
+    for config_language in config.languages:
+        config_language = _normalize_locale_with_region(config_language)
+        config_base_language = _get_base_language(config_language)
+        if "-" in config_language:
+            if normalized == config_language or normalized == config_base_language:
+                return True
+        elif base_language == config_base_language:
+            return True
+
+    return False
 
 
 def _seed_vc_base_id(embedding_key: str) -> str:
@@ -1426,16 +1451,13 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
     if forced_language is not None:
         _resolve_forced_language(forced_language)
 
-    voice_name = _root_voice_name(request.voice_id)
+    root_voice = _configured_root_voice_for_voice_id(request.voice_id)
     primary_speaker: str | None = None
     style, style_intensity = _seed_vc_style_from_request(request)
     style_requested = _seed_vc_style_requested(request)
-    if voice_name == "sparrow":
-        convert_all = forced_language == "en-GB"
-    elif voice_name == "sparrow_en_gb":
-        en_gb_voice = _configured_root_voice("sparrow_en_gb")
-        primary_speaker = forced_language if forced_language is not None else (en_gb_voice.speaker if en_gb_voice else "en-GB")
-        convert_all = forced_language is not None and _get_base_language(forced_language) != "en"
+    if root_voice is not None:
+        primary_speaker = forced_language if forced_language is not None else root_voice.speaker
+        convert_all = forced_language is not None and not _root_voice_can_synthesize_language(root_voice, forced_language)
     else:
         convert_all = True
 
@@ -1460,7 +1482,18 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
             forced_language=forced_language,
             validate_primary_speaker=False,
         )
-        if voice_name == "sparrow_en_gb" and any(_get_base_language(language) != "en" for language in languages):
+        if root_voice is not None:
+            fallback_root_voice = _default_root_voice()
+            for segment in segments:
+                if _root_voice_can_synthesize_language(root_voice, segment["lang"]):
+                    if root_voice.speaker is not None:
+                        segment["speaker"] = root_voice.speaker
+                    segment["model"] = root_voice.model
+                elif fallback_root_voice is not None:
+                    if fallback_root_voice.speaker is not None:
+                        segment["speaker"] = fallback_root_voice.speaker
+                    segment["model"] = fallback_root_voice.model
+        if root_voice is not None and any(not _root_voice_can_synthesize_language(root_voice, language) for language in languages):
             convert_item[item_idx] = True
         item_segments.append(segments)
         for segment_idx, segment in enumerate(segments):

@@ -110,6 +110,21 @@ def main() -> None:
         "--speaker-id", type=int, help="Add speaker id to single speaker dataset"
     )
     parser.add_argument(
+        "--default-speaker",
+        help=(
+            "Speaker label to use when LJSpeech metadata does not include a speaker "
+            "column. Useful for single-language slices that should still preserve the "
+            "original multilingual speaker map."
+        ),
+    )
+    parser.add_argument(
+        "--speaker-config",
+        help=(
+            "Path to a reference config.json whose speaker_id_map and "
+            "language_speakers should be copied into the generated dataset config."
+        ),
+    )
+    parser.add_argument(
         "--espeak-data",
         help="Path to espeak-ng-data directory (overrides packaged data)",
     )
@@ -168,6 +183,11 @@ def main() -> None:
     args.input_dir = Path(args.input_dir)
     args.output_dir = Path(args.output_dir)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    speaker_config: dict = {}
+    if args.speaker_config:
+        speaker_config_path = Path(args.speaker_config)
+        with speaker_config_path.open("r", encoding="utf-8") as speaker_config_file:
+            speaker_config = json.load(speaker_config_file)
 
     args.cache_dir = (
         Path(args.cache_dir)
@@ -231,15 +251,36 @@ def main() -> None:
         }
         language_config = {"code": "multilingual"}
 
+    configured_speaker_ids: Dict[str, int] = {}
+    configured_language_speakers: Dict[str, str] = {}
+    configured_num_speakers: Optional[int] = None
+    if speaker_config:
+        configured_speaker_ids = {
+            str(label): int(sid)
+            for label, sid in (speaker_config.get("speaker_id_map") or {}).items()
+        }
+        configured_language_speakers = {
+            str(label): str(speaker)
+            for label, speaker in (speaker_config.get("language_speakers") or {}).items()
+        }
+        raw_num_speakers = speaker_config.get("num_speakers")
+        if isinstance(raw_num_speakers, int):
+            configured_num_speakers = raw_num_speakers
+
     # Build language->speaker label mapping for inference routing
     language_speakers: Dict[str, str] = {}
-    if speaker_counts:
+    if configured_language_speakers:
+        language_speakers.update(configured_language_speakers)
+    elif speaker_counts:
         # Default: identity map for known labels
         for lbl in speaker_counts.keys():
             language_speakers[lbl] = lbl
         # Special-case: espeak 'cmn-latn-pinyin' voice corresponds to dataset label 'zh' when present
         if "zh" in speaker_counts:
             language_speakers.setdefault("cmn-latn-pinyin", "zh")
+
+    if configured_speaker_ids:
+        speaker_ids = configured_speaker_ids
 
     with open(args.output_dir / "config.json", "w", encoding="utf-8") as config_file:
         json.dump(
@@ -258,7 +299,9 @@ def main() -> None:
                 if args.phoneme_type == PhonemeType.TEXT
                 else get_espeak_map(),
                 "num_symbols": get_max_phonemes(),
-                "num_speakers": len(speaker_counts),
+                "num_speakers": configured_num_speakers
+                if configured_num_speakers is not None
+                else (len(speaker_ids) if speaker_ids else len(speaker_counts)),
                 "speaker_id_map": speaker_ids,
                 "language_speakers": language_speakers,
                 "piper_version": _VERSION,
@@ -1181,6 +1224,7 @@ def ljspeech_dataset(args: argparse.Namespace) -> Iterable[Utterance]:
         speaker: Optional[str] = None
         if is_single_speaker or (len(row) == 2):
             filename, text = row[0], row[-1]
+            speaker = args.default_speaker
         else:
             filename, speaker, text = row[0], row[1], row[2]
 

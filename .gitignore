@@ -12,6 +12,7 @@ wheels/
 # Data files
 local
 output
+outputs/
 data
 data/*
 !data/*/
