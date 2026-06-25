@@ -23,6 +23,8 @@ import uuid
 import wave
 from collections import OrderedDict
 from dataclasses import dataclass
+import multiprocessing as mp
+import queue
 from pathlib import Path
 from typing import Annotated, Any, Literal, Optional
 from urllib.parse import parse_qsl, urlencode
@@ -44,7 +46,7 @@ from ..ssml import BreakSegment, TextSegment, generate_silence, parse_ssml
 from ..matcha_inference import MatchaBackend as ProductionMatchaBackend
 from ..matcha_inference import MatchaBatcher as ProductionMatchaBatcher
 from . import qwen3
-from .qwen3 import router as qwen3_router
+from .qwen_worker import qwen_worker_main
 from .request_decompression import RequestDecompressionMiddleware
 from .rvc import RVCBackend, RVCSettings
 
@@ -122,6 +124,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+QWEN_WORKER_TIMEOUT_SECONDS = float(os.environ.get("QWEN_TTS_WORKER_TIMEOUT_SECONDS", "900"))
 
 
 def _resolve_project_path(value: str | Path) -> Path:
@@ -560,6 +565,10 @@ _seed_vc_backend: "_SeedVCBackend | None" = None
 _rvc_backend: "RVCBackend | None" = None
 _seed_vc_supported_voice_ids: set[str] | None = None
 _seed_vc_voice_ids: set[str] | None = None
+_qwen_worker_process: mp.Process | None = None
+_qwen_worker_requests: Any | None = None
+_qwen_worker_responses: Any | None = None
+_qwen_worker_lock = threading.Lock()
 
 _inference_counter = 0
 _CLEANUP_EVERY = 1
@@ -692,6 +701,93 @@ def _load_config() -> ServerConfig:
 def _engine_enabled(engine: Literal["pipertts", "qwen3", "matcha", "seed_vc", "rvc"], config: ServerConfig | None = None) -> bool:
     cfg = config or _server_config
     return bool(getattr(cfg.engines, engine))
+
+
+def _start_qwen_worker() -> None:
+    """Start the isolated Qwen worker process."""
+    global _qwen_worker_process, _qwen_worker_requests, _qwen_worker_responses
+    if _qwen_worker_process is not None and _qwen_worker_process.is_alive():
+        return
+
+    ctx = mp.get_context("spawn")
+    _qwen_worker_requests = ctx.Queue()
+    _qwen_worker_responses = ctx.Queue()
+    settings = _server_config.qwen.model_dump(mode="json")
+    _qwen_worker_process = ctx.Process(
+        target=qwen_worker_main,
+        args=(settings, _qwen_worker_requests, _qwen_worker_responses),
+        name="lz-tts-qwen-worker",
+        daemon=False,
+    )
+    _qwen_worker_process.start()
+
+
+def _stop_qwen_worker() -> None:
+    """Stop the isolated Qwen worker process."""
+    global _qwen_worker_process, _qwen_worker_requests, _qwen_worker_responses
+    process = _qwen_worker_process
+    requests = _qwen_worker_requests
+    if process is not None and process.is_alive() and requests is not None:
+        try:
+            requests.put({"action": "shutdown", "payload": None})
+            process.join(timeout=10)
+        except Exception:
+            _LOGGER.exception("Failed graceful Qwen worker shutdown")
+    if process is not None and process.is_alive():
+        process.terminate()
+        process.join(timeout=10)
+    _qwen_worker_process = None
+    _qwen_worker_requests = None
+    _qwen_worker_responses = None
+
+
+def _call_qwen_worker(action: str, payload: Any | None = None, *, timeout: float | None = None) -> dict[str, Any]:
+    """Call the Qwen worker process and return its serialized response."""
+    if not _engine_enabled("qwen3"):
+        raise HTTPException(status_code=503, detail="Qwen3 TTS backend is disabled")
+    _start_qwen_worker()
+    if (
+        _qwen_worker_process is None
+        or _qwen_worker_requests is None
+        or _qwen_worker_responses is None
+        or not _qwen_worker_process.is_alive()
+    ):
+        raise HTTPException(status_code=503, detail="Qwen3 worker is not running")
+
+    with _qwen_worker_lock:
+        try:
+            _qwen_worker_requests.put({"action": action, "payload": payload})
+            response = _qwen_worker_responses.get(timeout=timeout or QWEN_WORKER_TIMEOUT_SECONDS)
+        except queue.Empty as exc:
+            if _qwen_worker_process is not None and not _qwen_worker_process.is_alive():
+                raise HTTPException(status_code=503, detail="Qwen3 worker exited") from exc
+            raise HTTPException(status_code=504, detail="Qwen3 worker timed out") from exc
+
+    if not isinstance(response, dict):
+        raise HTTPException(status_code=502, detail="Qwen3 worker returned invalid response")
+    if response.get("ok"):
+        return response
+
+    status_code = int(response.get("status_code") or 500)
+    detail = response.get("detail") or response.get("error") or "Qwen3 worker failed"
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+def _qwen_worker_status() -> dict[str, Any]:
+    """Best-effort Qwen status without loading Qwen in the parent process."""
+    if not _engine_enabled("qwen3"):
+        return {"enabled": False}
+    try:
+        response = _call_qwen_worker("health", timeout=5)
+        data = response.get("data")
+        return data if isinstance(data, dict) else {"enabled": True, "worker": "invalid_response"}
+    except HTTPException as exc:
+        return {
+            "enabled": True,
+            "worker": "error",
+            "status_code": exc.status_code,
+            "detail": exc.detail,
+        }
 
 
 def _find_checkpoint(model_dir: Path) -> Path | None:
@@ -3253,8 +3349,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     if config is None:
         config = _load_config()
     _server_config = config
-    if _engine_enabled("qwen3", config):
-        qwen3.configure(config.qwen)
 
     app = FastAPI(
         title="LZ-TTS API",
@@ -3294,8 +3388,38 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         return await call_next(request)
 
     if _engine_enabled("qwen3", config):
-        app.include_router(qwen3_router)
         _mount_qwen_demo(app)
+
+        @app.get("/qwen3/health")
+        async def qwen3_health():
+            return await asyncio.to_thread(_qwen_worker_status)
+
+        @app.post("/qwen3/synthesize")
+        async def qwen3_synthesize(request: Request):
+            payload = await request.json()
+            req = qwen3.SynthesizeRequest(**payload)
+            result = await asyncio.to_thread(
+                _call_qwen_worker,
+                "synthesize",
+                req.model_dump(mode="json"),
+            )
+            media_type = str(result.get("media_type") or "audio/mpeg")
+            content = result.get("content") or b""
+            if not isinstance(content, bytes):
+                raise HTTPException(status_code=502, detail="Qwen3 worker returned invalid audio")
+            return _binary_response(content, media_type)
+
+        @app.post("/qwen3/synthesize/batch", response_model=qwen3.BatchSynthesizeResponse)
+        @app.post("/qwen3/synthesize-batch", response_model=qwen3.BatchSynthesizeResponse)
+        async def qwen3_synthesize_batch(request: Request):
+            payload = await request.json()
+            req = qwen3.BatchSynthesizeRequest(**payload)
+            result = await asyncio.to_thread(
+                _call_qwen_worker,
+                "synthesize_batch",
+                req.model_dump(mode="json"),
+            )
+            return result.get("data")
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -3363,16 +3487,14 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
         if _engine_enabled("qwen3"):
             with _logged_startup_step(
-                "qwen3",
+                "qwen3_worker",
                 model=_server_config.qwen.model,
                 device=_server_config.qwen.device,
                 dtype=_server_config.qwen.dtype,
                 dp_budget=_server_config.qwen.dp_budget.enabled,
             ):
-                qwen3.preload_model(
-                    background=False,
-                    include_dp_budget=_server_config.qwen.dp_budget.enabled,
-                )
+                _start_qwen_worker()
+                _call_qwen_worker("health", timeout=QWEN_WORKER_TIMEOUT_SECONDS)
         else:
             _LOGGER.info("Qwen3 TTS backend disabled")
 
@@ -3419,6 +3541,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             _LOGGER.info("RVC backend disabled")
 
         _LOGGER.info("Loaded server startup elapsed=%.2fs", time.perf_counter() - startup_started)
+
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        _stop_qwen_worker()
 
     @app.get("/")
     async def health():
@@ -3468,7 +3594,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             },
             "qwen3": {
                 "enabled": _engine_enabled("qwen3"),
-                **(qwen3.model_status() if _engine_enabled("qwen3") else {}),
+                **(_qwen_worker_status() if _engine_enabled("qwen3") else {}),
             },
             "matcha": {
                 "enabled": _engine_enabled("matcha"),
