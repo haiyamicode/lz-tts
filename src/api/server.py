@@ -539,8 +539,8 @@ def _request_model_input(request: BaseModel, **query_fields: Any) -> dict[str, A
 
 
 def _log_synthesize_batch_stage(stage: str, **data: Any) -> None:
-    _LOGGER.debug(
-        "Synthesize batch stage: %s",
+    _LOGGER.info(
+        "Synthesize stage: %s",
         json.dumps({"stage": stage, **data}, ensure_ascii=False, default=str),
     )
 
@@ -1605,6 +1605,14 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
     _log_synthesize_batch_stage(
         "configured_voice_routing",
         voice_id=request.voice_id,
+        forced_language=forced_language,
+        root_voice=bool(root_voice),
+        root_voice_id=root_voice.voice_id if root_voice is not None else None,
+        root_voice_model=root_voice.model if root_voice is not None else None,
+        root_voice_speaker=root_voice.speaker if root_voice is not None else None,
+        root_voice_languages=root_voice.languages if root_voice is not None else None,
+        primary_speaker=primary_speaker,
+        style_requested=style_requested,
         item_count=len(texts),
         item_segment_counts=[len(segments) for segments in item_segments],
         convert_indices=[idx for idx, value in enumerate(convert_item) if value],
@@ -3025,6 +3033,22 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
         for segment_idx, segment in enumerate(segments):
             record = {**segment, "item_idx": item_idx, "segment_idx": segment_idx}
             segment_groups.setdefault(segment["model"], []).append(record)
+
+    _log_synthesize_batch_stage(
+        "auto_multilingual_routing",
+        item_count=len(texts),
+        item_segment_counts=[len(segments) for segments in item_segments],
+        model_groups=[
+            {
+                "model": model_name,
+                "segment_count": len(records),
+                "item_indices": sorted({int(record["item_idx"]) for record in records}),
+                "speakers": sorted({str(record["speaker"]) for record in records}),
+                "languages": sorted({str(record["lang"]) for record in records}),
+            }
+            for model_name, records in segment_groups.items()
+        ],
+    )
 
     generated_segments: list[list[tuple[np.ndarray, int] | None]] = [
         [None for _ in segments]
