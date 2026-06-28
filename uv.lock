@@ -1091,12 +1091,20 @@ wheels = [
 [[package]]
 name = "flash-attn"
 version = "2.8.3.post1"
-source = { registry = "https://pypi.org/simple" }
+source = { path = "data/runtime-wheels/flash_attn-2.8.3.post1-cp310-cp310-linux_x86_64.whl" }
 dependencies = [
     { name = "einops" },
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/01/7a/92a46e7cd6bbb4d7b2855a457c3b855df54a97af5656d98fc92e58e61065/flash_attn-2.8.3.post1.tar.gz", hash = "sha256:55d5103ed846da8b56e0797acf4bde07dee4b1c7e8907fcfc6699c203030c348", size = 8451657, upload-time = "2026-06-11T04:35:21.318Z" }
+wheels = [
+    { filename = "flash_attn-2.8.3.post1-cp310-cp310-linux_x86_64.whl", hash = "sha256:8352387f602f01ece1a7dad8121280cf26cef96dab88e82f5cc11f37aeee111a" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "einops" },
+    { name = "torch" },
+]
 
 [[package]]
 name = "flatbuffers"
@@ -2190,7 +2198,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0,<0.116" },
     { name = "ffmpeg-normalize", specifier = ">=1.37.8" },
     { name = "ffmpeg-python", specifier = ">=0.2.0" },
-    { name = "flash-attn", marker = "extra == 'qwen-flash'", specifier = ">=2.8.3.post1" },
+    { name = "flash-attn", marker = "extra == 'qwen-flash'", path = "data/runtime-wheels/flash_attn-2.8.3.post1-cp310-cp310-linux_x86_64.whl" },
     { name = "fugashi", specifier = ">=1.5.0,<1.6" },
     { name = "funasr", specifier = ">=1.3.3" },
     { name = "g2p-en", specifier = "==2.1.0" },

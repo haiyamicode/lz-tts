@@ -38,6 +38,8 @@ _DEFAULTS: dict[str, Any] = {
     "gradient_clip_val": 0.0,
     "accumulate_grad_batches": 1,
     "checkpoint_epochs": 1,
+    "keep_last_checkpoints": 5,
+    "retain_every": 0,
     "batch_size": 1,
     "num_workers": 1,
     "use_length_buckets": False,

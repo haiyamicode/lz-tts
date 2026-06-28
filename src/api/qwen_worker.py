@@ -38,6 +38,7 @@ def qwen_worker_main(
     settings_data: dict[str, Any],
     request_queue: Any,
     response_queue: Any,
+    worker_name: str = "primary",
 ) -> None:
     """Run the Qwen model in a dedicated OS process.
 
@@ -46,14 +47,14 @@ def qwen_worker_main(
     """
     from . import qwen3
 
-    _LOGGER.info("Qwen worker starting pid=%s", os.getpid())
+    _LOGGER.info("Qwen worker starting name=%s pid=%s", worker_name, os.getpid())
     settings = qwen3.QwenSettings(**settings_data)
     qwen3.configure(settings)
     qwen3.preload_model(
         background=False,
         include_dp_budget=settings.dp_budget.enabled,
     )
-    _LOGGER.info("Qwen worker ready pid=%s", os.getpid())
+    _LOGGER.info("Qwen worker ready name=%s pid=%s", worker_name, os.getpid())
 
     while True:
         message = request_queue.get()
@@ -63,14 +64,16 @@ def qwen_worker_main(
                     "ok": False,
                     "status_code": 400,
                     "detail": "invalid worker message",
+                    "request_id": None,
                 }
             )
             continue
 
+        request_id = message.get("request_id")
         action = message.get("action")
         payload = message.get("payload")
         if action == "shutdown":
-            _LOGGER.info("Qwen worker shutting down pid=%s", os.getpid())
+            _LOGGER.info("Qwen worker shutting down name=%s pid=%s", worker_name, os.getpid())
             return
 
         try:
@@ -78,8 +81,10 @@ def qwen_worker_main(
                 response_queue.put(
                     {
                         "ok": True,
+                        "request_id": request_id,
                         "data": {
                             "worker": "ok",
+                            "worker_name": worker_name,
                             "worker_pid": os.getpid(),
                             **qwen3.model_status(),
                         },
@@ -91,6 +96,7 @@ def qwen_worker_main(
                 response_queue.put(
                     {
                         "ok": True,
+                        "request_id": request_id,
                         "media_type": response.media_type,
                         "content": response.body,
                     }
@@ -101,6 +107,7 @@ def qwen_worker_main(
                 response_queue.put(
                     {
                         "ok": True,
+                        "request_id": request_id,
                         "data": response.model_dump(mode="json"),
                     }
                 )
@@ -108,10 +115,11 @@ def qwen_worker_main(
                 response_queue.put(
                     {
                         "ok": False,
+                        "request_id": request_id,
                         "status_code": 400,
                         "detail": f"unknown worker action: {action}",
                     }
                 )
         except Exception as exc:
             _LOGGER.exception("Qwen worker action failed: %s", action)
-            response_queue.put(_error_response(exc))
+            response_queue.put({**_error_response(exc), "request_id": request_id})

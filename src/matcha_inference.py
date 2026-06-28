@@ -1,4 +1,4 @@
-"""Production Matcha-TTS inference helpers.
+"""Production Starling inference helpers.
 
 This module keeps the API server thin while still reusing the local Matcha-TTS
 model package/checkpoints during the transition to production packaging.
@@ -11,7 +11,6 @@ import json
 import logging
 import sys
 import time
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -23,9 +22,13 @@ _LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MATCHA_ROOT = PROJECT_ROOT / "local" / "Matcha-TTS"
 
+
 class MatchaSettings(Protocol):
     device: str
     checkpoint: str
+    config_path: str
+    semantic_model_name: str
+    semantic_max_tokens: int | None
     icbpe_vocab_path: str
     phoneme_vocab_path: str
     filelist_path: str
@@ -63,11 +66,7 @@ class MatchaPreparedItem:
     language: str
     phoneme_text: str
     x_phoneme: Any
-    x_text_tokens: Any
-    x_phoneme_mask: Any
-    x_text_mask: Any
-    x_unit_ids: Any
-    x_unit_texts: list[str]
+    semantic_features: Any
     speaker_id: int
 
 
@@ -103,22 +102,14 @@ def _resolve_path(value: str | Path) -> Path:
     path = Path(value)
     if path.is_absolute():
         return path
-    if path.parts and path.parts[0] == "local":
-        return PROJECT_ROOT / path
+    project_path = PROJECT_ROOT / path
+    if project_path.exists():
+        return project_path
     return MATCHA_ROOT / path
 
 
-def _vocab_size(vocab_path: Path) -> int:
-    payload = json.loads(vocab_path.read_text(encoding="utf-8"))
-    if isinstance(payload, dict) and "size" in payload:
-        return int(payload["size"])
-    if isinstance(payload, dict):
-        return len(payload)
-    raise ValueError(f"Unsupported vocab format: {vocab_path}")
-
-
 class MatchaBackend:
-    """Batched Matcha-TTS inference backend."""
+    """Batched Starling inference backend."""
 
     def __init__(self, settings: MatchaSettings):
         self.settings = settings
@@ -129,17 +120,19 @@ class MatchaBackend:
 
     def _load(self) -> None:
         if not self.checkpoint_path.exists():
-            raise FileNotFoundError(f"Matcha checkpoint not found: {self.checkpoint_path}")
+            raise FileNotFoundError(f"Starling checkpoint not found: {self.checkpoint_path}")
         if str(MATCHA_ROOT) not in sys.path:
             sys.path.insert(0, str(MATCHA_ROOT))
 
         import torch  # pylint: disable=import-outside-toplevel
-        from matcha.data.text_mel_datamodule import TextMelDataset  # pylint: disable=import-outside-toplevel
-        from matcha.models.matcha_tts import MatchaTTSFusedSemantic  # pylint: disable=import-outside-toplevel
+        from matcha.models.matcha_tts import MatchaTTS  # pylint: disable=import-outside-toplevel
+        from transformers import AutoModel  # pylint: disable=import-outside-toplevel
+        from src.piper.hf_cache import resolve_hf_model_path  # pylint: disable=import-outside-toplevel
+        from src.piper.semantic import SemanticTokenizer  # pylint: disable=import-outside-toplevel
 
         self.torch = torch
         self.device = torch.device(self.device_name if torch.cuda.is_available() else "cpu")
-        self.model = MatchaTTSFusedSemantic.load_from_checkpoint(
+        self.model = MatchaTTS.load_from_checkpoint(
             str(self.checkpoint_path),
             map_location=self.device,
             weights_only=False,
@@ -152,44 +145,35 @@ class MatchaBackend:
         self.vocoder_kind = self.settings.vocoder
         self.vocoder = self._load_vocoder()
 
-        self.dataset = TextMelDataset(
-            str(_resolve_path(self.settings.filelist_path)),
-            n_spks=1,
-            cleaners=["english_cleaners2"],
-            add_blank=True,
-            n_fft=int(self.settings.n_fft),
-            n_mels=int(self.settings.n_mels),
-            sample_rate=self.sample_rate,
-            hop_length=int(self.settings.hop_length),
-            win_length=int(self.settings.win_length),
-            f_min=float(self.settings.f_min),
-            f_max=self.settings.f_max,
-            data_parameters={"mel_mean": float(self.settings.mel_mean), "mel_std": float(self.settings.mel_std)},
-            seed=1234,
-            icbpe_vocab_path=str(_resolve_path(self.settings.icbpe_vocab_path)),
-            phoneme_vocab_path=str(_resolve_path(self.settings.phoneme_vocab_path)),
-            language_id_map={},
-            language_auto_id=0,
-            language_auto_prob=0.0,
-            mel_backend="vocos_mel_24khz",
-        )
+        self.config_path = _resolve_path(self.settings.config_path)
+        if not self.config_path.exists():
+            raise FileNotFoundError(f"Starling preprocessing config not found: {self.config_path}")
+        with self.config_path.open("r", encoding="utf-8") as handle:
+            self.voice_config = json.load(handle)
+        self.speaker_id_map = {
+            str(label): int(speaker_id)
+            for label, speaker_id in (self.voice_config.get("speaker_id_map") or {}).items()
+        }
 
-        expected_phoneme_vocab_size = int(self.model.encoder.phoneme_emb.weight.shape[0])
-        actual_phoneme_vocab_size = _vocab_size(_resolve_path(self.settings.phoneme_vocab_path))
-        if actual_phoneme_vocab_size != expected_phoneme_vocab_size:
-            raise ValueError(
-                "Phoneme vocab mismatch: "
-                f"{self.settings.phoneme_vocab_path} has size {actual_phoneme_vocab_size}, "
-                f"but checkpoint expects {expected_phoneme_vocab_size}"
-            )
+        semantic_model_name = self.settings.semantic_model_name or "distilbert/distilbert-base-multilingual-cased"
+        semantic_path = resolve_hf_model_path(semantic_model_name, require_weights=True)
+        self.semantic_tokenizer = SemanticTokenizer(semantic_model_name, max_length=self.settings.semantic_max_tokens)
+        self.semantic_model = AutoModel.from_pretrained(semantic_path).to(self.device).eval()
+
+        expected_vocab_size = int(self.model.encoder.emb.weight.shape[0])
+        if expected_vocab_size != int(self.model.n_vocab):
+            raise ValueError(f"Starling checkpoint vocab mismatch: encoder={expected_vocab_size} model={self.model.n_vocab}")
 
         _LOGGER.info(
-            "Loaded Matcha backend: checkpoint=%s device=%s vocoder=%s sr=%d n_mels=%d",
+            "Loaded Starling backend: checkpoint=%s device=%s vocoder=%s sr=%d n_mels=%d n_vocab=%d speakers=%d semantic=%s",
             self.checkpoint_path,
             self.device,
             self.vocoder_kind,
             self.sample_rate,
             int(self.settings.n_mels),
+            int(self.model.n_vocab),
+            len(self.speaker_id_map),
+            semantic_model_name,
         )
 
     def _load_vocoder(self):
@@ -199,107 +183,73 @@ class MatchaBackend:
 
         return Vocos.from_pretrained("charactr/vocos-mel-24khz").eval().to(self.device)
 
-    @staticmethod
-    def _normalize_for_alignment(text: str, language: str) -> str:
-        from src.piper.preprocess import _map_cld2_to_espeak, _normalize_punct_and_space  # pylint: disable=import-outside-toplevel
+    def _speaker_label_for_language(self, language: str) -> str:
+        base = language.lower().split("-")[0] or "en"
+        if base in self.speaker_id_map:
+            return base
+        if language in self.speaker_id_map:
+            return language
+        return "en" if "en" in self.speaker_id_map else next(iter(self.speaker_id_map), "en")
 
-        voice = _map_cld2_to_espeak(language, "en-us")
-        if voice.lower().startswith("ja"):
-            return text
-        return " ".join(_normalize_punct_and_space(text).split())
+    def _phonemize_request(self, request: MatchaBatchRequest) -> dict[str, Any]:
+        from src.piper.preprocess import phonemize_text_for_speaker  # pylint: disable=import-outside-toplevel
 
-    @staticmethod
-    def _flatten_phonemes(sentence) -> str:
-        return "".join(sentence)
+        language = request.language.lower().split("-")[0] or "en"
+        speaker_label = self._speaker_label_for_language(language)
+        return phonemize_text_for_speaker(
+            request.text,
+            self.config_path,
+            speaker_label=speaker_label,
+            neural=request.neural,
+        )
 
-    def _build_units(self, text: str, language: str, neural: bool) -> tuple[str, list[dict[str, str]], str]:
-        from src.piper.heteronym import get_resolver  # pylint: disable=import-outside-toplevel
-        from src.piper.preprocess import _map_cld2_to_espeak, _phonemize_espeak_with_mapping  # pylint: disable=import-outside-toplevel
+    def _prepare_batch(self, requests: list[MatchaBatchRequest]) -> list[MatchaPreparedItem]:
+        from src.piper.semantic import align_phone_features, build_bert_input  # pylint: disable=import-outside-toplevel
 
-        normalized_text = self._normalize_for_alignment(text, language)
-        voice = _map_cld2_to_espeak(language, "en-us")
-        sentences, mappings = _phonemize_espeak_with_mapping(normalized_text, voice, None)
-        replacements: dict[tuple[int, int], str] = {}
+        rows = [self._phonemize_request(request) for request in requests]
+        texts = [str(row["text"]) for row in rows]
+        lengths = [len(row["phoneme_ids"]) for row in rows]
+        word_spans = [row.get("word_spans") for row in rows]
+        bert_input = build_bert_input(
+            texts,
+            self.semantic_tokenizer,
+            phoneme_lengths=lengths,
+            word_spans=word_spans,
+        )
+        if bert_input is None or "word2ph" not in bert_input:
+            raise ValueError("Failed to build Starling semantic input")
+        input_ids = bert_input["input_ids"].to(self.device)
+        attention_mask = bert_input["attention_mask"].to(self.device)
+        word2ph = bert_input["word2ph"].to(self.device)
 
-        if neural and voice.lower().startswith("en"):
-            for word, h_start, h_end, correct_ipa in get_resolver(device=str(self.device)).resolve_all(normalized_text):
-                matched = None
-                for sent_idx, sentence_mappings in enumerate(mappings):
-                    for word_idx, (text_start, text_len, *_rest) in enumerate(sentence_mappings):
-                        map_start = text_start - 1
-                        map_end = map_start + text_len
-                        if (map_start <= h_start < map_end) or (map_start < h_end <= map_end) or (
-                            map_start == h_start and map_end == h_end
-                        ):
-                            matched = (sent_idx, word_idx)
-                            break
-                    if matched is not None:
-                        break
-                if matched is not None:
-                    replacements[matched] = correct_ipa
-                else:
-                    _LOGGER.warning("Matcha neural phonemizer could not map heteronym %r in %r", word, normalized_text)
+        with self.torch.inference_mode():
+            hidden = self.semantic_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
-        units: list[dict[str, str]] = []
-        for sent_idx, (sentence, sentence_mappings) in enumerate(zip(sentences, mappings)):
-            for word_idx, (text_start, text_len, ph_start, ph_end, punct_len) in enumerate(sentence_mappings):
-                if text_start <= 0:
-                    continue
-                start = text_start - 1
-                end = start + text_len
-                if punct_len and end < len(normalized_text) and normalized_text[end : end + punct_len].strip():
-                    end += punct_len
-                unit_text = normalized_text[start:end]
-                unit_phonemes = sentence[ph_start:ph_end]
-                replacement = replacements.get((sent_idx, word_idx))
-                if replacement is not None:
-                    word_ph_end = ph_end - punct_len
-                    trailing_punct = sentence[word_ph_end:ph_end]
-                    unit_phonemes = list(replacement) + trailing_punct
-                phonemes = self._flatten_phonemes(unit_phonemes)
-                if unit_text and phonemes:
-                    units.append({"text": unit_text, "phonemes": phonemes})
-
-        if not units:
-            raise ValueError(f"No Matcha alignment units produced for language={language!r}, text={text!r}")
-
-        phoneme_text = " ".join(unit["phonemes"] for unit in units)
-        return normalized_text, units, phoneme_text
+        prepared: list[MatchaPreparedItem] = []
+        for request, row, item_hidden, item_word2ph, phone_len in zip(requests, rows, hidden, word2ph, lengths):
+            language = request.language.lower().split("-")[0] or "en"
+            phoneme_ids = row["phoneme_ids"]
+            phoneme_text = "".join(row.get("phonemes") or [])
+            speaker_id = request.speaker_id if request.speaker_id is not None else int(row.get("speaker_id", 0))
+            semantic_features = align_phone_features(item_hidden, item_word2ph, phone_len)
+            prepared.append(
+                MatchaPreparedItem(
+                    text=str(row["text"]),
+                    language=language,
+                    phoneme_text=phoneme_text,
+                    x_phoneme=self.torch.tensor(phoneme_ids, dtype=self.torch.long),
+                    semantic_features=semantic_features.detach().cpu(),
+                    speaker_id=speaker_id,
+                )
+            )
+        return prepared
 
     def _prepare_item(self, request: MatchaBatchRequest) -> MatchaPreparedItem:
-        language = request.language.lower().split("-")[0] or "en"
-        normalized_text, units, phoneme_text = self._build_units(request.text, language, request.neural)
-        aligned = self.dataset.get_aligned_phoneme_icbpe(phoneme_text, normalized_text, units)
-        speaker_id = request.speaker_id if request.speaker_id is not None else 0
-        return MatchaPreparedItem(
-            text=normalized_text,
-            language=language,
-            phoneme_text=phoneme_text,
-            x_phoneme=aligned["phoneme_ids"],
-            x_text_tokens=aligned["text_ids"],
-            x_phoneme_mask=aligned["phoneme_mask"],
-            x_text_mask=aligned["text_mask"],
-            x_unit_ids=aligned["unit_ids"],
-            x_unit_texts=aligned["unit_texts"],
-            speaker_id=speaker_id,
-        )
+        return self._prepare_batch([request])[0]
 
     def prepare_row(self, row: list[str]) -> MatchaPreparedItem:
-        _filepath, lang, phoneme_text, raw_text = row[:4]
-        alignment_units = json.loads(row[4])
-        aligned = self.dataset.get_aligned_phoneme_icbpe(phoneme_text, raw_text, alignment_units)
-        return MatchaPreparedItem(
-            text=unicodedata.normalize("NFC", raw_text),
-            language=lang,
-            phoneme_text=unicodedata.normalize("NFC", phoneme_text),
-            x_phoneme=aligned["phoneme_ids"],
-            x_text_tokens=aligned["text_ids"],
-            x_phoneme_mask=aligned["phoneme_mask"],
-            x_text_mask=aligned["text_mask"],
-            x_unit_ids=aligned["unit_ids"],
-            x_unit_texts=aligned["unit_texts"],
-            speaker_id=0,
-        )
+        _filepath, _lang, _phoneme_text, _raw_text = row[:4]
+        raise NotImplementedError("Starling production inference no longer supports aligned filelist rows")
 
     def synthesize_prepared_batch(
         self,
@@ -316,24 +266,20 @@ class MatchaBackend:
         max_len = max(item.x_phoneme.shape[-1] for item in prepared)
 
         x = torch.zeros((batch_size, max_len), dtype=torch.long, device=self.device)
-        x_text = torch.zeros((batch_size, max_len), dtype=torch.long, device=self.device)
-        x_phoneme_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=self.device)
-        x_text_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=self.device)
-        x_unit_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=self.device)
+        semantic_features = torch.zeros(
+            (batch_size, int(prepared[0].semantic_features.shape[0]), max_len),
+            dtype=torch.float32,
+            device=self.device,
+        )
         x_lengths = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
         spks = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
-        x_unit_texts = []
 
         for idx, item in enumerate(prepared):
             length = item.x_phoneme.shape[-1]
             x_lengths[idx] = length
             spks[idx] = item.speaker_id
             x[idx, :length] = item.x_phoneme.to(self.device)
-            x_text[idx, :length] = item.x_text_tokens.to(self.device)
-            x_phoneme_mask[idx, :length] = item.x_phoneme_mask.to(self.device)
-            x_text_mask[idx, :length] = item.x_text_mask.to(self.device)
-            x_unit_ids[idx, :length] = item.x_unit_ids.to(self.device)
-            x_unit_texts.append(item.x_unit_texts)
+            semantic_features[idx, :, :length] = item.semantic_features.to(self.device)
 
         steps = steps or self.settings.n_timesteps
         temperature = temperature or self.settings.temperature
@@ -349,13 +295,7 @@ class MatchaBackend:
                 temperature=temperature,
                 length_scale=length_scale,
                 spks=spks,
-                input_type=input_type,
-                x_text=x_text,
-                x_text_lengths=x_lengths,
-                x_phoneme_mask=x_phoneme_mask,
-                x_text_mask=x_text_mask,
-                x_unit_ids=x_unit_ids,
-                x_unit_texts=x_unit_texts,
+                semantic_features=semantic_features,
             )
             audio = self.vocoder.decode(output["mel"]).clamp(-1, 1)
         if self.device.type == "cuda":
@@ -376,7 +316,7 @@ class MatchaBackend:
 
     def synthesize_batch(self, requests: list[MatchaBatchRequest]) -> list[MatchaBatchResult]:
         started = time.perf_counter()
-        prepared = [self._prepare_item(request) for request in requests]
+        prepared = self._prepare_batch(requests)
         wavs, info = self.synthesize_prepared_batch(
             prepared,
             steps=requests[0].steps,
@@ -462,7 +402,7 @@ class MatchaBatcher:
             try:
                 results = await asyncio.to_thread(self.backend.synthesize_batch, batch)
             except Exception as exc:  # pylint: disable=broad-exception-caught
-                _LOGGER.exception("Matcha batch failed")
+                _LOGGER.exception("Starling batch failed")
                 for item in batch:
                     if not item.future.done():
                         item.future.set_exception(exc)

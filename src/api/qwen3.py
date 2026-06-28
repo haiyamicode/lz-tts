@@ -58,6 +58,7 @@ SILERO_VAD_CHUNK_SAMPLES = 480
 SILERO_VAD_THRESHOLD = 0.2
 SILERO_VAD_ONNX_PROVIDERS_DEFAULT = "CUDAExecutionProvider,CPUExecutionProvider"
 SILENCE_TRIM_PADDING_MS = 250
+QWEN_DEFAULT_OUTPUT_BUFFER_SILENCE_MS = 100
 SILENCE_TRIM_MIN_CHUNK_RMS = 0.003
 SILENCE_TRIM_RELATIVE_CHUNK_RMS = 0.03
 SILENCE_TRIM_EMPTY_OUTPUT_MS = 200
@@ -167,11 +168,22 @@ class DpBudgetSettings(BaseModel):
     language_profiles: dict[str, dict[str, float | int]] = Field(default_factory=dict)
 
 
+class QwenValidationSettings(BaseModel):
+    enabled: bool = True
+    max_retries: int = Field(2, ge=0)
+    duration_tolerance: float = Field(0.25, ge=0.0)
+    reject_zero_phoneme_duration: bool = True
+
+
 class QwenSettings(BaseModel):
     preload: bool = True
     preload_background: bool = True
     model: str = QWEN_DEFAULT_MODEL
+    vietnamese_model: str = ""
+    vietnamese_device: str = ""
+    vietnamese_disable_cuda_graph: bool = False
     viet_lora_model: str = QWEN_DEFAULT_VIETNAMESE_LORA_MODEL
+    vietnamese_icl_mode: bool = True
     device: str = "cuda"
     precision_mode: str = "config"
     dtype: str = QWEN_DEFAULT_DTYPE
@@ -189,13 +201,16 @@ class QwenSettings(BaseModel):
     max_new_tokens: int = QWEN_DEFAULT_MAX_NEW_TOKENS
     xvec_only: bool = QWEN_DEFAULT_XVEC_ONLY
     non_streaming_mode: bool = QWEN_DEFAULT_NON_STREAMING_MODE
+    output_buffer_silence_ms: int = Field(QWEN_DEFAULT_OUTPUT_BUFFER_SILENCE_MS, ge=0)
     disable_cuda_graph: bool = False
+    disable_cuda_graph_batch: bool = True
     temperature: float = QWEN_DEFAULT_TEMPERATURE
     top_k: int = QWEN_DEFAULT_TOP_K
     top_p: float = QWEN_DEFAULT_TOP_P
     repetition_penalty: float = QWEN_DEFAULT_REPETITION_PENALTY
     voice_prompt_cache_entries: int = Field(8, ge=0)
     dp_budget: DpBudgetSettings = Field(default_factory=DpBudgetSettings)
+    validation: QwenValidationSettings = Field(default_factory=QwenValidationSettings)
 
 
 _qwen_settings = QwenSettings()
@@ -269,6 +284,8 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
 
     string_overrides = {
         "QWEN_TTS_MODEL": "model",
+        "QWEN_TTS_VIETNAMESE_MODEL": "vietnamese_model",
+        "QWEN_TTS_VIETNAMESE_DEVICE": "vietnamese_device",
         "QWEN_TTS_VIETNAMESE_LORA_MODEL": "viet_lora_model",
         "QWEN_TTS_DEVICE": "device",
         "QWEN_TTS_DTYPE": "dtype",
@@ -302,23 +319,48 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
         "QWEN_TTS_MAX_SEQ_LEN": "max_seq_len",
         "QWEN_TTS_MAX_NEW_TOKENS": "max_new_tokens",
         "QWEN_TTS_VOICE_PROMPT_CACHE_ENTRIES": "voice_prompt_cache_entries",
+        "QWEN_TTS_OUTPUT_BUFFER_SILENCE_MS": "output_buffer_silence_ms",
+        "QWEN_TTS_VALIDATION_MAX_RETRIES": "validation.max_retries",
     }
     for env_name, attr in int_overrides.items():
         value = os.environ.get(env_name)
         if value is not None and value.strip():
-            setattr(settings, attr, int(value.strip()))
+            if attr.startswith("validation."):
+                setattr(settings.validation, attr.split(".", 1)[1], int(value.strip()))
+            else:
+                setattr(settings, attr, int(value.strip()))
 
     bool_overrides = {
         "QWEN_TTS_PRELOAD": "preload",
         "QWEN_TTS_PRELOAD_BACKGROUND": "preload_background",
         "QWEN_TTS_WARMUP": "warmup",
         "QWEN_TTS_XVEC_ONLY": "xvec_only",
+        "QWEN_TTS_VIETNAMESE_ICL_MODE": "vietnamese_icl_mode",
+        "QWEN_TTS_VIETNAMESE_DISABLE_CUDA_GRAPH": "vietnamese_disable_cuda_graph",
         "QWEN_TTS_NON_STREAMING_MODE": "non_streaming_mode",
         "QWEN_TTS_DISABLE_CUDA_GRAPH": "disable_cuda_graph",
+        "QWEN_TTS_DISABLE_CUDA_GRAPH_BATCH": "disable_cuda_graph_batch",
+        "QWEN_TTS_VALIDATION_ENABLED": "validation.enabled",
+        "QWEN_TTS_VALIDATION_REJECT_ZERO_PHONEME_DURATION": "validation.reject_zero_phoneme_duration",
     }
     for env_name, attr in bool_overrides.items():
         if os.environ.get(env_name) is not None:
-            setattr(settings, attr, env_bool_value(env_name, getattr(settings, attr)))
+            if attr.startswith("validation."):
+                key = attr.split(".", 1)[1]
+                setattr(settings.validation, key, env_bool_value(env_name, getattr(settings.validation, key)))
+            else:
+                setattr(settings, attr, env_bool_value(env_name, getattr(settings, attr)))
+
+    float_overrides = {
+        "QWEN_TTS_VALIDATION_DURATION_TOLERANCE": "validation.duration_tolerance",
+    }
+    for env_name, attr in float_overrides.items():
+        value = os.environ.get(env_name)
+        if value is not None and value.strip():
+            if attr.startswith("validation."):
+                setattr(settings.validation, attr.split(".", 1)[1], float(value.strip()))
+            else:
+                setattr(settings, attr, float(value.strip()))
 
     return settings
 
@@ -351,8 +393,12 @@ def demo_defaults() -> dict[str, Any]:
         "top_p": _qwen_settings.top_p,
         "repetition_penalty": _qwen_settings.repetition_penalty,
         "xvec_only": _qwen_settings.xvec_only,
+        "vietnamese_icl_mode": _qwen_settings.vietnamese_icl_mode,
         "non_streaming_mode": _qwen_settings.non_streaming_mode,
+        "output_buffer_silence_ms": _qwen_settings.output_buffer_silence_ms,
+        "validation": _qwen_settings.validation.model_dump(),
         "disable_cuda_graph": _qwen_settings.disable_cuda_graph,
+        "disable_cuda_graph_batch": _qwen_settings.disable_cuda_graph_batch,
         "dp_budget": _qwen_settings.dp_budget.enabled,
         "precision_mode": _qwen_settings.precision_mode,
     }
@@ -472,13 +518,17 @@ def _is_vietnamese_qwen_language(language: str) -> bool:
 
 
 def _qwen_model_key_for_language(language: str) -> str:
-    if _is_vietnamese_qwen_language(language) and _qwen_settings.viet_lora_model.strip():
+    if _is_vietnamese_qwen_language(language) and (
+        _qwen_settings.vietnamese_model.strip() or _qwen_settings.viet_lora_model.strip()
+    ):
         return "vietnamese"
     return "base"
 
 
 def _qwen_model_label_for_key(key: str) -> str:
-    return "Vietnamese LoRA" if key == "vietnamese" else "base"
+    if key != "vietnamese":
+        return "base"
+    return "Vietnamese full model" if _qwen_settings.vietnamese_model.strip() else "Vietnamese LoRA"
 
 
 def _qwen_model_context(model_obj: Any, use_vietnamese_lora: bool):
@@ -528,18 +578,28 @@ def resolve_qwen_language(
 def model_status() -> dict[str, Any]:
     return {
         "model_loaded": model is not None,
-        "vietnamese_model_loaded": model is not None and bool(_qwen_settings.viet_lora_model.strip()),
+        "vietnamese_model_loaded": (
+            vietnamese_model is not None
+            if _qwen_settings.vietnamese_model.strip()
+            else model is not None and bool(_qwen_settings.viet_lora_model.strip())
+        ),
         "model_loading": model_loading,
-        "vietnamese_model_loading": model_loading,
+        "vietnamese_model_loading": vietnamese_model_loading,
         "model_load_error": model_load_error,
-        "vietnamese_model_load_error": model_load_error,
+        "vietnamese_model_load_error": vietnamese_model_load_error,
         "model_load_started_at": model_load_started_at,
         "model_load_finished_at": model_load_finished_at,
-        "vietnamese_model_load_started_at": model_load_started_at,
-        "vietnamese_model_load_finished_at": model_load_finished_at,
+        "vietnamese_model_load_started_at": vietnamese_model_load_started_at,
+        "vietnamese_model_load_finished_at": vietnamese_model_load_finished_at,
         "precision_mode": _qwen_settings.precision_mode,
         "model": _qwen_settings.model,
+        "vietnamese_model": _qwen_settings.vietnamese_model,
+        "vietnamese_device": _qwen_settings.vietnamese_device,
+        "vietnamese_disable_cuda_graph": _qwen_settings.vietnamese_disable_cuda_graph,
         "viet_lora_model": _qwen_settings.viet_lora_model,
+        "vietnamese_icl_mode": _qwen_settings.vietnamese_icl_mode,
+        "output_buffer_silence_ms": _qwen_settings.output_buffer_silence_ms,
+        "validation": _qwen_settings.validation.model_dump(),
         "dtype": _qwen_settings.dtype,
         "audio_dtype": _qwen_settings.audio_dtype,
         "attn": _qwen_settings.attn,
@@ -549,14 +609,26 @@ def model_status() -> dict[str, Any]:
         "large_block_precision": _qwen_settings.large_block_precision,
         "extra_precision": _qwen_settings.extra_precision,
         "linear_precision": _qwen_settings.linear_precision,
+        "disable_cuda_graph": _qwen_settings.disable_cuda_graph,
+        "disable_cuda_graph_batch": _qwen_settings.disable_cuda_graph_batch,
     }
 
 
-def _load_model_unlocked(model_name: str) -> Any:
+def _load_model_unlocked(
+    model_name: str,
+    *,
+    device: str | None = None,
+    capture_cuda_graph: bool | None = None,
+) -> Any:
     import torch
     from faster_qwen3_tts import FasterQwen3TTS
 
-    device = _qwen_settings.device
+    device = device or _qwen_settings.device
+    capture_cuda_graph = (
+        not _qwen_settings.disable_cuda_graph
+        if capture_cuda_graph is None
+        else capture_cuda_graph
+    )
     dtype_name = _qwen_settings.dtype
     if dtype_name.lower() == "auto":
         dtype = "auto"
@@ -598,13 +670,13 @@ def _load_model_unlocked(model_name: str) -> Any:
         attn_implementation=attn_implementation,
         max_seq_len=max_seq_len,
     )
-    if not _qwen_settings.disable_cuda_graph and _qwen_settings.warmup and hasattr(loaded_model, "_warmup"):
+    if capture_cuda_graph and _qwen_settings.warmup and hasattr(loaded_model, "_warmup"):
         _LOGGER.info("Capturing CUDA graphs...")
         loaded_model._warmup(prefill_len=100)
-        if hasattr(loaded_model, "capture_batch_graphs"):
+        if not _qwen_settings.disable_cuda_graph_batch and hasattr(loaded_model, "capture_batch_graphs"):
             _LOGGER.info("Capturing Qwen batch CUDA graph buckets: %s...", QWEN_BATCH_BUCKETS)
             loaded_model.capture_batch_graphs(QWEN_BATCH_BUCKETS, prefill_len=100)
-    elif _qwen_settings.disable_cuda_graph:
+    elif not capture_cuda_graph:
         _LOGGER.info("CUDA graph capture disabled by configuration; using eager/dynamic-cache path.")
     if hasattr(loaded_model, "max_voice_prompt_cache_entries"):
         loaded_model.max_voice_prompt_cache_entries = _qwen_settings.voice_prompt_cache_entries
@@ -643,7 +715,19 @@ def _load_base_model_unlocked() -> Any:
 
 
 def _load_vietnamese_model_unlocked() -> Any:
-    return get_model()
+    vietnamese_model_path = _qwen_settings.vietnamese_model.strip()
+    if not vietnamese_model_path:
+        return get_model()
+    checkpoint_path = Path(vietnamese_model_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Vietnamese Qwen checkpoint not found: {checkpoint_path}")
+    _LOGGER.info("Loading Vietnamese Qwen full checkpoint: %s", vietnamese_model_path)
+    vietnamese_device = _qwen_settings.vietnamese_device.strip() or None
+    return _load_model_unlocked(
+        vietnamese_model_path,
+        device=vietnamese_device,
+        capture_cuda_graph=not _qwen_settings.vietnamese_disable_cuda_graph,
+    )
 
 
 def get_model() -> Any:
@@ -673,7 +757,33 @@ def get_model() -> Any:
 
 
 def get_vietnamese_model() -> Any | None:
-    return get_model()
+    global vietnamese_model, vietnamese_model_loading, vietnamese_model_load_error
+    global vietnamese_model_load_started_at, vietnamese_model_load_finished_at
+
+    if not _qwen_settings.vietnamese_model.strip():
+        return get_model()
+    if vietnamese_model is not None:
+        return vietnamese_model
+
+    with vietnamese_model_load_lock:
+        if vietnamese_model is not None:
+            return vietnamese_model
+        vietnamese_model_loading = True
+        vietnamese_model_load_error = None
+        vietnamese_model_load_started_at = time.time()
+        vietnamese_model_load_finished_at = None
+        vietnamese_model_ready_event.clear()
+        try:
+            vietnamese_model = _load_vietnamese_model_unlocked()
+            vietnamese_model_load_error = None
+            return vietnamese_model
+        except Exception as e:
+            vietnamese_model_load_error = str(e)
+            raise
+        finally:
+            vietnamese_model_loading = False
+            vietnamese_model_load_finished_at = time.time()
+            vietnamese_model_ready_event.set()
 
 
 def get_qwen_model_for_language(language: str) -> Any:
@@ -710,9 +820,25 @@ def _apply_context_replacements_batch(texts: list[str], dp_languages: list[str])
     return results
 
 
+def _normalize_qwen_text(text: str, dp_language: str) -> str:
+    from ..text_norm import normalize_text
+
+    return normalize_text(text, dp_language)
+
+
+def _prepare_qwen_texts_batch(texts: list[str], dp_languages: list[str]) -> list[str]:
+    normalized = [
+        _normalize_qwen_text(text, dp_language)
+        for text, dp_language in zip(texts, dp_languages)
+    ]
+    return _apply_context_replacements_batch(normalized, dp_languages)
+
+
 def _preload_worker(include_dp_budget: bool) -> None:
     try:
         get_model()
+        if _qwen_settings.vietnamese_model.strip():
+            get_vietnamese_model()
         if include_dp_budget:
             get_dp_budget_model()
     except Exception:
@@ -736,6 +862,8 @@ def preload_model(background: bool = False, include_dp_budget: bool = False) -> 
         start_preload_background(include_dp_budget=include_dp_budget)
         return
     get_model()
+    if _qwen_settings.vietnamese_model.strip():
+        get_vietnamese_model()
     if include_dp_budget:
         get_dp_budget_model()
 
@@ -780,6 +908,7 @@ def get_dp_budget_model() -> Any:
                 max_extra_tokens=dp_settings.max_extra_tokens,
                 language_profiles=dp_settings.language_profiles,
                 use_bert=dp_settings.use_bert,
+                enable_alignment_validation=_qwen_settings.validation.enabled,
             )
         )
         loaded_dp_budget_model.load()
@@ -797,6 +926,12 @@ def predict_dp_budget_batch(
     languages: Optional[list[str | None]] = None,
 ) -> list[dict[str, Any]]:
     return get_dp_budget_model().predict_batch(texts, languages=languages)
+
+
+class QwenValidationError(RuntimeError):
+    def __init__(self, info: dict[str, Any]):
+        super().__init__(str(info.get("reason") or "validation_failed"))
+        self.info = info
 
 
 def _resolve_reference_transcription_dtype() -> torch.dtype:
@@ -819,7 +954,7 @@ def get_reference_transcription_model() -> tuple[Any, Any, torch.device, torch.d
     if reference_transcription_model is None:
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-        model_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_MODEL", "openai/whisper-base").strip()
+        model_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_MODEL", "openai/whisper-small").strip()
         device_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_DEVICE", "cuda").strip() or "cuda"
         if device_name == "cuda":
             device_name = "cuda:0"
@@ -1021,11 +1156,15 @@ def sanitize_prompt_text(text: str) -> str:
     return text
 
 
-def transcribe_voice_sample(audio_file: Path) -> str:
-    model_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_MODEL", "openai/whisper-base").strip()
-    language = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_LANGUAGE", "vi").strip() or "vi"
-    safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", model_name).strip("_") or "whisper"
-    transcript_file = audio_file.with_suffix(f".{safe_model_name}.{language}.txt")
+def _whisper_language_for_locale(locale: str | None) -> str | None:
+    if not locale or locale == "multilingual":
+        return None
+    return _locale_base(locale)
+
+
+def transcribe_voice_sample(audio_file: Path, language: str | None = None) -> str:
+    model_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_MODEL", "openai/whisper-small").strip()
+    transcript_file = audio_file.with_suffix(".txt")
     if transcript_file.exists():
         transcript = transcript_file.read_text(encoding="utf-8").strip()
         if transcript:
@@ -1057,8 +1196,9 @@ def transcribe_voice_sample(audio_file: Path) -> str:
     input_features = inputs.input_features.to(device=device, dtype=dtype)
     generate_kwargs: dict[str, Any] = {
         "task": "transcribe",
-        "language": language,
     }
+    if language:
+        generate_kwargs["language"] = language
     attention_mask = getattr(inputs, "attention_mask", None)
     if attention_mask is not None:
         generate_kwargs["attention_mask"] = attention_mask.to(device=device)
@@ -1163,6 +1303,15 @@ def trim_silence(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, fl
     return trimmed, start / sample_rate, (wav_data.size - end) / sample_rate
 
 
+def _ensure_output_buffer_silence(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, float]:
+    buffer_ms = max(0, int(_qwen_settings.output_buffer_silence_ms))
+    buffer_samples = int(sample_rate * buffer_ms / 1000)
+    if buffer_samples <= 0 or wav_data.size == 0:
+        return wav_data, 0.0
+    silence = np.zeros(buffer_samples, dtype=np.float32)
+    return np.concatenate([silence, wav_data.astype(np.float32, copy=False), silence]), buffer_ms / 1000
+
+
 def postprocess_audio(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, dict[str, Any]]:
     info: dict[str, Any] = {
         "enabled": False,
@@ -1170,6 +1319,7 @@ def postprocess_audio(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarra
         "trim": False,
         "trim_head_seconds": 0.0,
         "trim_tail_seconds": 0.0,
+        "buffer_silence_seconds": 0.0,
     }
 
     if env_bool("ENABLE_SILENCE_TRIM", ENABLE_SILENCE_TRIM_DEFAULT):
@@ -1182,6 +1332,9 @@ def postprocess_audio(wav_data: np.ndarray, sample_rate: int) -> tuple[np.ndarra
                 "trim_tail_seconds": tail_seconds,
             }
         )
+
+    wav_data, buffer_seconds = _ensure_output_buffer_silence(wav_data, sample_rate)
+    info["buffer_silence_seconds"] = buffer_seconds
 
     return wav_data, info
 
@@ -1201,6 +1354,16 @@ def wav_to_mp3(wav_data: np.ndarray, sample_rate: int) -> bytes:
     return proc.stdout
 
 
+def _encoded_mp3_duration_seconds(mp3_bytes: bytes, fallback: float) -> float:
+    try:
+        from pydub import AudioSegment
+
+        return float(AudioSegment.from_file(io.BytesIO(mp3_bytes), format="mp3").duration_seconds)
+    except Exception:
+        _LOGGER.warning("Failed to read encoded Qwen MP3 duration; using sample-count fallback", exc_info=True)
+        return fallback
+
+
 class SynthesizeRequest(BaseModel):
     text: str
     voice_url: str
@@ -1217,6 +1380,7 @@ class SynthesizeRequest(BaseModel):
     non_streaming_mode: Optional[bool] = None
     expressiveness: Optional[float] = None
     dp_budget: Optional[bool] = None
+    validation_enabled: Optional[bool] = None
 
 
 class BatchSynthesizeRequest(BaseModel):
@@ -1281,6 +1445,7 @@ def _log_qwen_synthesize_request(
             "expressiveness_level": settings.expressiveness_level,
             "dp_budget_enabled": settings.dp_budget_enabled,
             "dp_budget_info": settings.dp_budget_info,
+            "validation_enabled": settings.validation_enabled,
         }
     if info is not None:
         log_data["result"] = info
@@ -1289,10 +1454,71 @@ def _log_qwen_synthesize_request(
     _LOGGER.info("Qwen3 synthesize request: %s", json.dumps(log_data, ensure_ascii=False))
 
 
+def _qwen_resolved_settings_log(
+    settings: "_ResolvedGenerationSettings",
+    *,
+    xvec_only: bool | None = None,
+) -> dict[str, Any]:
+    return {
+        "language": settings.language,
+        "dp_language": settings.dp_language,
+        "prepared_text": settings.prepared_text,
+        "prepared_text_chars": len(settings.prepared_text),
+        "max_new_tokens": settings.max_new_tokens,
+        "temperature": settings.temperature,
+        "top_k": settings.top_k,
+        "top_p": settings.top_p,
+        "repetition_penalty": settings.repetition_penalty,
+        "xvec_only": xvec_only,
+        "non_streaming_mode": settings.non_streaming_mode,
+        "expressiveness_level": settings.expressiveness_level,
+        "dp_budget_enabled": settings.dp_budget_enabled,
+        "dp_budget_info": settings.dp_budget_info,
+        "validation_enabled": settings.validation_enabled,
+    }
+
+
+def _log_qwen_batch_synthesize_request(
+    *,
+    status: str,
+    started: float,
+    req: BatchSynthesizeRequest,
+    item_requests: list[SynthesizeRequest] | None = None,
+    settings_list: list["_ResolvedGenerationSettings"] | None = None,
+    resolved_prompts: list[tuple[Path, str, bool]] | None = None,
+    info: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    items = item_requests if item_requests is not None else req.items
+    log_data: dict[str, Any] = {
+        "route": "/qwen3/synthesize/batch",
+        "method": "POST",
+        "status": status,
+        "wall_seconds": round(time.perf_counter() - started, 6),
+        "backend": "faster-qwen3-tts",
+        "count": len(items),
+        "input": [item.model_dump() for item in items],
+    }
+    if settings_list is not None:
+        log_data["resolved_settings"] = [
+            _qwen_resolved_settings_log(
+                settings,
+                xvec_only=resolved_prompts[index][2] if resolved_prompts is not None else None,
+            )
+            for index, settings in enumerate(settings_list)
+        ]
+    if info is not None:
+        log_data["result"] = info
+    if error is not None:
+        log_data["error"] = error
+    _LOGGER.info("Qwen3 batch synthesize request: %s", json.dumps(log_data, ensure_ascii=False))
+
+
 @dataclass(frozen=True)
 class _ResolvedGenerationSettings:
     language: str
     dp_language: str
+    prepared_text: str
     max_new_tokens: int
     temperature: float
     top_k: int
@@ -1301,6 +1527,7 @@ class _ResolvedGenerationSettings:
     non_streaming_mode: bool
     dp_budget_enabled: bool
     dp_budget_info: Optional[dict[str, Any]]
+    validation_enabled: bool
     expressiveness_level: float
 
 
@@ -1321,6 +1548,10 @@ def _resolve_generation_settings_batch(
         else resolve_qwen_language(req.text, req.language, req.language_code)
         for index, req in enumerate(reqs)
     ]
+    prepared_texts = _prepare_qwen_texts_batch(
+        [req.text for req in reqs],
+        [resolved_language.dp_language for resolved_language in resolved_languages],
+    )
     dp_budget_indices = [
         index
         for index, req in enumerate(reqs)
@@ -1331,7 +1562,7 @@ def _resolve_generation_settings_batch(
     dp_budget_language_inputs: list[str] = []
     dp_budget_texts: list[str] = []
     for index in dp_budget_indices:
-        dp_budget_texts.append(reqs[index].text)
+        dp_budget_texts.append(prepared_texts[index])
         dp_budget_language_inputs.append(resolved_languages[index].dp_language)
     dp_budget_info_list: list[dict[str, Any] | None] = [None] * len(reqs)
     if dp_budget_indices:
@@ -1351,6 +1582,11 @@ def _resolve_generation_settings_batch(
             req.dp_budget
             if req.dp_budget is not None
             else _qwen_settings.dp_budget.enabled
+        )
+        validation_enabled = (
+            req.validation_enabled
+            if req.validation_enabled is not None
+            else _qwen_settings.validation.enabled
         )
         dp_budget_info = dp_budget_info_list[index]
         if dummy_mask[index]:
@@ -1393,6 +1629,7 @@ def _resolve_generation_settings_batch(
             _ResolvedGenerationSettings(
                 language=language,
                 dp_language=resolved_language.dp_language,
+                prepared_text=prepared_texts[index],
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_k=top_k,
@@ -1401,26 +1638,35 @@ def _resolve_generation_settings_batch(
                 non_streaming_mode=non_streaming_mode,
                 dp_budget_enabled=dp_budget_enabled,
                 dp_budget_info=dp_budget_info,
+                validation_enabled=validation_enabled,
                 expressiveness_level=expressiveness_level,
             )
         )
     return settings_list
 
 
-def _resolve_voice_prompt(req: SynthesizeRequest) -> tuple[Path, str, bool]:
+def _resolve_voice_prompt(req: SynthesizeRequest, settings: _ResolvedGenerationSettings) -> tuple[Path, str, bool]:
     try:
         sample_path = download_and_cache(req.voice_url)
     except Exception as e:
         raise HTTPException(400, f"Failed to download voice sample: {e}") from e
 
-    xvec_only = req.xvec_only if req.xvec_only is not None else _qwen_settings.xvec_only
+    if req.xvec_only is not None:
+        xvec_only = req.xvec_only
+    elif _is_vietnamese_qwen_language(settings.language):
+        xvec_only = not _qwen_settings.vietnamese_icl_mode
+    else:
+        xvec_only = _qwen_settings.xvec_only
     if req.voice_text and req.voice_text.strip():
         prompt_text = req.voice_text.strip()
     elif xvec_only:
         prompt_text = ""
     else:
         try:
-            prompt_text = transcribe_voice_sample(sample_path)
+            prompt_text = transcribe_voice_sample(
+                sample_path,
+                language=_whisper_language_for_locale(settings.dp_language),
+            )
         except EmptyVoiceTranscriptError as e:
             _LOGGER.warning(
                 "Qwen3 voice sample transcription was empty; falling back to xvec-only: voice_url=%s sample_path=%s error=%s",
@@ -1435,19 +1681,17 @@ def _resolve_voice_prompt(req: SynthesizeRequest) -> tuple[Path, str, bool]:
     return sample_path, prompt_text, xvec_only
 
 
-def _generate_qwen_mp3(
+def _generate_qwen_raw(
     model_obj: Any,
-    req: SynthesizeRequest,
     sample_path: Path,
     prompt_text: str,
     xvec_only: bool,
     use_vietnamese_lora: bool,
     settings: _ResolvedGenerationSettings,
-) -> tuple[bytes, dict[str, Any]]:
-    text = _apply_context_replacements(req.text, settings.dp_language)
+) -> tuple[np.ndarray, int]:
     with _qwen_model_context(model_obj, use_vietnamese_lora):
         audio_list, sample_rate = model_obj.generate_voice_clone(
-            text=text,
+            text=settings.prepared_text,
             language=settings.language,
             ref_audio=str(sample_path),
             ref_text=prompt_text,
@@ -1459,13 +1703,135 @@ def _generate_qwen_mp3(
             xvec_only=xvec_only,
             non_streaming_mode=settings.non_streaming_mode,
             append_silence=True,
+            parity_mode=_qwen_settings.disable_cuda_graph,
         )
 
     wav_data = _concat_qwen_audio(audio_list)
     if wav_data.size == 0:
         raise HTTPException(500, "Model produced no output")
 
-    return _encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens)
+    return wav_data, sample_rate
+
+
+def _expected_validation_duration_seconds(settings: _ResolvedGenerationSettings) -> float | None:
+    info = settings.dp_budget_info or {}
+    if not info:
+        try:
+            info = predict_dp_budget(settings.prepared_text, language=settings.dp_language)
+        except Exception:
+            _LOGGER.exception("Failed to predict Qwen validation duration")
+            info = {}
+    for key in ("p50_seconds", "mean_seconds", "seconds"):
+        value = info.get(key)
+        if value is not None:
+            try:
+                seconds = float(value)
+            except (TypeError, ValueError):
+                continue
+            if seconds > 0:
+                return seconds
+    return None
+
+
+def _qwen_generation_validation_info(
+    wav_data: np.ndarray,
+    sample_rate: int,
+    settings: _ResolvedGenerationSettings,
+) -> dict[str, Any]:
+    validation = _qwen_settings.validation
+    if not settings.validation_enabled:
+        return {"enabled": False, "valid": True}
+
+    info = get_dp_budget_model().validate_alignment(
+        text=settings.prepared_text,
+        wav_data=wav_data,
+        sample_rate=sample_rate,
+        language=settings.dp_language,
+        expected_seconds=_expected_validation_duration_seconds(settings),
+        duration_tolerance=validation.duration_tolerance,
+        reject_zero_phoneme_duration=validation.reject_zero_phoneme_duration,
+    )
+    info.update(
+        {
+            "qwen_language": settings.language,
+            "validation_language": settings.dp_language,
+            "prepared_text_chars": len(settings.prepared_text),
+            "dp_budget_enabled": settings.dp_budget_enabled,
+            "dp_budget_info": settings.dp_budget_info,
+        }
+    )
+    return info
+
+
+def _validate_qwen_generation(
+    wav_data: np.ndarray,
+    sample_rate: int,
+    settings: _ResolvedGenerationSettings,
+) -> dict[str, Any]:
+    info = _qwen_generation_validation_info(wav_data, sample_rate, settings)
+    if not info.get("valid", False):
+        raise QwenValidationError(info)
+    return info
+
+
+def _generate_qwen_mp3(
+    model_obj: Any,
+    sample_path: Path,
+    prompt_text: str,
+    xvec_only: bool,
+    use_vietnamese_lora: bool,
+    settings: _ResolvedGenerationSettings,
+) -> tuple[bytes, dict[str, Any]]:
+    attempts = max(1, _qwen_settings.validation.max_retries + 1) if settings.validation_enabled else 1
+    validation_info: dict[str, Any] = {"enabled": settings.validation_enabled, "valid": True}
+    failed_candidates: list[tuple[float, int, bytes, dict[str, Any]]] = []
+    for attempt in range(1, attempts + 1):
+        wav_data, sample_rate = _generate_qwen_raw(
+            model_obj,
+            sample_path,
+            prompt_text,
+            xvec_only,
+            use_vietnamese_lora,
+            settings,
+        )
+        try:
+            validation_info = _validate_qwen_generation(wav_data, sample_rate, settings)
+            validation_info["attempt"] = attempt
+            mp3_bytes, info = _encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens)
+            info["validation"] = validation_info
+            return mp3_bytes, info
+        except QwenValidationError as exc:
+            validation_info = exc.info | {"attempt": attempt}
+            mp3_bytes, info = _encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens)
+            info["validation"] = validation_info
+            duration_ratio = validation_info.get("duration_ratio")
+            try:
+                duration_score = abs(float(duration_ratio) - 1.0)
+            except (TypeError, ValueError):
+                duration_score = float("inf")
+            failed_candidates.append((duration_score, attempt, mp3_bytes, info))
+            if attempt >= attempts:
+                _, selected_attempt, selected_mp3_bytes, selected_info = min(
+                    failed_candidates,
+                    key=lambda item: (item[0], item[1]),
+                )
+                selected_info["validation"]["selected_after_retries"] = True
+                selected_info["validation"]["selected_attempt"] = selected_attempt
+                _LOGGER.warning(
+                    "Qwen3 generation failed validation after retries; returning closest-duration attempt selected_attempt=%d selected_info=%s",
+                    selected_attempt,
+                    selected_info["validation"],
+                )
+                return selected_mp3_bytes, selected_info
+            _LOGGER.warning(
+                "Qwen3 generation failed validation; retrying attempt=%d/%d reason=%s info=%s",
+                attempt,
+                attempts,
+                exc.info.get("reason"),
+                exc.info,
+            )
+
+    raise HTTPException(500, "Qwen3 generation failed unexpectedly")
 
 
 def _concat_qwen_audio(audio: Any) -> np.ndarray:
@@ -1493,13 +1859,15 @@ def _encode_qwen_audio(
     raw_level = _qwen_audio_level(wav_data)
     wav_data, postprocess_info = postprocess_audio(wav_data, sample_rate)
     output_level = _qwen_audio_level(wav_data)
-    audio_seconds = wav_data.size / sample_rate
+    postprocess_audio_seconds = wav_data.size / sample_rate
     cap_seconds = max_new_tokens / 12.0
     hit_token_cap = raw_audio_seconds >= max(0.0, cap_seconds - 0.25)
     mp3_bytes = wav_to_mp3(wav_data, sample_rate)
+    audio_seconds = _encoded_mp3_duration_seconds(mp3_bytes, postprocess_audio_seconds)
     return mp3_bytes, {
         "sample_rate": sample_rate,
         "raw_audio_seconds": raw_audio_seconds,
+        "postprocess_audio_seconds": postprocess_audio_seconds,
         "audio_seconds": audio_seconds,
         "cap_seconds": cap_seconds,
         "hit_token_cap": hit_token_cap,
@@ -1519,16 +1887,77 @@ def _qwen_audio_level(wav_data: np.ndarray) -> dict[str, float]:
     }
 
 
+def _generate_qwen_batch_audio_for_indices(
+    model_obj: Any,
+    item_indices: list[int],
+    voice_clone_prompts: list[Any],
+    settings_list: list[_ResolvedGenerationSettings],
+    xvec_only: bool,
+    use_vietnamese_lora: bool,
+) -> tuple[list[int | None], list[Any], int]:
+    if not item_indices:
+        raise ValueError("item_indices must not be empty")
+
+    template_index = item_indices[0]
+    template = settings_list[template_index]
+    bucket_size = _qwen_batch_bucket_size(len(item_indices))
+    active_indices: list[int | None] = list(item_indices)
+    active_indices.extend([None] * (bucket_size - len(active_indices)))
+
+    dummy_settings = _make_qwen_batch_dummy_settings(template)
+    dummy_prompt = voice_clone_prompts[template_index]
+    active_settings = [
+        settings_list[item_index] if item_index is not None else dummy_settings
+        for item_index in active_indices
+    ]
+    active_prompts = [
+        voice_clone_prompts[item_index] if item_index is not None else dummy_prompt
+        for item_index in active_indices
+    ]
+    active_texts = [settings.prepared_text for settings in active_settings]
+
+    with _qwen_model_context(model_obj, use_vietnamese_lora):
+        audio_list, sample_rate = model_obj.generate_voice_clone_batch(
+            texts=active_texts,
+            language=[settings.language for settings in active_settings],
+            ref_audio=None,
+            ref_text="",
+            max_new_tokens=[settings.max_new_tokens for settings in active_settings],
+            temperature=template.temperature,
+            top_k=template.top_k,
+            top_p=template.top_p,
+            repetition_penalty=template.repetition_penalty,
+            xvec_only=xvec_only,
+            non_streaming_mode=template.non_streaming_mode,
+            append_silence=True,
+            voice_clone_prompt=active_prompts,
+            parity_mode=_qwen_settings.disable_cuda_graph_batch,
+        )
+
+    if len(audio_list) != len(active_texts):
+        raise HTTPException(500, f"Model produced {len(audio_list)} outputs for {len(active_texts)} inputs")
+    return active_indices, audio_list, sample_rate
+
+
 def _generate_qwen_batch_mp3(
     model_obj: Any,
     item_requests: list[SynthesizeRequest],
+    sample_paths: list[Path],
+    prompt_texts: list[str],
     voice_clone_prompts: list[Any],
     settings_list: list[_ResolvedGenerationSettings],
     xvec_only: bool,
     use_vietnamese_lora: bool,
 ) -> list[tuple[bytes, dict[str, Any]] | None]:
-    if len(item_requests) != len(settings_list) or len(item_requests) != len(voice_clone_prompts):
-        raise ValueError("item_requests, voice_clone_prompts, and settings_list length mismatch")
+    if (
+        len(item_requests) != len(settings_list)
+        or len(item_requests) != len(voice_clone_prompts)
+        or len(item_requests) != len(sample_paths)
+        or len(item_requests) != len(prompt_texts)
+    ):
+        raise ValueError(
+            "item_requests, sample_paths, prompt_texts, voice_clone_prompts, and settings_list length mismatch"
+        )
 
     dummy_mask = [_is_qwen_batch_dummy(item) for item in item_requests]
     if not hasattr(model_obj, "generate_voice_clone_batch"):
@@ -1540,39 +1969,85 @@ def _generate_qwen_batch_mp3(
     )
     if first_real_index is None:
         raise HTTPException(400, "at least one non-dummy item is required")
-    first = settings_list[first_real_index]
-    texts = _apply_context_replacements_batch(
-        [item.text for item in item_requests],
-        [settings.dp_language for settings in settings_list],
+    attempts = (
+        max(1, _qwen_settings.validation.max_retries + 1)
+        if any(settings.validation_enabled for settings in settings_list)
+        else 1
     )
-    with _qwen_model_context(model_obj, use_vietnamese_lora):
-        audio_list, sample_rate = model_obj.generate_voice_clone_batch(
-            texts=texts,
-            language=[settings.language for settings in settings_list],
-            ref_audio=None,
-            ref_text="",
-            max_new_tokens=[settings.max_new_tokens for settings in settings_list],
-            temperature=first.temperature,
-            top_k=first.top_k,
-            top_p=first.top_p,
-            repetition_penalty=first.repetition_penalty,
+
+    results: list[tuple[bytes, dict[str, Any]] | None] = [None] * len(item_requests)
+    pending_indices = [
+        item_index
+        for item_index, is_dummy in enumerate(dummy_mask)
+        if not is_dummy
+    ]
+
+    for attempt in range(1, attempts + 1):
+        if not pending_indices:
+            return results
+
+        active_indices, audio_list, sample_rate = _generate_qwen_batch_audio_for_indices(
+            model_obj=model_obj,
+            item_indices=pending_indices,
+            voice_clone_prompts=voice_clone_prompts,
+            settings_list=settings_list,
             xvec_only=xvec_only,
-            non_streaming_mode=first.non_streaming_mode,
-            append_silence=True,
-            voice_clone_prompt=voice_clone_prompts,
+            use_vietnamese_lora=use_vietnamese_lora,
         )
 
-    if len(audio_list) != len(texts):
-        raise HTTPException(500, f"Model produced {len(audio_list)} outputs for {len(texts)} inputs")
+        invalid_items = []
+        next_pending_indices: list[int] = []
+        for batch_index, item_index in enumerate(active_indices):
+            if item_index is None:
+                continue
+            settings = settings_list[item_index]
+            audio = audio_list[batch_index]
+            wav_data = np.asarray(audio, dtype=np.float32).flatten()
+            validation_info = _qwen_generation_validation_info(wav_data, sample_rate, settings)
+            validation_info["attempt"] = attempt
+            mp3_bytes, info = _encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens)
+            info["validation"] = validation_info
 
-    encoded = []
-    for audio, settings, is_dummy in zip(audio_list, settings_list, dummy_mask):
-        if is_dummy:
-            encoded.append(None)
-            continue
-        wav_data = np.asarray(audio, dtype=np.float32).flatten()
-        encoded.append(_encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens))
-    return encoded
+            if validation_info.get("valid", False):
+                results[item_index] = (mp3_bytes, info)
+                continue
+
+            invalid_item = {
+                "item_index": item_index,
+                "text": settings.prepared_text,
+                "validation": validation_info,
+            }
+            invalid_items.append(invalid_item)
+            if attempt >= attempts:
+                results[item_index] = (mp3_bytes, info)
+            else:
+                next_pending_indices.append(item_index)
+
+        if not next_pending_indices:
+            if invalid_items:
+                _LOGGER.warning(
+                    "Qwen3 batch generation failed validation after retries; returning final items invalid_items=%s",
+                    invalid_items,
+                )
+            return results
+
+        if invalid_items:
+            _LOGGER.warning(
+                "Qwen3 batch generation failed validation; retrying invalid items attempt=%d/%d invalid_items=%s",
+                attempt,
+                attempts,
+                invalid_items,
+            )
+        pending_indices = next_pending_indices
+
+    missing_indices = [
+        item_index
+        for item_index, is_dummy in enumerate(dummy_mask)
+        if not is_dummy and results[item_index] is None
+    ]
+    if missing_indices:
+        raise HTTPException(500, f"Qwen3 batch generation did not produce results for items {missing_indices}")
+    return results
 
 
 def _validate_qwen_batch_shared_settings(settings_list: list[_ResolvedGenerationSettings]) -> None:
@@ -1633,6 +2108,7 @@ def _make_qwen_batch_dummy_settings(
     return _ResolvedGenerationSettings(
         language=template.language,
         dp_language=template.dp_language,
+        prepared_text=QWEN_BATCH_DUMMY_TEXT,
         max_new_tokens=0,
         temperature=template.temperature,
         top_k=template.top_k,
@@ -1641,6 +2117,7 @@ def _make_qwen_batch_dummy_settings(
         non_streaming_mode=template.non_streaming_mode,
         dp_budget_enabled=False,
         dp_budget_info=None,
+        validation_enabled=template.validation_enabled,
         expressiveness_level=template.expressiveness_level,
     )
 
@@ -1682,16 +2159,15 @@ def synthesize(req: SynthesizeRequest):
         if not req.text.strip():
             raise HTTPException(400, "text is required")
 
-        sample_path, prompt_text, xvec_only = _resolve_voice_prompt(req)
         settings = _resolve_generation_settings(req)
+        sample_path, prompt_text, xvec_only = _resolve_voice_prompt(req, settings)
         backend_key = _qwen_model_key_for_language(settings.language)
         qwen_model = get_qwen_model_for_language(settings.language)
-        use_vietnamese_lora = backend_key == "vietnamese"
+        use_vietnamese_lora = backend_key == "vietnamese" and not _qwen_settings.vietnamese_model.strip()
 
         with inference_lock:
             mp3_bytes, info = _generate_qwen_mp3(
                 qwen_model,
-                req,
                 sample_path,
                 prompt_text,
                 xvec_only,
@@ -1738,6 +2214,7 @@ def synthesize(req: SynthesizeRequest):
 @router.post("/synthesize/batch", response_model=BatchSynthesizeResponse)
 @router.post("/synthesize-batch", response_model=BatchSynthesizeResponse)
 def synthesize_batch(req: BatchSynthesizeRequest):
+    started = time.perf_counter()
     if len(req.items) > QWEN_MAX_BATCH_SIZE:
         raise HTTPException(400, f"Qwen3 batch size must be <= {QWEN_MAX_BATCH_SIZE}")
 
@@ -1745,91 +2222,90 @@ def synthesize_batch(req: BatchSynthesizeRequest):
         item.model_copy(update={"text": item.text.strip()})
         for item in req.items
     ]
+    _log_qwen_batch_synthesize_request(
+        status="received",
+        started=started,
+        req=req,
+        item_requests=item_requests,
+    )
     texts = [item.text for item in item_requests]
     for index, text in enumerate(texts):
         if not text:
             raise HTTPException(400, f"items[{index}].text is required")
 
     settings_list = _resolve_generation_settings_batch(item_requests)
-    _validate_qwen_batch_shared_settings(settings_list)
     resolved_prompts = [
-        _resolve_voice_prompt(item)
-        for item in item_requests
+        _resolve_voice_prompt(item, settings)
+        for item, settings in zip(item_requests, settings_list)
     ]
-    xvec_modes = [xvec_only for _, _, xvec_only in resolved_prompts]
-    if any(mode != xvec_modes[0] for mode in xvec_modes):
-        raise HTTPException(
-            400,
-            "Qwen3 batch generation requires all items to share xvec_only mode",
-        )
+    _log_qwen_batch_synthesize_request(
+        status="resolved",
+        started=started,
+        req=req,
+        item_requests=item_requests,
+        settings_list=settings_list,
+        resolved_prompts=resolved_prompts,
+    )
 
-    started = time.perf_counter()
     items: list[BatchSynthesizeItem | None] = [None] * len(item_requests)
     with inference_lock:
-        backend_keys = [_qwen_model_key_for_language(settings.language) for settings in settings_list]
-        grouped_indices: dict[str, list[int]] = {}
-        for index, backend_key in enumerate(backend_keys):
-            grouped_indices.setdefault(backend_key, []).append(index)
-
-        for backend_key, indices in grouped_indices.items():
-            model_obj = get_qwen_model_for_language(settings_list[indices[0]].language)
-            use_vietnamese_lora = backend_key == "vietnamese"
-            prompt_items_by_index = {
-                index: _create_voice_clone_prompt_item(
-                    model_obj=model_obj,
-                    sample_path=resolved_prompts[index][0],
-                    prompt_text=resolved_prompts[index][1],
-                    xvec_only=resolved_prompts[index][2],
-                    use_vietnamese_lora=use_vietnamese_lora,
-                )
-                for index in indices
-            }
-
-            for chunk_start in range(0, len(indices), QWEN_MODEL_MAX_BATCH_SIZE):
-                chunk_indices = indices[chunk_start : chunk_start + QWEN_MODEL_MAX_BATCH_SIZE]
-                chunk_requests = [item_requests[index] for index in chunk_indices]
-                chunk_settings = [settings_list[index] for index in chunk_indices]
-                chunk_prompts = [prompt_items_by_index[index] for index in chunk_indices]
-
-                bucket_size = _qwen_batch_bucket_size(len(chunk_requests))
-                padding_count = bucket_size - len(chunk_requests)
-                if padding_count:
-                    dummy_request = _make_qwen_batch_dummy_request(chunk_requests[0])
-                    dummy_settings = _make_qwen_batch_dummy_settings(chunk_settings[0])
-                    dummy_prompt = chunk_prompts[0]
-                    chunk_requests.extend(dummy_request for _ in range(padding_count))
-                    chunk_settings.extend(dummy_settings for _ in range(padding_count))
-                    chunk_prompts.extend(dummy_prompt for _ in range(padding_count))
-
-                generated = _generate_qwen_batch_mp3(
-                    model_obj=model_obj,
-                    item_requests=chunk_requests,
-                    voice_clone_prompts=chunk_prompts,
-                    settings_list=chunk_settings,
-                    xvec_only=xvec_modes[0],
-                    use_vietnamese_lora=use_vietnamese_lora,
-                )
-
-                for index, settings, generated_item in zip(chunk_indices, chunk_settings, generated):
-                    if generated_item is None:
-                        raise HTTPException(500, "Model did not produce audio for a non-dummy item")
-                    mp3_bytes, info = generated_item
-                    items[index] = BatchSynthesizeItem(
-                        text=texts[index],
-                        audio_base64=base64.b64encode(mp3_bytes).decode("ascii"),
-                        sample_rate=int(info["sample_rate"]),
-                        raw_audio_seconds=float(info["raw_audio_seconds"]),
-                        audio_seconds=float(info["audio_seconds"]),
-                        max_new_tokens=settings.max_new_tokens,
-                        hit_token_cap=bool(info["hit_token_cap"]),
-                        language=settings.language,
-                        dp_language=settings.dp_language,
-                    )
+        for index, (item, settings, resolved_prompt) in enumerate(
+            zip(item_requests, settings_list, resolved_prompts)
+        ):
+            sample_path, prompt_text, xvec_only = resolved_prompt
+            backend_key = _qwen_model_key_for_language(settings.language)
+            model_obj = get_qwen_model_for_language(settings.language)
+            use_vietnamese_lora = backend_key == "vietnamese" and not _qwen_settings.vietnamese_model.strip()
+            mp3_bytes, info = _generate_qwen_mp3(
+                model_obj,
+                sample_path,
+                prompt_text,
+                xvec_only,
+                use_vietnamese_lora,
+                settings,
+            )
+            items[index] = BatchSynthesizeItem(
+                text=item.text,
+                audio_base64=base64.b64encode(mp3_bytes).decode("ascii"),
+                sample_rate=int(info["sample_rate"]),
+                raw_audio_seconds=float(info["raw_audio_seconds"]),
+                audio_seconds=float(info["audio_seconds"]),
+                max_new_tokens=settings.max_new_tokens,
+                hit_token_cap=bool(info["hit_token_cap"]),
+                language=settings.language,
+                dp_language=settings.dp_language,
+            )
     wall_seconds = time.perf_counter() - started
     final_items = [item for item in items if item is not None]
+    result_info = {
+        "count": len(final_items),
+        "audio_seconds_total": sum(item.audio_seconds for item in final_items),
+        "items": [
+            {
+                "index": index,
+                "text": item.text,
+                "language": item.language,
+                "dp_language": item.dp_language,
+                "max_new_tokens": item.max_new_tokens,
+                "raw_audio_seconds": item.raw_audio_seconds,
+                "audio_seconds": item.audio_seconds,
+                "hit_token_cap": item.hit_token_cap,
+            }
+            for index, item in enumerate(final_items)
+        ],
+    }
+    _log_qwen_batch_synthesize_request(
+        status="ok",
+        started=started,
+        req=req,
+        item_requests=item_requests,
+        settings_list=settings_list,
+        resolved_prompts=resolved_prompts,
+        info=result_info,
+    )
     return BatchSynthesizeResponse(
         items=final_items,
         count=len(final_items),
         wall_seconds=wall_seconds,
-        audio_seconds_total=sum(item.audio_seconds for item in final_items),
+        audio_seconds_total=result_info["audio_seconds_total"],
     )

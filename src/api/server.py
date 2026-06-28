@@ -14,19 +14,16 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import sys
 import threading
 import time
 import httpx
 import uuid
-import wave
 from collections import OrderedDict
 from dataclasses import dataclass
 import multiprocessing as mp
-import queue
 from pathlib import Path
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Any, Awaitable, Callable, Literal, Optional
 from urllib.parse import parse_qsl, urlencode
 
 import numpy as np
@@ -43,12 +40,23 @@ from pydub import AudioSegment
 from ..multilingual_splitter import MultilingualSplitter
 from ..piper import PiperInference
 from ..ssml import BreakSegment, TextSegment, generate_silence, parse_ssml
-from ..matcha_inference import MatchaBackend as ProductionMatchaBackend
-from ..matcha_inference import MatchaBatcher as ProductionMatchaBatcher
+from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
+from ..matcha_inference import MatchaBatchRequest
+from ..matcha_inference import MatchaBatcher as ProductionStarlingBatcher
 from . import qwen3
 from .qwen_worker import qwen_worker_main
 from .request_decompression import RequestDecompressionMiddleware
+from .audio_utils import _audio_to_mp3_bytes, _audio_to_wav_bytes, _resample_audio
+from .model_workers import seed_vc_worker_main, sparrow_worker_main, starling_worker_main
+from .seed_vc_backend import (
+    SeedVCBackend as _SeedVCBackend,
+    SeedVCBatchRequest,
+    SeedVCEnhanceRequest,
+    SeedVCFindVoiceRequest,
+    SeedVCRequest,
+)
 from .rvc import RVCBackend, RVCSettings
+from .worker_common import WorkerProcessClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -126,9 +134,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-QWEN_WORKER_TIMEOUT_SECONDS = float(os.environ.get("QWEN_TTS_WORKER_TIMEOUT_SECONDS", "900"))
-
-
 def _resolve_project_path(value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else PROJECT_ROOT / path
@@ -187,6 +192,7 @@ class EngineEnableConfig(BaseModel):
 
     pipertts: bool = Field(default_factory=lambda: _env_bool("PIPER_TTS_ENABLED", True))
     qwen3: bool = Field(default_factory=lambda: _env_bool("QWEN_TTS_ENABLED", True))
+    starling: bool = Field(default_factory=lambda: _env_bool("STARLING_TTS_ENABLED", _env_bool("MATCHA_TTS_ENABLED", False)))
     matcha: bool = Field(default_factory=lambda: _env_bool("MATCHA_TTS_ENABLED", False))
     seed_vc: bool = Field(default_factory=lambda: _env_bool("SEED_VC_ENABLED", True))
     rvc: bool = Field(default_factory=lambda: _env_bool("RVC_ENABLED", False))
@@ -213,12 +219,21 @@ class QwenTTSConfig(qwen3.QwenSettings):
 
 
 class MatchaConfig(BaseModel):
-    """Matcha-TTS backend configuration."""
+    """Starling backend configuration."""
 
-    enabled: bool = Field(default_factory=lambda: _env_bool("MATCHA_TTS_ENABLED", False))
-    preload: bool = Field(default_factory=lambda: _env_bool("MATCHA_TTS_PRELOAD", True))
-    device: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_DEVICE", "cuda:2"))
-    checkpoint: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_CHECKPOINT", ""))
+    enabled: bool = Field(default_factory=lambda: _env_bool("STARLING_TTS_ENABLED", _env_bool("MATCHA_TTS_ENABLED", False)))
+    preload: bool = Field(default_factory=lambda: _env_bool("STARLING_TTS_PRELOAD", _env_bool("MATCHA_TTS_PRELOAD", True)))
+    device: str = Field(default_factory=lambda: os.environ.get("STARLING_TTS_DEVICE", os.environ.get("MATCHA_TTS_DEVICE", "cuda:2")))
+    checkpoint: str = Field(default_factory=lambda: os.environ.get("STARLING_TTS_CHECKPOINT", os.environ.get("MATCHA_TTS_CHECKPOINT", "")))
+    config_path: str = Field(default_factory=lambda: os.environ.get("STARLING_TTS_CONFIG", "data/lzspeech-starling/config.json"))
+    semantic_model_name: str = Field(
+        default_factory=lambda: os.environ.get("STARLING_TTS_SEMANTIC_MODEL", "distilbert/distilbert-base-multilingual-cased")
+    )
+    semantic_max_tokens: Optional[int] = Field(
+        default_factory=lambda: None
+        if os.environ.get("STARLING_TTS_SEMANTIC_MAX_TOKENS", "").lower() in {"", "none", "null"}
+        else int(os.environ.get("STARLING_TTS_SEMANTIC_MAX_TOKENS", "0"))
+    )
     icbpe_vocab_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_ICBPE_VOCAB", ""))
     phoneme_vocab_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_PHONEME_VOCAB", ""))
     filelist_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_FILELIST", ""))
@@ -296,6 +311,7 @@ class ServerConfig(BaseModel):
     engines: EngineEnableConfig = Field(default_factory=EngineEnableConfig)
     pipertts: PiperTTSConfig = Field(default_factory=PiperTTSConfig)
     qwen: QwenTTSConfig = Field(default_factory=QwenTTSConfig)
+    starling: MatchaConfig = Field(default_factory=MatchaConfig)
     matcha: MatchaConfig = Field(default_factory=MatchaConfig)
     seed_vc: SeedVCConfig = Field(default_factory=SeedVCConfig)
     rvc: RVCConfig = Field(default_factory=RVCConfig)
@@ -395,7 +411,7 @@ class BatchSynthesizeResponse(BaseModel):
 
 
 class MatchaSynthesizeRequest(BaseModel):
-    """Request body for the temporary Matcha backend."""
+    """Request body for the Starling backend."""
 
     text: str
     language: str = Field("en", description="Language code used for phonemization and speaker/language conditioning")
@@ -407,38 +423,6 @@ class MatchaSynthesizeRequest(BaseModel):
     temperature: Optional[float] = None
     length_scale: Optional[float] = None
 
-
-class SeedVCRequest(BaseModel):
-    """Request body compatible with the Seed-VC /vc endpoint."""
-
-    audio: str = Field(..., description="Base64 encoded source audio")
-    reference_url: Optional[str] = Field(None, description="Reference voice URL; optional when cached sample/embedding exists")
-    id: str = Field(..., description="Voice id used for cached reference audio/embeddings")
-    style: Optional[str] = "general"
-    intensity: Optional[float] = 1.0
-    preset: Optional[str] = None
-    remove_glitches: Optional[bool] = False
-
-
-class SeedVCBatchRequest(BaseModel):
-    """Batch Seed-VC request.
-
-    The initial batched path is intended for a Matcha -> one target timbre
-    pipeline, so all items share the same target voice settings.
-    """
-
-    items: list[SeedVCRequest] = Field(..., min_length=1)
-    max_chunk_batch_size: int = Field(1, ge=1, le=64)
-
-
-class SeedVCFindVoiceRequest(BaseModel):
-    reference_url: str
-    id: str
-
-
-class SeedVCEnhanceRequest(BaseModel):
-    reference_url: str
-    id: str
 
 
 class RVCConvertRequest(BaseModel):
@@ -559,16 +543,43 @@ _speaker_routes: dict[str, tuple[str, Optional[int]]] = {}  # speaker -> (model,
 _lang_speaker_map: dict[str, str] = {}  # canonical locale -> speaker
 _splitter: MultilingualSplitter | None = None
 _splitter_languages: tuple[str, ...] | None = None
-_matcha_backend: "ProductionMatchaBackend | None" = None
-_matcha_batcher: "ProductionMatchaBatcher | None" = None
+_starling_backend: "ProductionStarlingBackend | None" = None
+_starling_batcher: "ProductionStarlingBatcher | None" = None
 _seed_vc_backend: "_SeedVCBackend | None" = None
 _rvc_backend: "RVCBackend | None" = None
 _seed_vc_supported_voice_ids: set[str] | None = None
 _seed_vc_voice_ids: set[str] | None = None
-_qwen_worker_process: mp.Process | None = None
-_qwen_worker_requests: Any | None = None
-_qwen_worker_responses: Any | None = None
-_qwen_worker_lock = threading.Lock()
+_qwen_worker_processes: dict[str, mp.Process | None] = {"primary": None, "vietnamese": None}
+_qwen_worker_requests: dict[str, Any | None] = {"primary": None, "vietnamese": None}
+_qwen_worker_responses: dict[str, Any | None] = {"primary": None, "vietnamese": None}
+_qwen_worker_locks: dict[str, threading.Lock] = {
+    "primary": threading.Lock(),
+    "vietnamese": threading.Lock(),
+}
+_qwen_worker_start_lock = threading.Lock()
+_sparrow_worker: WorkerProcessClient | None = None
+_sparrow_model_info: dict[str, dict[str, Any]] = {}
+_starling_worker: WorkerProcessClient | None = None
+_starling_info: dict[str, Any] = {}
+_seed_vc_worker: WorkerProcessClient | None = None
+_seed_vc_info: dict[str, Any] = {}
+_startup_loader_task: asyncio.Task | None = None
+
+
+@dataclass
+class _EngineLoadState:
+    name: str
+    ready: threading.Event
+    status: str = "disabled"
+    error: str | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
+_engine_load_states: dict[str, _EngineLoadState] = {
+    name: _EngineLoadState(name=name, ready=threading.Event())
+    for name in ("pipertts", "qwen3", "starling", "seed_vc", "rvc")
+}
 
 _inference_counter = 0
 _CLEANUP_EVERY = 1
@@ -693,78 +704,252 @@ def _load_config() -> ServerConfig:
         return config
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         data = json.load(f)
+    if "starling" not in data and "matcha" in data:
+        data["starling"] = data["matcha"]
+    engines = data.get("engines")
+    if isinstance(engines, dict) and "starling" not in engines and "matcha" in engines:
+        engines["starling"] = engines["matcha"]
     config = ServerConfig(**data)
     qwen3.apply_env_overrides(config.qwen)
     return config
 
 
-def _engine_enabled(engine: Literal["pipertts", "qwen3", "matcha", "seed_vc", "rvc"], config: ServerConfig | None = None) -> bool:
+def _engine_enabled(engine: Literal["pipertts", "qwen3", "starling", "matcha", "seed_vc", "rvc"], config: ServerConfig | None = None) -> bool:
     cfg = config or _server_config
+    if engine == "starling":
+        return bool(cfg.engines.starling or cfg.engines.matcha)
+    if engine == "matcha":
+        return bool(cfg.engines.matcha or cfg.engines.starling)
     return bool(getattr(cfg.engines, engine))
 
 
-def _start_qwen_worker() -> None:
-    """Start the isolated Qwen worker process."""
-    global _qwen_worker_process, _qwen_worker_requests, _qwen_worker_responses
-    if _qwen_worker_process is not None and _qwen_worker_process.is_alive():
+def _engine_state(engine: str) -> _EngineLoadState:
+    return _engine_load_states[engine]
+
+
+def _mark_engine_disabled(engine: str) -> None:
+    state = _engine_state(engine)
+    state.status = "disabled"
+    state.error = None
+    state.started_at = None
+    state.finished_at = None
+    state.ready.clear()
+
+
+def _mark_engine_loading(engine: str) -> None:
+    state = _engine_state(engine)
+    state.status = "loading"
+    state.error = None
+    state.started_at = time.perf_counter()
+    state.finished_at = None
+    state.ready.clear()
+
+
+def _mark_engine_ready(engine: str) -> None:
+    state = _engine_state(engine)
+    state.status = "ready"
+    state.error = None
+    state.finished_at = time.perf_counter()
+    state.ready.set()
+
+
+def _mark_engine_failed(engine: str, exc: BaseException) -> None:
+    state = _engine_state(engine)
+    state.status = "error"
+    state.error = str(exc)
+    state.finished_at = time.perf_counter()
+    state.ready.set()
+
+
+def _engine_status(engine: str) -> dict[str, Any]:
+    state = _engine_state(engine)
+    elapsed = None
+    if state.started_at is not None:
+        end = state.finished_at or time.perf_counter()
+        elapsed = round(end - state.started_at, 3)
+    return {
+        "status": state.status,
+        "ready": state.status == "ready",
+        "loading_seconds": elapsed,
+        **({"error": state.error} if state.error else {}),
+    }
+
+
+def _wait_for_engine_ready(engine: str) -> None:
+    if not _engine_enabled("starling" if engine == "starling" else engine):  # type: ignore[arg-type]
+        raise HTTPException(status_code=503, detail=f"{engine} backend is disabled")
+
+    state = _engine_state(engine)
+    if state.status == "ready":
         return
+    if state.status == "disabled":
+        raise HTTPException(status_code=503, detail=f"{engine} backend is disabled")
 
-    ctx = mp.get_context("spawn")
-    _qwen_worker_requests = ctx.Queue()
-    _qwen_worker_responses = ctx.Queue()
-    settings = _server_config.qwen.model_dump(mode="json")
-    _qwen_worker_process = ctx.Process(
-        target=qwen_worker_main,
-        args=(settings, _qwen_worker_requests, _qwen_worker_responses),
-        name="lz-tts-qwen-worker",
-        daemon=False,
+    if state.status == "loading":
+        _LOGGER.info("Waiting for %s backend readiness", engine)
+        state.ready.wait()
+
+    if state.status == "ready":
+        return
+    if state.status == "error":
+        raise HTTPException(status_code=503, detail=f"{engine} backend failed to load: {state.error}")
+    raise HTTPException(status_code=503, detail=f"{engine} backend is still loading")
+
+
+async def _await_engine_ready(engine: str) -> None:
+    await asyncio.to_thread(_wait_for_engine_ready, engine)
+
+
+def _separate_vietnamese_qwen_worker_enabled() -> bool:
+    return bool(
+        _server_config.qwen.vietnamese_model.strip()
+        and _server_config.qwen.vietnamese_device.strip()
+        and _server_config.qwen.vietnamese_device.strip() != _server_config.qwen.device.strip()
     )
-    _qwen_worker_process.start()
 
 
-def _stop_qwen_worker() -> None:
+def _qwen_worker_settings(worker_name: str) -> dict[str, Any]:
+    settings = _server_config.qwen.model_dump(mode="json")
+    if worker_name == "primary" and _separate_vietnamese_qwen_worker_enabled():
+        settings["vietnamese_model"] = ""
+        settings["viet_lora_model"] = ""
+        settings["vietnamese_device"] = ""
+        return settings
+    if worker_name == "vietnamese":
+        if not _separate_vietnamese_qwen_worker_enabled():
+            raise RuntimeError("Separate Vietnamese Qwen worker is not configured")
+        settings["model"] = _server_config.qwen.vietnamese_model
+        settings["device"] = _server_config.qwen.vietnamese_device
+        settings["disable_cuda_graph"] = _server_config.qwen.vietnamese_disable_cuda_graph
+        settings["vietnamese_model"] = ""
+        settings["viet_lora_model"] = ""
+        settings["vietnamese_device"] = ""
+        return settings
+    return settings
+
+
+def _qwen_worker_name_for_request(req: qwen3.SynthesizeRequest) -> str:
+    if not _separate_vietnamese_qwen_worker_enabled():
+        return "primary"
+    resolved = qwen3.resolve_qwen_language(req.text, req.language, req.language_code)
+    return "vietnamese" if qwen3._is_vietnamese_qwen_language(resolved.qwen_language) else "primary"
+
+
+def _qwen_worker_name_for_batch(req: qwen3.BatchSynthesizeRequest) -> str:
+    if not _separate_vietnamese_qwen_worker_enabled():
+        return "primary"
+    worker_names = {
+        _qwen_worker_name_for_request(item)
+        for item in req.items
+        if item.text and item.text.strip()
+    }
+    if len(worker_names) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Qwen3 batch generation cannot mix Vietnamese and non-Vietnamese models in one request",
+        )
+    return next(iter(worker_names), "primary")
+
+
+def _start_qwen_worker(worker_name: str = "primary") -> None:
+    """Start the isolated Qwen worker process."""
+    if worker_name == "vietnamese" and not _separate_vietnamese_qwen_worker_enabled():
+        return
+    with _qwen_worker_start_lock:
+        process = _qwen_worker_processes.get(worker_name)
+        if process is not None and process.is_alive():
+            return
+
+        ctx = mp.get_context("spawn")
+        requests = ctx.Queue()
+        responses = ctx.Queue()
+        settings = _qwen_worker_settings(worker_name)
+        process = ctx.Process(
+            target=qwen_worker_main,
+            args=(settings, requests, responses, worker_name),
+            name=f"lz-tts-qwen-{worker_name}-worker",
+            daemon=False,
+        )
+        _qwen_worker_requests[worker_name] = requests
+        _qwen_worker_responses[worker_name] = responses
+        _qwen_worker_processes[worker_name] = process
+        process.start()
+
+
+def _stop_qwen_worker(worker_name: str | None = None) -> None:
     """Stop the isolated Qwen worker process."""
-    global _qwen_worker_process, _qwen_worker_requests, _qwen_worker_responses
-    process = _qwen_worker_process
-    requests = _qwen_worker_requests
-    if process is not None and process.is_alive() and requests is not None:
-        try:
-            requests.put({"action": "shutdown", "payload": None})
-            process.join(timeout=10)
-        except Exception:
-            _LOGGER.exception("Failed graceful Qwen worker shutdown")
-    if process is not None and process.is_alive():
-        process.terminate()
-        process.join(timeout=10)
-    _qwen_worker_process = None
-    _qwen_worker_requests = None
-    _qwen_worker_responses = None
+    with _qwen_worker_start_lock:
+        worker_names = [worker_name] if worker_name else list(_qwen_worker_processes.keys())
+        for name in worker_names:
+            process = _qwen_worker_processes.get(name)
+            requests = _qwen_worker_requests.get(name)
+            if process is not None and process.is_alive() and requests is not None:
+                try:
+                    requests.put({"action": "shutdown", "payload": None})
+                    process.join(timeout=10)
+                except Exception:
+                    _LOGGER.exception("Failed graceful Qwen worker shutdown name=%s", name)
+            if process is not None and process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+            _qwen_worker_processes[name] = None
+            _qwen_worker_requests[name] = None
+            _qwen_worker_responses[name] = None
 
 
-def _call_qwen_worker(action: str, payload: Any | None = None, *, timeout: float | None = None) -> dict[str, Any]:
+def _call_qwen_worker(
+    action: str,
+    payload: Any | None = None,
+    *,
+    wait_ready: bool = True,
+    worker_name: str = "primary",
+) -> dict[str, Any]:
     """Call the Qwen worker process and return its serialized response."""
     if not _engine_enabled("qwen3"):
         raise HTTPException(status_code=503, detail="Qwen3 TTS backend is disabled")
-    _start_qwen_worker()
+    if wait_ready:
+        _wait_for_engine_ready("qwen3")
+    _start_qwen_worker(worker_name)
+    process = _qwen_worker_processes.get(worker_name)
+    requests = _qwen_worker_requests.get(worker_name)
+    responses = _qwen_worker_responses.get(worker_name)
     if (
-        _qwen_worker_process is None
-        or _qwen_worker_requests is None
-        or _qwen_worker_responses is None
-        or not _qwen_worker_process.is_alive()
+        process is None
+        or requests is None
+        or responses is None
+        or not process.is_alive()
     ):
-        raise HTTPException(status_code=503, detail="Qwen3 worker is not running")
+        raise HTTPException(status_code=503, detail=f"Qwen3 {worker_name} worker is not running")
 
-    with _qwen_worker_lock:
-        try:
-            _qwen_worker_requests.put({"action": action, "payload": payload})
-            response = _qwen_worker_responses.get(timeout=timeout or QWEN_WORKER_TIMEOUT_SECONDS)
-        except queue.Empty as exc:
-            if _qwen_worker_process is not None and not _qwen_worker_process.is_alive():
-                raise HTTPException(status_code=503, detail="Qwen3 worker exited") from exc
-            raise HTTPException(status_code=504, detail="Qwen3 worker timed out") from exc
+    request_id = uuid.uuid4().hex
+    _qwen_worker_locks[worker_name].acquire()
+    started = time.perf_counter()
+    _LOGGER.info("Qwen worker request start name=%s action=%s request_id=%s", worker_name, action, request_id)
+    try:
+        requests.put({"request_id": request_id, "action": action, "payload": payload})
+        while True:
+            response = responses.get()
+            if not isinstance(response, dict):
+                raise HTTPException(status_code=502, detail="Qwen3 worker returned invalid response")
+            if response.get("request_id") == request_id:
+                break
+            _LOGGER.warning(
+                "Discarding stale Qwen worker response name=%s action=%s expected_request_id=%s got_request_id=%s",
+                worker_name,
+                action,
+                request_id,
+                response.get("request_id"),
+            )
+    finally:
+        _qwen_worker_locks[worker_name].release()
 
-    if not isinstance(response, dict):
-        raise HTTPException(status_code=502, detail="Qwen3 worker returned invalid response")
+    _LOGGER.info(
+        "Qwen worker request done name=%s action=%s request_id=%s elapsed=%.2fs",
+        worker_name,
+        action,
+        request_id,
+        time.perf_counter() - started,
+    )
     if response.get("ok"):
         return response
 
@@ -777,17 +962,81 @@ def _qwen_worker_status() -> dict[str, Any]:
     """Best-effort Qwen status without loading Qwen in the parent process."""
     if not _engine_enabled("qwen3"):
         return {"enabled": False}
-    try:
-        response = _call_qwen_worker("health", timeout=5)
-        data = response.get("data")
-        return data if isinstance(data, dict) else {"enabled": True, "worker": "invalid_response"}
-    except HTTPException as exc:
-        return {
-            "enabled": True,
-            "worker": "error",
-            "status_code": exc.status_code,
-            "detail": exc.detail,
-        }
+    state = _engine_status("qwen3")
+    if state["status"] != "ready":
+        return {"enabled": True, "worker": state["status"], **state}
+    worker_names = ["primary"]
+    if _separate_vietnamese_qwen_worker_enabled():
+        worker_names.append("vietnamese")
+    workers: dict[str, Any] = {}
+    for worker_name in worker_names:
+        try:
+            response = _call_qwen_worker("health", wait_ready=False, worker_name=worker_name)
+            data = response.get("data")
+            workers[worker_name] = data if isinstance(data, dict) else {"worker": "invalid_response"}
+        except HTTPException as exc:
+            detail = str(exc.detail)
+            workers[worker_name] = {
+                "worker": "busy" if exc.status_code == 504 and "request slot" in detail else "error",
+                "status_code": exc.status_code,
+                "detail": detail,
+            }
+    primary = workers.get("primary")
+    return {
+        **state,
+        "enabled": True,
+        "worker": primary.get("worker") if isinstance(primary, dict) else "unknown",
+        "separate_vietnamese_worker": _separate_vietnamese_qwen_worker_enabled(),
+        "workers": workers,
+    }
+
+
+
+def _worker_settings_data() -> dict[str, Any]:
+    return _server_config.model_dump(mode="json")
+
+
+def _ensure_sparrow_worker() -> WorkerProcessClient:
+    global _sparrow_worker
+    if _sparrow_worker is None:
+        _sparrow_worker = WorkerProcessClient(
+            name="sparrow",
+            target=sparrow_worker_main,
+            args=(_worker_settings_data(),),
+        )
+    return _sparrow_worker
+
+
+def _ensure_starling_worker() -> WorkerProcessClient:
+    global _starling_worker
+    if _starling_worker is None:
+        _starling_worker = WorkerProcessClient(
+            name="starling",
+            target=starling_worker_main,
+            args=(_worker_settings_data(),),
+        )
+    return _starling_worker
+
+
+def _ensure_seed_vc_worker() -> WorkerProcessClient:
+    global _seed_vc_worker
+    if _seed_vc_worker is None:
+        _seed_vc_worker = WorkerProcessClient(
+            name="seed-vc",
+            target=seed_vc_worker_main,
+            args=(_worker_settings_data(),),
+        )
+    return _seed_vc_worker
+
+
+def _stop_model_workers() -> None:
+    global _sparrow_worker, _starling_worker, _seed_vc_worker
+    for worker in (_sparrow_worker, _starling_worker, _seed_vc_worker):
+        if worker is not None:
+            worker.stop()
+    _sparrow_worker = None
+    _starling_worker = None
+    _seed_vc_worker = None
 
 
 def _find_checkpoint(model_dir: Path) -> Path | None:
@@ -919,10 +1168,73 @@ def _load_model(model: str) -> PiperInference:
     return inference
 
 
+class _SparrowInferenceProxy:
+    """Parent-process stand-in for a Sparrow model owned by the worker."""
+
+    def __init__(self, model: str, info: dict[str, Any]):
+        self.model = model
+        self.sample_rate = int(info.get("sample_rate") or 22050)
+        self.speakers = dict(info.get("speakers") or {})
+        self.use_bert = bool(info.get("use_bert", False))
+
+    def synthesize_batch(
+        self,
+        texts: list[str],
+        *,
+        speaker: Any = None,
+        batch_size: int = 1,
+        neural: bool = True,
+        **synth_kwargs: Any,
+    ) -> list[np.ndarray]:
+        response = _ensure_sparrow_worker().call(
+            "synthesize_batch",
+            {
+                "model": self.model,
+                "texts": texts,
+                "speaker": speaker,
+                "batch_size": batch_size,
+                "neural": neural,
+                "synth_kwargs": synth_kwargs,
+            },
+        )
+        data = response.get("data") or {}
+        self.sample_rate = int(data.get("sample_rate") or self.sample_rate)
+        return list(data.get("audios") or [])
+
+    def synthesize_span(
+        self,
+        text: str,
+        *,
+        speaker: Any = None,
+        neural: bool = True,
+        **synth_kwargs: Any,
+    ) -> np.ndarray:
+        response = _ensure_sparrow_worker().call(
+            "synthesize_span",
+            {
+                "model": self.model,
+                "text": text,
+                "speaker": speaker,
+                "neural": neural,
+                "synth_kwargs": synth_kwargs,
+            },
+        )
+        data = response.get("data") or {}
+        self.sample_rate = int(data.get("sample_rate") or self.sample_rate)
+        return data.get("audio")
+
+
 def _get_inference(model: str) -> PiperInference:
     """Get an already loaded inference instance for a model."""
     if not _engine_enabled("pipertts"):
         raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
+    _wait_for_engine_ready("pipertts")
+    if _sparrow_worker is not None:
+        if model in _sparrow_model_info:
+            return _SparrowInferenceProxy(model, _sparrow_model_info[model])
+        if _is_model_allowed(model):
+            raise HTTPException(status_code=503, detail=f"Model was not loaded at startup: {model}")
+        raise HTTPException(status_code=404, detail=f"Model is not configured for this server: {model}")
     if model in _inference_cache:
         inference = _inference_cache.pop(model)
         _inference_cache[model] = inference
@@ -1225,8 +1537,12 @@ def _get_seed_vc_supported_voice_ids() -> set[str]:
         return _seed_vc_supported_voice_ids
 
     supported = {cfg.voice_id for cfg in _server_config.pipertts.root_voices.values()}
-    backend = _get_seed_vc_backend()
-    emb_ids = {_seed_vc_base_id(key) for key in backend.cached_embeddings.keys()} if backend.cached_embeddings else set()
+    if _seed_vc_info.get("embedding_keys"):
+        embedding_keys = list(_seed_vc_info.get("embedding_keys") or [])
+    else:
+        backend = _get_seed_vc_backend()
+        embedding_keys = list(backend.cached_embeddings.keys()) if backend.cached_embeddings else []
+    emb_ids = {_seed_vc_base_id(key) for key in embedding_keys}
     if not emb_ids:
         raise RuntimeError("Seed-VC backend loaded without cached embeddings")
 
@@ -1294,6 +1610,7 @@ async def _convert_generated_audio_to_sample_batch(
     sample_url: str,
     output_format: Literal["wav", "mp3"],
 ) -> tuple[list[tuple[bytes, float]], int]:
+    await _await_engine_ready("seed_vc")
     backend = _get_seed_vc_backend()
     sample_request = SeedVCRequest(
         audio="",
@@ -1357,6 +1674,7 @@ async def _convert_encoded_audio_rvc_batch(
     if not audio_items:
         return []
 
+    await _await_engine_ready("rvc")
     backend = _get_rvc_backend()
     started = time.perf_counter()
     _log_synthesize_batch_stage(
@@ -1538,6 +1856,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
     if any(not text for text in texts):
         raise HTTPException(status_code=400, detail="all texts must be non-empty")
 
+    await _await_engine_ready("seed_vc")
     supported_voice_ids = _get_seed_vc_supported_voice_ids()
     if request.voice_id not in supported_voice_ids:
         supported = sorted(supported_voice_ids)
@@ -1634,6 +1953,53 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
     ]
 
     for model_name, records in segment_groups.items():
+        if _is_starling_model(model_name):
+            await _await_engine_ready("starling")
+            starling_batcher = _get_starling_batcher()
+            starling_length_scale = request.options.length_scale if request.options and request.options.length_scale is not None else None
+            batch_started = time.perf_counter()
+            _log_synthesize_batch_stage(
+                "starling_batch_start",
+                pipeline="configured_voice",
+                voice_id=request.voice_id,
+                model=model_name,
+                item_count=len(texts),
+                segment_count=len(records),
+                batch_size=len(records),
+                languages=sorted({str(record["lang"]) for record in records}),
+                neural=request.neural,
+            )
+            batch_results = await asyncio.gather(
+                *[
+                    starling_batcher.submit(
+                        MatchaSynthesizeRequest(
+                            text=record["text"],
+                            language=record["lang"],
+                            format="wav",
+                            neural=request.neural,
+                            length_scale=starling_length_scale,
+                        )
+                    )
+                    for record in records
+                ]
+            )
+            audio_seconds = sum(result.audio_seconds for result in batch_results)
+            elapsed = time.perf_counter() - batch_started
+            _log_synthesize_batch_stage(
+                "starling_batch_done",
+                pipeline="configured_voice",
+                voice_id=request.voice_id,
+                model=model_name,
+                output_count=len(batch_results),
+                audio_seconds=round(audio_seconds, 6),
+                wall_seconds=round(elapsed, 6),
+                rtf=round(elapsed / audio_seconds, 6) if audio_seconds else 0.0,
+                sample_rate=_server_config.starling.sample_rate,
+            )
+            for record, result in zip(records, batch_results):
+                generated_segments[record["item_idx"]][record["segment_idx"]] = (result.audio, result.sample_rate)
+            continue
+
         inference = _get_inference(model_name)
         model_sample_rate = inference.sample_rate
         batch_texts = [record["text"] for record in records]
@@ -1963,662 +2329,132 @@ def _synthesize_ssml(
     return np.concatenate(audio_parts, axis=0), sample_rate
 
 
-def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
-    """Convert audio array to WAV bytes."""
-    pcm_audio = _audio_to_pcm16(audio)
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)  # 16-bit
-        wav.setframerate(sample_rate)
-        wav.writeframes(pcm_audio.tobytes())
-    return buffer.getvalue()
 
+class _StarlingBatcherProxy:
+    """Parent-process async proxy for the Starling worker."""
 
-def _audio_to_mp3_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
-    """Convert audio array to MP3 bytes with highest quality settings."""
-    pcm_audio = _audio_to_pcm16(audio)
-    # First convert to WAV in memory
-    wav_buffer = io.BytesIO()
-    with wave.open(wav_buffer, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)  # 16-bit
-        wav.setframerate(sample_rate)
-        wav.writeframes(pcm_audio.tobytes())
-    wav_buffer.seek(0)
-
-    # Convert WAV to MP3 using pydub with highest quality
-    # Use 320kbps CBR (constant bitrate) for maximum quality
-    audio_segment = AudioSegment.from_wav(wav_buffer)
-    mp3_buffer = io.BytesIO()
-    audio_segment.export(
-        mp3_buffer,
-        format="mp3",
-        bitrate="320k",
-        parameters=["-q:a", "0"]  # Highest quality VBR setting
-    )
-    return mp3_buffer.getvalue()
-
-
-def _audio_to_pcm16(audio: np.ndarray) -> np.ndarray:
-    audio_array = np.asarray(audio).squeeze()
-    if np.issubdtype(audio_array.dtype, np.floating):
-        return (np.clip(audio_array, -1.0, 1.0).astype(np.float32) * 32767.0).astype(np.int16)
-    return audio_array.astype(np.int16, copy=False)
-
-
-def _resample_audio(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
-    if source_rate == target_rate:
-        return audio
-    import math
-    from scipy.signal import resample_poly  # pylint: disable=import-outside-toplevel
-
-    audio_array = np.asarray(audio).squeeze()
-    gcd = math.gcd(source_rate, target_rate)
-    resampled = resample_poly(audio_array.astype(np.float32), target_rate // gcd, source_rate // gcd)
-    if np.issubdtype(audio_array.dtype, np.floating):
-        return resampled.astype(audio_array.dtype, copy=False)
-    return np.clip(resampled, np.iinfo(audio_array.dtype).min, np.iinfo(audio_array.dtype).max).astype(audio_array.dtype)
-
-
-@contextlib.contextmanager
-def _temporary_cwd(path: Path):
-    previous = Path.cwd()
-    os.chdir(path)
-    try:
-        yield
-    finally:
-        os.chdir(previous)
-
-
-def _safe_file_stem(value: str) -> str:
-    stem = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value).strip("._")
-    return stem[:120] or "voice"
-
-
-def _audio_file_to_mp3_bytes(audio_path: Path) -> bytes:
-    audio_segment = AudioSegment.from_file(audio_path)
-    mp3_buffer = io.BytesIO()
-    audio_segment.export(mp3_buffer, format="mp3", bitrate="320k", parameters=["-q:a", "0"])
-    return mp3_buffer.getvalue()
-
-
-class _SeedVCBackend:
-    """Embedded Seed-VC inference backend compatible with the standalone /vc API."""
-
-    model_presets = {
-        "default": {"diffusion_steps": 30},
-        "distilled": {"diffusion_steps": 30},
-        "medium": {"diffusion_steps": 23},
-        "fast": {"diffusion_steps": 15},
-    }
-
-    def __init__(self, settings: SeedVCConfig):
-        self.settings = settings
-        self.runtime_root = _resolve_project_path(settings.runtime_root).resolve()
-        self.root = _resolve_project_path(settings.root).resolve()
-        self.tmp_dir = _resolve_project_path(settings.tmp_dir).resolve()
-        self.output_dir = _resolve_project_path(settings.output_dir).resolve()
-        self.voice_samples_dir = _resolve_project_path(settings.voice_samples_dir).resolve()
-        self.tmp_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.voice_samples_dir.mkdir(parents=True, exist_ok=True)
-        self.lock = threading.Lock()
-        self._load()
-
-    def _load(self) -> None:
-        if not self.runtime_root.exists():
-            raise FileNotFoundError(f"Seed-VC runtime root not found: {self.runtime_root}")
-        if not self.root.exists():
-            raise FileNotFoundError(f"Seed-VC asset root not found: {self.root}")
-        if str(self.runtime_root) not in sys.path:
-            sys.path.insert(0, str(self.runtime_root))
-
-        import torch  # pylint: disable=import-outside-toplevel
-        import torchaudio  # pylint: disable=import-outside-toplevel
-        import yaml  # pylint: disable=import-outside-toplevel
-        from transformers import AutoFeatureExtractor, WhisperModel  # pylint: disable=import-outside-toplevel
-
-        with _temporary_cwd(self.root):
-            from hf_utils import load_custom_model_from_hf  # pylint: disable=import-outside-toplevel
-            from inference import convert_voice, crossfade, find_silence_boundaries  # pylint: disable=import-outside-toplevel
-            from modules.audio import mel_spectrogram  # pylint: disable=import-outside-toplevel
-            from modules.bigvgan import bigvgan  # pylint: disable=import-outside-toplevel
-            from modules.campplus.DTDNN import CAMPPlus  # pylint: disable=import-outside-toplevel
-            from modules.commons import build_model, load_checkpoint, recursive_munch  # pylint: disable=import-outside-toplevel
-            from modules.lazy_embedding_loader import HDF5EmbeddingLoader  # pylint: disable=import-outside-toplevel
-
-            self.torch = torch
-            self.torchaudio = torchaudio
-            self.convert_voice = convert_voice
-            self.seed_vc_crossfade = crossfade
-            self.find_silence_boundaries = find_silence_boundaries
-
-            if torch.cuda.is_available() and self.settings.device.startswith("cuda"):
-                self.device = torch.device(self.settings.device)
-            elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-                self.device = torch.device("mps")
-            else:
-                self.device = torch.device("cpu")
-            self.dtype = torch.float16 if self.settings.fp16 else torch.float32
-
-            _LOGGER.info("Loading Seed-VC models on %s from %s", self.device, self.root)
-            medium_checkpoint_path, medium_config_path = load_custom_model_from_hf(
-                "Plachta/Seed-VC",
-                "DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth",
-                "config_dit_mel_seed_uvit_whisper_small_wavenet.yml",
-            )
-            with open(medium_config_path, "r", encoding="utf-8") as f:
-                config = yaml.safe_load(f)
-
-            self.config = config
-            self.model_params = recursive_munch(config["model_params"])
-            self.model_params.dit_type = "DiT"
-            self.sample_rate = int(config["preprocess_params"]["sr"])
-            self.hop_length = int(config["preprocess_params"]["spect_params"]["hop_length"])
-
-            self.default_model = build_model(self.model_params, stage="DiT")
-            self.default_model, _, _, _ = load_checkpoint(
-                self.default_model,
-                None,
-                medium_checkpoint_path,
-                load_only_params=True,
-                ignore_modules=[],
-                is_distributed=False,
-            )
-            self._prepare_model_dict(self.default_model)
-            self.model_cache = {"default": self.default_model}
-
-            campplus_ckpt_path = load_custom_model_from_hf("funasr/campplus", "campplus_cn_common.bin", config_filename=None)
-            self.campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
-            self.campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu", weights_only=False))
-            self.campplus_model.eval().to(self.device)
-
-            whisper_name = self.model_params.speech_tokenizer.name
-            self.whisper_model = WhisperModel.from_pretrained(whisper_name, torch_dtype=torch.float16).to(self.device)
-            del self.whisper_model.decoder
-            self.whisper_feature_extractor = AutoFeatureExtractor.from_pretrained(whisper_name)
-
-            self.bigvgan_model = bigvgan.BigVGAN.from_pretrained(self.model_params.vocoder.name, use_cuda_kernel=False)
-            self.bigvgan_model.remove_weight_norm()
-            self.bigvgan_model = self.bigvgan_model.eval().to(self.device)
-
-            spect_params = config["preprocess_params"]["spect_params"]
-            mel_fn_args = {
-                "n_fft": spect_params["n_fft"],
-                "win_size": spect_params["win_length"],
-                "hop_size": spect_params["hop_length"],
-                "num_mels": spect_params["n_mels"],
-                "sampling_rate": self.sample_rate,
-                "fmin": spect_params.get("fmin", 0),
-                "fmax": None,
-                "center": False,
-            }
-            self.to_mel = lambda x: mel_spectrogram(x, **mel_fn_args)
-
-            embeddings_path = _resolve_project_path(self.settings.embeddings_hdf5_path)
-            if embeddings_path.exists():
-                self.cached_embeddings = HDF5EmbeddingLoader(embeddings_path, cache_size=self.settings.embedding_cache_size)
-            else:
-                raise RuntimeError(f"Seed-VC embeddings file not found: {embeddings_path}")
-
-            try:
-                from find_voice import find_base_voice  # pylint: disable=import-outside-toplevel
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                find_base_voice = None
-                _LOGGER.warning("Seed-VC find_voice unavailable: %s", exc)
-            try:
-                from glitch_remover import process_file  # pylint: disable=import-outside-toplevel
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                process_file = None
-                _LOGGER.warning("Seed-VC glitch remover unavailable: %s", exc)
-
-            self.find_base_voice = find_base_voice
-            self.process_file = process_file
-            _LOGGER.info("Seed-VC backend ready: sr=%d cached_embeddings=%s", self.sample_rate, bool(self.cached_embeddings))
-
-    def _prepare_model_dict(self, model_dict: dict[str, Any]) -> None:
-        for key in model_dict:
-            model_dict[key].eval()
-            model_dict[key].to(self.device)
-        estimator = getattr(model_dict.cfm, "estimator", None)
-        if estimator is not None and hasattr(estimator, "setup_caches"):
-            estimator.setup_caches(
-                max_batch_size=self.settings.estimator_cache_batch_size,
-                max_seq_length=self.settings.estimator_cache_seq_length,
-            )
-
-    def get_semantic_features(self, waves_16k):
-        torch = self.torch
-        ori_inputs = self.whisper_feature_extractor(
-            [waves_16k.squeeze(0).cpu().numpy()],
-            return_tensors="pt",
-            return_attention_mask=True,
-            sampling_rate=16000,
+    async def submit(self, request: MatchaSynthesizeRequest) -> Any:
+        queued_at = time.perf_counter()
+        response = await asyncio.to_thread(
+            _ensure_starling_worker().call,
+            "synthesize_batch",
+            {
+                "items": [
+                    {
+                        "text": request.text,
+                        "language": request.language,
+                        "input_type": request.input_type,
+                        "speaker_id": request.speaker_id,
+                        "neural": request.neural,
+                        "steps": request.steps,
+                        "temperature": request.temperature,
+                        "length_scale": request.length_scale,
+                        "queued_at": queued_at,
+                    }
+                ]
+            },
         )
-        ori_input_features = self.whisper_model._mask_input_features(
-            ori_inputs.input_features,
-            attention_mask=ori_inputs.attention_mask,
-        ).to(self.device)
-        with torch.no_grad():
-            ori_outputs = self.whisper_model.encoder(ori_input_features.to(self.whisper_model.encoder.dtype))
-        features = ori_outputs.last_hidden_state.to(torch.float32)
-        return features[:, : waves_16k.size(-1) // 320 + 1]
+        results = (response.get("data") or {}).get("results") or []
+        if not results:
+            raise HTTPException(status_code=502, detail="Starling worker returned no result")
+        return results[0]
 
-    def get_semantic_features_batch(self, waves_16k: list[Any]):
-        torch = self.torch
-        lengths = [int(wave.size(-1)) for wave in waves_16k]
-        ori_inputs = self.whisper_feature_extractor(
-            [wave.squeeze(0).cpu().numpy() for wave in waves_16k],
-            return_tensors="pt",
-            return_attention_mask=True,
-            sampling_rate=16000,
-        )
-        ori_input_features = self.whisper_model._mask_input_features(
-            ori_inputs.input_features,
-            attention_mask=ori_inputs.attention_mask,
-        ).to(self.device)
-        with torch.no_grad():
-            ori_outputs = self.whisper_model.encoder(ori_input_features.to(self.whisper_model.encoder.dtype))
-        features = ori_outputs.last_hidden_state.to(torch.float32)
-        max_frames = max(length // 320 + 1 for length in lengths)
-        return features[:, :max_frames], torch.LongTensor([length // 320 + 1 for length in lengths]).to(self.device)
+
+def _get_starling_batcher() -> ProductionStarlingBatcher:
+    if not _engine_enabled("starling"):
+        raise HTTPException(status_code=503, detail="Starling backend is disabled")
+    _wait_for_engine_ready("starling")
+    if _starling_worker is not None:
+        return _StarlingBatcherProxy()
+    if _starling_batcher is None:
+        raise HTTPException(status_code=503, detail="Starling backend is not enabled or not loaded")
+    return _starling_batcher
+
+
+def _is_starling_model(model_name: str | None) -> bool:
+    return bool(model_name) and str(model_name).lower() in {"lzspeech-starling", "starling"}
+
+
+class _CachedEmbeddingKeysProxy:
+    def __init__(self, keys: list[str]):
+        self._keys = list(keys)
+
+    def keys(self) -> list[str]:
+        return list(self._keys)
+
+    def __bool__(self) -> bool:
+        return bool(self._keys)
+
+
+class _SeedVCBackendProxy:
+    """Parent-process proxy for a Seed-VC worker-owned backend."""
+
+    def __init__(self, info: dict[str, Any]):
+        self.settings = _server_config.seed_vc
+        self.sample_rate = int(info.get("sample_rate") or 22050)
+        self.device = info.get("device") or self.settings.device
+        self.root = info.get("root") or self.settings.root
+        self.runtime_root = info.get("runtime_root") or self.settings.runtime_root
+        self.cached_embeddings = _CachedEmbeddingKeysProxy(list(info.get("embedding_keys") or []))
 
     async def _fetch_sample(self, request: SeedVCRequest) -> Path:
-        sample_path = self.voice_samples_dir / f"{_safe_file_stem(request.id)}.mp3"
-        if sample_path.exists():
-            return sample_path
-        if not request.reference_url:
-            raise ValueError(f"No cached sample for voice {request.id!r} and no reference_url provided")
-        _LOGGER.info("Fetching Seed-VC reference sample: id=%s url=%s", request.id, request.reference_url)
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            resp = await client.get(request.reference_url)
-            resp.raise_for_status()
-            sample_path.write_bytes(resp.content)
-        return sample_path
-
-    @staticmethod
-    def _embedding_key(voice_id: str, style: str, intensity: float) -> str:
-        if style == "general":
-            return f"{voice_id}.general"
-        if intensity == 1.0:
-            return f"{voice_id}.{style}"
-        if intensity == int(intensity):
-            return f"{voice_id}.{style}.{int(intensity)}"
-        return f"{voice_id}.{style}.{intensity}"
-
-    def _available_styles_for_voice(self, voice_id: str) -> dict[str, list[float]]:
-        styles: dict[str, set[float]] = {}
-        if not self.cached_embeddings:
-            return {}
-        prefix = f"{voice_id}."
-        for key in self.cached_embeddings.keys():
-            if not key.startswith(prefix):
-                continue
-            suffix = key[len(prefix) :]
-            style = suffix
-            intensity = 1.0
-            parts = suffix.split(".")
-            for idx in range(1, len(parts)):
-                try:
-                    intensity = float(".".join(parts[idx:]))
-                    style = ".".join(parts[:idx])
-                    break
-                except ValueError:
-                    pass
-            styles.setdefault(style, set()).add(intensity)
-        return {style: sorted(intensities) for style, intensities in sorted(styles.items())}
+        response = await asyncio.to_thread(
+            _ensure_seed_vc_worker().call,
+            "fetch_sample",
+            {"request": request.model_dump(mode="json")},
+        )
+        return Path((response.get("data") or {})["path"])
 
     def _resolve_exact_cached_embeddings(self, voice_id: str, style: str, intensity: float) -> tuple[str, Any]:
-        embedding_key = self._embedding_key(voice_id, style, intensity)
-        if style == "general" and intensity != 1.0:
-            embedding_key = f"{voice_id}.general.{intensity:g}"
-        cached = self.cached_embeddings.get(embedding_key) if self.cached_embeddings else None
-        if cached is not None:
-            return embedding_key, cached
-
-        available = self._available_styles_for_voice(voice_id)
-        if not available:
-            raise ValueError(f"No cached Seed-VC embeddings found for voice {voice_id!r}")
-        if style not in available:
-            raise ValueError(
-                f"Unsupported style {style!r} for voice {voice_id!r}; supported styles: {sorted(available)}"
-            )
-        raise ValueError(
-            f"Unsupported styleIntensity {intensity:g} for voice {voice_id!r} style {style!r}; "
-            f"supported intensities: {available[style]}"
+        response = _ensure_seed_vc_worker().call(
+            "resolve_exact_cached_embeddings",
+            {"voice_id": voice_id, "style": style, "intensity": intensity},
         )
+        return str((response.get("data") or {})["embedding_key"]), True
 
     def _resolve_cached_embeddings(self, request: SeedVCRequest) -> tuple[str, Any | None]:
-        style = request.style or "general"
-        intensity = request.intensity or 1.0
-        embedding_key = self._embedding_key(request.id, style, intensity)
-        cached = self.cached_embeddings.get(embedding_key) if self.cached_embeddings else None
-        if cached or style == "general" or not self.cached_embeddings:
-            return embedding_key, cached
-
-        available: list[tuple[float, str]] = []
-        prefix = f"{request.id}.{style}"
-        for key in self.cached_embeddings.keys():
-            if key == prefix:
-                available.append((1.0, key))
-            elif key.startswith(prefix + "."):
-                try:
-                    available.append((float(key[len(prefix) + 1 :]), key))
-                except ValueError:
-                    pass
-        if not available:
-            return embedding_key, None
-        available.sort(key=lambda item: abs(item[0] - intensity))
-        closest_intensity, closest_key = available[0]
-        _LOGGER.info("Seed-VC exact intensity %.3f not found for %s; using %.3f", intensity, prefix, closest_intensity)
-        return closest_key, self.cached_embeddings.get(closest_key)
-
-    def _convert_voice_v1(
-        self,
-        source_path: Path,
-        target_path: Path | None,
-        preset_config: dict[str, Any],
-        cached_embeddings: Any | None,
-        voice_id: str | None,
-    ) -> Path:
-        torch = self.torch
-        import soundfile as sf  # pylint: disable=import-outside-toplevel
-
-        diffusion_steps = int(preset_config.get("diffusion_steps", 25))
-        length_adjust = float(preset_config.get("length_adjust", 1.0))
-        cfg_rate = float(preset_config.get("cfg_rate", 0.7))
-        model = self.model_cache["default"]
-
-        with torch.no_grad(), _temporary_cwd(self.root):
-            vc_wave = self.convert_voice(
-                source_audio_path=str(source_path),
-                ref_audio_path=str(target_path) if target_path is not None else None,
-                model=model,
-                semantic_fn=self.get_semantic_features,
-                vocoder_fn=self.bigvgan_model,
-                campplus_model=self.campplus_model,
-                mel_fn=self.to_mel,
-                sr=self.sample_rate,
-                hop_length=self.hop_length,
-                diffusion_steps=diffusion_steps,
-                length_adjust=length_adjust,
-                inference_cfg_rate=cfg_rate,
-                f0_condition=False,
-                f0_fn=None,
-                device=self.device,
-                fp16=self.settings.fp16,
-                cached_ref_embeddings=cached_embeddings,
-            )
-
-        source_name = source_path.stem
-        target_name = _safe_file_stem(voice_id or (target_path.stem if target_path is not None else "cached"))
-        output_path = self.output_dir / f"vc_{source_name}_{target_name}_{length_adjust}_{diffusion_steps}_{cfg_rate}.wav"
-        if torch.is_tensor(vc_wave):
-            vc_wave = vc_wave.detach().float().cpu().numpy()
-        vc_wave = np.asarray(vc_wave, dtype=np.float32).squeeze()
-        sf.write(output_path, vc_wave, self.sample_rate)
-        return output_path
-
-    def _prepare_seed_vc_reference(self, target_path: Path | None, cached_ref_embeddings: Any | None, model: Any):
-        torch = self.torch
-        if cached_ref_embeddings is not None:
-            style = cached_ref_embeddings["style"].to(self.device)
-            mel_ref = cached_ref_embeddings["mel_ref"].to(self.device)
-            prompt_condition = cached_ref_embeddings["prompt_condition"].to(self.device)
-            if style.dim() == 1:
-                style = style.unsqueeze(0)
-            if mel_ref.dim() == 2:
-                mel_ref = mel_ref.unsqueeze(0)
-            if prompt_condition.dim() == 2:
-                prompt_condition = prompt_condition.unsqueeze(0)
-            return style, mel_ref, prompt_condition
-
-        if target_path is None:
-            raise ValueError("target_path is required when cached reference embeddings are unavailable")
-
-        import librosa  # pylint: disable=import-outside-toplevel
-
-        ref_audio_np = librosa.load(target_path, sr=self.sample_rate)[0]
-        ref_audio = torch.tensor(ref_audio_np[: self.sample_rate * 25]).unsqueeze(0).float().to(self.device)
-        ref_16k = self.torchaudio.functional.resample(ref_audio, self.sample_rate, 16000)
-        semantic_ref = self.get_semantic_features(ref_16k)
-        mel_ref = self.to_mel(ref_audio.float())
-        ref_lengths = torch.LongTensor([mel_ref.size(2)]).to(self.device)
-        feat_ref = self.torchaudio.compliance.kaldi.fbank(ref_16k, num_mel_bins=80, dither=0, sample_frequency=16000)
-        feat_ref = feat_ref - feat_ref.mean(dim=0, keepdim=True)
-        style = self.campplus_model(feat_ref.unsqueeze(0))
-        prompt_condition, _, _, _, _ = model.length_regulator(
-            semantic_ref, ylens=ref_lengths, n_quantizers=3, f0=None
+        response = _ensure_seed_vc_worker().call(
+            "resolve_cached_embeddings",
+            {"request": request.model_dump(mode="json")},
         )
-        return style, mel_ref, prompt_condition
+        data = response.get("data") or {}
+        return str(data["embedding_key"]), True if data.get("cached") else None
 
-    @staticmethod
-    def _fade_seed_vc_start(result: np.ndarray, sample_rate: int) -> np.ndarray:
-        check_window = int(sample_rate * 0.03)
-        if len(result) <= check_window:
-            return result
-        first_10ms = int(sample_rate * 0.01)
-        window_20_30ms = result[int(sample_rate * 0.02) : check_window]
-        energy_first = np.sqrt(np.mean(result[:first_10ms] ** 2))
-        energy_later = np.sqrt(np.mean(window_20_30ms ** 2))
-        if energy_first > energy_later * 1.5:
-            fade_samples = int(sample_rate * 0.025)
-            fade_in = np.linspace(0, 1, fade_samples) ** 4
-        else:
-            fade_samples = int(sample_rate * 0.005)
-            fade_in = np.linspace(0, 1, fade_samples)
-        result[:fade_samples] *= fade_in
-        return result
-
-    def _convert_voice_v1_batch(
+    def _convert_with_reference(
         self,
-        source_paths: list[Path],
-        target_path: Path | None,
-        preset_config: dict[str, Any],
-        cached_embeddings: Any | None,
-        max_chunk_batch_size: int,
-    ) -> list[np.ndarray]:
-        torch = self.torch
-        import librosa  # pylint: disable=import-outside-toplevel
-
-        diffusion_steps = int(preset_config.get("diffusion_steps", 25))
-        length_adjust = float(preset_config.get("length_adjust", 1.0))
-        cfg_rate = float(preset_config.get("cfg_rate", 0.7))
-        model = self.model_cache["default"]
-
-        style, mel_ref, prompt_condition = self._prepare_seed_vc_reference(target_path, cached_embeddings, model)
-        source_audios = [
-            np.asarray(librosa.load(path, sr=self.sample_rate)[0], dtype=np.float32)
-            for path in source_paths
-        ]
-        chunk_records: list[tuple[int, int, int, np.ndarray]] = []
-        generated_wave_chunks: list[list[np.ndarray]] = [[] for _ in source_audios]
-        crossfade_samples = int(self.sample_rate * 0.05)
-
-        for item_idx, source_audio in enumerate(source_audios):
-            chunks = self.find_silence_boundaries(
-                source_audio,
-                self.sample_rate,
-                min_silence_duration=0.15,
-                silence_threshold=0.02,
-                max_chunk_duration=25.0,
-                min_chunk_duration=3.0,
-            )
-            for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
-                chunk_records.append(
-                    (
-                        item_idx,
-                        chunk_idx,
-                        chunk_start,
-                        source_audio[chunk_start:chunk_end],
-                    )
-                )
-
-        for batch_start in range(0, len(chunk_records), max_chunk_batch_size):
-            records = chunk_records[batch_start : batch_start + max_chunk_batch_size]
-            chunk_audios = [
-                torch.from_numpy(record[3]).unsqueeze(0).to(self.device, dtype=torch.float32)
-                for record in records
-            ]
-            chunk_16k = [
-                self.torchaudio.functional.resample(chunk_audio, self.sample_rate, 16000)
-                for chunk_audio in chunk_audios
-            ]
-            semantic_batch, _ = self.get_semantic_features_batch(chunk_16k)
-
-            target_lengths = []
-            for chunk_audio in chunk_audios:
-                mel_chunk = self.to_mel(chunk_audio.float())
-                target_lengths.append(int(mel_chunk.size(2) * length_adjust))
-            chunk_target_lengths = torch.LongTensor(target_lengths).to(self.device)
-
-            cond_chunk, _, _, _, _ = model.length_regulator(
-                semantic_batch,
-                ylens=chunk_target_lengths,
-                n_quantizers=3,
-                f0=None,
-            )
-
-            batch_size = len(records)
-            prompt_batch = prompt_condition.expand(batch_size, -1, -1)
-            mel_ref_batch = mel_ref.expand(batch_size, -1, -1)
-            style_batch = style.expand(batch_size, -1)
-            cat_condition = torch.cat([prompt_batch, cond_chunk], dim=1)
-            x_lens = torch.LongTensor([prompt_condition.size(1) + length for length in target_lengths]).to(self.device)
-
-            with torch.autocast(device_type=self.device.type, dtype=torch.float16 if self.settings.fp16 else torch.float32):
-                vc_target = model.cfm.inference(
-                    cat_condition,
-                    x_lens,
-                    mel_ref_batch,
-                    style_batch,
-                    None,
-                    diffusion_steps,
-                    inference_cfg_rate=cfg_rate,
-                )
-                vc_target = vc_target[:, :, mel_ref.size(-1) :]
-                vc_wave_batch = self.bigvgan_model(vc_target.float())
-
-            if vc_wave_batch.dim() == 1:
-                vc_wave_batch = vc_wave_batch.unsqueeze(0)
-            elif vc_wave_batch.dim() == 3:
-                vc_wave_batch = vc_wave_batch.squeeze(1)
-
-            for batch_idx, (item_idx, chunk_idx, _, _) in enumerate(records):
-                target_samples = max(1, int(target_lengths[batch_idx] * self.hop_length))
-                chunk_output = vc_wave_batch[batch_idx, :target_samples].detach().float().cpu().numpy()
-                if chunk_idx > 0 and generated_wave_chunks[item_idx] and crossfade_samples > 0:
-                    prev_chunk = generated_wave_chunks[item_idx][-1]
-                    if len(prev_chunk) >= crossfade_samples and len(chunk_output) >= crossfade_samples:
-                        chunk_output = self.seed_vc_crossfade(prev_chunk, chunk_output, crossfade_samples)
-                        generated_wave_chunks[item_idx][-1] = prev_chunk[:-crossfade_samples]
-                generated_wave_chunks[item_idx].append(chunk_output)
-
-            del chunk_audios, chunk_16k, semantic_batch, chunk_target_lengths, cond_chunk
-            del prompt_batch, mel_ref_batch, style_batch, cat_condition, x_lens, vc_target, vc_wave_batch
-
-        results = []
-        for chunks in generated_wave_chunks:
-            result = np.concatenate(chunks) if chunks else np.zeros(1, dtype=np.float32)
-            results.append(self._fade_seed_vc_start(result, self.sample_rate).astype(np.float32))
-        return results
+        request: SeedVCRequest,
+        reference_path: Path | None,
+        embedding_key: str | None = None,
+        cached_embeddings: Any | None = None,
+    ) -> bytes:
+        response = _ensure_seed_vc_worker().call(
+            "convert_with_reference",
+            {
+                "request": request.model_dump(mode="json"),
+                "reference_path": str(reference_path) if reference_path is not None else None,
+                "embedding_key": embedding_key if cached_embeddings is not None else None,
+            },
+        )
+        data = response.get("data") or {}
+        self.sample_rate = int(data.get("sample_rate") or self.sample_rate)
+        return data["audio"]
 
     def convert_batch_request(
-        self, request: SeedVCBatchRequest, reference_path: Path | None = None,
-        embedding_key: str | None = None, cached_embeddings=None,
+        self,
+        request: SeedVCBatchRequest,
+        reference_path: Path | None = None,
+        embedding_key: str | None = None,
+        cached_embeddings: Any | None = None,
     ) -> dict[str, Any]:
-        items = request.items
-        first = items[0]
-        for item in items[1:]:
-            if (
-                item.id != first.id
-                or item.style != first.style
-                or item.intensity != first.intensity
-                or item.preset != first.preset
-                or item.reference_url != first.reference_url
-            ):
-                raise ValueError("Seed-VC batch currently requires a shared id/style/intensity/preset/reference_url")
-
-        preset = first.preset or "default"
-        preset_config = self.model_presets.get(preset)
-        if preset_config is None:
-            raise ValueError(f"Unknown Seed-VC preset {preset!r}; expected one of {sorted(self.model_presets)}")
-        chunk_batch_size = min(
-            max(1, int(request.max_chunk_batch_size)),
-            max(1, int(self.settings.max_chunk_batch_size)),
+        response = _ensure_seed_vc_worker().call(
+            "convert_batch_request",
+            {
+                "request": request.model_dump(mode="json"),
+                "reference_path": str(reference_path) if reference_path is not None else None,
+                "embedding_key": embedding_key if cached_embeddings is not None else None,
+            },
         )
-
-        import soundfile as sf  # pylint: disable=import-outside-toplevel
-
-        source_paths = [self.tmp_dir / f"{uuid.uuid4().hex}.input" for _ in items]
-        wav_output_paths: list[Path] = []
-        try:
-            for item, source_path in zip(items, source_paths):
-                source_path.write_bytes(base64.b64decode(item.audio))
-
-            with self.lock, self.torch.no_grad(), _temporary_cwd(self.root):
-                waves = self._convert_voice_v1_batch(
-                    source_paths,
-                    reference_path,
-                    preset_config,
-                    cached_embeddings=cached_embeddings,
-                    max_chunk_batch_size=chunk_batch_size,
-                )
-                encoded = []
-                for idx, (item, wave_data) in enumerate(zip(items, waves)):
-                    wav_output_path = self.output_dir / f"vc_batch_{uuid.uuid4().hex}_{idx}.wav"
-                    wav_output_paths.append(wav_output_path)
-                    sf.write(wav_output_path, wave_data, self.sample_rate)
-                    if item.remove_glitches:
-                        self._remove_glitches(wav_output_path)
-                    mp3_bytes = _audio_file_to_mp3_bytes(wav_output_path)
-                    encoded.append(base64.b64encode(mp3_bytes).decode("ascii"))
-
-            return {
-                "sample_rate": self.sample_rate,
-                "format": "mp3",
-                "preset": preset,
-                "count": len(encoded),
-                "audios": encoded,
-            }
-        finally:
-            for path in source_paths:
-                path.unlink(missing_ok=True)
-            for path in wav_output_paths:
-                path.unlink(missing_ok=True)
-
-    def _remove_glitches(self, wav_path: Path) -> None:
-        if self.process_file is None:
-            _LOGGER.warning("Seed-VC glitch removal requested but glitch_remover is unavailable")
-            return
-        glitch_temp_dir = self.tmp_dir / f"glitch_temp_{uuid.uuid4().hex}"
-        glitch_temp_dir.mkdir(parents=True, exist_ok=True)
-        params = {
-            "rms_win_ms": 5.0,
-            "rms_hop_ms": 1.0,
-            "rms_thr": 0.002,
-            "hold_ms": 15.0,
-            "safety_ms": 2.0,
-            "max_cut_ms": 200.0,
-            "veto_cut_ms": 50.0,
-            "fallback_trim_ms": 0.0,
-        }
-        try:
-            result = self.process_file(str(wav_path), str(glitch_temp_dir), params, do_write=True)
-            _LOGGER.info("Seed-VC glitch removal: %s cut_ms=%s", result.get("decision"), result.get("cut_ms"))
-            shutil.copyfile(result["out"], wav_path)
-        finally:
-            shutil.rmtree(glitch_temp_dir, ignore_errors=True)
-
-    def convert_request(self, request: SeedVCRequest) -> bytes:
-        emb_key, emb = self._resolve_cached_embeddings(request)
-        reference_path = None if emb is not None else self._fetch_sample(request)
-        return self._convert_with_reference(
-            request, reference_path,
-            embedding_key=emb_key if emb is not None else None,
-            cached_embeddings=emb,
-        )
+        return response.get("data") or {}
 
     def convert_generated_audio_batch(
         self,
@@ -2632,68 +2468,23 @@ class _SeedVCBackend:
         max_chunk_batch_size: int | None = None,
         strict_embedding: bool = False,
     ) -> list[tuple[bytes, float]]:
-        if not source_audios:
-            return []
-
-        if strict_embedding:
-            emb_key, emb = self._resolve_exact_cached_embeddings(voice_id, style, intensity)
-        else:
-            request = SeedVCRequest(
-                audio="",
-                id=voice_id,
-                style=style,
-                intensity=intensity,
-                preset=preset,
-            )
-            emb_key, emb = self._resolve_cached_embeddings(request)
-        if emb is None:
-            raise ValueError(f"No cached Seed-VC embedding for voice {emb_key!r}")
-
-        preset_name = preset or "default"
-        preset_config = self.model_presets.get(preset_name)
-        if preset_config is None:
-            raise ValueError(f"Unknown Seed-VC preset {preset_name!r}; expected one of {sorted(self.model_presets)}")
-        chunk_batch_size = max_chunk_batch_size or self.settings.max_chunk_batch_size
-
-        import soundfile as sf  # pylint: disable=import-outside-toplevel
-
-        source_paths = [self.tmp_dir / f"{uuid.uuid4().hex}.input.wav" for _ in source_audios]
-        wav_output_paths: list[Path] = []
-        try:
-            for source_audio, source_path in zip(source_audios, source_paths):
-                sf.write(source_path, _audio_to_pcm16(source_audio), source_sample_rate)
-
-            _LOGGER.info(
-                "Seed-VC convert generated batch: voice=%s preset=%s count=%d",
-                voice_id,
-                preset_name,
-                len(source_paths),
-            )
-            with self.lock, self.torch.no_grad(), _temporary_cwd(self.root):
-                waves = self._convert_voice_v1_batch(
-                    source_paths,
-                    None,
-                    preset_config,
-                    cached_embeddings=emb,
-                    max_chunk_batch_size=chunk_batch_size,
-                )
-
-            encoded: list[tuple[bytes, float]] = []
-            for idx, wave_data in enumerate(waves):
-                audio_seconds = float(len(wave_data)) / self.sample_rate if self.sample_rate else 0.0
-                if output_format == "mp3":
-                    wav_output_path = self.output_dir / f"vc_synth_batch_{uuid.uuid4().hex}_{idx}.wav"
-                    wav_output_paths.append(wav_output_path)
-                    sf.write(wav_output_path, wave_data, self.sample_rate)
-                    encoded.append((_audio_file_to_mp3_bytes(wav_output_path), audio_seconds))
-                else:
-                    encoded.append((_audio_to_wav_bytes(wave_data, self.sample_rate), audio_seconds))
-            return encoded
-        finally:
-            for path in source_paths:
-                path.unlink(missing_ok=True)
-            for path in wav_output_paths:
-                path.unlink(missing_ok=True)
+        response = _ensure_seed_vc_worker().call(
+            "convert_generated_audio_batch",
+            {
+                "source_audios": source_audios,
+                "source_sample_rate": source_sample_rate,
+                "voice_id": voice_id,
+                "style": style,
+                "intensity": intensity,
+                "preset": preset,
+                "output_format": output_format,
+                "max_chunk_batch_size": max_chunk_batch_size,
+                "strict_embedding": strict_embedding,
+            },
+        )
+        data = response.get("data") or {}
+        self.sample_rate = int(data.get("sample_rate") or self.sample_rate)
+        return list(data.get("items") or [])
 
     def convert_generated_audio_reference_batch(
         self,
@@ -2704,130 +2495,42 @@ class _SeedVCBackend:
         output_format: Literal["wav", "mp3"],
         max_chunk_batch_size: int | None = None,
     ) -> list[tuple[bytes, float]]:
-        if not source_audios:
-            return []
-
-        preset_name = preset or "default"
-        preset_config = self.model_presets.get(preset_name)
-        if preset_config is None:
-            raise ValueError(f"Unknown Seed-VC preset {preset_name!r}; expected one of {sorted(self.model_presets)}")
-        chunk_batch_size = max_chunk_batch_size or self.settings.max_chunk_batch_size
-
-        import soundfile as sf  # pylint: disable=import-outside-toplevel
-
-        source_paths = [self.tmp_dir / f"{uuid.uuid4().hex}.input.wav" for _ in source_audios]
-        wav_output_paths: list[Path] = []
-        try:
-            for source_audio, source_path in zip(source_audios, source_paths):
-                sf.write(source_path, _audio_to_pcm16(source_audio), source_sample_rate)
-
-            _LOGGER.info(
-                "Seed-VC convert generated reference batch: reference=%s preset=%s count=%d",
-                reference_path,
-                preset_name,
-                len(source_paths),
-            )
-            with self.lock, self.torch.no_grad(), _temporary_cwd(self.root):
-                waves = self._convert_voice_v1_batch(
-                    source_paths,
-                    reference_path,
-                    preset_config,
-                    cached_embeddings=None,
-                    max_chunk_batch_size=chunk_batch_size,
-                )
-
-            encoded: list[tuple[bytes, float]] = []
-            for idx, wave_data in enumerate(waves):
-                audio_seconds = float(len(wave_data)) / self.sample_rate if self.sample_rate else 0.0
-                if output_format == "mp3":
-                    wav_output_path = self.output_dir / f"vc_synth_sample_batch_{uuid.uuid4().hex}_{idx}.wav"
-                    wav_output_paths.append(wav_output_path)
-                    sf.write(wav_output_path, wave_data, self.sample_rate)
-                    encoded.append((_audio_file_to_mp3_bytes(wav_output_path), audio_seconds))
-                else:
-                    encoded.append((_audio_to_wav_bytes(wave_data, self.sample_rate), audio_seconds))
-            return encoded
-        finally:
-            for path in source_paths:
-                path.unlink(missing_ok=True)
-            for path in wav_output_paths:
-                path.unlink(missing_ok=True)
-
-    def _convert_with_reference(
-        self,
-        request: SeedVCRequest,
-        reference_path: Path | None,
-        embedding_key: str | None = None,
-        cached_embeddings: torch.Tensor | None = None,
-    ) -> bytes:
-        preset = request.preset or "default"
-        preset_config = self.model_presets.get(preset)
-        if preset_config is None:
-            raise ValueError(f"Unknown Seed-VC preset {preset!r}; expected one of {sorted(self.model_presets)}")
-
-        source_path = self.tmp_dir / f"{uuid.uuid4().hex}.input"
-        wav_output_path: Path | None = None
-        try:
-            source_path.write_bytes(base64.b64decode(request.audio))
-            _LOGGER.info(
-                "Seed-VC convert: voice=%s preset=%s cached_embedding=%s reference=%s",
-                request.id, preset, bool(cached_embeddings), reference_path,
-            )
-            with self.lock:
-                wav_output_path = self._convert_voice_v1(
-                    source_path,
-                    reference_path,
-                    preset_config,
-                    cached_embeddings=cached_embeddings,
-                    voice_id=embedding_key if cached_embeddings is not None else None,
-                )
-                if request.remove_glitches:
-                    self._remove_glitches(wav_output_path)
-                return _audio_file_to_mp3_bytes(wav_output_path)
-        finally:
-            source_path.unlink(missing_ok=True)
-            if wav_output_path is not None:
-                wav_output_path.unlink(missing_ok=True)
+        response = _ensure_seed_vc_worker().call(
+            "convert_generated_audio_reference_batch",
+            {
+                "source_audios": source_audios,
+                "source_sample_rate": source_sample_rate,
+                "reference_path": str(reference_path),
+                "preset": preset,
+                "output_format": output_format,
+                "max_chunk_batch_size": max_chunk_batch_size,
+            },
+        )
+        data = response.get("data") or {}
+        self.sample_rate = int(data.get("sample_rate") or self.sample_rate)
+        return list(data.get("items") or [])
 
     def find_voice(self, request: SeedVCFindVoiceRequest, reference_path: Path) -> str:
-        if self.find_base_voice is None:
-            raise RuntimeError("Seed-VC find_voice support is unavailable")
-        with self.lock, _temporary_cwd(self.root):
-            return str(self.find_base_voice(str(reference_path)))
+        response = _ensure_seed_vc_worker().call(
+            "find_voice",
+            {"request": request.model_dump(mode="json"), "reference_path": str(reference_path)},
+        )
+        return str((response.get("data") or {})["voice_id"])
 
     def enhance(self, request: SeedVCEnhanceRequest, raw_path: Path) -> bytes:
-        import subprocess
-        enhance_dir = raw_path.parent
-        sample_dir = enhance_dir / "sample"
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        wav_path = enhance_dir / "sample_raw.wav"
-
-        subprocess.run(["ffmpeg", "-i", str(raw_path), "-t", "120", str(wav_path), "-y"],
-                       capture_output=True, check=True)
-        subprocess.run(["uv", "tool", "run", "ffmpeg-normalize", str(wav_path), "-o", str(sample_dir / "sample.wav"), "-f"],
-                       capture_output=True, check=True)
-        sample_wav = sample_dir / "sample.wav"
-        enhanced_dir = enhance_dir / "enhanced"
-        enhanced_dir.mkdir(exist_ok=True)
-        enhanced_wav = enhanced_dir / "sample.wav"
-        enhanced_wav.write_bytes(sample_wav.read_bytes())
-        mp3_path = enhance_dir / "final_sample.mp3"
-        subprocess.run(["ffmpeg", "-i", str(enhanced_wav), "-f", "mp3", "-aq", "2", "-b:a", "320k", str(mp3_path), "-y"],
-                       capture_output=True, check=True)
-        return mp3_path.read_bytes()
-
-
-def _get_matcha_batcher() -> ProductionMatchaBatcher:
-    if not _engine_enabled("matcha"):
-        raise HTTPException(status_code=503, detail="Matcha backend is disabled")
-    if _matcha_batcher is None:
-        raise HTTPException(status_code=503, detail="Matcha backend is not enabled or not loaded")
-    return _matcha_batcher
+        response = _ensure_seed_vc_worker().call(
+            "enhance",
+            {"request": request.model_dump(mode="json"), "raw_path": str(raw_path)},
+        )
+        return (response.get("data") or {})["audio"]
 
 
 def _get_seed_vc_backend() -> _SeedVCBackend:
     if not _engine_enabled("seed_vc"):
         raise HTTPException(status_code=503, detail="Seed-VC backend is disabled")
+    _wait_for_engine_ready("seed_vc")
+    if _seed_vc_worker is not None:
+        return _SeedVCBackendProxy(_seed_vc_info)
     if _seed_vc_backend is None:
         raise HTTPException(status_code=503, detail="Seed-VC backend was not loaded at startup")
     return _seed_vc_backend
@@ -2852,6 +2555,7 @@ def _build_rvc_backend(settings: RVCConfig) -> RVCBackend:
 def _get_rvc_backend() -> RVCBackend:
     if not _engine_enabled("rvc"):
         raise HTTPException(status_code=503, detail="RVC backend is disabled")
+    _wait_for_engine_ready("rvc")
     if _rvc_backend is None:
         raise HTTPException(status_code=503, detail="RVC backend was not loaded at startup")
     return _rvc_backend
@@ -3422,10 +3126,12 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         async def qwen3_synthesize(request: Request):
             payload = await request.json()
             req = qwen3.SynthesizeRequest(**payload)
+            worker_name = _qwen_worker_name_for_request(req)
             result = await asyncio.to_thread(
                 _call_qwen_worker,
                 "synthesize",
                 req.model_dump(mode="json"),
+                worker_name=worker_name,
             )
             media_type = str(result.get("media_type") or "audio/mpeg")
             content = result.get("content") or b""
@@ -3438,10 +3144,12 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         async def qwen3_synthesize_batch(request: Request):
             payload = await request.json()
             req = qwen3.BatchSynthesizeRequest(**payload)
+            worker_name = _qwen_worker_name_for_batch(req)
             result = await asyncio.to_thread(
                 _call_qwen_worker,
                 "synthesize_batch",
                 req.model_dump(mode="json"),
+                worker_name=worker_name,
             )
             return result.get("data")
 
@@ -3466,113 +3174,198 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     @app.on_event("startup")
     async def startup_event():
-        """Load enabled engines in one deterministic startup sequence."""
+        """Schedule enabled model engines to load in background worker processes."""
         global _speaker_routes, _lang_speaker_map, _splitter, _splitter_languages
-        global _matcha_backend, _matcha_batcher, _seed_vc_backend, _rvc_backend
+        global _starling_backend, _starling_batcher, _seed_vc_backend, _rvc_backend
         global _seed_vc_supported_voice_ids, _seed_vc_voice_ids
+        global _sparrow_model_info, _starling_info, _seed_vc_info
+        global _startup_loader_task
 
         startup_started = time.perf_counter()
-        _LOGGER.info("Loading server startup order=pipertts,qwen3,matcha,seed_vc,rvc config=%s", CONFIG_PATH)
+        _LOGGER.info("Scheduling server startup mode=early-online-parallel-workers config=%s", CONFIG_PATH)
         with _logged_startup_step("reset_runtime_state"):
+            if _startup_loader_task is not None and not _startup_loader_task.done():
+                _startup_loader_task.cancel()
+            _stop_model_workers()
+            _stop_qwen_worker()
             _inference_cache.clear()
             _lang_speaker_map.clear()
             _speaker_routes.clear()
             _splitter = None
             _splitter_languages = None
-            _matcha_backend = None
-            _matcha_batcher = None
+            _starling_backend = None
+            _starling_batcher = None
             _seed_vc_backend = None
             _rvc_backend = None
             _seed_vc_supported_voice_ids = None
             _seed_vc_voice_ids = None
+            _sparrow_model_info = {}
+            _starling_info = {}
+            _seed_vc_info = {}
+            for engine in _engine_load_states:
+                if _engine_enabled("starling" if engine == "starling" else engine):  # type: ignore[arg-type]
+                    _mark_engine_loading(engine)
+                else:
+                    _mark_engine_disabled(engine)
 
-        if _engine_enabled("pipertts"):
-            with _logged_startup_step("pipertts"):
+        async def run_loader(engine: str, loader: Callable[[], Awaitable[None]]) -> None:
+            try:
+                await loader()
+                _mark_engine_ready(engine)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                _LOGGER.exception("Failed loading %s backend", engine)
+                _mark_engine_failed(engine, exc)
+
+        async def load_models_background() -> None:
+            load_started = time.perf_counter()
+            startup_tasks: list[asyncio.Task] = []
+
+            if _engine_enabled("pipertts"):
                 required_models = _required_piper_models()
                 if not required_models:
-                    raise RuntimeError("PiperTTS is enabled but no Sparrow models are configured or available")
+                    _mark_engine_failed("pipertts", RuntimeError("PiperTTS is enabled but no Sparrow models are configured or available"))
+                else:
+                    async def start_sparrow() -> None:
+                        global _sparrow_model_info
+                        with _logged_startup_step("sparrow_worker", models=required_models):
+                            worker = _ensure_sparrow_worker()
+                            worker.start()
+                            response = await asyncio.to_thread(worker.call, "health")
+                            data = response.get("data") or {}
+                            _sparrow_model_info = dict(data.get("models") or {})
+                            _LOGGER.info("Sparrow worker loaded models=%s", list(_sparrow_model_info.keys()))
 
-                for locale, speaker in _server_config.pipertts.lang_speaker_map.items():
-                    canonical = _normalize_locale(locale)
-                    _lang_speaker_map[canonical] = speaker
+                    startup_tasks.append(asyncio.create_task(run_loader("pipertts", start_sparrow)))
+            else:
+                _LOGGER.info("PiperTTS backend disabled")
 
-                _LOGGER.info("Sparrow required models count=%d models=%s", len(required_models), required_models)
-                _preload_models(required_models, strict=True)
-                _LOGGER.info("Sparrow loaded models=%s", list(_inference_cache.keys()))
-                _preload_piper_text_models()
+            if _engine_enabled("qwen3"):
+                async def start_qwen() -> None:
+                    with _logged_startup_step(
+                        "qwen3_worker",
+                        model=_server_config.qwen.model,
+                        device=_server_config.qwen.device,
+                        separate_vietnamese_worker=_separate_vietnamese_qwen_worker_enabled(),
+                        vietnamese_model=_server_config.qwen.vietnamese_model,
+                        vietnamese_device=_server_config.qwen.vietnamese_device,
+                        dtype=_server_config.qwen.dtype,
+                        dp_budget=_server_config.qwen.dp_budget.enabled,
+                    ):
+                        worker_names = ["primary"]
+                        if _separate_vietnamese_qwen_worker_enabled():
+                            worker_names.append("vietnamese")
+                        for worker_name in worker_names:
+                            _start_qwen_worker(worker_name)
+                        for worker_name in worker_names:
+                            _LOGGER.info("Checking Qwen worker health name=%s", worker_name)
+                            await asyncio.to_thread(
+                                _call_qwen_worker,
+                                "health",
+                                None,
+                                wait_ready=False,
+                                worker_name=worker_name,
+                            )
+                            _LOGGER.info("Qwen worker health ok name=%s", worker_name)
 
-                route_models = _server_config.pipertts.model_priority or _allowed_models()
-                if route_models:
-                    _LOGGER.info("Loading PiperTTS speaker routes models=%s", route_models)
-                    _speaker_routes = _build_speaker_routes(route_models)
-                    _LOGGER.info("Loaded PiperTTS speaker routes speakers=%d locales=%d", len(_speaker_routes), len(_lang_speaker_map))
+                startup_tasks.append(asyncio.create_task(run_loader("qwen3", start_qwen)))
+            else:
+                _LOGGER.info("Qwen3 TTS backend disabled")
+
+            if _engine_enabled("starling"):
+                async def start_starling() -> None:
+                    global _starling_info
+                    with _logged_startup_step(
+                        "starling_worker",
+                        device=_server_config.starling.device,
+                        checkpoint=_server_config.starling.checkpoint,
+                        vocoder=_server_config.starling.vocoder,
+                    ):
+                        worker = _ensure_starling_worker()
+                        worker.start()
+                        response = await asyncio.to_thread(worker.call, "health")
+                        _starling_info = dict(response.get("data") or {})
+
+                startup_tasks.append(asyncio.create_task(run_loader("starling", start_starling)))
+            else:
+                _LOGGER.info("Starling backend disabled")
+
+            if _engine_enabled("seed_vc"):
+                async def start_seed_vc() -> None:
+                    global _seed_vc_info, _seed_vc_supported_voice_ids
+                    with _logged_startup_step(
+                        "seed_vc_worker",
+                        device=_server_config.seed_vc.device,
+                        root=_server_config.seed_vc.root,
+                        embeddings=_server_config.seed_vc.embeddings_hdf5_path,
+                    ):
+                        worker = _ensure_seed_vc_worker()
+                        worker.start()
+                        response = await asyncio.to_thread(worker.call, "health")
+                        _seed_vc_info = dict(response.get("data") or {})
+                        _LOGGER.info("Loading Seed-VC voice catalog manifest=%s", SEED_VC_VOICE_IDS_PATH)
+                        catalog_started = time.perf_counter()
+                        _seed_vc_supported_voice_ids = _get_seed_vc_supported_voice_ids()
+                        _LOGGER.info(
+                            "Loaded Seed-VC voice catalog voices=%d elapsed=%.2fs",
+                            len(_seed_vc_supported_voice_ids),
+                            time.perf_counter() - catalog_started,
+                        )
+
+                startup_tasks.append(asyncio.create_task(run_loader("seed_vc", start_seed_vc)))
+            else:
+                _LOGGER.info("Seed-VC backend disabled")
+
+            if _engine_enabled("rvc"):
+                async def start_rvc() -> None:
+                    global _rvc_backend
+                    with _logged_startup_step(
+                        "rvc",
+                        cache_size=_server_config.rvc.cache_size,
+                        preload_models=_server_config.rvc.preload_models,
+                    ):
+                        _rvc_backend = await asyncio.to_thread(_build_rvc_backend, _server_config.rvc)
+
+                startup_tasks.append(asyncio.create_task(run_loader("rvc", start_rvc)))
+            else:
+                _LOGGER.info("RVC backend disabled")
+
+            if startup_tasks:
+                await asyncio.gather(*startup_tasks)
+            _LOGGER.info("Loaded server background models elapsed=%.2fs", time.perf_counter() - load_started)
+
+        if _engine_enabled("pipertts"):
+            for locale, speaker in _server_config.pipertts.lang_speaker_map.items():
+                canonical = _normalize_locale(locale)
+                _lang_speaker_map[canonical] = speaker
+            route_models = _server_config.pipertts.model_priority or _allowed_models()
+            if route_models:
+                _LOGGER.info("Loading PiperTTS speaker routes models=%s", route_models)
+                _speaker_routes = _build_speaker_routes(route_models)
+                _LOGGER.info("Loaded PiperTTS speaker routes speakers=%d locales=%d", len(_speaker_routes), len(_lang_speaker_map))
         else:
             _LOGGER.info("PiperTTS backend disabled")
 
-        if _engine_enabled("qwen3"):
-            with _logged_startup_step(
-                "qwen3_worker",
-                model=_server_config.qwen.model,
-                device=_server_config.qwen.device,
-                dtype=_server_config.qwen.dtype,
-                dp_budget=_server_config.qwen.dp_budget.enabled,
-            ):
-                _start_qwen_worker()
-                _call_qwen_worker("health", timeout=QWEN_WORKER_TIMEOUT_SECONDS)
-        else:
-            _LOGGER.info("Qwen3 TTS backend disabled")
-
-        if _engine_enabled("matcha"):
-            with _logged_startup_step(
-                "matcha",
-                device=_server_config.matcha.device,
-                checkpoint=_server_config.matcha.checkpoint,
-                vocoder=_server_config.matcha.vocoder,
-            ):
-                _matcha_backend = await asyncio.to_thread(ProductionMatchaBackend, _server_config.matcha)
-                _matcha_batcher = ProductionMatchaBatcher(_matcha_backend, _server_config.matcha)
-                _matcha_batcher.start()
-        else:
-            _LOGGER.info("Matcha backend disabled")
-
-        if _engine_enabled("seed_vc"):
-            with _logged_startup_step(
-                "seed_vc",
-                device=_server_config.seed_vc.device,
-                root=_server_config.seed_vc.root,
-                embeddings=_server_config.seed_vc.embeddings_hdf5_path,
-            ):
-                _seed_vc_backend = await asyncio.to_thread(_SeedVCBackend, _server_config.seed_vc)
-                _LOGGER.info("Loading Seed-VC voice catalog manifest=%s", SEED_VC_VOICE_IDS_PATH)
-                catalog_started = time.perf_counter()
-                _seed_vc_supported_voice_ids = _get_seed_vc_supported_voice_ids()
-                _LOGGER.info(
-                    "Loaded Seed-VC voice catalog voices=%d elapsed=%.2fs",
-                    len(_seed_vc_supported_voice_ids),
-                    time.perf_counter() - catalog_started,
-                )
-        else:
-            _LOGGER.info("Seed-VC backend disabled")
-
-        if _engine_enabled("rvc"):
-            with _logged_startup_step(
-                "rvc",
-                cache_size=_server_config.rvc.cache_size,
-                preload_models=_server_config.rvc.preload_models,
-            ):
-                _rvc_backend = await asyncio.to_thread(_build_rvc_backend, _server_config.rvc)
-        else:
-            _LOGGER.info("RVC backend disabled")
-
-        _LOGGER.info("Loaded server startup elapsed=%.2fs", time.perf_counter() - startup_started)
+        _startup_loader_task = asyncio.create_task(load_models_background())
+        _LOGGER.info("Server startup scheduled background loading elapsed=%.2fs", time.perf_counter() - startup_started)
 
     @app.on_event("shutdown")
     async def shutdown_event():
+        global _startup_loader_task
+        if _startup_loader_task is not None and not _startup_loader_task.done():
+            _startup_loader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _startup_loader_task
+        _startup_loader_task = None
+        _stop_model_workers()
         _stop_qwen_worker()
 
     @app.get("/")
     async def health():
         """Health check and server info."""
+        qwen_status = await asyncio.to_thread(_qwen_worker_status) if _engine_enabled("qwen3") else {}
+
         # Build speaker list with locale mappings
         speakers = []
         seen_locales: set[str] = set()
@@ -3605,35 +3398,38 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "engines": {
                 "pipertts": _engine_enabled("pipertts"),
                 "qwen3": _engine_enabled("qwen3"),
-                "matcha": _engine_enabled("matcha"),
+                "starling": _engine_enabled("starling"),
                 "seed_vc": _engine_enabled("seed_vc"),
                 "rvc": _engine_enabled("rvc"),
             },
             "pipertts": {
                 "enabled": _engine_enabled("pipertts"),
-                "models_loaded": list(_inference_cache.keys()),
+                **_engine_status("pipertts"),
+                "models_loaded": list(_sparrow_model_info.keys()) if _sparrow_worker is not None else list(_inference_cache.keys()),
                 "models_enabled": _allowed_models(),
                 "max_models_in_cache": _server_config.pipertts.max_models_in_cache,
                 "default_model": _server_config.pipertts.default_model,
             },
             "qwen3": {
                 "enabled": _engine_enabled("qwen3"),
-                **(_qwen_worker_status() if _engine_enabled("qwen3") else {}),
+                **qwen_status,
             },
-            "matcha": {
-                "enabled": _engine_enabled("matcha"),
-                "loaded": _matcha_backend is not None,
-                "device": _server_config.matcha.device,
-                "checkpoint": _server_config.matcha.checkpoint,
-                "vocoder": _server_config.matcha.vocoder,
-                "sample_rate": getattr(_matcha_backend, "sample_rate", _server_config.matcha.sample_rate),
-                "n_mels": _server_config.matcha.n_mels,
-                "max_batch_size": _server_config.matcha.max_batch_size,
-                "batch_wait_ms": _server_config.matcha.batch_wait_ms,
+            "starling": {
+                "enabled": _engine_enabled("starling"),
+                **_engine_status("starling"),
+                "loaded": (_starling_worker is not None and bool(_starling_info)) or _starling_backend is not None,
+                "device": _server_config.starling.device,
+                "checkpoint": _server_config.starling.checkpoint,
+                "vocoder": _server_config.starling.vocoder,
+                "sample_rate": _starling_info.get("sample_rate") or getattr(_starling_backend, "sample_rate", _server_config.starling.sample_rate),
+                "n_mels": _server_config.starling.n_mels,
+                "max_batch_size": _server_config.starling.max_batch_size,
+                "batch_wait_ms": _server_config.starling.batch_wait_ms,
             },
             "seed_vc": {
                 "enabled": _engine_enabled("seed_vc"),
-                "loaded": _seed_vc_backend is not None,
+                **_engine_status("seed_vc"),
+                "loaded": (_seed_vc_worker is not None and bool(_seed_vc_info)) or _seed_vc_backend is not None,
                 "device": _server_config.seed_vc.device,
                 "root": _server_config.seed_vc.root,
                 "runtime_root": _server_config.seed_vc.runtime_root,
@@ -3641,6 +3437,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             },
             "rvc": {
                 "enabled": _engine_enabled("rvc"),
+                **_engine_status("rvc"),
                 "loaded": _rvc_backend is not None,
             },
             "speakers": speakers,
@@ -3654,39 +3451,45 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     @app.get("/synthesize/voices", response_model=SynthesizeVoicesResponse)
     async def list_synthesize_voices():
         """List voices and locales supported by /synthesize endpoints."""
+        if _engine_enabled("seed_vc"):
+            await _await_engine_ready("seed_vc")
         locales, voices = _build_synthesize_voices_catalog()
         return SynthesizeVoicesResponse(locales=locales, voices=voices)
 
+    @app.get("/starling/status")
     @app.get("/matcha/status")
-    async def matcha_status():
-        """Temporary Matcha backend status."""
+    async def starling_status():
+        """Starling backend status."""
         return {
-            "enabled": _engine_enabled("matcha"),
-            "loaded": _matcha_backend is not None,
-            "device": _server_config.matcha.device,
-            "checkpoint": _server_config.matcha.checkpoint,
-            "vocoder": _server_config.matcha.vocoder,
-            "sample_rate": getattr(_matcha_backend, "sample_rate", _server_config.matcha.sample_rate),
-            "n_mels": _server_config.matcha.n_mels,
-            "n_timesteps": _server_config.matcha.n_timesteps,
+            "enabled": _engine_enabled("starling"),
+            **_engine_status("starling"),
+            "loaded": (_starling_worker is not None and bool(_starling_info)) or _starling_backend is not None,
+            "device": _server_config.starling.device,
+            "checkpoint": _server_config.starling.checkpoint,
+            "vocoder": _server_config.starling.vocoder,
+            "sample_rate": _starling_info.get("sample_rate") or getattr(_starling_backend, "sample_rate", _server_config.starling.sample_rate),
+            "n_mels": _server_config.starling.n_mels,
+            "n_timesteps": _server_config.starling.n_timesteps,
             "semantic": "always",
-            "max_batch_size": _server_config.matcha.max_batch_size,
-            "batch_wait_ms": _server_config.matcha.batch_wait_ms,
+            "max_batch_size": _server_config.starling.max_batch_size,
+            "batch_wait_ms": _server_config.starling.batch_wait_ms,
         }
 
+    @app.post("/starling/synthesize")
     @app.post("/matcha/synthesize")
-    async def matcha_synthesize(request: MatchaSynthesizeRequest):
-        """Temporary Matcha synthesis endpoint with dynamic request batching."""
+    async def starling_synthesize(request: MatchaSynthesizeRequest):
+        """Starling synthesis endpoint with dynamic request batching."""
         if not request.text.strip():
             raise HTTPException(status_code=400, detail="text is required")
-        result = await _get_matcha_batcher().submit(request)
+        await _await_engine_ready("starling")
+        result = await _get_starling_batcher().submit(request)
         headers = {
-            "X-Matcha-Audio-Seconds": f"{result.audio_seconds:.6f}",
-            "X-Matcha-Backend-Seconds": f"{result.backend_seconds:.6f}",
-            "X-Matcha-Backend-RTF": f"{result.backend_rtf:.6f}",
-            "X-Matcha-Model-RTF": f"{result.model_rtf:.6f}",
-            "X-Matcha-Batch-Size": str(result.batch_size),
-            "X-Matcha-Queue-Seconds": f"{result.queue_seconds:.6f}",
+            "X-Starling-Audio-Seconds": f"{result.audio_seconds:.6f}",
+            "X-Starling-Backend-Seconds": f"{result.backend_seconds:.6f}",
+            "X-Starling-Backend-RTF": f"{result.backend_rtf:.6f}",
+            "X-Starling-Model-RTF": f"{result.model_rtf:.6f}",
+            "X-Starling-Batch-Size": str(result.batch_size),
+            "X-Starling-Queue-Seconds": f"{result.queue_seconds:.6f}",
         }
         if request.format == "json":
             return {
@@ -3707,7 +3510,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         """Embedded Seed-VC backend status."""
         return {
             "enabled": _engine_enabled("seed_vc"),
-            "loaded": _seed_vc_backend is not None,
+            **_engine_status("seed_vc"),
+            "loaded": (_seed_vc_worker is not None and bool(_seed_vc_info)) or _seed_vc_backend is not None,
             "device": _server_config.seed_vc.device,
             "root": _server_config.seed_vc.root,
             "runtime_root": _server_config.seed_vc.runtime_root,
@@ -3720,6 +3524,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if not request.audio:
             raise HTTPException(status_code=400, detail="audio is required")
         try:
+            await _await_engine_ready("seed_vc")
             backend = _get_seed_vc_backend()
             # Resolve cached embedding check async; download reference in background
             emb_key, emb = backend._resolve_cached_embeddings(request)
@@ -3743,6 +3548,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if any(not item.audio for item in request.items):
             raise HTTPException(status_code=400, detail="all items require audio")
         try:
+            await _await_engine_ready("seed_vc")
             started = time.perf_counter()
             backend = _get_seed_vc_backend()
             first = request.items[0]
@@ -3765,6 +3571,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     async def seed_vc_find_voice(request: SeedVCFindVoiceRequest):
         """Seed-VC compatible voice lookup endpoint."""
         try:
+            await _await_engine_ready("seed_vc")
             backend = _get_seed_vc_backend()
             sample_request = SeedVCRequest(audio="", reference_url=request.reference_url, id=request.id)
             reference_path = await backend._fetch_sample(sample_request)
@@ -3780,6 +3587,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     async def seed_vc_enhance(request: SeedVCEnhanceRequest):
         """Seed-VC compatible audio enhancement endpoint."""
         try:
+            await _await_engine_ready("seed_vc")
             backend = _get_seed_vc_backend()
             raw_path = backend.tmp_dir / request.id / "sample_raw.mp3"
             raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3803,14 +3611,16 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if backend is None:
             return {
                 "enabled": _engine_enabled("rvc"),
+                **_engine_status("rvc"),
                 "loaded": False,
                 "available_models": [],
             }
-        return backend.status()
+        return {**_engine_status("rvc"), **backend.status()}
 
     @app.get("/rvc/models", response_model=list[str])
     async def rvc_models():
         """List available RVC model weights."""
+        await _await_engine_ready("rvc")
         backend = _get_rvc_backend()
         return backend.list_models()
 
@@ -3824,6 +3634,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if not request.audio:
             raise HTTPException(status_code=400, detail="audio is required")
         try:
+            await _await_engine_ready("rvc")
             audio_bytes = base64.b64decode(request.audio)
             backend = _get_rvc_backend()
             result_bytes, sr = await asyncio.to_thread(
@@ -3860,6 +3671,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 detail="RVC real batch conversion does not support index_rate != 0",
             )
         try:
+            await _await_engine_ready("rvc")
             audio_items = [base64.b64decode(item.audio) for item in request.items]
             backend = _get_rvc_backend()
             converted = await asyncio.to_thread(
@@ -3908,6 +3720,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Use either 'language' or 'model', not both")
         if not _engine_enabled("pipertts"):
             raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
+        await _await_engine_ready("pipertts")
         if request.sample_url is not None and request.voice_id is not None:
             raise HTTPException(status_code=400, detail="Use either 'voice_id' or 'sample_url', not both")
         if request.sample_url is not None and _seed_vc_style_requested(request):
@@ -4048,6 +3861,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         """Batched synthesis with independent /synthesize-shaped inputs."""
         started = time.perf_counter()
         try:
+            await _await_engine_ready("pipertts")
             result = await synthesize_mixed_batch(request)
         except HTTPException as exc:
             _log_synthesize_request(

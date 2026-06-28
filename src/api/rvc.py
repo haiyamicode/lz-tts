@@ -16,6 +16,7 @@ Directory layout::
 from __future__ import annotations
 
 import io
+import importlib
 import logging
 import os
 import sys
@@ -91,8 +92,17 @@ class RVCBackend:
         self._validate_assets()
 
         rvc_src = str(RVC_SRC)
-        if rvc_src not in sys.path:
-            sys.path.insert(0, rvc_src)
+        if rvc_src in sys.path:
+            sys.path.remove(rvc_src)
+        sys.path.insert(0, rvc_src)
+
+        existing_configs = sys.modules.get("configs")
+        existing_config_path = Path(getattr(existing_configs, "__file__", "") or "")
+        if existing_configs is not None and RVC_SRC not in existing_config_path.parents:
+            for name in list(sys.modules):
+                if name == "configs" or name.startswith("configs."):
+                    del sys.modules[name]
+        importlib.invalidate_caches()
 
         saved_argv = sys.argv
         sys.argv = ["rvc-backend"]

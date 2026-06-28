@@ -1,7 +1,7 @@
 """
 Test suite for context_replacer.py
 
-Data-driven tests for contextual text replacement (AI -> ây ai, numbers, etc.)
+Data-driven tests for contextual text replacement (AI -> ây ai, etc.)
 
 Run with: python -m pytest src/piper/test_context_replacer.py -v
 Or directly: python -m unittest src/piper/test_context_replacer.py
@@ -282,42 +282,22 @@ class TestContextReplacer(unittest.TestCase):
         result = self.replacer.apply_replacements("Phòng IT mới", "vi-VN")
         self.assertIn("ai ti", result)
 
-    # --- Number pattern tests ---
-
-    def test_number_replaced(self):
-        result = self.replacer.apply_replacements("Có 42 người", "vi-VN")
-        self.assertIn("bốn mươi hai", result)
-
-    def test_thousand_sep_replaced(self):
-        result = self.replacer.apply_replacements("gọi vốn 1.000.000 đô", "vi-VN")
-        self.assertIn("một triệu", result)
-
-    def test_decimal_replaced(self):
-        result = self.replacer.apply_replacements("Giá 3.14 đô", "vi-VN")
-        self.assertIn("ba phẩy mười bốn", result)
-
-    # --- Percent pattern tests ---
-
-    def test_percent_replaced(self):
-        result = self.replacer.apply_replacements("Pin còn 3%", "vi-VN")
-        self.assertIn("ba phần trăm", result)
-
-    # --- Mixed tests ---
+    # --- Mixed token tests ---
 
     def test_ai_and_percent(self):
         result = self.replacer.apply_replacements(
             "Startup về AI tăng 25%", "vi-VN"
         )
         self.assertIn("ây ai", result)
-        self.assertIn("hai mươi lăm phần trăm", result)
+        self.assertIn("25%", result)
 
     def test_ai_and_number_and_percent(self):
         result = self.replacer.apply_replacements(
             "Startup về AI tăng 25% sau khi nhận 10.000.000 đô.", "vi-VN"
         )
         self.assertIn("ây ai", result)
-        self.assertIn("hai mươi lăm phần trăm", result)
-        self.assertIn("mười triệu", result)
+        self.assertIn("25%", result)
+        self.assertIn("10.000.000", result)
 
     # --- Language filter tests ---
 

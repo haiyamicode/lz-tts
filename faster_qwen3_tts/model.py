@@ -1062,6 +1062,7 @@ class FasterQwen3TTS:
         append_silence: bool = True,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
         instruct: Optional[str] = None,
+        use_cuda_graph: bool = True,
     ):
         """Prepare inputs for generation (shared by streaming and non-streaming).
 
@@ -1117,7 +1118,7 @@ class FasterQwen3TTS:
             instruct_ids=instruct_ids,
         )
 
-        if not self._warmed_up:
+        if use_cuda_graph and not self._warmed_up:
             self._warmup(tie.shape[1])
 
         talker = m.talker
@@ -1507,6 +1508,7 @@ class FasterQwen3TTS:
         xvec_only: bool = False,
         non_streaming_mode: Optional[bool] = None,
         append_silence: bool = True,
+        parity_mode: bool = False,
         instruct: Optional[str] = None,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
     ) -> Tuple[list, int]:
@@ -1532,6 +1534,8 @@ class FasterQwen3TTS:
             non_streaming_mode: Match upstream text-feeding layout. When None, use the
                 upstream voice-cloning default (False, step-by-step text feeding during
                 decode). Set True to prefill the full target text before decode.
+            parity_mode: When True, disables CUDA graphs and uses the dynamic
+                Hugging Face generation path.
             voice_clone_prompt: Optional precomputed voice clone prompt dict. When provided,
                 `xvec_only` is ignored and prompt extraction from `ref_audio` is skipped.
                 This path supports x-vector-only prompts (`ref_spk_embedding` only)
@@ -1561,6 +1565,7 @@ class FasterQwen3TTS:
             append_silence=append_silence,
             voice_clone_prompt=voice_clone_prompt,
             instruct=instruct,
+            use_cuda_graph=not parity_mode,
         )
 
         codec_ids, timing = fast_generate(
@@ -1579,6 +1584,7 @@ class FasterQwen3TTS:
             top_p=top_p,
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
+            parity_mode=parity_mode,
         )
 
         if codec_ids is None:
@@ -1642,10 +1648,10 @@ class FasterQwen3TTS:
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
         parity_mode: bool = False,
     ) -> Tuple[list, int]:
-        """Generate a batch of voice-cloned utterances with the CUDA graph backend."""
-        from .generate import fast_generate_batch_graph
+        """Generate a batch of voice-cloned utterances."""
+        from .generate import fast_generate_batch_dynamic, fast_generate_batch_graph
 
-        if len(texts) not in CUDA_GRAPH_BATCH_SIZES:
+        if not parity_mode and len(texts) not in CUDA_GRAPH_BATCH_SIZES:
             raise ValueError(
                 f"Qwen3 batch size must be one of {CUDA_GRAPH_BATCH_SIZES}; got {len(texts)}"
             )
@@ -1673,27 +1679,48 @@ class FasterQwen3TTS:
             instruct=instruct,
         )
 
-        predictor_graph, talker_graph = self._get_batch_graphs(
-            batch_size=len(texts),
-            prefill_len=tie.shape[1],
-        )
-        codec_ids_list, timing = fast_generate_batch_graph(
-            talker=talker,
-            talker_input_embeds=tie,
-            attention_mask=tam,
-            trailing_text_hiddens=tth,
-            tts_pad_embed=tpe,
-            config=config,
-            predictor_graph=predictor_graph,
-            talker_graph=talker_graph,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=min_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            do_sample=do_sample,
-            repetition_penalty=repetition_penalty,
-        )
+        if parity_mode:
+            logger.info(
+                "Using dynamic batch generation without CUDA graphs: batch_size=%s",
+                len(texts),
+            )
+            codec_ids_list, timing = fast_generate_batch_dynamic(
+                talker=talker,
+                talker_input_embeds=tie,
+                attention_mask=tam,
+                trailing_text_hiddens=tth,
+                tts_pad_embed=tpe,
+                config=config,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
+                repetition_penalty=repetition_penalty,
+            )
+        else:
+            predictor_graph, talker_graph = self._get_batch_graphs(
+                batch_size=len(texts),
+                prefill_len=tie.shape[1],
+            )
+            codec_ids_list, timing = fast_generate_batch_graph(
+                talker=talker,
+                talker_input_embeds=tie,
+                attention_mask=tam,
+                trailing_text_hiddens=tth,
+                tts_pad_embed=tpe,
+                config=config,
+                predictor_graph=predictor_graph,
+                talker_graph=talker_graph,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
+                repetition_penalty=repetition_penalty,
+            )
 
         speech_tokenizer = m.speech_tokenizer
         audio_arrays = []
@@ -1811,6 +1838,7 @@ class FasterQwen3TTS:
             append_silence=append_silence,
             voice_clone_prompt=voice_clone_prompt,
             instruct=instruct,
+            use_cuda_graph=not parity_mode,
         )
 
         speech_tokenizer = m.speech_tokenizer

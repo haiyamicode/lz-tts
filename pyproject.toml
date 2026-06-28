@@ -130,3 +130,4 @@ flash-attn = { MAX_JOBS = "24" }
 
 [tool.uv.sources]
 piper-phonemize = { path = "./src/phonemizer" }
+flash-attn = { path = "data/runtime-wheels/flash_attn-2.8.3.post1-cp310-cp310-linux_x86_64.whl" }

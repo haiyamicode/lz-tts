@@ -5,11 +5,13 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 _LOGGER = logging.getLogger(__name__)
@@ -32,6 +34,7 @@ class DpBudgetConfig:
     max_extra_tokens: int = 36
     language_profiles: dict[str, dict[str, float | int]] = field(default_factory=dict)
     use_bert: bool = False
+    enable_alignment_validation: bool = False
 
 
 LANGUAGE_ALIASES = {
@@ -70,6 +73,9 @@ LANGUAGE_ALIASES = {
     "it": "italian",
     "ita": "italian",
     "italian": "italian",
+    "vi": "vietnamese",
+    "vie": "vietnamese",
+    "vietnamese": "vietnamese",
 }
 
 
@@ -115,7 +121,9 @@ class QwenDpBudget:
         self._model = None
         self._model_config: dict[str, Any] = {}
         self._semantic_tokenizer = None
+        self._semantic_model = None
         self._build_bert_input = None
+        self._align_phone_features = None
 
     def load(self) -> None:
         if self._model is not None:
@@ -148,18 +156,29 @@ class QwenDpBudget:
 
             model_g = model.model_g
             model_g.dec = None
-            model_g.enc_q = None
-            model_g.flow = None
+            if not self.config.enable_alignment_validation:
+                model_g.enc_q = None
+                model_g.flow = None
             gc.collect()
 
             self._sync_config_from_checkpoint(model)
             checkpoint_uses_bert = bool(getattr(model.hparams, "use_bert", False))
             if checkpoint_uses_bert and self.config.use_bert:
                 from src.piper.semantic import SemanticTokenizer, build_bert_input
+                from src.piper.semantic import align_phone_features
 
                 bert_model_name = getattr(model.hparams, "bert_model_name", None)
                 self._semantic_tokenizer = SemanticTokenizer(model_name=bert_model_name)
                 self._build_bert_input = build_bert_input
+                self._align_phone_features = align_phone_features
+                enc_p = getattr(model_g, "enc_p", None)
+                if bool(getattr(enc_p, "bert_features_precomputed", False)):
+                    from transformers import AutoModel
+
+                    from src.piper.hf_cache import resolve_hf_model_path
+
+                    semantic_path = resolve_hf_model_path(bert_model_name, require_weights=True)
+                    self._semantic_model = AutoModel.from_pretrained(semantic_path).to(self.device).eval()
             elif checkpoint_uses_bert:
                 self._strip_bert_from_text_encoder(model_g)
 
@@ -201,6 +220,7 @@ class QwenDpBudget:
             "russian": "ru",
             "portuguese": "pt",
             "italian": "it",
+            "vietnamese": "vi",
         }
         voice = language_map.get(language_lower, language)
         return {
@@ -388,6 +408,147 @@ class QwenDpBudget:
 
         return budgets
 
+    @torch.no_grad()
+    def validate_alignment(
+        self,
+        text: str,
+        wav_data: np.ndarray,
+        sample_rate: int,
+        language: str | None = None,
+        expected_seconds: float | None = None,
+        duration_tolerance: float = 0.25,
+        reject_zero_phoneme_duration: bool = True,
+    ) -> dict[str, Any]:
+        self.load()
+        assert self._model is not None
+        model = self._model
+        if getattr(model, "enc_q", None) is None or getattr(model, "flow", None) is None:
+            raise RuntimeError("Qwen DP alignment validation requires enc_q/flow; enable_alignment_validation is false")
+
+        from src.piper.preprocess import phonemize_text_for_infer
+        from src.piper.vits import monotonic_align
+        from src.piper.vits.mel_processing import spectrogram_torch
+
+        phoneme_result = phonemize_text_for_infer(
+            text,
+            self._phoneme_config(language),
+            neural=False,
+        )
+        phoneme_ids = phoneme_result.get("phoneme_ids") or []
+        if not phoneme_ids:
+            return {
+                "enabled": True,
+                "valid": True,
+                "skipped": True,
+                "reason": "empty_phonemes",
+            }
+
+        audio = np.asarray(wav_data, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return {
+                "enabled": True,
+                "valid": False,
+                "reason": "empty_audio",
+                "phoneme_count": len(phoneme_ids),
+            }
+
+        target_sample_rate = int(getattr(model, "sample_rate", 0) or self._model_config.get("audio", {}).get("sample_rate") or 22050)
+        if sample_rate != target_sample_rate:
+            import librosa
+
+            audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=target_sample_rate).astype(np.float32, copy=False)
+
+        audio = np.clip(audio, -1.0, 1.0)
+        y = torch.from_numpy(audio).to(device=self.device, dtype=torch.float32).unsqueeze(0)
+        if y.size(1) < int(getattr(model, "hop_length", 256)):
+            return {
+                "enabled": True,
+                "valid": False,
+                "reason": "audio_too_short",
+                "audio_seconds": float(audio.size / target_sample_rate),
+                "phoneme_count": len(phoneme_ids),
+            }
+
+        filter_length = int(getattr(model, "filter_length", 1024))
+        hop_length = int(getattr(model, "hop_length", 256))
+        win_length = int(getattr(model, "win_length", 1024))
+        y_spec = spectrogram_torch(
+            y,
+            n_fft=filter_length,
+            sampling_rate=target_sample_rate,
+            hop_size=hop_length,
+            win_size=win_length,
+            center=False,
+        )
+        y_lengths = torch.tensor([y_spec.size(-1)], dtype=torch.long, device=self.device)
+
+        x = torch.tensor([phoneme_ids], dtype=torch.long, device=self.device)
+        x_lengths = torch.tensor([len(phoneme_ids)], dtype=torch.long, device=self.device)
+        sid = torch.tensor([self._speaker_id_for_language(language)], dtype=torch.long, device=self.device)
+        bert_input = self._bert_input(
+            phoneme_result.get("text") or text,
+            phoneme_length=len(phoneme_ids),
+            word_spans=phoneme_result.get("word_spans"),
+        )
+
+        if model.n_speakers > 1:
+            g = model.emb_g(sid).unsqueeze(-1)
+        else:
+            g = None
+
+        try:
+            _x_encoded, m_p, logs_p, x_mask = model.enc_p(x, x_lengths, bert_input=bert_input, g=g)
+        except TypeError:
+            _x_encoded, m_p, logs_p, x_mask = model.enc_p(x, x_lengths, g=g)
+        z, _m_q, _logs_q, y_mask = model.enc_q(y_spec, y_lengths, g=g)
+        z_p = model.flow(z, y_mask, g=g)
+
+        s_p_sq_r = torch.exp(-2 * logs_p)
+        neg_cent1 = torch.sum(-0.5 * math.log(2 * math.pi) - logs_p, [1], keepdim=True)
+        neg_cent2 = torch.matmul(-0.5 * (z_p**2).transpose(1, 2), s_p_sq_r)
+        neg_cent3 = torch.matmul(z_p.transpose(1, 2), (m_p * s_p_sq_r))
+        neg_cent4 = torch.sum(-0.5 * (m_p**2) * s_p_sq_r, [1], keepdim=True)
+        neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
+
+        attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+        attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1)
+        durations = attn.sum(2).squeeze(0).squeeze(0)
+        active_durations = durations[: len(phoneme_ids)].detach().cpu()
+        zero_indices = torch.nonzero(active_durations <= 0, as_tuple=False).flatten().tolist()
+
+        audio_seconds = float(audio.size / target_sample_rate)
+        duration_ratio = None
+        duration_valid = True
+        if expected_seconds is not None and expected_seconds > 0:
+            duration_ratio = audio_seconds / float(expected_seconds)
+            duration_valid = (1.0 - duration_tolerance) <= duration_ratio <= (1.0 + duration_tolerance)
+
+        zero_valid = (not reject_zero_phoneme_duration) or not zero_indices
+        valid = bool(duration_valid and zero_valid)
+        reason = "ok"
+        if not zero_valid:
+            reason = "zero_phoneme_duration"
+        elif not duration_valid:
+            reason = "duration_out_of_range"
+
+        return {
+            "enabled": True,
+            "valid": valid,
+            "reason": reason,
+            "audio_seconds": audio_seconds,
+            "expected_seconds": float(expected_seconds) if expected_seconds is not None else None,
+            "duration_ratio": float(duration_ratio) if duration_ratio is not None else None,
+            "duration_tolerance": float(duration_tolerance),
+            "phoneme_count": len(phoneme_ids),
+            "aligned_frames": int(y_lengths.item()),
+            "zero_duration_count": len(zero_indices),
+            "zero_duration_indices": [int(index) for index in zero_indices[:20]],
+            "min_phoneme_frames": int(active_durations.min().item()) if active_durations.numel() else 0,
+            "max_phoneme_frames": int(active_durations.max().item()) if active_durations.numel() else 0,
+            "speaker_id": int(sid.item()),
+            "sample_rate": target_sample_rate,
+        }
+
     def _bert_input(
         self,
         text: str | list[str],
@@ -414,6 +575,41 @@ class QwenDpBudget:
             )
         if bert_dict is None:
             return None
+        if self._semantic_model is not None and self._align_phone_features is not None:
+            input_ids = bert_dict["input_ids"].to(self.device)
+            attention_mask = bert_dict["attention_mask"].to(self.device)
+            word2ph = bert_dict.get("word2ph")
+            if word2ph is None:
+                return None
+            if isinstance(phoneme_length, int):
+                phone_lengths = [phoneme_length]
+            elif isinstance(phoneme_length, list):
+                phone_lengths = [int(length) for length in phoneme_length]
+            else:
+                return None
+
+            with torch.inference_mode():
+                hidden = self._semantic_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                ).last_hidden_state
+
+            word2ph = word2ph.to(hidden.device)
+            feature_items = [
+                self._align_phone_features(hidden[idx], word2ph[idx], phone_len=phone_lengths[idx])
+                for idx in range(len(phone_lengths))
+            ]
+            hidden_dim = int(feature_items[0].size(0))
+            max_len = max(phone_lengths)
+            features = torch.zeros(
+                (len(feature_items), hidden_dim, max_len),
+                device=self.device,
+                dtype=hidden.dtype,
+            )
+            for idx, item in enumerate(feature_items):
+                features[idx, :, : item.size(1)] = item.to(device=self.device)
+            return {"features": features}
+
         out = {
             "input_ids": bert_dict["input_ids"].to(self.device),
             "attention_mask": bert_dict["attention_mask"].to(self.device),

@@ -30,6 +30,7 @@ from piper_phonemize import (
     tashkeel_run,
 )
 from ..multilingual_splitter import MultilingualSplitter
+from ..text_norm import normalize_text as _normalize_written_text
 
 from .norm_audio import cache_norm_audio, make_silence_detector
 from .preprocess import (
@@ -1305,13 +1306,14 @@ def batched(iterable, n):
 def _normalize_text_for_voice(text: str, voice: str) -> str:
     """Apply language-specific normalization before espeak phonemization.
 
+    - text-only written normalization for EN/ZH/JA/KO/FR/ES
     - ja: particle normalization (は→わ, へ→え, を→お) + Kanji/Katakana→Hiragana
     - ar: diacritize with libtashkeel
-    - others: unchanged
     """
     # Always normalize punctuation/space first
     norm_text = _normalize_punct_and_space(text)
     v = (voice or "").lower()
+    norm_text = _normalize_written_text(norm_text, v)
     if v.startswith("ja"):
         norm_text = _normalize_japanese_text(norm_text)
     elif v.startswith("ar"):

@@ -254,8 +254,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise-scale", type=float)
     parser.add_argument("--length-scale", type=float)
     parser.add_argument("--noise-w", type=float)
-    parser.add_argument("--sdp-ratio", type=float)
-    parser.add_argument("--neural", action="store_true", help="Use neural heteronym frontend")
+    parser.add_argument(
+        "--sdp-ratio",
+        type=float,
+        default=0.2,
+        help="Duration predictor blend ratio; defaults to production Sparrow DP/SDP blend",
+    )
+    parser.add_argument(
+        "--neural",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use neural heteronym frontend; enabled by default to match production",
+    )
     parser.add_argument("--no-utmos", action="store_true", help="Skip UTMOS scoring")
     parser.add_argument("--utmos-python", type=Path, default=Path("local/utmos_probe/.venv/bin/python"))
     parser.add_argument("--utmos-worker", type=Path, default=Path("local/utmos_probe/utmos_stdin_worker.py"))
@@ -324,6 +334,7 @@ def main() -> None:
             "utmos": "",
             "checkpoint": str(checkpoint),
             "config": str(config),
+            "synth_kwargs": json.dumps(synth_kwargs, sort_keys=True),
         }
         rows.append(row)
         wav_paths.append(wav_path)
@@ -351,6 +362,7 @@ def main() -> None:
         "utmos",
         "checkpoint",
         "config",
+        "synth_kwargs",
     ]
     with (run_dir / "utmos_scores.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -366,6 +378,7 @@ def main() -> None:
         "output_dir": str(run_dir),
         "sample_rate": inference.sample_rate,
         "num_prompts": len(rows),
+        "synth_kwargs": synth_kwargs,
         "utmos": numeric_summary(utmos_values),
         "rtf": numeric_summary(rtf_values),
     }

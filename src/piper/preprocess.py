@@ -17,6 +17,7 @@ from piper_phonemize import (
 )
 
 from ..multilingual_splitter import MultilingualSplitter
+from ..text_norm import normalize_text as _normalize_written_text
 from .heteronym import get_resolver as _get_heteronym_resolver
 
 
@@ -1016,6 +1017,7 @@ def _normalize_text_for_voice(text: str, voice: str) -> str:
     """Apply language-specific normalization before espeak phonemization."""
     norm_text = _normalize_punct_and_space(text)
     v = (voice or "").lower()
+    norm_text = _normalize_written_text(norm_text, v)
 
     if v.startswith("ja"):
         norm_text = _normalize_japanese_text(norm_text)
@@ -1029,16 +1031,12 @@ def _normalize_text_for_voice(text: str, voice: str) -> str:
 def _normalize_text_for_mapping(text: str, voice: str) -> str:
     """Normalize text before phonemization paths that build word mappings.
 
-    Japanese and Korean mapping functions perform their own tokenizer/G2P pass
-    so they can keep surface-text spans aligned to phoneme spans. Pre-normalizing
-    those languages would feed reading text back into the tokenizer and can make
-    symbols like the Japanese long-vowel mark become standalone spoken tokens.
+    This is text-only normalization. It intentionally does not call G2P,
+    IPA conversion, or phone/tone generation.
     """
     v = (voice or "").lower()
-    if v.startswith("ja") or v.startswith("ko"):
-        return text
-
     norm_text = _normalize_punct_and_space(text)
+    norm_text = _normalize_written_text(norm_text, v)
 
     if v.startswith("ar"):
         norm_text = tashkeel_run(norm_text)

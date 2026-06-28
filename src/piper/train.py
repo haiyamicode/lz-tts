@@ -13,6 +13,8 @@ import json
 import logging
 import os
 from pathlib import Path, PosixPath
+import re
+import shutil
 import subprocess
 import time
 from typing import Any
@@ -20,7 +22,7 @@ from typing import Any
 import numpy as np
 import torch
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from .vits.utils import audio_float_to_int16
@@ -171,12 +173,10 @@ def train_from_args(
     callbacks = []
     if args.checkpoint_epochs and args.checkpoint_epochs > 0:
         callbacks.append(
-            ModelCheckpoint(
+            LatestCheckpointCallback(
                 every_n_epochs=args.checkpoint_epochs,
-                monitor="val_loss",
-                mode="min",
-                save_top_k=20,
-                save_last=True,
+                keep_last=int(getattr(args, "keep_last_checkpoints", 5)),
+                retain_every=int(getattr(args, "retain_every", 0)),
             )
         )
     if getattr(args, "utmos_enabled", False):
@@ -207,7 +207,7 @@ def train_from_args(
         callbacks=callbacks,
         logger=logger,
         log_every_n_steps=args.log_every_n_steps,
-        enable_checkpointing=True,
+        enable_checkpointing=False,
         enable_progress_bar=bool(getattr(args, "enable_progress_bar", True)),
         benchmark=torch.backends.cudnn.benchmark,
         gradient_clip_val=args.gradient_clip_val,
@@ -237,6 +237,8 @@ def add_trainer_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cudnn-benchmark", action="store_true")
     parser.add_argument("--gradient-clip-val", type=float, default=0.0)
     parser.add_argument("--accumulate-grad-batches", type=int, default=1)
+    parser.add_argument("--keep-last-checkpoints", type=int, default=5)
+    parser.add_argument("--retain-every", type=int, default=0)
     parser.add_argument("--use-length-buckets", action="store_true")
     parser.add_argument("--bucket-boundaries", nargs="*", type=int)
 
@@ -664,6 +666,87 @@ class EpochSummaryCallback(Callback):
             except (TypeError, ValueError):
                 continue
         return (" " + " ".join(parts)) if parts else ""
+
+
+class LatestCheckpointCallback(Callback):
+    """Keep recent epoch checkpoints plus sparse long-term milestones."""
+
+    _EPOCH_RE = re.compile(r"^epoch=(?P<epoch>\d+)-step=(?P<step>\d+)(?:-v\d+)?\.ckpt$")
+
+    def __init__(
+        self, every_n_epochs: int, keep_last: int = 5, retain_every: int = 0
+    ) -> None:
+        super().__init__()
+        self.every_n_epochs = max(1, int(every_n_epochs))
+        self.keep_last = max(1, int(keep_last))
+        self.retain_every = max(0, int(retain_every))
+        self._last_global_step_saved = -1
+
+    def on_train_epoch_end(self, trainer: Trainer, pl_module: VitsModel) -> None:
+        epoch = int(trainer.current_epoch)
+        if epoch % self.every_n_epochs != 0 and (epoch + 1) != int(trainer.max_epochs):
+            return
+        if int(trainer.global_step) == self._last_global_step_saved:
+            return
+
+        self._save_checkpoint(trainer)
+
+    def _save_checkpoint(self, trainer: Trainer) -> None:
+        if not getattr(trainer, "is_global_zero", True):
+            return
+
+        epoch = int(trainer.current_epoch)
+        checkpoint_dir = Path(trainer.log_dir or trainer.default_root_dir) / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        checkpoint_path = checkpoint_dir / (
+            f"epoch={epoch}-step={int(trainer.global_step)}.ckpt"
+        )
+        trainer.save_checkpoint(str(checkpoint_path))
+        self._last_global_step_saved = int(trainer.global_step)
+        self._update_last_checkpoint(checkpoint_path, checkpoint_dir / "last.ckpt")
+        self._prune_old_checkpoints(checkpoint_dir)
+        _LOGGER.info(
+            "Saved checkpoint %s; keeping last %s and retaining every %s epochs",
+            checkpoint_path,
+            self.keep_last,
+            self.retain_every or "disabled",
+        )
+
+    @staticmethod
+    def _update_last_checkpoint(checkpoint_path: Path, last_path: Path) -> None:
+        if last_path.exists() or last_path.is_symlink():
+            last_path.unlink()
+        try:
+            os.link(checkpoint_path, last_path)
+        except OSError:
+            shutil.copy2(checkpoint_path, last_path)
+
+    def _prune_old_checkpoints(self, checkpoint_dir: Path) -> None:
+        checkpoints = []
+        for path in checkpoint_dir.glob("epoch=*-step=*.ckpt"):
+            match = self._EPOCH_RE.match(path.name)
+            if match is None:
+                continue
+            epoch = int(match.group("epoch"))
+            step = int(match.group("step"))
+            checkpoints.append((epoch, step, path))
+
+        checkpoints.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        recent_paths = {path for _, _, path in checkpoints[: self.keep_last]}
+
+        for epoch, _, path in checkpoints[self.keep_last :]:
+            if self._is_retained_epoch(epoch):
+                continue
+            if path in recent_paths:
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _is_retained_epoch(self, epoch: int) -> bool:
+        return self.retain_every > 0 and epoch > 0 and epoch % self.retain_every == 0
 
 
 class UtmosQualityCallback(Callback):
