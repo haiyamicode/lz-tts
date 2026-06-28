@@ -1,15 +1,10 @@
-"""Production Starling inference helpers.
-
-This module keeps the API server thin while still reusing the local Matcha-TTS
-model package/checkpoints during the transition to production packaging.
-"""
+"""Production Starling inference helpers."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +15,6 @@ import numpy as np
 _LOGGER = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MATCHA_ROOT = PROJECT_ROOT / "local" / "Matcha-TTS"
 
 
 class MatchaSettings(Protocol):
@@ -102,10 +96,7 @@ def _resolve_path(value: str | Path) -> Path:
     path = Path(value)
     if path.is_absolute():
         return path
-    project_path = PROJECT_ROOT / path
-    if project_path.exists():
-        return project_path
-    return MATCHA_ROOT / path
+    return PROJECT_ROOT / path
 
 
 class MatchaBackend:
@@ -121,11 +112,9 @@ class MatchaBackend:
     def _load(self) -> None:
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(f"Starling checkpoint not found: {self.checkpoint_path}")
-        if str(MATCHA_ROOT) not in sys.path:
-            sys.path.insert(0, str(MATCHA_ROOT))
 
         import torch  # pylint: disable=import-outside-toplevel
-        from matcha.models.matcha_tts import MatchaTTS  # pylint: disable=import-outside-toplevel
+        from src.starling.models.matcha_tts import MatchaTTS  # pylint: disable=import-outside-toplevel
         from transformers import AutoModel  # pylint: disable=import-outside-toplevel
         from src.piper.hf_cache import resolve_hf_model_path  # pylint: disable=import-outside-toplevel
         from src.piper.semantic import SemanticTokenizer  # pylint: disable=import-outside-toplevel
