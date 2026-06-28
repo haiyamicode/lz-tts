@@ -23,6 +23,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+PRIORITY_DATA_DIRS = ("runtime-wheels",)
+
 
 def get_s3_client():
     import botocore.config
@@ -178,6 +180,15 @@ def sync_data_from_s3(
         if not filtered:
             print(f"No matching files (filter: {name_filter})")
             return 0
+
+        priority_index = {name: idx for idx, name in enumerate(PRIORITY_DATA_DIRS)}
+        filtered.sort(
+            key=lambda item: (
+                priority_index.get(item[1].split("/")[0], len(priority_index)),
+                item[1].split("/")[0],
+                item[1],
+            )
+        )
 
         print(f"Found {len(filtered)} files → {local_data_dir}/\n")
 

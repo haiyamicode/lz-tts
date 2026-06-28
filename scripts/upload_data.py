@@ -22,6 +22,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+PRIORITY_DATA_DIRS = ("runtime-wheels",)
+
 
 def get_s3_client():
     """Create and return S3 client with Wasabi configuration"""
@@ -167,7 +169,13 @@ def upload_data_to_s3(
             print(f"Error: Model directory not found: {model_dirs[0]}")
             return 1
     else:
-        model_dirs = [d for d in data_dir.iterdir() if d.is_dir()]
+        all_dirs = {d.name: d for d in data_dir.iterdir() if d.is_dir()}
+        model_dirs = [
+            all_dirs.pop(name)
+            for name in PRIORITY_DATA_DIRS
+            if name in all_dirs
+        ]
+        model_dirs.extend(all_dirs[name] for name in sorted(all_dirs))
         if not model_dirs:
             print(f"No model directories found in {data_dir}")
             return 0
