@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import sys
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -13,6 +15,11 @@ from typing import Any
 from fastapi import HTTPException
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s: %(name)s: %(message)s",
+    stream=sys.stdout,
+)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -122,6 +129,14 @@ class WorkerProcessClient:
 
         request_id = uuid.uuid4().hex
         self.lock.acquire()
+        started = time.perf_counter()
+        _LOGGER.info(
+            "%s worker request start action=%s request_id=%s pid=%s",
+            self.name,
+            action,
+            request_id,
+            self.process.pid if self.process is not None else None,
+        )
         try:
             self.requests.put({"request_id": request_id, "action": action, "payload": payload})
             while True:
@@ -140,9 +155,26 @@ class WorkerProcessClient:
         finally:
             self.lock.release()
 
+        elapsed = time.perf_counter() - started
         if response.get("ok"):
+            _LOGGER.info(
+                "%s worker request done action=%s request_id=%s elapsed=%.2fs",
+                self.name,
+                action,
+                request_id,
+                elapsed,
+            )
             return response
 
         status_code = int(response.get("status_code") or 500)
         detail = response.get("detail") or response.get("error") or f"{self.name} worker failed"
+        _LOGGER.warning(
+            "%s worker request failed action=%s request_id=%s status_code=%s elapsed=%.2fs detail=%s",
+            self.name,
+            action,
+            request_id,
+            status_code,
+            elapsed,
+            detail,
+        )
         raise HTTPException(status_code=status_code, detail=detail)

@@ -2393,8 +2393,16 @@ class _SeedVCBackendProxy:
         self.settings = _server_config.seed_vc
         self.sample_rate = int(info.get("sample_rate") or 22050)
         self.device = info.get("device") or self.settings.device
-        self.root = info.get("root") or self.settings.root
-        self.runtime_root = info.get("runtime_root") or self.settings.runtime_root
+        self.root = Path(info.get("root") or _resolve_project_path(self.settings.root)).resolve()
+        self.runtime_root = Path(info.get("runtime_root") or _resolve_project_path(self.settings.runtime_root)).resolve()
+        self.tmp_dir = Path(info.get("tmp_dir") or _resolve_project_path(self.settings.tmp_dir)).resolve()
+        self.output_dir = Path(info.get("output_dir") or _resolve_project_path(self.settings.output_dir)).resolve()
+        self.voice_samples_dir = Path(
+            info.get("voice_samples_dir") or _resolve_project_path(self.settings.voice_samples_dir)
+        ).resolve()
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.voice_samples_dir.mkdir(parents=True, exist_ok=True)
         self.cached_embeddings = _CachedEmbeddingKeysProxy(list(info.get("embedding_keys") or []))
 
     async def _fetch_sample(self, request: SeedVCRequest) -> Path:
@@ -3475,36 +3483,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "batch_wait_ms": _server_config.starling.batch_wait_ms,
         }
 
-    @app.post("/starling/synthesize")
-    @app.post("/matcha/synthesize")
-    async def starling_synthesize(request: MatchaSynthesizeRequest):
-        """Starling synthesis endpoint with dynamic request batching."""
-        if not request.text.strip():
-            raise HTTPException(status_code=400, detail="text is required")
-        await _await_engine_ready("starling")
-        result = await _get_starling_batcher().submit(request)
-        headers = {
-            "X-Starling-Audio-Seconds": f"{result.audio_seconds:.6f}",
-            "X-Starling-Backend-Seconds": f"{result.backend_seconds:.6f}",
-            "X-Starling-Backend-RTF": f"{result.backend_rtf:.6f}",
-            "X-Starling-Model-RTF": f"{result.model_rtf:.6f}",
-            "X-Starling-Batch-Size": str(result.batch_size),
-            "X-Starling-Queue-Seconds": f"{result.queue_seconds:.6f}",
-        }
-        if request.format == "json":
-            return {
-                "audio_seconds": result.audio_seconds,
-                "backend_seconds": result.backend_seconds,
-                "backend_rtf": result.backend_rtf,
-                "model_rtf": result.model_rtf,
-                "batch_size": result.batch_size,
-                "queue_seconds": result.queue_seconds,
-                "text": result.text,
-                "phoneme": result.phoneme_text,
-            }
-        _maybe_cleanup_gpu()
-        return _binary_response(_audio_to_wav_bytes(result.audio, result.sample_rate), "audio/wav", headers=headers)
-
     @app.get("/seed-vc/status")
     async def seed_vc_status():
         """Embedded Seed-VC backend status."""
@@ -3816,6 +3794,16 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         Use `language` to force one supported locale for the entire text.
         """
         started = time.perf_counter()
+        _log_synthesize_request(
+            route=fastapi_request.url.path,
+            method=fastapi_request.method,
+            status="received",
+            started=started,
+            count=1,
+            text_chars=_text_length(request.text),
+            ssml_chars=_text_length(request.ssml),
+            input_data=_request_model_input(request, model=model),
+        )
         try:
             response = await _handle_synthesize(request, model=model)
         except HTTPException as exc:
@@ -3860,6 +3848,16 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     async def synthesize_batch(request: BatchSynthesizeRequest, fastapi_request: Request):
         """Batched synthesis with independent /synthesize-shaped inputs."""
         started = time.perf_counter()
+        _log_synthesize_request(
+            route=fastapi_request.url.path,
+            method=fastapi_request.method,
+            status="received",
+            started=started,
+            count=len(request.items),
+            text_chars=sum(_text_length(item.text) for item in request.items),
+            ssml_chars=sum(_text_length(item.ssml) for item in request.items),
+            input_data=_request_model_input(request),
+        )
         try:
             await _await_engine_ready("pipertts")
             result = await synthesize_mixed_batch(request)
@@ -3948,6 +3946,16 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "format": format,
             "neural": neural,
         }
+        _log_synthesize_request(
+            route=fastapi_request.url.path,
+            method=fastapi_request.method,
+            status="received",
+            started=started,
+            count=1,
+            text_chars=_text_length(text),
+            ssml_chars=_text_length(ssml),
+            input_data=get_input,
+        )
         try:
             parsed_options = SparrowSynthesizeOptions.model_validate_json(options) if options else None
         except ValidationError as exc:
