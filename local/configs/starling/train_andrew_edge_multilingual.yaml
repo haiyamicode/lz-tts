@@ -1,0 +1,176 @@
+task_name: train
+run_name: lzspeech_starling_andrew_edge_multilingual_f5_dit
+tags:
+  - lzspeech
+  - starling
+  - andrew-edge
+  - sparrow-frontend
+  - vocos24k
+  - f5-dit
+
+train: true
+test: false
+ckpt_path: null
+init_from_checkpoint: null
+seed: 1234
+
+data:
+  _target_: src.starling.data.text_mel_datamodule.TextMelDataModule
+  name: lzspeech_starling_andrew_edge_multilingual_24k
+  train_filelist_path: ${paths.data_dir}/lzspeech_starling_andrew_edge_multilingual_24k/train.jsonl
+  valid_filelist_path: ${paths.data_dir}/lzspeech_starling_andrew_edge_multilingual_24k/val.jsonl
+  batch_size: 16
+  num_workers: 8
+  pin_memory: true
+  cleaners: []
+  add_blank: false
+  n_spks: 22
+  n_fft: 1024
+  n_feats: 100
+  sample_rate: 24000
+  hop_length: 256
+  win_length: 1024
+  f_min: 0
+  f_max: null
+  mel_backend: vocos_mel_24khz
+  data_statistics:
+    mel_mean: 0.0
+    mel_std: 1.0
+  seed: ${seed}
+  load_durations: false
+
+model:
+  _target_: src.starling.models.matcha_tts.MatchaTTS
+  n_vocab: 151
+  n_spks: 22
+  spk_emb_dim: 64
+  n_feats: 100
+  data_statistics: ${data.data_statistics}
+  out_size: 512
+  prior_loss: true
+  use_precomputed_durations: ${data.load_durations}
+  encoder:
+    encoder_type: RoPE Encoder
+    encoder_params:
+      n_feats: ${model.n_feats}
+      n_channels: 192
+      filter_channels: 768
+      filter_channels_dp: 256
+      n_heads: 2
+      n_layers: 6
+      kernel_size: 3
+      p_dropout: 0.1
+      spk_emb_dim: 64
+      n_spks: 22
+      prenet: true
+      semantic_dim: 768
+    duration_predictor_params:
+      filter_channels_dp: ${model.encoder.encoder_params.filter_channels_dp}
+      kernel_size: 3
+      p_dropout: ${model.encoder.encoder_params.p_dropout}
+      use_sdp: true
+      sdp_loss_weight: 1.0
+      sdp_ratio: 0.2
+      noise_scale_w: 0.8
+  decoder:
+    decoder_type: f5_dit
+    dim: 512
+    depth: 16
+    heads: 8
+    dim_head: 64
+    dropout: 0.05
+    ff_mult: 2
+    qk_norm: null
+    pe_attn_head: null
+    attn_mask_enabled: false
+    conv_pos_embed: true
+    conv_pos_kernel_size: 31
+    long_skip_connection: true
+    checkpoint_activations: false
+  cfm:
+    name: CFM
+    solver: euler
+    sigma_min: 0.0001
+  optimizer:
+    _target_: torch.optim.Adam
+    _partial_: true
+    lr: 0.0001
+    weight_decay: 0.0
+
+callbacks:
+  model_checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: checkpoint_{epoch:03d}
+    monitor: epoch
+    verbose: false
+    save_last: true
+    save_top_k: 8
+    mode: max
+    auto_insert_metric_name: true
+    save_weights_only: false
+    every_n_train_steps: null
+    train_time_interval: null
+    every_n_epochs: 1
+    save_on_train_epoch_end: null
+  model_summary: null
+  rich_progress_bar:
+    _target_: lightning.pytorch.callbacks.RichProgressBar
+  epoch_summary:
+    _target_: src.starling.callbacks.epoch_summary.EpochSummaryCallback
+    precision: 4
+  utmos_quality:
+    _target_: src.starling.callbacks.utmos_quality.MatchaUtmosQualityCallback
+    enabled: true
+    every_n_epochs: 5
+    train_num_samples: 5
+    val_num_samples: 5
+    output_dir: ${paths.output_dir}/quality/utmos_samples
+    python_bin: ${paths.root_dir}/local/utmos_probe/.venv/bin/python
+    worker_path: ${paths.root_dir}/local/utmos_probe/utmos_stdin_worker.py
+    cuda_visible_devices: ${oc.env:STARLING_UTMOS_CUDA_VISIBLE_DEVICES,2}
+    vocoder: vocos24k
+    sample_rate: ${data.sample_rate}
+    n_timesteps: 32
+    temperature: 1.0
+    length_scale: 1.0
+    noise_scale_w: null
+    sdp_ratio: null
+    score_final_epoch: true
+
+logger:
+  tensorboard:
+    _target_: lightning.pytorch.loggers.tensorboard.TensorBoardLogger
+    save_dir: ${paths.output_dir}/tensorboard/
+    name: null
+    log_graph: false
+    default_hp_metric: true
+    prefix: ""
+
+trainer:
+  _target_: lightning.pytorch.trainer.Trainer
+  default_root_dir: ${paths.output_dir}
+  max_epochs: 1000
+  accelerator: gpu
+  devices:
+    - 0
+  precision: 32-true
+  check_val_every_n_epoch: 1
+  deterministic: false
+  gradient_clip_val: 5.0
+  enable_model_summary: false
+
+paths:
+  root_dir: ${oc.env:PROJECT_ROOT}
+  exp_dir: ${paths.root_dir}/local/exp/starling
+  data_dir: ${paths.exp_dir}/data
+  log_dir: ${paths.exp_dir}/train/${run_name}
+  output_dir: ${paths.exp_dir}/train/${run_name}
+  work_dir: ${hydra:runtime.cwd}
+
+extras:
+  ignore_warnings: false
+  enforce_tags: false
+  print_config: false
+
+optimized_metric: null

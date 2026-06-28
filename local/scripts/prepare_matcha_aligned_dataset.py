@@ -24,7 +24,7 @@ from src.piper.preprocess import _map_cld2_to_espeak, _normalize_punct_and_space
 
 
 DEFAULT_INPUT_DIR = Path.home() / "Projects/gen-tts/data/lzspeech-multilingual-plus"
-DEFAULT_OUTPUT_DIR = Path("local/Matcha-TTS/data/lzspeech_multilingual_plus_22050")
+DEFAULT_OUTPUT_DIR = Path("local/exp/starling/data/lzspeech_multilingual_plus_22050")
 DEFAULT_SAMPLE_RATE = 22050
 DEFAULT_VALID_RATIO = 0.025
 DEFAULT_SEED = 1234

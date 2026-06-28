@@ -60,12 +60,12 @@ def main() -> None:
     parser.add_argument(
         "--flores-dir",
         type=Path,
-        default=Path("local/Matcha-TTS/data/flores200/flores200_dataset"),
+        default=Path("local/exp/starling/data/flores200/flores200_dataset"),
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("local/Matcha-TTS/data/flores200/tokenizers/unicode_codepoint_byte_fallback_10000/vocab.json"),
+        default=Path("local/exp/starling/data/flores200/tokenizers/unicode_codepoint_byte_fallback_10000/vocab.json"),
     )
     parser.add_argument("--max-size", type=int, default=10000)
     args = parser.parse_args()

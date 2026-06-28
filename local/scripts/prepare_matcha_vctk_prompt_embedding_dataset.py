@@ -17,12 +17,12 @@ import soundfile as sf
 from scipy.signal import resample_poly
 from tqdm import tqdm
 
-from scripts.prepare_matcha_aligned_dataset import build_units, has_lexical_text, normalize_for_alignment
+from prepare_matcha_aligned_dataset import build_units, has_lexical_text, normalize_for_alignment
 
 
 DEFAULT_INPUT_DIR = Path("local/exp/lzspeech-vctk-full")
-DEFAULT_OUTPUT_DIR = Path("local/Matcha-TTS/data/lzspeech_vctk_prompt_embeddings_22050")
-DEFAULT_PHONEME_VOCAB = Path("local/Matcha-TTS/data/lzspeech_multilingual_plus_22050/fused_phoneme_vocab.json")
+DEFAULT_OUTPUT_DIR = Path("local/exp/starling/data/lzspeech_vctk_prompt_embeddings_22050")
+DEFAULT_PHONEME_VOCAB = Path("local/exp/starling/data/lzspeech_multilingual_plus_22050/fused_phoneme_vocab.json")
 DEFAULT_SAMPLE_RATE = 22050
 DEFAULT_VALID_RATIO = 0.025
 DEFAULT_SEED = 1234

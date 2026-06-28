@@ -8,7 +8,7 @@ import json
 import shutil
 from pathlib import Path
 
-from scripts.prepare_matcha_aligned_dataset import (
+from prepare_matcha_aligned_dataset import (
     SourceRow,
     process_split,
     write_filelist,
@@ -39,7 +39,7 @@ def read_split(input_dir: Path, split: str) -> list[SourceRow]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", type=Path, default=Path.home() / "Projects/gen-tts/data/lzspeech")
-    parser.add_argument("--output-dir", type=Path, default=Path("local/Matcha-TTS/data/lzspeech_en_vocos24k_24000"))
+    parser.add_argument("--output-dir", type=Path, default=Path("local/exp/starling/data/lzspeech_en_vocos24k_24000"))
     parser.add_argument("--sample-rate", type=int, default=24000)
     parser.add_argument("--workers", type=int, default=24)
     parser.add_argument("--purge", action="store_true")
@@ -73,7 +73,7 @@ def main() -> None:
         "phoneme_vocab_size": vocab_size,
         "langs": {"en": len(train_items) + len(valid_items)},
         "source_dir": str(input_dir),
-        "icbpe_vocab_path": "data/flores200/tokenizers/unicode_codepoint_byte_fallback_10000/vocab.json",
+        "icbpe_vocab_path": "local/exp/starling/data/flores200/tokenizers/unicode_codepoint_byte_fallback_10000/vocab.json",
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 

@@ -25,8 +25,8 @@ class MatchaUtmosQualityCallback(Callback):
         train_num_samples: int = 5,
         val_num_samples: int = 5,
         output_dir: str | None = None,
-        python_bin: str = "/mnt/data/lz-tts/local/utmos_probe/.venv/bin/python",
-        worker_path: str = "/mnt/data/lz-tts/local/utmos_probe/utmos_stdin_worker.py",
+        python_bin: str | None = None,
+        worker_path: str | None = None,
         cuda_visible_devices: str | None = None,
         vocoder: str = "vocos24k",
         sample_rate: int = 24000,
@@ -179,6 +179,8 @@ class MatchaUtmosQualityCallback(Callback):
         return self._vocoder
 
     def _score_wavs(self, wav_paths: list[Path]) -> dict[str, float]:
+        if self.python_bin is None or self.worker_path is None:
+            raise RuntimeError("UTMOS scoring is enabled, but python_bin or worker_path was not configured")
         python_bin = Path(self.python_bin)
         worker_path = Path(self.worker_path)
         if not python_bin.exists() or not worker_path.exists():

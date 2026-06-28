@@ -25,15 +25,11 @@ def expand_tensor(tensor, target_shape):
 
 
 def convert_checkpoint(src_path, dst_path):
-    import torch, os, sys
-    from pathlib import Path
+    import torch
 
-    REPO = Path(__file__).resolve().parents[1]
-    MATCHA = REPO / "local" / "Matcha-TTS"
-    CONFIG = MATCHA / "configs" / "train_starling_multilingual.yaml"
-
-    os.chdir(str(MATCHA))
-    sys.path.insert(0, str(MATCHA))
+    REPO = Path(__file__).resolve().parents[2]
+    CONFIG = REPO / "local" / "configs" / "starling" / "train_andrew_edge_multilingual.yaml"
+    sys.path.insert(0, str(REPO))
 
     from omegaconf import OmegaConf
     from hydra.utils import instantiate

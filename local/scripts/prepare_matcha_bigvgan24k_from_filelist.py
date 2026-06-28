@@ -71,8 +71,8 @@ def convert_split(name: str, rows: list[list[str]], output_dir: Path, sample_rat
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input-dir", type=Path, default=Path("local/Matcha-TTS/data/lzspeech_multilingual_plus_22050"))
-    parser.add_argument("--output-dir", type=Path, default=Path("local/Matcha-TTS/data/lzspeech_multilingual_plus_bigvgan24k_24000"))
+    parser.add_argument("--input-dir", type=Path, default=Path("local/exp/starling/data/lzspeech_multilingual_plus_22050"))
+    parser.add_argument("--output-dir", type=Path, default=Path("local/exp/starling/data/lzspeech_multilingual_plus_bigvgan24k_24000"))
     parser.add_argument("--sample-rate", type=int, default=24000)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--purge", action="store_true")
