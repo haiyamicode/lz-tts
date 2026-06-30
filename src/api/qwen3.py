@@ -208,6 +208,7 @@ class QwenSettings(BaseModel):
     xvec_only: bool = QWEN_DEFAULT_XVEC_ONLY
     non_streaming_mode: bool = QWEN_DEFAULT_NON_STREAMING_MODE
     output_buffer_silence_ms: int = Field(QWEN_DEFAULT_OUTPUT_BUFFER_SILENCE_MS, ge=0)
+    max_reference_audio_seconds: float = Field(0.0, ge=0.0)
     disable_cuda_graph: bool = False
     disable_cuda_graph_batch: bool = True
     temperature: float = QWEN_DEFAULT_TEMPERATURE
@@ -380,6 +381,7 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
 
     float_overrides = {
         "QWEN_TTS_VALIDATION_DURATION_TOLERANCE": "validation.duration_tolerance",
+        "QWEN_TTS_MAX_REFERENCE_AUDIO_SECONDS": "max_reference_audio_seconds",
     }
     for env_name, attr in float_overrides.items():
         value = os.environ.get(env_name)
@@ -1093,39 +1095,88 @@ class EmptyVoiceTranscriptError(RuntimeError):
 def download_and_cache(url: str) -> Path:
     d = get_cache_dir(url)
     metadata_file = d / "source.json"
+    max_reference_seconds = float(_qwen_settings.max_reference_audio_seconds or 0.0)
     if metadata_file.exists():
         try:
-            cached_name = json.loads(metadata_file.read_text(encoding="utf-8")).get("file")
+            metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+            cached_name = metadata.get("file")
             if cached_name:
                 audio_file = d / cached_name
-                if audio_file.exists():
+                cached_limit = float(metadata.get("max_reference_audio_seconds") or 0.0)
+                if audio_file.exists() and abs(cached_limit - max_reference_seconds) < 0.001:
                     return audio_file
         except Exception:
             pass
 
     audio_file = d / "reference_audio"
-    if audio_file.exists():
+    if audio_file.exists() and max_reference_seconds <= 0:
+        metadata_file.write_text(
+            json.dumps({"file": audio_file.name, "max_reference_audio_seconds": max_reference_seconds}),
+            encoding="utf-8",
+        )
         return audio_file
 
     import urllib.request
     from urllib.parse import urlparse
 
     ext = Path(urlparse(url).path).suffix or ".wav"
-    raw_file = d / f"raw{ext}"
+    if audio_file.exists():
+        source_file = audio_file
+    else:
+        raw_file = d / f"raw{ext}"
 
-    req = urllib.request.Request(url, headers={"User-Agent": "vc-temp/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp, open(raw_file, "wb") as f:
-        f.write(resp.read())
+        req = urllib.request.Request(url, headers={"User-Agent": "vc-temp/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp, open(raw_file, "wb") as f:
+            f.write(resp.read())
 
-    if raw_file.stat().st_size > MAX_AUDIO_BYTES:
-        raw_file.unlink(missing_ok=True)
-        raise RuntimeError(f"voice sample is too large; max is {MAX_AUDIO_BYTES / 1024 / 1024:.1f} MB")
+        if max_reference_seconds <= 0 and raw_file.stat().st_size > MAX_AUDIO_BYTES:
+            raw_file.unlink(missing_ok=True)
+            raise RuntimeError(f"voice sample is too large; max is {MAX_AUDIO_BYTES / 1024 / 1024:.1f} MB")
 
-    audio_file = d / f"reference_audio{ext}"
-    raw_file.replace(audio_file)
-    metadata_file.write_text(json.dumps({"file": audio_file.name}), encoding="utf-8")
+        audio_file = d / f"reference_audio{ext}"
+        raw_file.replace(audio_file)
+        source_file = audio_file
 
-    return audio_file
+    cached_file = limit_reference_audio_duration(source_file, max_reference_seconds)
+    if cached_file.stat().st_size > MAX_AUDIO_BYTES:
+        if cached_file != source_file:
+            cached_file.unlink(missing_ok=True)
+        raise RuntimeError(f"voice sample is too large after trimming; max is {MAX_AUDIO_BYTES / 1024 / 1024:.1f} MB")
+    metadata_file.write_text(
+        json.dumps({"file": cached_file.name, "max_reference_audio_seconds": max_reference_seconds}),
+        encoding="utf-8",
+    )
+
+    return cached_file
+
+
+def limit_reference_audio_duration(audio_file: Path, max_seconds: float) -> Path:
+    if max_seconds <= 0:
+        return audio_file
+    try:
+        info = sf.info(audio_file)
+    except Exception as e:
+        raise RuntimeError(f"failed to inspect voice sample duration: {e}") from e
+    if not info.samplerate or info.duration <= max_seconds + 0.01:
+        return audio_file
+
+    frames = max(1, int(round(max_seconds * info.samplerate)))
+    try:
+        audio, sample_rate = sf.read(audio_file, frames=frames, always_2d=True)
+    except Exception as e:
+        raise RuntimeError(f"failed to trim voice sample to {max_seconds:g}s: {e}") from e
+
+    clipped_file = audio_file.with_name(f"{audio_file.stem}.max{max_seconds:g}s.wav")
+    sf.write(clipped_file, audio, sample_rate, format="WAV", subtype="PCM_16")
+    _LOGGER.info(
+        "Trimmed Qwen3 reference sample: path=%s duration=%.2fs max=%.2fs clipped_path=%s",
+        audio_file,
+        info.duration,
+        max_seconds,
+        clipped_file,
+    )
+
+    return clipped_file
 
 
 def assemblyai_json_request(url: str, api_key: str, payload: Optional[dict] = None, timeout: int = 30) -> dict:
