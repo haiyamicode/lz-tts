@@ -8,6 +8,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -37,6 +38,24 @@ _inference_cache: OrderedDict[str, PiperInference] = OrderedDict()
 _server_config: SimpleNamespace | None = None
 _speaker_routes: dict[str, tuple[str, Optional[int]]] = {}
 _lang_speaker_map: dict[str, str] = {}
+
+
+def _cleanup_worker_gpu() -> None:
+    """Release per-request tensors from this worker process' CUDA allocator."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _with_gpu_cleanup(handler: Callable[[str, Any], dict[str, Any]]) -> Callable[[str, Any], dict[str, Any]]:
+    def wrapped(action: str, payload: Any) -> dict[str, Any]:
+        try:
+            return handler(action, payload)
+        finally:
+            if action != "health":
+                _cleanup_worker_gpu()
+
+    return wrapped
 
 
 def _settings_data_to_config(settings_data: dict[str, Any]) -> SimpleNamespace:
@@ -329,7 +348,7 @@ def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
             return {"ok": True, "data": {"audio": audio, "sample_rate": inference.sample_rate}}
         raise ValueError(f"unknown worker action: {action}")
 
-    run_worker_loop("Sparrow", handler, request_queue, response_queue)
+    run_worker_loop("Sparrow", _with_gpu_cleanup(handler), request_queue, response_queue)
 
 
 def starling_worker_main(settings_data: dict[str, Any], request_queue: Any, response_queue: Any) -> None:
@@ -371,7 +390,7 @@ def starling_worker_main(settings_data: dict[str, Any], request_queue: Any, resp
             return {"ok": True, "data": {"results": results}}
         raise ValueError(f"unknown worker action: {action}")
 
-    run_worker_loop("Starling", handler, request_queue, response_queue)
+    run_worker_loop("Starling", _with_gpu_cleanup(handler), request_queue, response_queue)
 
 
 def seed_vc_worker_main(settings_data: dict[str, Any], request_queue: Any, response_queue: Any) -> None:
@@ -460,4 +479,4 @@ def seed_vc_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
             return {"ok": True, "data": {"audio": data}}
         raise ValueError(f"unknown worker action: {action}")
 
-    run_worker_loop("Seed-VC", handler, request_queue, response_queue)
+    run_worker_loop("Seed-VC", _with_gpu_cleanup(handler), request_queue, response_queue)
