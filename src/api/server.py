@@ -3287,22 +3287,34 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                         worker_names = ["primary"]
                         if _separate_vietnamese_qwen_worker_enabled():
                             worker_names.append("vietnamese")
-                        for worker_name in worker_names:
-                            _start_qwen_worker(worker_name)
-                        for worker_name in worker_names:
-                            _LOGGER.info("Checking Qwen worker health name=%s", worker_name)
-                            await asyncio.to_thread(
-                                _call_qwen_worker,
-                                "health",
-                                None,
-                                wait_ready=False,
-                                worker_name=worker_name,
+
+                        async def start_tts_workers() -> None:
+                            for worker_name in worker_names:
+                                _start_qwen_worker(worker_name)
+                            for worker_name in worker_names:
+                                _LOGGER.info("Checking Qwen worker health name=%s", worker_name)
+                                await asyncio.to_thread(
+                                    _call_qwen_worker,
+                                    "health",
+                                    None,
+                                    wait_ready=False,
+                                    worker_name=worker_name,
+                                )
+                                _LOGGER.info("Qwen worker health ok name=%s", worker_name)
+
+                        async def start_asr_worker() -> None:
+                            if not (_server_config.qwen.asr.enabled and _server_config.qwen.asr.preload):
+                                return
+                            _LOGGER.info(
+                                "Preloading Qwen ASR model model=%s device=%s isolated=%s",
+                                _server_config.qwen.asr.model,
+                                _server_config.qwen.asr.device,
+                                _server_config.qwen.asr.isolated,
                             )
-                            _LOGGER.info("Qwen worker health ok name=%s", worker_name)
-                        if _server_config.qwen.asr.enabled and _server_config.qwen.asr.preload:
-                            _LOGGER.info("Preloading Qwen ASR model")
                             await asyncio.to_thread(qwen3.preload_reference_transcription_model)
                             _LOGGER.info("Qwen ASR preload ok")
+
+                        await asyncio.gather(start_tts_workers(), start_asr_worker())
 
                 startup_tasks.append(asyncio.create_task(run_loader("qwen3", start_qwen)))
             else:
