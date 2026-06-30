@@ -1,3 +1,0 @@
-include src/starling/utils/monotonic_align/core.pyx
-exclude src/starling/utils/monotonic_align/core.c
-global-exclude *.so
