@@ -19,6 +19,24 @@ logging.basicConfig(
 _LOGGER = logging.getLogger(__name__)
 
 
+def _select_cuda_device(device: str) -> None:
+    normalized = device.strip().lower()
+    if normalized == "cuda":
+        normalized = "cuda:0"
+    if not normalized.startswith("cuda:"):
+        return
+
+    try:
+        index = int(normalized.split(":", 1)[1])
+    except ValueError:
+        raise RuntimeError(f"Invalid Qwen worker CUDA device: {device!r}") from None
+
+    import torch
+
+    torch.cuda.set_device(index)
+    _LOGGER.info("Qwen worker selected CUDA device=%s", normalized)
+
+
 def _error_response(exc: Exception) -> dict[str, Any]:
     if isinstance(exc, HTTPException):
         return {
@@ -45,6 +63,8 @@ def qwen_worker_main(
     The parent process owns HTTP. This worker owns Qwen model loading, CUDA graph
     state, and Qwen inference.
     """
+    _select_cuda_device(str(settings_data.get("device") or ""))
+
     from . import qwen3
 
     _LOGGER.info("Qwen worker starting name=%s pid=%s", worker_name, os.getpid())

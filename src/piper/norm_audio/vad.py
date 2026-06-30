@@ -14,7 +14,7 @@ class SileroVoiceActivityDetector:
     def __init__(
         self,
         onnx_path: typing.Union[str, Path],
-        providers: typing.Optional[typing.Sequence[str]] = None,
+        providers: typing.Optional[typing.Sequence[typing.Any]] = None,
     ):
         onnx_path = str(onnx_path)
 
@@ -24,7 +24,11 @@ class SileroVoiceActivityDetector:
         session_providers = None
         if providers is not None:
             available = set(onnxruntime.get_available_providers())
-            session_providers = [provider for provider in providers if provider in available]
+            session_providers = [
+                provider
+                for provider in providers
+                if (provider[0] if isinstance(provider, tuple) else provider) in available
+            ]
             if not session_providers:
                 raise RuntimeError(
                     f"None of the requested Silero VAD ONNX providers are available: {providers}. "

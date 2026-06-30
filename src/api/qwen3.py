@@ -610,15 +610,31 @@ def resolve_qwen_language(
 
 
 def model_status() -> dict[str, Any]:
+    model_batch_graphs = getattr(model, "_batch_graphs", None)
+    vietnamese_batch_graphs = getattr(vietnamese_model, "_batch_graphs", None)
     return {
         "model_loaded": model is not None,
+        "model_warmed_up": bool(getattr(model, "_warmed_up", False)) if model is not None else False,
+        "model_batch_graphs": sorted(model_batch_graphs.keys()) if isinstance(model_batch_graphs, dict) else [],
         "vietnamese_model_loaded": (
             vietnamese_model is not None
             if _qwen_settings.vietnamese_model.strip()
             else model is not None and bool(_qwen_settings.viet_lora_model.strip())
         ),
+        "vietnamese_model_warmed_up": (
+            bool(getattr(vietnamese_model, "_warmed_up", False))
+            if vietnamese_model is not None
+            else False
+        ),
+        "vietnamese_model_batch_graphs": (
+            sorted(vietnamese_batch_graphs.keys())
+            if isinstance(vietnamese_batch_graphs, dict)
+            else []
+        ),
         "model_loading": model_loading,
         "vietnamese_model_loading": vietnamese_model_loading,
+        "dp_budget_model_loaded": dp_budget_model is not None,
+        "dp_budget_device": _qwen_settings.dp_budget.device,
         "model_load_error": model_load_error,
         "vietnamese_model_load_error": vietnamese_model_load_error,
         "model_load_started_at": model_load_started_at,
@@ -1026,6 +1042,23 @@ def preload_reference_transcription_model() -> None:
         reference_transcription_worker_loaded = True
 
 
+def _silero_vad_provider(provider: str) -> Any:
+    if provider != "CUDAExecutionProvider":
+        return provider
+
+    device = _qwen_settings.device.strip().lower()
+    if device == "cuda":
+        device = "cuda:0"
+    if not device.startswith("cuda:"):
+        return provider
+
+    try:
+        device_id = int(device.split(":", 1)[1])
+    except ValueError:
+        return provider
+    return (provider, {"device_id": device_id})
+
+
 def get_silero_vad_detector() -> Any:
     global silero_vad_detector
     if silero_vad_detector is None:
@@ -1041,6 +1074,7 @@ def get_silero_vad_detector() -> Any:
                     ).split(",")
                     if provider.strip()
                 ]
+                providers = [_silero_vad_provider(provider) for provider in providers]
                 _LOGGER.info("Loading Silero VAD postprocessor...")
                 silero_vad_detector = make_silence_detector(providers=providers)
                 _LOGGER.info("Silero VAD ready. Providers: %s", silero_vad_detector.providers)

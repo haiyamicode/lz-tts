@@ -821,6 +821,10 @@ def _qwen_worker_settings(worker_name: str) -> dict[str, Any]:
             raise RuntimeError("Separate Vietnamese Qwen worker is not configured")
         settings["model"] = _server_config.qwen.vietnamese_model
         settings["device"] = _server_config.qwen.vietnamese_device
+        settings["dp_budget"] = {
+            **settings.get("dp_budget", {}),
+            "device": _server_config.qwen.vietnamese_device,
+        }
         settings["disable_cuda_graph"] = _server_config.qwen.vietnamese_disable_cuda_graph
         settings["vietnamese_model"] = ""
         settings["viet_lora_model"] = ""

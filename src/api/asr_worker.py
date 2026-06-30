@@ -72,6 +72,23 @@ def _resolve_dtype(dtype_name: str) -> torch.dtype:
     raise RuntimeError(f"Unsupported Qwen ASR dtype: {dtype_name!r}")
 
 
+def _select_cuda_device(device: str) -> str:
+    normalized = device.strip() or "cuda"
+    if normalized == "cuda":
+        normalized = "cuda:0"
+    if not normalized.lower().startswith("cuda:"):
+        return normalized
+
+    try:
+        index = int(normalized.split(":", 1)[1])
+    except ValueError:
+        raise RuntimeError(f"Invalid Qwen ASR CUDA device: {device!r}") from None
+
+    torch.cuda.set_device(index)
+    _LOGGER.info("Qwen ASR selected CUDA device=%s", normalized)
+    return normalized
+
+
 class QwenASRBackend:
     """Lazy Qwen3 ASR model wrapper."""
 
@@ -88,9 +105,7 @@ class QwenASRBackend:
         from qwen_asr import Qwen3ASRModel
 
         dtype = _resolve_dtype(self.settings.dtype)
-        device = self.settings.device.strip() or "cuda"
-        if device == "cuda":
-            device = "cuda:0"
+        device = _select_cuda_device(self.settings.device)
         kwargs: dict[str, Any] = {
             "dtype": dtype,
             "device_map": device,
