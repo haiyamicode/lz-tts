@@ -3151,6 +3151,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         async def qwen3_synthesize(request: Request):
             payload = await request.json()
             req = qwen3.SynthesizeRequest(**payload)
+            await _await_engine_ready("qwen3")
             req = await asyncio.to_thread(_prepare_qwen_request_for_worker, req)
             worker_name = _qwen_worker_name_for_request(req)
             result = await asyncio.to_thread(
@@ -3170,6 +3171,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         async def qwen3_synthesize_batch(request: Request):
             payload = await request.json()
             req = qwen3.BatchSynthesizeRequest(**payload)
+            await _await_engine_ready("qwen3")
             req = await asyncio.to_thread(_prepare_qwen_batch_for_worker, req)
             worker_name = _qwen_worker_name_for_batch(req)
             result = await asyncio.to_thread(
