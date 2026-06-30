@@ -82,6 +82,7 @@ model: Optional[Any] = None
 vietnamese_model: Optional[Any] = None
 reference_transcription_model: Optional[Any] = None
 reference_transcription_worker: Optional[WorkerProcessClient] = None
+reference_transcription_worker_loaded = False
 silero_vad_detector: Optional[Any] = None
 dp_budget_model: Optional[Any] = None
 inference_lock = threading.Lock()
@@ -393,6 +394,7 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
 
 def configure(settings: QwenSettings) -> None:
     global _qwen_settings, dp_budget_model, model, vietnamese_model, reference_transcription_model
+    global reference_transcription_worker_loaded
     global model_loading, vietnamese_model_loading, model_load_error, vietnamese_model_load_error
     global model_load_started_at, model_load_finished_at, vietnamese_model_load_started_at, vietnamese_model_load_finished_at
     stop_reference_transcription_worker()
@@ -401,6 +403,7 @@ def configure(settings: QwenSettings) -> None:
     model = None
     vietnamese_model = None
     reference_transcription_model = None
+    reference_transcription_worker_loaded = False
     model_loading = False
     vietnamese_model_loading = False
     model_load_error = None
@@ -977,20 +980,25 @@ def _ensure_reference_transcription_worker() -> WorkerProcessClient:
 
 
 def stop_reference_transcription_worker() -> None:
-    global reference_transcription_worker
+    global reference_transcription_worker, reference_transcription_worker_loaded
     with reference_transcription_worker_lock:
         if reference_transcription_worker is not None:
             reference_transcription_worker.stop()
             reference_transcription_worker = None
+        reference_transcription_worker_loaded = False
 
 
 def reference_transcription_status() -> dict[str, Any]:
     status = {
         **_qwen_settings.asr.model_dump(mode="json"),
-        "model_loaded": reference_transcription_model is not None,
+        "model_loaded": reference_transcription_worker_loaded or reference_transcription_model is not None,
         "worker_started": reference_transcription_worker is not None,
     }
     return status
+
+
+def reference_transcription_available() -> bool:
+    return _qwen_settings.asr.enabled
 
 
 def get_reference_transcription_model() -> QwenASRBackend:
@@ -1005,12 +1013,15 @@ def get_reference_transcription_model() -> QwenASRBackend:
 
 
 def preload_reference_transcription_model() -> None:
+    global reference_transcription_worker_loaded
     if not _qwen_settings.asr.enabled:
         return
     if _qwen_settings.asr.isolated:
         _ensure_reference_transcription_worker().call("preload")
+        reference_transcription_worker_loaded = True
     else:
         get_reference_transcription_model().load()
+        reference_transcription_worker_loaded = True
 
 
 def get_silero_vad_detector() -> Any:
@@ -1192,6 +1203,7 @@ def _qwen_asr_language_for_locale(locale: str | None) -> str | None:
 
 
 def transcribe_voice_sample(audio_file: Path, language: str | None = None) -> str:
+    global reference_transcription_worker_loaded
     transcript_file = audio_file.with_suffix(".txt")
     if transcript_file.exists():
         transcript = transcript_file.read_text(encoding="utf-8").strip()
@@ -1207,9 +1219,11 @@ def transcribe_voice_sample(audio_file: Path, language: str | None = None) -> st
             {"audio_file": str(audio_file), "language": asr_language},
         )
         result = response.get("data") or {}
+        reference_transcription_worker_loaded = True
     else:
         with reference_transcription_lock:
             result = get_reference_transcription_model().transcribe(audio_file, language=asr_language)
+        reference_transcription_worker_loaded = True
     text = str(result.get("text") or "").strip()
     if not text:
         try:
@@ -1691,7 +1705,7 @@ def _resolve_voice_prompt(req: SynthesizeRequest, settings: _ResolvedGenerationS
         try:
             prompt_text = transcribe_voice_sample(
                 sample_path,
-                language=settings.dp_language,
+                language=None,
             )
         except EmptyVoiceTranscriptError as e:
             _LOGGER.warning(

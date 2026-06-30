@@ -299,9 +299,13 @@ async def root():
 
 @app.post("/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)):
-    """Transcribe reference audio using nano-parakeet."""
-    parakeet = shared_qwen3.get_parakeet_model() if EMBEDDED_IN_LZ_TTS else _parakeet
-    if parakeet is None:
+    """Transcribe reference audio."""
+    parakeet = None if EMBEDDED_IN_LZ_TTS else _parakeet
+    if EMBEDDED_IN_LZ_TTS:
+        transcription_available = shared_qwen3.reference_transcription_available()
+    else:
+        transcription_available = parakeet is not None
+    if not transcription_available:
         raise HTTPException(status_code=503, detail="Transcription model not loaded")
 
     content = await audio.read()
@@ -318,6 +322,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
             audio_path.write_bytes(content)
             if EMBEDDED_IN_LZ_TTS:
                 return shared_qwen3.transcribe_voice_sample(audio_path)
+            assert parakeet is not None
             with threading.Lock(), torch.inference_mode():
                 return parakeet.transcribe(str(audio_path)).strip()
 
@@ -343,7 +348,7 @@ async def get_status():
         "available_models": AVAILABLE_MODELS,
         "model_type": model_type,
         "speakers": speakers,
-        "transcription_available": _parakeet is not None,
+        "transcription_available": shared_qwen3.reference_transcription_available() if EMBEDDED_IN_LZ_TTS else _parakeet is not None,
         "preset_refs": [
             {"id": p["id"], "label": p["label"], "ref_text": p["ref_text"]}
             for p in _preset_refs.values()

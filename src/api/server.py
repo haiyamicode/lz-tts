@@ -810,6 +810,7 @@ def _separate_vietnamese_qwen_worker_enabled() -> bool:
 
 def _qwen_worker_settings(worker_name: str) -> dict[str, Any]:
     settings = _server_config.qwen.model_dump(mode="json")
+    settings["asr"] = {**settings.get("asr", {}), "enabled": False, "preload": False}
     if worker_name == "primary" and _separate_vietnamese_qwen_worker_enabled():
         settings["vietnamese_model"] = ""
         settings["viet_lora_model"] = ""
@@ -849,6 +850,21 @@ def _qwen_worker_name_for_batch(req: qwen3.BatchSynthesizeRequest) -> str:
             detail="Qwen3 batch generation cannot mix Vietnamese and non-Vietnamese models in one request",
         )
     return next(iter(worker_names), "primary")
+
+
+def _prepare_qwen_request_for_worker(req: qwen3.SynthesizeRequest) -> qwen3.SynthesizeRequest:
+    settings = qwen3._resolve_generation_settings(req)
+    _, prompt_text, xvec_only = qwen3._resolve_voice_prompt(req, settings)
+    return req.model_copy(update={"voice_text": prompt_text, "xvec_only": xvec_only})
+
+
+def _prepare_qwen_batch_for_worker(req: qwen3.BatchSynthesizeRequest) -> qwen3.BatchSynthesizeRequest:
+    settings_list = qwen3._resolve_generation_settings_batch(req.items)
+    items = []
+    for item, settings in zip(req.items, settings_list):
+        _, prompt_text, xvec_only = qwen3._resolve_voice_prompt(item, settings)
+        items.append(item.model_copy(update={"voice_text": prompt_text, "xvec_only": xvec_only}))
+    return req.model_copy(update={"items": items})
 
 
 def _start_qwen_worker(worker_name: str = "primary") -> None:
@@ -3135,6 +3151,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         async def qwen3_synthesize(request: Request):
             payload = await request.json()
             req = qwen3.SynthesizeRequest(**payload)
+            req = await asyncio.to_thread(_prepare_qwen_request_for_worker, req)
             worker_name = _qwen_worker_name_for_request(req)
             result = await asyncio.to_thread(
                 _call_qwen_worker,
@@ -3153,6 +3170,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         async def qwen3_synthesize_batch(request: Request):
             payload = await request.json()
             req = qwen3.BatchSynthesizeRequest(**payload)
+            req = await asyncio.to_thread(_prepare_qwen_batch_for_worker, req)
             worker_name = _qwen_worker_name_for_batch(req)
             result = await asyncio.to_thread(
                 _call_qwen_worker,
@@ -3281,7 +3299,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                                 worker_name=worker_name,
                             )
                             _LOGGER.info("Qwen worker health ok name=%s", worker_name)
-                        if _server_config.qwen.asr.enabled:
+                        if _server_config.qwen.asr.enabled and _server_config.qwen.asr.preload:
                             _LOGGER.info("Preloading Qwen ASR model")
                             await asyncio.to_thread(qwen3.preload_reference_transcription_model)
                             _LOGGER.info("Qwen ASR preload ok")
@@ -3431,6 +3449,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "qwen3": {
                 "enabled": _engine_enabled("qwen3"),
                 **qwen_status,
+                "asr": qwen3.reference_transcription_status(),
             },
             "starling": {
                 "enabled": _engine_enabled("starling"),
