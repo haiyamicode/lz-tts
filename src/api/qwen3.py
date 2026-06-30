@@ -35,10 +35,10 @@ QWEN_DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 QWEN_DEFAULT_DTYPE = "bfloat16"
 QWEN_DEFAULT_LANGUAGE = "Auto"
 QWEN_DEFAULT_MAX_NEW_TOKENS = 360
-QWEN_DEFAULT_TEMPERATURE = 0.9
-QWEN_DEFAULT_TOP_K = 50
-QWEN_DEFAULT_TOP_P = 1.0
-QWEN_DEFAULT_REPETITION_PENALTY = 1.03
+QWEN_DEFAULT_TEMPERATURE = 0.80
+QWEN_DEFAULT_TOP_K = 20
+QWEN_DEFAULT_TOP_P = 0.95
+QWEN_DEFAULT_REPETITION_PENALTY = 1.01
 QWEN_DEFAULT_XVEC_ONLY = False
 QWEN_DEFAULT_NON_STREAMING_MODE = True
 QWEN_DEFAULT_EXPRESSIVENESS = 1.0
@@ -63,12 +63,15 @@ SILENCE_TRIM_MIN_CHUNK_RMS = 0.003
 SILENCE_TRIM_RELATIVE_CHUNK_RMS = 0.03
 SILENCE_TRIM_EMPTY_OUTPUT_MS = 200
 EXPRESSIVENESS_PRESETS = {
-    1.0: {"temperature": 0.90, "top_k": 50, "repetition_penalty": 1.03},
-    0.8: {"temperature": 0.84, "top_k": 48, "repetition_penalty": 1.035},
-    0.6: {"temperature": 0.78, "top_k": 46, "repetition_penalty": 1.04},
-    0.4: {"temperature": 0.72, "top_k": 44, "repetition_penalty": 1.045},
-    0.2: {"temperature": 0.66, "top_k": 42, "repetition_penalty": 1.05},
-    0.0: {"temperature": 0.60, "top_k": 40, "repetition_penalty": 1.055},
+    0.0: {"temperature": 0.60, "top_k": 12, "top_p": 0.85, "repetition_penalty": 1.02},
+    0.25: {"temperature": 0.65, "top_k": 14, "top_p": 0.88, "repetition_penalty": 1.018},
+    0.5: {"temperature": 0.70, "top_k": 16, "top_p": 0.90, "repetition_penalty": 1.015},
+    0.75: {"temperature": 0.75, "top_k": 18, "top_p": 0.93, "repetition_penalty": 1.012},
+    1.0: {"temperature": 0.80, "top_k": 20, "top_p": 0.95, "repetition_penalty": 1.01},
+    1.25: {"temperature": 0.85, "top_k": 28, "top_p": 0.97, "repetition_penalty": 1.005},
+    1.5: {"temperature": 0.90, "top_k": 35, "top_p": 0.98, "repetition_penalty": 1.0},
+    1.75: {"temperature": 0.95, "top_k": 45, "top_p": 0.99, "repetition_penalty": 1.0},
+    2.0: {"temperature": 1.00, "top_k": 50, "top_p": 1.0, "repetition_penalty": 1.0},
 }
 
 router = APIRouter(prefix="/qwen3", tags=["qwen3"])
@@ -423,10 +426,10 @@ def env_bool(name: str, default: bool) -> bool:
 def resolve_expressiveness(value: Optional[float]) -> tuple[float, dict[str, float | int]]:
     if value is None:
         value = QWEN_DEFAULT_EXPRESSIVENESS
-    if value < 0 or value > 1:
-        raise HTTPException(400, "expressiveness must be between 0 and 1")
+    if value < 0 or value > 2:
+        raise HTTPException(400, "expressiveness must be between 0 and 2")
 
-    level = round(value * 5) / 5
+    level = round(value * 4) / 4
     level = min(EXPRESSIVENESS_PRESETS, key=lambda preset: abs(preset - level))
     return level, EXPRESSIVENESS_PRESETS[level]
 
@@ -1345,7 +1348,20 @@ def wav_to_mp3(wav_data: np.ndarray, sample_rate: int) -> bytes:
     buf.seek(0)
 
     proc = subprocess.run(
-        ["ffmpeg", "-i", "pipe:0", "-codec:a", "libmp3lame", "-q:a", "0", "-f", "mp3", "pipe:1"],
+        [
+            "ffmpeg",
+            "-i",
+            "pipe:0",
+            "-codec:a",
+            "libmp3lame",
+            "-q:a",
+            "0",
+            "-b:a",
+            "320k",
+            "-f",
+            "mp3",
+            "pipe:1",
+        ],
         input=buf.read(),
         capture_output=True,
     )
@@ -1612,7 +1628,13 @@ def _resolve_generation_settings_batch(
             if req.expressiveness is not None
             else _qwen_settings.top_k
         )
-        top_p = req.top_p if req.top_p is not None else _qwen_settings.top_p
+        top_p = (
+            req.top_p
+            if req.top_p is not None
+            else expressiveness_config["top_p"]
+            if req.expressiveness is not None
+            else _qwen_settings.top_p
+        )
         repetition_penalty = (
             req.repetition_penalty
             if req.repetition_penalty is not None

@@ -146,6 +146,15 @@ class MatchaUtmosQualityCallback(Callback):
         if semantic_features is None:
             raise ValueError("Matcha UTMOS synthesis requires precomputed aligned BERT features")
         semantic_features = semantic_features[:, :, :x_length].to(device)
+        prompt_mel = batch.get("prompt_mel")
+        prompt_mel_lengths = batch.get("prompt_mel_lengths")
+        if prompt_mel is not None:
+            prompt_mel_lengths = prompt_mel_lengths.to(device)
+            prompt_length = int(prompt_mel_lengths[0].item())
+            prompt_mel = prompt_mel[:, :, :prompt_length].to(device)
+        prompt_embedding = batch.get("prompt_embedding")
+        if prompt_embedding is not None:
+            prompt_embedding = prompt_embedding.to(device)
 
         output = pl_module.synthesise(
             x,
@@ -157,6 +166,9 @@ class MatchaUtmosQualityCallback(Callback):
             semantic_features=semantic_features,
             noise_scale_w=self.noise_scale_w,
             sdp_ratio=self.sdp_ratio,
+            prompt_mel=prompt_mel,
+            prompt_mel_lengths=prompt_mel_lengths,
+            prompt_embedding=prompt_embedding,
         )
         audio = self._decode_mel(output["mel"]).squeeze().detach().float().cpu().numpy()
         sf.write(wav_path, np.clip(audio, -1.0, 1.0), self.sample_rate, subtype="PCM_24")

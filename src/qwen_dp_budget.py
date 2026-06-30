@@ -435,6 +435,7 @@ class QwenDpBudget:
             neural=False,
         )
         phoneme_ids = phoneme_result.get("phoneme_ids") or []
+        phoneme_count = len(phoneme_ids)
         if not phoneme_ids:
             return {
                 "enabled": True,
@@ -449,7 +450,7 @@ class QwenDpBudget:
                 "enabled": True,
                 "valid": False,
                 "reason": "empty_audio",
-                "phoneme_count": len(phoneme_ids),
+                "phoneme_count": phoneme_count,
             }
 
         target_sample_rate = int(getattr(model, "sample_rate", 0) or self._model_config.get("audio", {}).get("sample_rate") or 22050)
@@ -459,15 +460,40 @@ class QwenDpBudget:
             audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=target_sample_rate).astype(np.float32, copy=False)
 
         audio = np.clip(audio, -1.0, 1.0)
-        y = torch.from_numpy(audio).to(device=self.device, dtype=torch.float32).unsqueeze(0)
-        if y.size(1) < int(getattr(model, "hop_length", 256)):
-            return {
+        audio_seconds = float(audio.size / target_sample_rate)
+
+        def invalid_alignment_result(
+            reason: str,
+            *,
+            aligned_frames: int | None = None,
+            alignment_error: str | None = None,
+        ) -> dict[str, Any]:
+            duration_ratio = None
+            if expected_seconds is not None and expected_seconds > 0:
+                duration_ratio = audio_seconds / float(expected_seconds)
+            result: dict[str, Any] = {
                 "enabled": True,
                 "valid": False,
-                "reason": "audio_too_short",
-                "audio_seconds": float(audio.size / target_sample_rate),
-                "phoneme_count": len(phoneme_ids),
+                "reason": reason,
+                "audio_seconds": audio_seconds,
+                "expected_seconds": float(expected_seconds) if expected_seconds is not None else None,
+                "duration_ratio": float(duration_ratio) if duration_ratio is not None else None,
+                "duration_tolerance": float(duration_tolerance),
+                "phoneme_count": phoneme_count,
+                "aligned_frames": int(aligned_frames) if aligned_frames is not None else None,
+                "zero_duration_count": None,
+                "zero_duration_indices": [],
+                "min_phoneme_frames": 0,
+                "max_phoneme_frames": 0,
+                "sample_rate": target_sample_rate,
             }
+            if alignment_error:
+                result["alignment_error"] = alignment_error
+            return result
+
+        y = torch.from_numpy(audio).to(device=self.device, dtype=torch.float32).unsqueeze(0)
+        if y.size(1) < int(getattr(model, "hop_length", 256)):
+            return invalid_alignment_result("audio_too_short", aligned_frames=0)
 
         filter_length = int(getattr(model, "filter_length", 1024))
         hop_length = int(getattr(model, "hop_length", 256))
@@ -481,15 +507,22 @@ class QwenDpBudget:
             center=False,
         )
         y_lengths = torch.tensor([y_spec.size(-1)], dtype=torch.long, device=self.device)
+        aligned_frames = int(y_lengths.item())
+        if phoneme_count > aligned_frames:
+            return invalid_alignment_result(
+                "audio_too_short_for_alignment",
+                aligned_frames=aligned_frames,
+            )
 
         x = torch.tensor([phoneme_ids], dtype=torch.long, device=self.device)
-        x_lengths = torch.tensor([len(phoneme_ids)], dtype=torch.long, device=self.device)
+        x_lengths = torch.tensor([phoneme_count], dtype=torch.long, device=self.device)
         sid = torch.tensor([self._speaker_id_for_language(language)], dtype=torch.long, device=self.device)
         bert_input = self._bert_input(
             phoneme_result.get("text") or text,
-            phoneme_length=len(phoneme_ids),
+            phoneme_length=phoneme_count,
             word_spans=phoneme_result.get("word_spans"),
         )
+        speaker_id = int(sid.item())
 
         if model.n_speakers > 1:
             g = model.emb_g(sid).unsqueeze(-1)
@@ -511,12 +544,18 @@ class QwenDpBudget:
         neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
 
         attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
-        attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1)
+        try:
+            attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1)
+        except ValueError as exc:
+            return invalid_alignment_result(
+                "alignment_error",
+                aligned_frames=aligned_frames,
+                alignment_error=str(exc),
+            ) | {"speaker_id": speaker_id}
         durations = attn.sum(2).squeeze(0).squeeze(0)
-        active_durations = durations[: len(phoneme_ids)].detach().cpu()
+        active_durations = durations[:phoneme_count].detach().cpu()
         zero_indices = torch.nonzero(active_durations <= 0, as_tuple=False).flatten().tolist()
 
-        audio_seconds = float(audio.size / target_sample_rate)
         duration_ratio = None
         duration_valid = True
         if expected_seconds is not None and expected_seconds > 0:
@@ -539,13 +578,13 @@ class QwenDpBudget:
             "expected_seconds": float(expected_seconds) if expected_seconds is not None else None,
             "duration_ratio": float(duration_ratio) if duration_ratio is not None else None,
             "duration_tolerance": float(duration_tolerance),
-            "phoneme_count": len(phoneme_ids),
-            "aligned_frames": int(y_lengths.item()),
+            "phoneme_count": phoneme_count,
+            "aligned_frames": aligned_frames,
             "zero_duration_count": len(zero_indices),
             "zero_duration_indices": [int(index) for index in zero_indices[:20]],
             "min_phoneme_frames": int(active_durations.min().item()) if active_durations.numel() else 0,
             "max_phoneme_frames": int(active_durations.max().item()) if active_durations.numel() else 0,
-            "speaker_id": int(sid.item()),
+            "speaker_id": speaker_id,
             "sample_rate": target_sample_rate,
         }
 

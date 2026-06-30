@@ -260,6 +260,9 @@ class MatchaF5DiTDecoder(nn.Module):
         conv_pos_kernel_size: int = 31,
         long_skip_connection: bool = True,
         checkpoint_activations: bool = False,
+        global_cond_dim: int | None = None,
+        global_cond_scale: float = 1.0,
+        prompt_mel_condition: bool = False,
     ):
         super().__init__()
         if dim != heads * dim_head:
@@ -270,12 +273,15 @@ class MatchaF5DiTDecoder(nn.Module):
         self.dim = dim
         self.depth = depth
         self.checkpoint_activations = checkpoint_activations
+        self.global_cond_scale = float(global_cond_scale)
+        self.prompt_mel_condition = bool(prompt_mel_condition)
 
         self.input_proj = nn.Linear(in_channels, dim)
         self.conv_pos_embed = (
             ConvPositionEmbedding(dim=dim, kernel_size=conv_pos_kernel_size) if conv_pos_embed else None
         )
         self.time_embed = TimestepEmbedding(dim)
+        self.global_cond_proj = nn.Linear(global_cond_dim, dim, bias=False) if global_cond_dim else None
         self.transformer_blocks = nn.ModuleList(
             [
                 DiTBlock(
@@ -309,14 +315,24 @@ class MatchaF5DiTDecoder(nn.Module):
     def _checkpoint_block(self, block, x, t, mask):
         return torch.utils.checkpoint.checkpoint(block, x, t, mask, use_reentrant=False)
 
-    def forward(self, x, mask, mu, t, spks=None, cond=None):  # pylint: disable=unused-argument
+    def forward(self, x, mask, mu, t, spks=None, cond=None):
         batch_size = x.shape[0]
         if t.ndim == 0:
             t = t.repeat(batch_size)
         elif t.ndim > 1:
             t = t.reshape(batch_size)
 
-        h = torch.cat((x, mu), dim=1)
+        inputs = [x, mu]
+        if self.prompt_mel_condition:
+            prompt_x = cond.get("prompt_x") if isinstance(cond, dict) else None
+            if prompt_x is None:
+                prompt_x = torch.zeros_like(x)
+            if prompt_x.shape != x.shape:
+                raise ValueError(f"Expected prompt_x shape {tuple(x.shape)}, got {tuple(prompt_x.shape)}")
+            inputs.append(prompt_x.to(device=x.device, dtype=x.dtype))
+
+        h = torch.cat(inputs, dim=1)
+        global_cond = spks
         if spks is not None:
             spks = spks.unsqueeze(-1).expand(-1, -1, h.shape[-1])
             h = torch.cat((h, spks), dim=1)
@@ -332,6 +348,10 @@ class MatchaF5DiTDecoder(nn.Module):
         h = h.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
 
         time = self.time_embed(t)
+        if self.global_cond_proj is not None:
+            if global_cond is None:
+                raise ValueError("global_cond_dim is configured but no speaker condition was provided")
+            time = time + self.global_cond_proj(global_cond.to(device=time.device, dtype=time.dtype)) * self.global_cond_scale
         residual = h
         for block in self.transformer_blocks:
             if self.checkpoint_activations and self.training:

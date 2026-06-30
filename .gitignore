@@ -5,6 +5,8 @@ build/
 dist/
 wheels/
 *.egg-info
+src/starling/utils/monotonic_align/core.c
+src/starling/utils/monotonic_align/*.so
 
 # Virtual environments
 .venv

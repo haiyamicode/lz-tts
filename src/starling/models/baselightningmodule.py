@@ -68,6 +68,9 @@ class BaseLightningClass(LightningModule, ABC):
             out_size=self.out_size,
             durations=batch["durations"],
             semantic_features=semantic_features,
+            prompt_mel=batch.get("prompt_mel"),
+            prompt_mel_lengths=batch.get("prompt_mel_lengths"),
+            prompt_embedding=batch.get("prompt_embedding"),
         )
         dur_loss, prior_loss, diff_loss, *extra = outputs
         metrics = {}
@@ -265,12 +268,24 @@ class BaseLightningClass(LightningModule, ABC):
                 if one_batch.get("bert_features") is not None:
                     semantic_features = one_batch["bert_features"][i].unsqueeze(0).to(self.device)
                     semantic_features = semantic_features[:, :, : x_lengths.item()]
+                prompt_mel = None
+                prompt_mel_lengths = None
+                if one_batch.get("prompt_mel") is not None:
+                    prompt_mel_lengths = one_batch["prompt_mel_lengths"][i].unsqueeze(0).to(self.device)
+                    prompt_mel = one_batch["prompt_mel"][i].unsqueeze(0).to(self.device)
+                    prompt_mel = prompt_mel[:, :, : prompt_mel_lengths.item()]
+                prompt_embedding = None
+                if one_batch.get("prompt_embedding") is not None:
+                    prompt_embedding = one_batch["prompt_embedding"][i].unsqueeze(0).to(self.device)
                 output = self.synthesise(
                     x[:, : x_lengths.item()],
                     x_lengths,
                     n_timesteps=10,
                     spks=spks,
                     semantic_features=semantic_features,
+                    prompt_mel=prompt_mel,
+                    prompt_mel_lengths=prompt_mel_lengths,
+                    prompt_embedding=prompt_embedding,
                 )
                 y_enc, y_dec = output["encoder_outputs"], output["decoder_outputs"]
                 attn = output["attn"]

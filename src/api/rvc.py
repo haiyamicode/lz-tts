@@ -29,6 +29,8 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 
+from .audio_utils import MP3_BITRATE, MP3_EXPORT_PARAMETERS, MP3_INTERMEDIATE_WAV_SUBTYPE
+
 _LOGGER = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -214,7 +216,10 @@ class RVCBackend:
                     raise RuntimeError(f"RVC inference failed: {msg}")
 
                 buf = io.BytesIO()
-                sf.write(buf, audio_data, sr, format="WAV")
+                if output_format == "mp3":
+                    sf.write(buf, audio_data, sr, format="WAV", subtype=MP3_INTERMEDIATE_WAV_SUBTYPE)
+                else:
+                    sf.write(buf, audio_data, sr, format="WAV")
                 wav_bytes = buf.getvalue()
 
                 if output_format == "mp3":
@@ -223,7 +228,7 @@ class RVCBackend:
                     wav_buf = io.BytesIO(wav_bytes)
                     seg = AudioSegment.from_wav(wav_buf)
                     mp3_buf = io.BytesIO()
-                    seg.export(mp3_buf, format="mp3", bitrate="320k", parameters=["-q:a", "0"])
+                    seg.export(mp3_buf, format="mp3", bitrate=MP3_BITRATE, parameters=MP3_EXPORT_PARAMETERS)
                     return mp3_buf.getvalue(), sr
 
                 return wav_bytes, sr
@@ -303,7 +308,10 @@ class RVCBackend:
                 encoded = []
                 for sr, audio_data in outputs:
                     buf = io.BytesIO()
-                    sf.write(buf, audio_data, sr, format="WAV")
+                    if output_format == "mp3":
+                        sf.write(buf, audio_data, sr, format="WAV", subtype=MP3_INTERMEDIATE_WAV_SUBTYPE)
+                    else:
+                        sf.write(buf, audio_data, sr, format="WAV")
                     wav_bytes = buf.getvalue()
 
                     if output_format == "mp3":
@@ -312,7 +320,7 @@ class RVCBackend:
                         wav_buf = io.BytesIO(wav_bytes)
                         seg = AudioSegment.from_wav(wav_buf)
                         mp3_buf = io.BytesIO()
-                        seg.export(mp3_buf, format="mp3", bitrate="320k", parameters=["-q:a", "0"])
+                        seg.export(mp3_buf, format="mp3", bitrate=MP3_BITRATE, parameters=MP3_EXPORT_PARAMETERS)
                         encoded.append((mp3_buf.getvalue(), sr))
                     else:
                         encoded.append((wav_bytes, sr))

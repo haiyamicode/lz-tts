@@ -56,7 +56,8 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     log.info(f"Instantiating model <{cfg.model._target_}>")  # pylint: disable=protected-access
     model: LightningModule = hydra.utils.instantiate(cfg.model)
 
-    resume_ckpt_path = _latest_output_checkpoint(cfg.paths.output_dir) if cfg.get("train") else None
+    resume_from_output = bool(cfg.get("resume_from_output_checkpoint", True))
+    resume_ckpt_path = _latest_output_checkpoint(cfg.paths.output_dir) if cfg.get("train") and resume_from_output else None
     if resume_ckpt_path is not None:
         cfg.ckpt_path = str(resume_ckpt_path)
         log.info(f"Resuming training from output checkpoint: {cfg.ckpt_path}")
@@ -66,7 +67,17 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         import torch
 
         init_ckpt = torch.load(cfg.init_from_checkpoint, map_location="cpu", weights_only=False)
-        model.load_state_dict(init_ckpt["state_dict"], strict=True)
+        strict = bool(cfg.get("init_strict", True))
+        incompatible = model.load_state_dict(init_ckpt["state_dict"], strict=strict)
+        if not strict:
+            missing = list(getattr(incompatible, "missing_keys", []))
+            unexpected = list(getattr(incompatible, "unexpected_keys", []))
+            if missing:
+                log.info("Initializer checkpoint missing %d model keys; newly initialized modules will train from scratch", len(missing))
+                log.debug("Missing keys: %s", missing)
+            if unexpected:
+                log.info("Initializer checkpoint has %d unused model keys", len(unexpected))
+                log.debug("Unexpected keys: %s", unexpected)
         log.info(f"Loaded initial weights from {cfg.init_from_checkpoint}")
         cfg.ckpt_path = None
 

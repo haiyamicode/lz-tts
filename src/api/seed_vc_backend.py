@@ -17,8 +17,9 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from .audio_utils import (
+    MP3_INTERMEDIATE_WAV_SUBTYPE,
     _audio_file_to_mp3_bytes,
-    _audio_to_pcm16,
+    _audio_to_float32,
     _audio_to_wav_bytes,
     _safe_file_stem,
     _temporary_cwd,
@@ -380,7 +381,7 @@ class SeedVCBackend:
         if torch.is_tensor(vc_wave):
             vc_wave = vc_wave.detach().float().cpu().numpy()
         vc_wave = np.asarray(vc_wave, dtype=np.float32).squeeze()
-        sf.write(output_path, vc_wave, self.sample_rate)
+        sf.write(output_path, vc_wave, self.sample_rate, subtype=MP3_INTERMEDIATE_WAV_SUBTYPE)
         return output_path
 
     def _prepare_seed_vc_reference(self, target_path: Path | None, cached_ref_embeddings: Any | None, model: Any):
@@ -592,7 +593,7 @@ class SeedVCBackend:
                 for idx, (item, wave_data) in enumerate(zip(items, waves)):
                     wav_output_path = self.output_dir / f"vc_batch_{uuid.uuid4().hex}_{idx}.wav"
                     wav_output_paths.append(wav_output_path)
-                    sf.write(wav_output_path, wave_data, self.sample_rate)
+                    sf.write(wav_output_path, wave_data, self.sample_rate, subtype=MP3_INTERMEDIATE_WAV_SUBTYPE)
                     if item.remove_glitches:
                         self._remove_glitches(wav_output_path)
                     mp3_bytes = _audio_file_to_mp3_bytes(wav_output_path)
@@ -684,7 +685,12 @@ class SeedVCBackend:
         wav_output_paths: list[Path] = []
         try:
             for source_audio, source_path in zip(source_audios, source_paths):
-                sf.write(source_path, _audio_to_pcm16(source_audio), source_sample_rate)
+                sf.write(
+                    source_path,
+                    _audio_to_float32(source_audio),
+                    source_sample_rate,
+                    subtype=MP3_INTERMEDIATE_WAV_SUBTYPE,
+                )
 
             _LOGGER.info(
                 "Seed-VC convert generated batch: voice=%s preset=%s count=%d",
@@ -707,7 +713,7 @@ class SeedVCBackend:
                 if output_format == "mp3":
                     wav_output_path = self.output_dir / f"vc_synth_batch_{uuid.uuid4().hex}_{idx}.wav"
                     wav_output_paths.append(wav_output_path)
-                    sf.write(wav_output_path, wave_data, self.sample_rate)
+                    sf.write(wav_output_path, wave_data, self.sample_rate, subtype=MP3_INTERMEDIATE_WAV_SUBTYPE)
                     encoded.append((_audio_file_to_mp3_bytes(wav_output_path), audio_seconds))
                 else:
                     encoded.append((_audio_to_wav_bytes(wave_data, self.sample_rate), audio_seconds))
@@ -742,7 +748,12 @@ class SeedVCBackend:
         wav_output_paths: list[Path] = []
         try:
             for source_audio, source_path in zip(source_audios, source_paths):
-                sf.write(source_path, _audio_to_pcm16(source_audio), source_sample_rate)
+                sf.write(
+                    source_path,
+                    _audio_to_float32(source_audio),
+                    source_sample_rate,
+                    subtype=MP3_INTERMEDIATE_WAV_SUBTYPE,
+                )
 
             _LOGGER.info(
                 "Seed-VC convert generated reference batch: reference=%s preset=%s count=%d",
@@ -765,7 +776,7 @@ class SeedVCBackend:
                 if output_format == "mp3":
                     wav_output_path = self.output_dir / f"vc_synth_sample_batch_{uuid.uuid4().hex}_{idx}.wav"
                     wav_output_paths.append(wav_output_path)
-                    sf.write(wav_output_path, wave_data, self.sample_rate)
+                    sf.write(wav_output_path, wave_data, self.sample_rate, subtype=MP3_INTERMEDIATE_WAV_SUBTYPE)
                     encoded.append((_audio_file_to_mp3_bytes(wav_output_path), audio_seconds))
                 else:
                     encoded.append((_audio_to_wav_bytes(wave_data, self.sample_rate), audio_seconds))
@@ -835,6 +846,9 @@ class SeedVCBackend:
         enhanced_wav = enhanced_dir / "sample.wav"
         enhanced_wav.write_bytes(sample_wav.read_bytes())
         mp3_path = enhance_dir / "final_sample.mp3"
-        subprocess.run(["ffmpeg", "-i", str(enhanced_wav), "-f", "mp3", "-aq", "2", "-b:a", "320k", str(mp3_path), "-y"],
-                       capture_output=True, check=True)
+        subprocess.run(
+            ["ffmpeg", "-i", str(enhanced_wav), "-f", "mp3", "-q:a", "0", "-b:a", "320k", str(mp3_path), "-y"],
+            capture_output=True,
+            check=True,
+        )
         return mp3_path.read_bytes()

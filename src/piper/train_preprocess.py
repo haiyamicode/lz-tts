@@ -343,7 +343,7 @@ def main() -> None:
 
     # Drain results in a background thread to avoid queue buffer deadlock.
     missing_phonemes: "Counter[str]" = Counter()
-    dataset_rows: List[dict] = []
+    dataset_rows: List[Tuple[int, dict]] = []
     results_done = threading.Event()
     drain_error: Optional[Exception] = None
     progress_counter = [0]  # mutable for closure
@@ -363,7 +363,14 @@ def main() -> None:
                     utt_dict = dataclasses.asdict(utt)
                     utt_dict.pop("missing_phonemes")
                     dataset_rows.append(
-                        json.loads(json.dumps(utt_dict, ensure_ascii=False, cls=PathEncoder))
+                        (
+                            int(getattr(utt, "_dataset_order", len(dataset_rows))),
+                            json.loads(
+                                json.dumps(
+                                    utt_dict, ensure_ascii=False, cls=PathEncoder
+                                )
+                            ),
+                        )
                     )
                     missing_phonemes.update(utt.missing_phonemes)
                 pbar.update(1)
@@ -377,8 +384,14 @@ def main() -> None:
     drain_thread = threading.Thread(target=_drain_results, daemon=True)
     drain_thread.start()
 
+    dataset_order = 0
     for utt_batch in batched(make_dataset(args), batch_size):
-        queue_in.put(utt_batch)
+        ordered_batch = []
+        for utt in utt_batch:
+            setattr(utt, "_dataset_order", dataset_order)
+            dataset_order += 1
+            ordered_batch.append(utt)
+        queue_in.put(ordered_batch)
 
     results_done.wait()
     drain_thread.join()
@@ -386,7 +399,9 @@ def main() -> None:
         raise drain_error
 
     dataset_path = args.output_dir / "dataset.parquet"
-    pq.write_table(pa.Table.from_pylist(dataset_rows), dataset_path, compression="zstd")
+    dataset_rows.sort(key=lambda item: item[0])
+    ordered_rows = [row for _, row in dataset_rows]
+    pq.write_table(pa.Table.from_pylist(ordered_rows), dataset_path, compression="zstd")
     _LOGGER.info("Wrote %s utterance(s) to %s", len(dataset_rows), dataset_path)
 
     if missing_phonemes:

@@ -46,6 +46,7 @@ class VoiceConversionWrapper(torch.nn.Module):
         # Set streaming parameters
         self.overlap_frame_len = 16
         self.bitrate = "320k"
+        self.mp3_export_parameters = ["-q:a", "0"]
         self.compiled_decode_fn = None
         self.dit_compiled = False
         self.dit_max_context_len = 30  # in seconds
@@ -197,7 +198,7 @@ class VoiceConversionWrapper(torch.nn.Module):
                     mp3_bytes = AudioSegment(
                         output_wave_int16.tobytes(), frame_rate=self.sr,
                         sample_width=output_wave_int16.dtype.itemsize, channels=1
-                    ).export(format="mp3", bitrate=self.bitrate).read()
+                    ).export(format="mp3", bitrate=self.bitrate, parameters=self.mp3_export_parameters).read()
                     full_audio = (self.sr, np.concatenate(generated_wave_chunks))
                 else:
                     return processed_frames, previous_chunk, True, None, np.concatenate(generated_wave_chunks)
@@ -214,7 +215,7 @@ class VoiceConversionWrapper(torch.nn.Module):
                 mp3_bytes = AudioSegment(
                     output_wave_int16.tobytes(), frame_rate=self.sr,
                     sample_width=output_wave_int16.dtype.itemsize, channels=1
-                ).export(format="mp3", bitrate=self.bitrate).read()
+                ).export(format="mp3", bitrate=self.bitrate, parameters=self.mp3_export_parameters).read()
 
         elif is_last_chunk:
             output_wave = self.crossfade(previous_chunk.cpu().numpy(), vc_wave[0].cpu().numpy(), overlap_wave_len)
@@ -226,7 +227,7 @@ class VoiceConversionWrapper(torch.nn.Module):
                 mp3_bytes = AudioSegment(
                     output_wave_int16.tobytes(), frame_rate=self.sr,
                     sample_width=output_wave_int16.dtype.itemsize, channels=1
-                ).export(format="mp3", bitrate=self.bitrate).read()
+                ).export(format="mp3", bitrate=self.bitrate, parameters=self.mp3_export_parameters).read()
                 full_audio = (self.sr, np.concatenate(generated_wave_chunks))
             else:
                 return processed_frames, previous_chunk, True, None, np.concatenate(generated_wave_chunks)
@@ -244,7 +245,7 @@ class VoiceConversionWrapper(torch.nn.Module):
                 mp3_bytes = AudioSegment(
                     output_wave_int16.tobytes(), frame_rate=self.sr,
                     sample_width=output_wave_int16.dtype.itemsize, channels=1
-                ).export(format="mp3", bitrate=self.bitrate).read()
+                ).export(format="mp3", bitrate=self.bitrate, parameters=self.mp3_export_parameters).read()
                 
         return processed_frames, previous_chunk, False, mp3_bytes, full_audio
 

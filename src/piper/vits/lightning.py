@@ -9,7 +9,7 @@ import pytorch_lightning as pl
 import torch
 from torch import autocast
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from .commons import slice_segments
 from .mel_processing import mel_spectrogram_torch, spec_to_mel_torch
@@ -232,16 +232,25 @@ class VitsModel(pl.LightningModule):
                 f"total={dataset_size}, test={num_test_examples}, val={valid_set_size}"
             )
 
+        test_start = train_set_size
+        val_start = test_start + num_test_examples
+
         _LOGGER.info(
-            "Dataset split: train=%s test=%s val=%s",
+            "Dataset split: train=%s test=%s val=%s "
+            "(contiguous rows: train=[0,%s) test=[%s,%s) val=[%s,%s))",
             train_set_size,
             num_test_examples,
             valid_set_size,
+            train_set_size,
+            test_start,
+            val_start,
+            val_start,
+            dataset_size,
         )
 
-        self._train_dataset, self._test_dataset, self._val_dataset = random_split(
-            full_dataset, [train_set_size, num_test_examples, valid_set_size]
-        )
+        self._train_dataset = Subset(full_dataset, range(0, train_set_size))
+        self._test_dataset = Subset(full_dataset, range(test_start, val_start))
+        self._val_dataset = Subset(full_dataset, range(val_start, dataset_size))
 
     def forward(self, text, text_lengths, scales, sid=None, bert_input=None):
         noise_scale = scales[0]

@@ -110,7 +110,7 @@ def process_file(path, out_dir, params, do_write):
 
     if do_write:
         # always write output copy (either trimmed or original) to allow inspection
-        sf.write(out_fn, out, sr)
+        sf.write(out_fn, out, sr, subtype="PCM_24")
 
     return {
         "src": path,

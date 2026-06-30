@@ -4,11 +4,11 @@ import random
 
 import torch
 
-from src.piper.vits import monotonic_align
 from src.starling import utils
 from src.starling.models.baselightningmodule import BaseLightningClass
 from src.starling.models.components.flow_matching import CFM
 from src.starling.models.components.text_encoder import TextEncoder
+from src.starling.utils import monotonic_align
 from src.starling.utils.model import (
     denormalize,
     duration_loss,
@@ -36,6 +36,11 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         scheduler=None,
         prior_loss=True,
         use_precomputed_durations=False,
+        freeze_spk_emb=False,
+        speaker_condition_scale=1.0,
+        prompt_condition_scale=1.0,
+        prompt_mel_conditioning=None,
+        prompt_embedding_encoder=None,
     ):
         super().__init__()
 
@@ -48,16 +53,37 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         self.out_size = out_size
         self.prior_loss = prior_loss
         self.use_precomputed_durations = use_precomputed_durations
+        self.speaker_condition_scale = float(speaker_condition_scale)
+        self.prompt_condition_scale = float(prompt_condition_scale)
+        self.prompt_mel_enabled = bool(prompt_mel_conditioning and prompt_mel_conditioning.get("enabled", False))
+        self.prompt_embedding_enabled = bool(prompt_embedding_encoder and prompt_embedding_encoder.get("enabled", False))
+        encoder_condition_n_spks = n_spks if n_spks > 1 else 1
+        decoder_condition_n_spks = n_spks if n_spks > 1 or self.prompt_embedding_enabled else 1
 
         if n_spks > 1:
             self.spk_emb = torch.nn.Embedding(n_spks, spk_emb_dim)
+            if freeze_spk_emb:
+                self.spk_emb.weight.requires_grad_(False)
+        if self.prompt_embedding_enabled:
+            input_dim = int(prompt_embedding_encoder.get("input_dim", spk_emb_dim))
+            hidden_dim = int(prompt_embedding_encoder.get("hidden_dim", max(spk_emb_dim * 4, input_dim)))
+            self.prompt_embedding_proj = torch.nn.Sequential(
+                torch.nn.LayerNorm(input_dim),
+                torch.nn.Linear(input_dim, hidden_dim),
+                torch.nn.SiLU(),
+                torch.nn.Dropout(prompt_embedding_encoder.get("dropout", 0.0)),
+                torch.nn.Linear(hidden_dim, spk_emb_dim),
+            )
+            if prompt_embedding_encoder.get("zero_init", False):
+                torch.nn.init.zeros_(self.prompt_embedding_proj[-1].weight)
+                torch.nn.init.zeros_(self.prompt_embedding_proj[-1].bias)
 
         self.encoder = TextEncoder(
             encoder.encoder_type,
             encoder.encoder_params,
             encoder.duration_predictor_params,
             n_vocab,
-            n_spks,
+            encoder_condition_n_spks,
             spk_emb_dim,
         )
 
@@ -66,11 +92,24 @@ class MatchaTTS(BaseLightningClass):  # 🍵
             out_channel=encoder.encoder_params.n_feats,
             cfm_params=cfm,
             decoder_params=decoder,
-            n_spks=n_spks,
+            n_spks=decoder_condition_n_spks,
             spk_emb_dim=spk_emb_dim,
         )
 
         self.update_data_statistics(data_statistics)
+
+    def _conditions(self, spks=None, prompt_embedding=None):
+        cond = None
+        if self.n_spks > 1:
+            if spks is None:
+                raise ValueError("spks is required when n_spks > 1")
+            cond = self.spk_emb(spks.long()) * self.speaker_condition_scale
+        if self.prompt_embedding_enabled and prompt_embedding is not None:
+            dtype = cond.dtype if cond is not None else self.prompt_embedding_proj[1].weight.dtype
+            voice_cond = self.prompt_embedding_proj(prompt_embedding.to(device=self.device, dtype=dtype))
+            voice_cond = voice_cond * self.prompt_condition_scale
+            cond = voice_cond if cond is None else cond + voice_cond.to(dtype=cond.dtype)
+        return cond
 
     @torch.inference_mode()
     def synthesise(
@@ -84,6 +123,9 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         semantic_features=None,
         noise_scale_w=None,
         sdp_ratio=None,
+        prompt_mel=None,
+        prompt_mel_lengths=None,
+        prompt_embedding=None,
     ):
         """
         Generates mel-spectrogram from text. Returns:
@@ -122,9 +164,7 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         # For RTF computation
         t = dt.datetime.now()
 
-        if self.n_spks > 1:
-            # Get speaker embedding
-            spks = self.spk_emb(spks.long())
+        spks = self._conditions(spks, prompt_embedding)
 
         # Get encoder_outputs `mu_x` and log-scaled token durations `logw`
         if self.encoder.use_sdp:
@@ -162,7 +202,15 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         encoder_outputs = mu_y[:, :, :y_max_length]
 
         # Generate sample tracing the probability flow
-        decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, spks)
+        decoder_outputs = self.decoder(
+            mu_y,
+            y_mask,
+            n_timesteps,
+            temperature,
+            spks,
+            prompt_mel=prompt_mel,
+            prompt_mel_lengths=prompt_mel_lengths,
+        )
         decoder_outputs = decoder_outputs[:, :, :y_max_length]
 
         t = (dt.datetime.now() - t).total_seconds()
@@ -188,6 +236,9 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         cond=None,
         durations=None,
         semantic_features=None,
+        prompt_mel=None,
+        prompt_mel_lengths=None,
+        prompt_embedding=None,
     ):
         """
         Computes 3 losses:
@@ -209,9 +260,7 @@ class MatchaTTS(BaseLightningClass):  # 🍵
             spks (torch.Tensor, optional): speaker ids.
                 shape: (batch_size,)
         """
-        if self.n_spks > 1:
-            # Get speaker embedding
-            spks = self.spk_emb(spks)
+        spks = self._conditions(spks, prompt_embedding)
 
         # Get encoder_outputs `mu_x` and log-scaled token durations `logw`
         if self.encoder.use_sdp:
@@ -289,7 +338,15 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         mu_y = mu_y.transpose(1, 2)
 
         # Compute loss of the decoder
-        diff_loss, _ = self.decoder.compute_loss(x1=y, mask=y_mask, mu=mu_y, spks=spks, cond=cond)
+        diff_loss, _ = self.decoder.compute_loss(
+            x1=y,
+            mask=y_mask,
+            mu=mu_y,
+            spks=spks,
+            cond=cond,
+            prompt_mel=prompt_mel,
+            prompt_mel_lengths=prompt_mel_lengths,
+        )
 
         if self.prior_loss:
             prior_loss = torch.sum(0.5 * ((y - mu_y) ** 2 + math.log(2 * math.pi)) * y_mask)

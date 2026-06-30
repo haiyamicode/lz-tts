@@ -416,6 +416,12 @@ class TextEncoder(nn.Module):
                 shape: (batch_size, 1, max_text_length)
         """
         x = self.emb(x) * math.sqrt(self.n_channels)
+        if self.semantic_projection is not None and semantic_features is None:
+            raise ValueError(
+                f"encoder_params.semantic_dim={self.semantic_dim} requires semantic_features, "
+                "but the batch did not provide them. Regenerate the dataset with bert_path sidecars "
+                "or set encoder_params.semantic_dim=0."
+            )
         if semantic_features is not None:
             if self.semantic_projection is None:
                 raise ValueError("semantic_features were provided, but encoder_params.semantic_dim is not set")

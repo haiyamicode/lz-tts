@@ -12,6 +12,12 @@ from pathlib import Path
 
 import numpy as np
 from pydub import AudioSegment
+import soundfile as sf
+
+MP3_BITRATE = "320k"
+MP3_EXPORT_PARAMETERS = ["-q:a", "0"]
+MP3_INTERMEDIATE_WAV_SUBTYPE = "PCM_24"
+
 
 def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     """Convert audio array to WAV bytes."""
@@ -27,25 +33,24 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
 
 def _audio_to_mp3_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     """Convert audio array to MP3 bytes with highest quality settings."""
-    pcm_audio = _audio_to_pcm16(audio)
-    # First convert to WAV in memory
     wav_buffer = io.BytesIO()
-    with wave.open(wav_buffer, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)  # 16-bit
-        wav.setframerate(sample_rate)
-        wav.writeframes(pcm_audio.tobytes())
+    sf.write(
+        wav_buffer,
+        _audio_to_float32(audio),
+        sample_rate,
+        format="WAV",
+        subtype=MP3_INTERMEDIATE_WAV_SUBTYPE,
+    )
     wav_buffer.seek(0)
 
-    # Convert WAV to MP3 using pydub with highest quality
-    # Use 320kbps CBR (constant bitrate) for maximum quality
+    # Convert WAV to MP3 using the production quality settings.
     audio_segment = AudioSegment.from_wav(wav_buffer)
     mp3_buffer = io.BytesIO()
     audio_segment.export(
         mp3_buffer,
         format="mp3",
-        bitrate="320k",
-        parameters=["-q:a", "0"]  # Highest quality VBR setting
+        bitrate=MP3_BITRATE,
+        parameters=MP3_EXPORT_PARAMETERS,
     )
     return mp3_buffer.getvalue()
 
@@ -55,6 +60,17 @@ def _audio_to_pcm16(audio: np.ndarray) -> np.ndarray:
     if np.issubdtype(audio_array.dtype, np.floating):
         return (np.clip(audio_array, -1.0, 1.0).astype(np.float32) * 32767.0).astype(np.int16)
     return audio_array.astype(np.int16, copy=False)
+
+
+def _audio_to_float32(audio: np.ndarray) -> np.ndarray:
+    audio_array = np.asarray(audio).squeeze()
+    if np.issubdtype(audio_array.dtype, np.floating):
+        return np.clip(audio_array, -1.0, 1.0).astype(np.float32, copy=False)
+    if np.issubdtype(audio_array.dtype, np.integer):
+        info = np.iinfo(audio_array.dtype)
+        peak = max(abs(info.min), info.max)
+        return np.clip(audio_array.astype(np.float32) / float(peak), -1.0, 1.0)
+    return np.clip(audio_array.astype(np.float32), -1.0, 1.0)
 
 
 def _resample_audio(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
@@ -89,5 +105,10 @@ def _safe_file_stem(value: str) -> str:
 def _audio_file_to_mp3_bytes(audio_path: Path) -> bytes:
     audio_segment = AudioSegment.from_file(audio_path)
     mp3_buffer = io.BytesIO()
-    audio_segment.export(mp3_buffer, format="mp3", bitrate="320k", parameters=["-q:a", "0"])
+    audio_segment.export(
+        mp3_buffer,
+        format="mp3",
+        bitrate=MP3_BITRATE,
+        parameters=MP3_EXPORT_PARAMETERS,
+    )
     return mp3_buffer.getvalue()
