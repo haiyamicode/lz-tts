@@ -3085,6 +3085,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     if config is None:
         config = _load_config()
     _server_config = config
+    qwen3.configure(_server_config.qwen)
 
     app = FastAPI(
         title="LZ-TTS API",
@@ -3196,6 +3197,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 _startup_loader_task.cancel()
             _stop_model_workers()
             _stop_qwen_worker()
+            qwen3.stop_reference_transcription_worker()
             _inference_cache.clear()
             _lang_speaker_map.clear()
             _speaker_routes.clear()
@@ -3260,6 +3262,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                         vietnamese_device=_server_config.qwen.vietnamese_device,
                         dtype=_server_config.qwen.dtype,
                         dp_budget=_server_config.qwen.dp_budget.enabled,
+                        asr_model=_server_config.qwen.asr.model,
+                        asr_device=_server_config.qwen.asr.device,
+                        asr_isolated=_server_config.qwen.asr.isolated,
                     ):
                         worker_names = ["primary"]
                         if _separate_vietnamese_qwen_worker_enabled():
@@ -3276,6 +3281,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                                 worker_name=worker_name,
                             )
                             _LOGGER.info("Qwen worker health ok name=%s", worker_name)
+                        if _server_config.qwen.asr.enabled:
+                            _LOGGER.info("Preloading Qwen ASR model")
+                            await asyncio.to_thread(qwen3.preload_reference_transcription_model)
+                            _LOGGER.info("Qwen ASR preload ok")
 
                 startup_tasks.append(asyncio.create_task(run_loader("qwen3", start_qwen)))
             else:
@@ -3368,6 +3377,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         _startup_loader_task = None
         _stop_model_workers()
         _stop_qwen_worker()
+        qwen3.stop_reference_transcription_worker()
 
     @app.get("/")
     async def health():

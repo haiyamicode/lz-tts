@@ -20,6 +20,9 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from .asr_worker import QwenASRBackend, QwenASRSettings, qwen_asr_worker_main
+from .worker_common import WorkerProcessClient
+
 _LOGGER = logging.getLogger(__name__)
 
 CACHE_DIR = Path("cache/voice_samples")
@@ -78,14 +81,13 @@ router = APIRouter(prefix="/qwen3", tags=["qwen3"])
 model: Optional[Any] = None
 vietnamese_model: Optional[Any] = None
 reference_transcription_model: Optional[Any] = None
-reference_transcription_processor: Optional[Any] = None
-reference_transcription_device: Optional[torch.device] = None
-reference_transcription_dtype: Optional[torch.dtype] = None
+reference_transcription_worker: Optional[WorkerProcessClient] = None
 silero_vad_detector: Optional[Any] = None
 dp_budget_model: Optional[Any] = None
 inference_lock = threading.Lock()
 vietnamese_model_load_lock = threading.Lock()
 reference_transcription_lock = threading.Lock()
+reference_transcription_worker_lock = threading.Lock()
 model_load_lock = threading.Lock()
 dp_budget_load_lock = threading.Lock()
 silero_vad_lock = threading.Lock()
@@ -212,6 +214,7 @@ class QwenSettings(BaseModel):
     top_p: float = QWEN_DEFAULT_TOP_P
     repetition_penalty: float = QWEN_DEFAULT_REPETITION_PENALTY
     voice_prompt_cache_entries: int = Field(8, ge=0)
+    asr: QwenASRSettings = Field(default_factory=QwenASRSettings)
     dp_budget: DpBudgetSettings = Field(default_factory=DpBudgetSettings)
     validation: QwenValidationSettings = Field(default_factory=QwenValidationSettings)
 
@@ -300,11 +303,21 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
         "QWEN_TTS_LARGE_BLOCK_PRECISION": "large_block_precision",
         "QWEN_TTS_EXTRA_PRECISION": "extra_precision",
         "QWEN_TTS_LINEAR_PRECISION": "linear_precision",
+        "QWEN_ASR_MODEL": "asr.model",
+        "QWEN_ASR_DEVICE": "asr.device",
+        "QWEN_ASR_DTYPE": "asr.dtype",
+        "QWEN_ASR_ATTN": "asr.attn",
+        "QWEN_TTS_REFERENCE_TRANSCRIPTION_MODEL": "asr.model",
+        "QWEN_TTS_REFERENCE_TRANSCRIPTION_DEVICE": "asr.device",
+        "QWEN_TTS_REFERENCE_TRANSCRIPTION_DTYPE": "asr.dtype",
     }
     for env_name, attr in string_overrides.items():
         value = os.environ.get(env_name)
         if value is not None and value.strip():
-            setattr(settings, attr, value.strip())
+            if attr.startswith("asr."):
+                setattr(settings.asr, attr.split(".", 1)[1], value.strip())
+            else:
+                setattr(settings, attr, value.strip())
             if attr in {
                 "dtype",
                 "audio_dtype",
@@ -324,12 +337,16 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
         "QWEN_TTS_VOICE_PROMPT_CACHE_ENTRIES": "voice_prompt_cache_entries",
         "QWEN_TTS_OUTPUT_BUFFER_SILENCE_MS": "output_buffer_silence_ms",
         "QWEN_TTS_VALIDATION_MAX_RETRIES": "validation.max_retries",
+        "QWEN_ASR_MAX_NEW_TOKENS": "asr.max_new_tokens",
+        "QWEN_ASR_MAX_INFERENCE_BATCH_SIZE": "asr.max_inference_batch_size",
     }
     for env_name, attr in int_overrides.items():
         value = os.environ.get(env_name)
         if value is not None and value.strip():
             if attr.startswith("validation."):
                 setattr(settings.validation, attr.split(".", 1)[1], int(value.strip()))
+            elif attr.startswith("asr."):
+                setattr(settings.asr, attr.split(".", 1)[1], int(value.strip()))
             else:
                 setattr(settings, attr, int(value.strip()))
 
@@ -345,12 +362,18 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
         "QWEN_TTS_DISABLE_CUDA_GRAPH_BATCH": "disable_cuda_graph_batch",
         "QWEN_TTS_VALIDATION_ENABLED": "validation.enabled",
         "QWEN_TTS_VALIDATION_REJECT_ZERO_PHONEME_DURATION": "validation.reject_zero_phoneme_duration",
+        "QWEN_ASR_ENABLED": "asr.enabled",
+        "QWEN_ASR_ISOLATED": "asr.isolated",
+        "QWEN_ASR_PRELOAD": "asr.preload",
     }
     for env_name, attr in bool_overrides.items():
         if os.environ.get(env_name) is not None:
             if attr.startswith("validation."):
                 key = attr.split(".", 1)[1]
                 setattr(settings.validation, key, env_bool_value(env_name, getattr(settings.validation, key)))
+            elif attr.startswith("asr."):
+                key = attr.split(".", 1)[1]
+                setattr(settings.asr, key, env_bool_value(env_name, getattr(settings.asr, key)))
             else:
                 setattr(settings, attr, env_bool_value(env_name, getattr(settings, attr)))
 
@@ -369,13 +392,15 @@ def apply_env_overrides(settings: QwenSettings) -> QwenSettings:
 
 
 def configure(settings: QwenSettings) -> None:
-    global _qwen_settings, dp_budget_model, model, vietnamese_model
+    global _qwen_settings, dp_budget_model, model, vietnamese_model, reference_transcription_model
     global model_loading, vietnamese_model_loading, model_load_error, vietnamese_model_load_error
     global model_load_started_at, model_load_finished_at, vietnamese_model_load_started_at, vietnamese_model_load_finished_at
+    stop_reference_transcription_worker()
     _qwen_settings = settings
     dp_budget_model = None
     model = None
     vietnamese_model = None
+    reference_transcription_model = None
     model_loading = False
     vietnamese_model_loading = False
     model_load_error = None
@@ -400,6 +425,7 @@ def demo_defaults() -> dict[str, Any]:
         "non_streaming_mode": _qwen_settings.non_streaming_mode,
         "output_buffer_silence_ms": _qwen_settings.output_buffer_silence_ms,
         "validation": _qwen_settings.validation.model_dump(),
+        "asr": _qwen_settings.asr.model_dump(),
         "disable_cuda_graph": _qwen_settings.disable_cuda_graph,
         "disable_cuda_graph_batch": _qwen_settings.disable_cuda_graph_batch,
         "dp_budget": _qwen_settings.dp_budget.enabled,
@@ -603,6 +629,7 @@ def model_status() -> dict[str, Any]:
         "vietnamese_icl_mode": _qwen_settings.vietnamese_icl_mode,
         "output_buffer_silence_ms": _qwen_settings.output_buffer_silence_ms,
         "validation": _qwen_settings.validation.model_dump(),
+        "asr": reference_transcription_status(),
         "dtype": _qwen_settings.dtype,
         "audio_dtype": _qwen_settings.audio_dtype,
         "attn": _qwen_settings.attn,
@@ -937,55 +964,53 @@ class QwenValidationError(RuntimeError):
         self.info = info
 
 
-def _resolve_reference_transcription_dtype() -> torch.dtype:
-    dtype_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_DTYPE", "bf16").strip().lower()
-    if dtype_name in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    if dtype_name in {"fp16", "float16"}:
-        return torch.float16
-    if dtype_name in {"fp32", "float32"}:
-        return torch.float32
-    raise RuntimeError(f"Unsupported QWEN_TTS_REFERENCE_TRANSCRIPTION_DTYPE={dtype_name!r}")
+def _ensure_reference_transcription_worker() -> WorkerProcessClient:
+    global reference_transcription_worker
+    with reference_transcription_worker_lock:
+        if reference_transcription_worker is None:
+            reference_transcription_worker = WorkerProcessClient(
+                name="qwen-asr",
+                target=qwen_asr_worker_main,
+                args=(_qwen_settings.asr.model_dump(mode="json"),),
+            )
+        return reference_transcription_worker
 
 
-def get_reference_transcription_model() -> tuple[Any, Any, torch.device, torch.dtype]:
+def stop_reference_transcription_worker() -> None:
+    global reference_transcription_worker
+    with reference_transcription_worker_lock:
+        if reference_transcription_worker is not None:
+            reference_transcription_worker.stop()
+            reference_transcription_worker = None
+
+
+def reference_transcription_status() -> dict[str, Any]:
+    status = {
+        **_qwen_settings.asr.model_dump(mode="json"),
+        "model_loaded": reference_transcription_model is not None,
+        "worker_started": reference_transcription_worker is not None,
+    }
+    return status
+
+
+def get_reference_transcription_model() -> QwenASRBackend:
     global reference_transcription_model
-    global reference_transcription_processor
-    global reference_transcription_device
-    global reference_transcription_dtype
 
+    if not _qwen_settings.asr.enabled:
+        raise RuntimeError("Qwen ASR is disabled")
     if reference_transcription_model is None:
-        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+        reference_transcription_model = QwenASRBackend(_qwen_settings.asr)
+    assert isinstance(reference_transcription_model, QwenASRBackend)
+    return reference_transcription_model
 
-        model_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_MODEL", "openai/whisper-small").strip()
-        device_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_DEVICE", "cuda").strip() or "cuda"
-        if device_name == "cuda":
-            device_name = "cuda:0"
-        reference_transcription_device = torch.device(device_name)
-        reference_transcription_dtype = _resolve_reference_transcription_dtype()
 
-        _LOGGER.info(
-            "Loading reference transcription model: model=%s device=%s dtype=%s",
-            model_name,
-            reference_transcription_device,
-            reference_transcription_dtype,
-        )
-        reference_transcription_processor = WhisperProcessor.from_pretrained(model_name)
-        reference_transcription_model = WhisperForConditionalGeneration.from_pretrained(model_name).eval()
-        reference_transcription_model.to(reference_transcription_device)
-        if reference_transcription_dtype != torch.float32:
-            reference_transcription_model.to(dtype=reference_transcription_dtype)
-        _LOGGER.info("Reference transcription model ready.")
-
-    assert reference_transcription_processor is not None
-    assert reference_transcription_device is not None
-    assert reference_transcription_dtype is not None
-    return (
-        reference_transcription_model,
-        reference_transcription_processor,
-        reference_transcription_device,
-        reference_transcription_dtype,
-    )
+def preload_reference_transcription_model() -> None:
+    if not _qwen_settings.asr.enabled:
+        return
+    if _qwen_settings.asr.isolated:
+        _ensure_reference_transcription_worker().call("preload")
+    else:
+        get_reference_transcription_model().load()
 
 
 def get_silero_vad_detector() -> Any:
@@ -1159,60 +1184,33 @@ def sanitize_prompt_text(text: str) -> str:
     return text
 
 
-def _whisper_language_for_locale(locale: str | None) -> str | None:
+def _qwen_asr_language_for_locale(locale: str | None) -> str | None:
     if not locale or locale == "multilingual":
         return None
-    return _locale_base(locale)
+    base = _locale_base(locale)
+    return QWEN_LANGUAGE_NAMES.get(base)
 
 
 def transcribe_voice_sample(audio_file: Path, language: str | None = None) -> str:
-    model_name = os.environ.get("QWEN_TTS_REFERENCE_TRANSCRIPTION_MODEL", "openai/whisper-small").strip()
     transcript_file = audio_file.with_suffix(".txt")
     if transcript_file.exists():
         transcript = transcript_file.read_text(encoding="utf-8").strip()
         if transcript:
             return transcript
 
-    transcriber, processor, device, dtype = get_reference_transcription_model()
-    audio, sample_rate = sf.read(audio_file, dtype="float32", always_2d=False)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    audio = np.asarray(audio, dtype=np.float32)
-    if sample_rate != 16000:
-        import torchaudio
-
-        audio_tensor = torch.from_numpy(audio).unsqueeze(0)
-        audio = (
-            torchaudio.functional.resample(audio_tensor, sample_rate, 16000)
-            .squeeze(0)
-            .cpu()
-            .numpy()
-            .astype(np.float32, copy=False)
+    if not _qwen_settings.asr.enabled:
+        raise RuntimeError("Qwen ASR is disabled")
+    asr_language = _qwen_asr_language_for_locale(language)
+    if _qwen_settings.asr.isolated:
+        response = _ensure_reference_transcription_worker().call(
+            "transcribe",
+            {"audio_file": str(audio_file), "language": asr_language},
         )
-
-    inputs = processor(
-        audio,
-        sampling_rate=16000,
-        return_tensors="pt",
-        return_attention_mask=True,
-    )
-    input_features = inputs.input_features.to(device=device, dtype=dtype)
-    generate_kwargs: dict[str, Any] = {
-        "task": "transcribe",
-    }
-    if language:
-        generate_kwargs["language"] = language
-    attention_mask = getattr(inputs, "attention_mask", None)
-    if attention_mask is not None:
-        generate_kwargs["attention_mask"] = attention_mask.to(device=device)
-
-    with reference_transcription_lock, torch.inference_mode():
-        if device.type == "cuda":
-            with torch.cuda.device(device):
-                predicted_ids = transcriber.generate(input_features, **generate_kwargs)
-        else:
-            predicted_ids = transcriber.generate(input_features, **generate_kwargs)
-    text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+        result = response.get("data") or {}
+    else:
+        with reference_transcription_lock:
+            result = get_reference_transcription_model().transcribe(audio_file, language=asr_language)
+    text = str(result.get("text") or "").strip()
     if not text:
         try:
             audio_info = sf.info(audio_file)
@@ -1224,9 +1222,15 @@ def transcribe_voice_sample(audio_file: Path, language: str | None = None) -> st
             )
         except Exception as e:
             debug = f"path={audio_file} size_bytes={audio_file.stat().st_size} info_error={e}"
-        raise EmptyVoiceTranscriptError(f"Whisper transcript completed with empty text ({debug})")
+        raise EmptyVoiceTranscriptError(f"Qwen ASR transcript completed with empty text ({debug})")
     transcript_file.write_text(text, encoding="utf-8")
-    _LOGGER.info("Reference audio transcribed with Whisper: path=%s text=%s", audio_file, text)
+    _LOGGER.info(
+        "Reference audio transcribed with Qwen ASR: path=%s language=%s detected_language=%s text=%s",
+        audio_file,
+        asr_language,
+        result.get("language"),
+        text,
+    )
     return text
 
 
@@ -1687,7 +1691,7 @@ def _resolve_voice_prompt(req: SynthesizeRequest, settings: _ResolvedGenerationS
         try:
             prompt_text = transcribe_voice_sample(
                 sample_path,
-                language=_whisper_language_for_locale(settings.dp_language),
+                language=settings.dp_language,
             )
         except EmptyVoiceTranscriptError as e:
             _LOGGER.warning(
@@ -1833,6 +1837,44 @@ def _generate_qwen_mp3(
                 duration_score = float("inf")
             failed_candidates.append((duration_score, attempt, mp3_bytes, info))
             if attempt >= attempts:
+                if not xvec_only:
+                    _LOGGER.warning(
+                        "Qwen3 generation failed validation after retries; falling back to xvec-only mode failures=%s",
+                        [candidate[3]["validation"] for candidate in failed_candidates],
+                    )
+                    fallback_wav_data, fallback_sample_rate = _generate_qwen_raw(
+                        model_obj,
+                        sample_path,
+                        "",
+                        True,
+                        use_vietnamese_lora,
+                        settings,
+                    )
+                    fallback_mp3_bytes, fallback_info = _encode_qwen_audio(
+                        fallback_wav_data,
+                        fallback_sample_rate,
+                        settings.max_new_tokens,
+                    )
+                    fallback_validation_info = _qwen_generation_validation_info(
+                        fallback_wav_data,
+                        fallback_sample_rate,
+                        settings,
+                    )
+                    fallback_validation_info.update(
+                        {
+                            "attempt": attempt + 1,
+                            "fallback_after_retries": "xvec_only",
+                            "fallback_from_xvec_only": xvec_only,
+                            "previous_attempts": attempts,
+                            "previous_failures": [
+                                candidate[3]["validation"]
+                                for candidate in failed_candidates
+                            ],
+                        }
+                    )
+                    fallback_info["validation"] = fallback_validation_info
+                    return fallback_mp3_bytes, fallback_info
+
                 _, selected_attempt, selected_mp3_bytes, selected_info = min(
                     failed_candidates,
                     key=lambda item: (item[0], item[1]),
@@ -1840,7 +1882,7 @@ def _generate_qwen_mp3(
                 selected_info["validation"]["selected_after_retries"] = True
                 selected_info["validation"]["selected_attempt"] = selected_attempt
                 _LOGGER.warning(
-                    "Qwen3 generation failed validation after retries; returning closest-duration attempt selected_attempt=%d selected_info=%s",
+                    "Qwen3 xvec-only generation failed validation after retries; returning closest-duration attempt selected_attempt=%d selected_info=%s",
                     selected_attempt,
                     selected_info["validation"],
                 )
