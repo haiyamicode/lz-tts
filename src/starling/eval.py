@@ -59,7 +59,7 @@ def run_configured_eval(
     device = torch.device(device_name)
     model.to(device).eval()
 
-    references = list(eval_cfg.get("references") or [])
+    references = list(eval_cfg.get("references") or []) + _load_dataset_references(cfg, eval_cfg)
     if not references:
         raise ValueError("Starling eval requires eval.references")
 
@@ -78,7 +78,14 @@ def run_configured_eval(
     wav_paths: list[Path] = []
     with torch.inference_mode():
         for sample in samples:
-            for ref_id, ref_data in reference_cache.items():
+            matching_references = {
+                ref_id: ref_data
+                for ref_id, ref_data in reference_cache.items()
+                if _reference_matches_sample(ref_data, sample)
+            }
+            if not matching_references:
+                raise ValueError(f"No eval references matched sample kind {sample.kind!r} for {sample.sample_id}")
+            for ref_id, ref_data in matching_references.items():
                 wav_path = output_dir / f"{sample.sample_id}__ref_{_safe_id(ref_id)}.wav"
                 row = _synthesise_one(
                     cfg=cfg,
@@ -121,7 +128,7 @@ def _load_dataset_samples(cfg: DictConfig, eval_cfg: DictConfig) -> list[EvalSam
     samples: list[EvalSample] = []
     for sample_cfg in sample_cfgs:
         split = str(sample_cfg.get("split", "train"))
-        filelist_path = Path(str(cfg.data.train_filelist_path if split == "train" else cfg.data.valid_filelist_path))
+        filelist_path = _filelist_path(cfg, split)
         language = sample_cfg.get("language")
         count = int(sample_cfg.get("count", 0))
         if count <= 0:
@@ -153,6 +160,49 @@ def _load_dataset_samples(cfg: DictConfig, eval_cfg: DictConfig) -> list[EvalSam
                 )
             )
     return samples
+
+
+def _filelist_path(cfg: DictConfig, split: str) -> Path:
+    if split == "train":
+        return Path(str(cfg.data.train_filelist_path))
+    if split in ("val", "valid", "validation"):
+        return Path(str(cfg.data.valid_filelist_path))
+    raise ValueError(f"Unsupported eval split: {split}")
+
+
+def _load_dataset_references(cfg: DictConfig, eval_cfg: DictConfig) -> list[dict[str, Any]]:
+    reference_cfgs = list(eval_cfg.get("dataset_references") or [])
+    references: list[dict[str, Any]] = []
+    for ref_cfg in reference_cfgs:
+        split = str(ref_cfg.get("split", "train"))
+        filelist_path = _filelist_path(cfg, split)
+        language = ref_cfg.get("language")
+        count = int(ref_cfg.get("count", 0))
+        audio_field = str(ref_cfg.get("audio_field") or "prompt_audio_path")
+        if count <= 0:
+            continue
+        selected = _select_jsonl_rows(filelist_path, count=count, language=language)
+        for row_index, row in selected:
+            path = row.get(audio_field)
+            if not path:
+                raise ValueError(f"Missing {audio_field} in {filelist_path}:{row_index}")
+            speaker = str(row.get("speaker") or language or "spk")
+            source_id = str(row.get("source_utt_id") or row_index)
+            references.append(
+                {
+                    "id": str(ref_cfg.get("id_prefix") or f"{split}_{row_index:05d}_{_safe_id(speaker)}_{_safe_id(source_id)}"),
+                    "path": str(path),
+                    "source_split": split,
+                    "source_index": row_index,
+                    "source_audio_field": audio_field,
+                    "source_audio_path": str(row.get("audio_path") or ""),
+                    "speaker": speaker,
+                    "speaker_id": int(row["speaker_id"]),
+                    "text": str(row.get("text") or ""),
+                    "sample_kinds": list(ref_cfg.get("sample_kinds") or []),
+                }
+            )
+    return references
 
 
 def _select_jsonl_rows(path: Path, count: int, language: str | None = None) -> list[tuple[int, dict[str, Any]]]:
@@ -268,8 +318,14 @@ def _prepare_references(
             "prompt_mel_length": int(prompt_mel.shape[-1]),
             "prompt_original_frames": original_frames,
             "prompt_embedding": prompt_embedding,
+            "sample_kinds": list(ref.get("sample_kinds") or []),
         }
     return out
+
+
+def _reference_matches_sample(ref_data: dict[str, Any], sample: EvalSample) -> bool:
+    sample_kinds = [str(item) for item in ref_data.get("sample_kinds") or []]
+    return not sample_kinds or sample.kind in sample_kinds
 
 
 def _load_audio(path: Path, sample_rate: int) -> torch.Tensor:
@@ -343,6 +399,7 @@ def _synthesise_one(
     prompt_mel = ref_data["prompt_mel"].unsqueeze(0).to(device)
     prompt_mel_lengths = torch.tensor([int(ref_data["prompt_mel_length"])], dtype=torch.long, device=device)
     prompt_embedding = ref_data["prompt_embedding"].unsqueeze(0).to(device)
+    sdp_ratio = _resolve_sdp_ratio(eval_cfg)
 
     output = model.synthesise(
         x,
@@ -353,7 +410,7 @@ def _synthesise_one(
         length_scale=float(eval_cfg.get("length_scale", 1.0)),
         semantic_features=semantic_features,
         noise_scale_w=eval_cfg.get("noise_scale_w"),
-        sdp_ratio=eval_cfg.get("sdp_ratio"),
+        sdp_ratio=sdp_ratio,
         prompt_mel=prompt_mel,
         prompt_mel_lengths=prompt_mel_lengths,
         prompt_embedding=prompt_embedding,
@@ -380,8 +437,29 @@ def _synthesise_one(
         "mel_frames": int(output["mel"].shape[-1]),
         "mel_length": int(output["mel_lengths"][0].item()),
         "rtf_model": float(output["rtf"]),
+        "dp_ratio": "" if sdp_ratio is None else 1.0 - float(sdp_ratio),
+        "sdp_ratio": "" if sdp_ratio is None else float(sdp_ratio),
+        "noise_scale_w": "" if eval_cfg.get("noise_scale_w") is None else float(eval_cfg.get("noise_scale_w")),
         "utmos": "",
     }
+
+
+def _resolve_sdp_ratio(eval_cfg: DictConfig) -> float | None:
+    dp_ratio = eval_cfg.get("dp_ratio")
+    sdp_ratio = eval_cfg.get("sdp_ratio")
+    if dp_ratio is not None:
+        if sdp_ratio is not None:
+            raise ValueError("Use either eval.dp_ratio or eval.sdp_ratio, not both")
+        dp_ratio_float = float(dp_ratio)
+        if not 0.0 <= dp_ratio_float <= 1.0:
+            raise ValueError(f"eval.dp_ratio must be in [0, 1], got {dp_ratio_float}")
+        return 1.0 - dp_ratio_float
+    if sdp_ratio is None:
+        return None
+    sdp_ratio_float = float(sdp_ratio)
+    if not 0.0 <= sdp_ratio_float <= 1.0:
+        raise ValueError(f"eval.sdp_ratio must be in [0, 1], got {sdp_ratio_float}")
+    return sdp_ratio_float
 
 
 def _load_vocoder(name: str, device: torch.device) -> torch.nn.Module:
