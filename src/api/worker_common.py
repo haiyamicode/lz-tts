@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import signal
 import sys
 import threading
 import time
 import uuid
 from collections.abc import Callable
+from multiprocessing.connection import wait as mp_connection_wait
 from typing import Any
 
 from fastapi import HTTPException
@@ -21,6 +23,19 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+def _process_exit_description(exitcode: int | None) -> str:
+    if exitcode is None:
+        return "exitcode unknown"
+    if exitcode < 0:
+        signum = -exitcode
+        try:
+            signame = signal.Signals(signum).name
+        except ValueError:
+            signame = f"signal {signum}"
+        return f"exitcode {exitcode} ({signame})"
+    return f"exitcode {exitcode}"
 
 
 def error_response(exc: Exception) -> dict[str, Any]:
@@ -139,7 +154,31 @@ class WorkerProcessClient:
         )
         try:
             self.requests.put({"request_id": request_id, "action": action, "payload": payload})
+            response_reader = getattr(self.responses, "_reader", None)
+            if response_reader is None:
+                raise HTTPException(status_code=502, detail=f"{self.name} worker response queue is not readable")
             while True:
+                ready = mp_connection_wait([response_reader, self.process.sentinel])
+                if response_reader not in ready:
+                    self.process.join()
+                    exit_detail = _process_exit_description(self.process.exitcode)
+                    with self.start_lock:
+                        if self.process is not None and self.process.exitcode is not None:
+                            self.process = None
+                            self.requests = None
+                            self.responses = None
+                    _LOGGER.error(
+                        "%s worker exited without response action=%s request_id=%s %s elapsed=%.2fs",
+                        self.name,
+                        action,
+                        request_id,
+                        exit_detail,
+                        time.perf_counter() - started,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"{self.name} worker exited without response ({exit_detail})",
+                    )
                 response = self.responses.get()
                 if not isinstance(response, dict):
                     raise HTTPException(status_code=502, detail=f"{self.name} worker returned invalid response")

@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import secrets
+import signal
 import sys
 import threading
 import time
@@ -22,6 +23,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 import multiprocessing as mp
+from multiprocessing.connection import wait as mp_connection_wait
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal, Optional
 from urllib.parse import parse_qsl, urlencode
@@ -68,6 +70,19 @@ _LOGGER = logging.getLogger(__name__)
 load_dotenv()
 
 BINARY_RESPONSE_HEADERS = {"Content-Encoding": "identity"}
+
+
+def _process_exit_description(exitcode: int | None) -> str:
+    if exitcode is None:
+        return "exitcode unknown"
+    if exitcode < 0:
+        signum = -exitcode
+        try:
+            signame = signal.Signals(signum).name
+        except ValueError:
+            signame = f"signal {signum}"
+        return f"exitcode {exitcode} ({signame})"
+    return f"exitcode {exitcode}"
 
 
 def _binary_response(content: bytes, media_type: str, headers: dict[str, str] | None = None) -> Response:
@@ -840,20 +855,42 @@ def _qwen_worker_name_for_request(req: qwen3.SynthesizeRequest) -> str:
     return "vietnamese" if qwen3._is_vietnamese_qwen_language(resolved.qwen_language) else "primary"
 
 
-def _qwen_worker_name_for_batch(req: qwen3.BatchSynthesizeRequest) -> str:
-    if not _separate_vietnamese_qwen_worker_enabled():
-        return "primary"
-    worker_names = {
-        _qwen_worker_name_for_request(item)
-        for item in req.items
-        if item.text and item.text.strip()
-    }
-    if len(worker_names) > 1:
+def _qwen_worker_groups_for_batch(
+    req: qwen3.BatchSynthesizeRequest,
+) -> OrderedDict[str, list[tuple[int, qwen3.SynthesizeRequest]]]:
+    groups: OrderedDict[str, list[tuple[int, qwen3.SynthesizeRequest]]] = OrderedDict()
+    for index, item in enumerate(req.items):
+        worker_name = _qwen_worker_name_for_request(item)
+        groups.setdefault(worker_name, []).append((index, item))
+    return groups
+
+
+def _call_qwen_batch_worker(
+    worker_name: str,
+    indexed_items: list[tuple[int, qwen3.SynthesizeRequest]],
+) -> list[tuple[int, qwen3.BatchSynthesizeItem]]:
+    req = qwen3.BatchSynthesizeRequest(items=[item for _, item in indexed_items])
+    result = _call_qwen_worker(
+        "synthesize_batch",
+        req.model_dump(mode="json"),
+        worker_name=worker_name,
+    )
+    data = result.get("data")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail=f"Qwen3 {worker_name} worker returned invalid batch data")
+    response = qwen3.BatchSynthesizeResponse(**data)
+    if len(response.items) != len(indexed_items):
         raise HTTPException(
-            status_code=400,
-            detail="Qwen3 batch generation cannot mix Vietnamese and non-Vietnamese models in one request",
+            status_code=502,
+            detail=(
+                f"Qwen3 {worker_name} worker returned {len(response.items)} batch items "
+                f"for {len(indexed_items)} requests"
+            ),
         )
-    return next(iter(worker_names), "primary")
+    return [
+        (original_index, item)
+        for (original_index, _), item in zip(indexed_items, response.items)
+    ]
 
 
 def _prepare_qwen_request_for_worker(req: qwen3.SynthesizeRequest) -> qwen3.SynthesizeRequest:
@@ -947,7 +984,31 @@ def _call_qwen_worker(
     _LOGGER.info("Qwen worker request start name=%s action=%s request_id=%s", worker_name, action, request_id)
     try:
         requests.put({"request_id": request_id, "action": action, "payload": payload})
+        response_reader = getattr(responses, "_reader", None)
+        if response_reader is None:
+            raise HTTPException(status_code=502, detail=f"Qwen3 {worker_name} worker response queue is not readable")
         while True:
+            ready = mp_connection_wait([response_reader, process.sentinel])
+            if response_reader not in ready:
+                process.join()
+                exit_detail = _process_exit_description(process.exitcode)
+                with _qwen_worker_start_lock:
+                    if _qwen_worker_processes.get(worker_name) is process:
+                        _qwen_worker_processes[worker_name] = None
+                        _qwen_worker_requests[worker_name] = None
+                        _qwen_worker_responses[worker_name] = None
+                _LOGGER.error(
+                    "Qwen worker exited without response name=%s action=%s request_id=%s %s elapsed=%.2fs",
+                    worker_name,
+                    action,
+                    request_id,
+                    exit_detail,
+                    time.perf_counter() - started,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Qwen3 {worker_name} worker exited without response ({exit_detail})",
+                )
             response = responses.get()
             if not isinstance(response, dict):
                 raise HTTPException(status_code=502, detail="Qwen3 worker returned invalid response")
@@ -3173,18 +3234,31 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         @app.post("/qwen3/synthesize/batch", response_model=qwen3.BatchSynthesizeResponse)
         @app.post("/qwen3/synthesize-batch", response_model=qwen3.BatchSynthesizeResponse)
         async def qwen3_synthesize_batch(request: Request):
+            started = time.perf_counter()
             payload = await request.json()
             req = qwen3.BatchSynthesizeRequest(**payload)
             await _await_engine_ready("qwen3")
             req = await asyncio.to_thread(_prepare_qwen_batch_for_worker, req)
-            worker_name = _qwen_worker_name_for_batch(req)
-            result = await asyncio.to_thread(
-                _call_qwen_worker,
-                "synthesize_batch",
-                req.model_dump(mode="json"),
-                worker_name=worker_name,
+            worker_groups = _qwen_worker_groups_for_batch(req)
+            results = await asyncio.gather(
+                *(
+                    asyncio.to_thread(_call_qwen_batch_worker, worker_name, indexed_items)
+                    for worker_name, indexed_items in worker_groups.items()
+                )
             )
-            return result.get("data")
+            items: list[qwen3.BatchSynthesizeItem | None] = [None] * len(req.items)
+            for worker_items in results:
+                for index, item in worker_items:
+                    items[index] = item
+            final_items = [item for item in items if item is not None]
+            if len(final_items) != len(req.items):
+                raise HTTPException(status_code=502, detail="Qwen3 worker batch response was incomplete")
+            return qwen3.BatchSynthesizeResponse(
+                items=final_items,
+                count=len(final_items),
+                wall_seconds=time.perf_counter() - started,
+                audio_seconds_total=sum(item.audio_seconds for item in final_items),
+            )
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):

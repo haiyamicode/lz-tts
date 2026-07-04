@@ -1920,6 +1920,17 @@ def _generate_qwen_mp3(
             settings,
         )
         try:
+            audio_seconds = float(np.asarray(wav_data).size / sample_rate) if sample_rate else 0.0
+            expected_seconds = _expected_validation_duration_seconds(settings) if settings.validation_enabled else None
+            if settings.validation_enabled:
+                _LOGGER.info(
+                    "Qwen3 validating generation attempt=%d/%d audio_seconds=%.2f expected_seconds=%s prepared_text_chars=%d",
+                    attempt,
+                    attempts,
+                    audio_seconds,
+                    f"{expected_seconds:.2f}" if expected_seconds is not None else None,
+                    len(settings.prepared_text),
+                )
             validation_info = _validate_qwen_generation(wav_data, sample_rate, settings)
             validation_info["attempt"] = attempt
             mp3_bytes, info = _encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens)

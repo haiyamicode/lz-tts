@@ -491,6 +491,19 @@ class QwenDpBudget:
                 result["alignment_error"] = alignment_error
             return result
 
+        if expected_seconds is not None and expected_seconds > 0:
+            duration_ratio = audio_seconds / float(expected_seconds)
+            if duration_ratio > 1.0 + duration_tolerance:
+                _LOGGER.info(
+                    "Qwen DP alignment validation rejected duration before alignment audio_seconds=%.2f expected_seconds=%.2f ratio=%.3f tolerance=%.3f phoneme_count=%d",
+                    audio_seconds,
+                    float(expected_seconds),
+                    duration_ratio,
+                    float(duration_tolerance),
+                    phoneme_count,
+                )
+                return invalid_alignment_result("duration_out_of_range")
+
         y = torch.from_numpy(audio).to(device=self.device, dtype=torch.float32).unsqueeze(0)
         if y.size(1) < int(getattr(model, "hop_length", 256)):
             return invalid_alignment_result("audio_too_short", aligned_frames=0)
