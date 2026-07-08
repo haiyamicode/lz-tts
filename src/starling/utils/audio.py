@@ -12,6 +12,23 @@ def load_wav(full_path):
     return data, sampling_rate
 
 
+def normalize_audio_rms(audio, target_rms=0.1, peak_limit=0.99, eps=1e-6):
+    if target_rms is None or float(target_rms) <= 0:
+        return audio.float()
+
+    audio = audio.float()
+    rms = torch.sqrt(torch.mean(audio.pow(2))).clamp_min(float(eps))
+    audio = audio * (float(target_rms) / rms)
+
+    if peak_limit is not None and float(peak_limit) > 0:
+        peak = audio.abs().amax()
+        peak_value = float(peak.detach().cpu())
+        if peak_value > float(peak_limit):
+            audio = audio * (float(peak_limit) / peak_value)
+
+    return audio.clamp(-1.0, 1.0)
+
+
 def dynamic_range_compression(x, C=1, clip_val=1e-5):
     return np.log(np.clip(x, a_min=clip_val, a_max=None) * C)
 

@@ -9,7 +9,7 @@ import torchaudio as ta
 from lightning import LightningDataModule
 from torch.utils.data.dataloader import DataLoader
 
-from src.starling.utils.audio import mel_spectrogram, vocos_mel_spectrogram
+from src.starling.utils.audio import mel_spectrogram, normalize_audio_rms, vocos_mel_spectrogram
 from src.starling.utils.model import fix_len_compatibility, normalize
 from src.starling.utils.utils import intersperse
 
@@ -55,6 +55,10 @@ class TextMelDataModule(LightningDataModule):
         prompt_embedding_dim=192,
         speaker_auto_id=0,
         speaker_auto_train_prob=0.0,
+        rms_normalize_audio=False,
+        rms_target=0.1,
+        rms_peak_limit=0.99,
+        rms_eps=1e-6,
     ):
         super().__init__()
 
@@ -94,6 +98,10 @@ class TextMelDataModule(LightningDataModule):
             self.hparams.prompt_embedding_dim,
             self.hparams.speaker_auto_id,
             self.hparams.speaker_auto_train_prob,
+            self.hparams.rms_normalize_audio,
+            self.hparams.rms_target,
+            self.hparams.rms_peak_limit,
+            self.hparams.rms_eps,
         )
         self.validset = TextMelDataset(  # pylint: disable=attribute-defined-outside-init
             self.hparams.valid_filelist_path,
@@ -119,6 +127,10 @@ class TextMelDataModule(LightningDataModule):
             self.hparams.prompt_embedding_dim,
             self.hparams.speaker_auto_id,
             0.0,
+            self.hparams.rms_normalize_audio,
+            self.hparams.rms_target,
+            self.hparams.rms_peak_limit,
+            self.hparams.rms_eps,
         )
 
     def train_dataloader(self):
@@ -180,6 +192,10 @@ class TextMelDataset(torch.utils.data.Dataset):
         prompt_embedding_dim=192,
         speaker_auto_id=0,
         speaker_auto_prob=0.0,
+        rms_normalize_audio=False,
+        rms_target=0.1,
+        rms_peak_limit=0.99,
+        rms_eps=1e-6,
     ):
         self.filepaths_and_text = parse_filelist(filelist_path)
         self.n_spks = n_spks
@@ -202,6 +218,10 @@ class TextMelDataset(torch.utils.data.Dataset):
         self.prompt_embedding_dim = int(prompt_embedding_dim)
         self.speaker_auto_id = int(speaker_auto_id)
         self.speaker_auto_prob = float(speaker_auto_prob)
+        self.rms_normalize_audio = bool(rms_normalize_audio)
+        self.rms_target = float(rms_target)
+        self.rms_peak_limit = float(rms_peak_limit)
+        self.rms_eps = float(rms_eps)
         if not 0.0 <= self.speaker_auto_prob <= 1.0:
             raise ValueError(f"speaker_auto_prob must be between 0 and 1, got {self.speaker_auto_prob}")
         if self.n_spks > 1 and not 0 <= self.speaker_auto_id < self.n_spks:
@@ -392,6 +412,8 @@ class TextMelDataset(torch.utils.data.Dataset):
         else:
             audio, sr = ta.load(filepath)
         assert sr == self.sample_rate, f"Expected sample_rate={self.sample_rate}, got {sr} for {filepath}"
+        if self.rms_normalize_audio:
+            audio = normalize_audio_rms(audio, self.rms_target, self.rms_peak_limit, self.rms_eps)
         if self.mel_backend == "vocos_mel_24khz":
             mel = vocos_mel_spectrogram(
                 audio,

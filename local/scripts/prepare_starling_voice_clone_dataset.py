@@ -32,6 +32,7 @@ from modules.campplus.DTDNN import CAMPPlus  # noqa: E402
 from src.piper.hf_cache import resolve_hf_model_path  # noqa: E402
 from src.piper.preprocess import phonemize_texts_for_speaker  # noqa: E402
 from src.piper.semantic import SemanticTokenizer, align_phone_features, build_bert_input  # noqa: E402
+from src.starling.utils.audio import normalize_audio_rms  # noqa: E402
 
 
 DEFAULT_LANG_TO_ID = {
@@ -86,21 +87,30 @@ def embedding_name(audio_path: Path) -> str:
     return f"{audio_path.stem}_{digest}.npy"
 
 
-def load_audio(path: Path, sample_rate: int) -> torch.Tensor:
+def load_audio(
+    path: Path,
+    sample_rate: int,
+    rms_normalize_audio: bool = False,
+    rms_target: float = 0.1,
+    rms_peak_limit: float = 0.99,
+    rms_eps: float = 1e-6,
+) -> torch.Tensor:
     if path.suffix == ".pt":
         audio = torch.load(path, map_location="cpu", weights_only=True).float()
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0, keepdim=True)
-        return audio
-    audio_np, source_rate = sf.read(path, always_2d=True, dtype="float32")
-    audio = torch.from_numpy(audio_np.T.copy())
-    if source_rate != sample_rate:
-        audio = torchaudio.functional.resample(audio, source_rate, sample_rate)
-    if audio.shape[0] > 1:
-        audio = audio.mean(dim=0, keepdim=True)
-    return audio
+    else:
+        audio_np, source_rate = sf.read(path, always_2d=True, dtype="float32")
+        audio = torch.from_numpy(audio_np.T.copy())
+        if source_rate != sample_rate:
+            audio = torchaudio.functional.resample(audio, source_rate, sample_rate)
+        if audio.shape[0] > 1:
+            audio = audio.mean(dim=0, keepdim=True)
+    if rms_normalize_audio:
+        audio = normalize_audio_rms(audio, rms_target, rms_peak_limit, rms_eps)
+    return audio.contiguous()
 
 
 @torch.inference_mode()
@@ -115,11 +125,29 @@ def extract_campplus(model: CAMPPlus, audio_path: Path, sample_rate: int, device
     return embedding.astype(np.float32)
 
 
-def cache_audio(path: Path, output_dir: Path, sample_rate: int) -> str:
+def cache_audio(
+    path: Path,
+    output_dir: Path,
+    sample_rate: int,
+    rms_normalize_audio: bool = False,
+    rms_target: float = 0.1,
+    rms_peak_limit: float = 0.99,
+    rms_eps: float = 1e-6,
+) -> str:
     output_path = output_dir / f"{path.stem}_{hashlib.sha1(str(path.resolve()).encode('utf-8')).hexdigest()[:16]}.pt"
     if not output_path.exists():
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(load_audio(path, sample_rate).contiguous(), output_path)
+        torch.save(
+            load_audio(
+                path,
+                sample_rate,
+                rms_normalize_audio=rms_normalize_audio,
+                rms_target=rms_target,
+                rms_peak_limit=rms_peak_limit,
+                rms_eps=rms_eps,
+            ),
+            output_path,
+        )
     return str(output_path.resolve())
 
 
@@ -351,6 +379,12 @@ def main() -> None:
     parser.add_argument("--bert-batch-size", type=int, default=32)
     parser.add_argument("--bert-storage-dtype", choices=("float32", "float16"), default="float16")
     parser.add_argument("--frontend-batch-size", type=int, default=64)
+    parser.set_defaults(rms_normalize_audio=True)
+    parser.add_argument("--rms-normalize-audio", dest="rms_normalize_audio", action="store_true")
+    parser.add_argument("--no-rms-normalize-audio", dest="rms_normalize_audio", action="store_false")
+    parser.add_argument("--rms-target", type=float, default=0.1)
+    parser.add_argument("--rms-peak-limit", type=float, default=0.99)
+    parser.add_argument("--rms-eps", type=float, default=1e-6)
     parser.add_argument("--purge", action="store_true")
     args = parser.parse_args()
 
@@ -376,12 +410,24 @@ def main() -> None:
             Path(row.get("wav_path") or row.get("audio_path", "")).resolve(),
             target_audio_dir,
             args.sample_rate,
+            rms_normalize_audio=args.rms_normalize_audio,
+            rms_target=args.rms_target,
+            rms_peak_limit=args.rms_peak_limit,
+            rms_eps=args.rms_eps,
         )
         for row in tqdm(rows, desc="Cache target audio")
     }
     reference_paths = sorted({str(Path(row["reference_voice"]).resolve()) for row in rows})
     prompt_audio_paths = {
-        reference: cache_audio(Path(reference), reference_audio_dir, args.sample_rate)
+        reference: cache_audio(
+            Path(reference),
+            reference_audio_dir,
+            args.sample_rate,
+            rms_normalize_audio=args.rms_normalize_audio,
+            rms_target=args.rms_target,
+            rms_peak_limit=args.rms_peak_limit,
+            rms_eps=args.rms_eps,
+        )
         for reference in tqdm(reference_paths, desc="Cache reference audio")
     }
 
@@ -454,6 +500,10 @@ def main() -> None:
         "semantic_max_tokens": args.semantic_max_tokens,
         "bert_storage_dtype": args.bert_storage_dtype,
         "frontend_batch_size": args.frontend_batch_size,
+        "rms_normalize_audio": args.rms_normalize_audio,
+        "rms_target": args.rms_target,
+        "rms_peak_limit": args.rms_peak_limit,
+        "rms_eps": args.rms_eps,
         "langs": dict(sorted(counts.items())),
         "language_id_map": DEFAULT_LANG_TO_ID,
     }

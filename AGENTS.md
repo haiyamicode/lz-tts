@@ -17,7 +17,7 @@ When running long tasks in tmux:
 
 # Qwen3 TTS precision on V100
 - V100 can run Qwen3 TTS inference with `bf16`; it is simulated and slower, but works correctly.
-- Do not use `fp16` for Qwen3 TTS inference on V100; it produces broken audio.
+- Do not use pure `fp16` for Qwen3 TTS inference on V100; it produces broken audio, but we do have an optimized preset for mixed fp16 and fp32 on the V100 that does work well, so don't make changes to the eval/inference code regarding that.
 - Use the RTX 3090 for Qwen3 TTS training. V100 `bf16` is acceptable for inference checks only.
 
 # Building piper-phonemize C++ extension

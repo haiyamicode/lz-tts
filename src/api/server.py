@@ -894,6 +894,8 @@ def _call_qwen_batch_worker(
 
 
 def _prepare_qwen_request_for_worker(req: qwen3.SynthesizeRequest) -> qwen3.SynthesizeRequest:
+    if req.random_voice_embedding:
+        return req
     settings = qwen3._resolve_generation_settings(req)
     _, prompt_text, xvec_only = qwen3._resolve_voice_prompt(req, settings)
     return req.model_copy(update={"voice_text": prompt_text, "xvec_only": xvec_only})
@@ -903,6 +905,9 @@ def _prepare_qwen_batch_for_worker(req: qwen3.BatchSynthesizeRequest) -> qwen3.B
     settings_list = qwen3._resolve_generation_settings_batch(req.items)
     items = []
     for item, settings in zip(req.items, settings_list):
+        if item.random_voice_embedding:
+            items.append(item)
+            continue
         _, prompt_text, xvec_only = qwen3._resolve_voice_prompt(item, settings)
         items.append(item.model_copy(update={"voice_text": prompt_text, "xvec_only": xvec_only}))
     return req.model_copy(update={"items": items})

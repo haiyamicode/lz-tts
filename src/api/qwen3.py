@@ -1485,8 +1485,11 @@ def _encoded_mp3_duration_seconds(mp3_bytes: bytes, fallback: float) -> float:
 
 class SynthesizeRequest(BaseModel):
     text: str
-    voice_url: str
+    voice_url: Optional[str] = None
     voice_text: Optional[str] = None
+    random_voice_embedding: bool = False
+    random_voice_embedding_seed: Optional[int] = None
+    random_voice_embedding_scale: float = Field(1.0, gt=0.0)
     speed: float = 1.0
     language: Optional[str] = None
     language_code: Optional[str] = None
@@ -1771,6 +1774,10 @@ def _resolve_generation_settings_batch(
 
 
 def _resolve_voice_prompt(req: SynthesizeRequest, settings: _ResolvedGenerationSettings) -> tuple[Path, str, bool]:
+    if req.random_voice_embedding:
+        raise HTTPException(400, "random_voice_embedding must be handled without a voice sample")
+    if not req.voice_url:
+        raise HTTPException(400, "voice_url is required unless random_voice_embedding is enabled")
     try:
         sample_path = download_and_cache(req.voice_url)
     except Exception as e:
@@ -1806,6 +1813,35 @@ def _resolve_voice_prompt(req: SynthesizeRequest, settings: _ResolvedGenerationS
     return sample_path, prompt_text, xvec_only
 
 
+def _random_voice_clone_prompt(
+    model_obj: Any,
+    *,
+    seed: int | None,
+    scale: float,
+) -> dict[str, Any]:
+    base_model = getattr(getattr(model_obj, "model", None), "model", None)
+    if base_model is None:
+        raise HTTPException(500, "Qwen model does not expose speaker embedding config")
+    config = getattr(base_model, "config", None)
+    speaker_config = getattr(config, "speaker_encoder_config", None)
+    talker_config = getattr(config, "talker_config", None)
+    dim = getattr(speaker_config, "enc_dim", None) or getattr(talker_config, "hidden_size", None)
+    if dim is None:
+        raise HTTPException(500, "Qwen model config does not expose speaker embedding dimension")
+    dim = int(dim)
+    generator = torch.Generator(device="cpu")
+    if seed is not None:
+        generator.manual_seed(int(seed))
+    embedding = torch.randn(dim, generator=generator, dtype=torch.float32)
+    embedding = torch.nn.functional.normalize(embedding, dim=0) * (float(dim) ** 0.5) * float(scale)
+    return {
+        "ref_code": [None],
+        "ref_spk_embedding": [embedding],
+        "x_vector_only_mode": [True],
+        "icl_mode": [False],
+    }
+
+
 def _generate_qwen_raw(
     model_obj: Any,
     sample_path: Path,
@@ -1826,6 +1862,36 @@ def _generate_qwen_raw(
             top_p=settings.top_p,
             repetition_penalty=settings.repetition_penalty,
             xvec_only=xvec_only,
+            non_streaming_mode=settings.non_streaming_mode,
+            append_silence=True,
+            parity_mode=_qwen_settings.disable_cuda_graph,
+        )
+
+    wav_data = _concat_qwen_audio(audio_list)
+    if wav_data.size == 0:
+        raise HTTPException(500, "Model produced no output")
+
+    return wav_data, sample_rate
+
+
+def _generate_qwen_raw_with_prompt(
+    model_obj: Any,
+    voice_clone_prompt: dict[str, Any],
+    use_vietnamese_lora: bool,
+    settings: _ResolvedGenerationSettings,
+) -> tuple[np.ndarray, int]:
+    with _qwen_model_context(model_obj, use_vietnamese_lora):
+        audio_list, sample_rate = model_obj.generate_voice_clone(
+            text=settings.prepared_text,
+            language=settings.language,
+            ref_audio=None,
+            ref_text="",
+            max_new_tokens=settings.max_new_tokens,
+            temperature=settings.temperature,
+            top_k=settings.top_k,
+            top_p=settings.top_p,
+            repetition_penalty=settings.repetition_penalty,
+            voice_clone_prompt=voice_clone_prompt,
             non_streaming_mode=settings.non_streaming_mode,
             append_silence=True,
             parity_mode=_qwen_settings.disable_cuda_graph,
@@ -2006,6 +2072,61 @@ def _generate_qwen_mp3(
             )
 
     raise HTTPException(500, "Qwen3 generation failed unexpectedly")
+
+
+def _generate_qwen_mp3_with_prompt(
+    model_obj: Any,
+    voice_clone_prompt: dict[str, Any],
+    use_vietnamese_lora: bool,
+    settings: _ResolvedGenerationSettings,
+) -> tuple[bytes, dict[str, Any]]:
+    attempts = max(1, _qwen_settings.validation.max_retries + 1) if settings.validation_enabled else 1
+    failed_candidates: list[tuple[float, int, bytes, dict[str, Any]]] = []
+    for attempt in range(1, attempts + 1):
+        wav_data, sample_rate = _generate_qwen_raw_with_prompt(
+            model_obj,
+            voice_clone_prompt,
+            use_vietnamese_lora,
+            settings,
+        )
+        try:
+            validation_info = _validate_qwen_generation(wav_data, sample_rate, settings)
+            validation_info["attempt"] = attempt
+            mp3_bytes, info = _encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens)
+            info["validation"] = validation_info
+            return mp3_bytes, info
+        except QwenValidationError as exc:
+            validation_info = exc.info | {"attempt": attempt}
+            mp3_bytes, info = _encode_qwen_audio(wav_data, sample_rate, settings.max_new_tokens)
+            info["validation"] = validation_info
+            duration_ratio = validation_info.get("duration_ratio")
+            try:
+                duration_score = abs(float(duration_ratio) - 1.0)
+            except (TypeError, ValueError):
+                duration_score = float("inf")
+            failed_candidates.append((duration_score, attempt, mp3_bytes, info))
+            if attempt >= attempts:
+                _, selected_attempt, selected_mp3_bytes, selected_info = min(
+                    failed_candidates,
+                    key=lambda item: (item[0], item[1]),
+                )
+                selected_info["validation"]["selected_after_retries"] = True
+                selected_info["validation"]["selected_attempt"] = selected_attempt
+                _LOGGER.warning(
+                    "Qwen3 random-embedding generation failed validation after retries; returning closest-duration attempt selected_attempt=%d selected_info=%s",
+                    selected_attempt,
+                    selected_info["validation"],
+                )
+                return selected_mp3_bytes, selected_info
+            _LOGGER.warning(
+                "Qwen3 random-embedding generation failed validation; retrying attempt=%d/%d reason=%s info=%s",
+                attempt,
+                attempts,
+                exc.info.get("reason"),
+                exc.info,
+            )
+
+    raise HTTPException(500, "Qwen3 random-embedding generation failed unexpectedly")
 
 
 def _concat_qwen_audio(audio: Any) -> np.ndarray:
@@ -2334,20 +2455,39 @@ def synthesize(req: SynthesizeRequest):
             raise HTTPException(400, "text is required")
 
         settings = _resolve_generation_settings(req)
-        sample_path, prompt_text, xvec_only = _resolve_voice_prompt(req, settings)
         backend_key = _qwen_model_key_for_language(settings.language)
         qwen_model = get_qwen_model_for_language(settings.language)
         use_vietnamese_lora = backend_key == "vietnamese" and not _qwen_settings.vietnamese_model.strip()
 
         with inference_lock:
-            mp3_bytes, info = _generate_qwen_mp3(
-                qwen_model,
-                sample_path,
-                prompt_text,
-                xvec_only,
-                use_vietnamese_lora,
-                settings,
-            )
+            if req.random_voice_embedding:
+                prompt_text = ""
+                xvec_only = True
+                voice_clone_prompt = _random_voice_clone_prompt(
+                    qwen_model,
+                    seed=req.random_voice_embedding_seed,
+                    scale=req.random_voice_embedding_scale,
+                )
+                mp3_bytes, info = _generate_qwen_mp3_with_prompt(
+                    qwen_model,
+                    voice_clone_prompt,
+                    use_vietnamese_lora,
+                    settings,
+                )
+                info["random_voice_embedding"] = {
+                    "seed": req.random_voice_embedding_seed,
+                    "scale": req.random_voice_embedding_scale,
+                }
+            else:
+                sample_path, prompt_text, xvec_only = _resolve_voice_prompt(req, settings)
+                mp3_bytes, info = _generate_qwen_mp3(
+                    qwen_model,
+                    sample_path,
+                    prompt_text,
+                    xvec_only,
+                    use_vietnamese_lora,
+                    settings,
+                )
             info["backend"] = backend_key
 
         _log_qwen_synthesize_request(

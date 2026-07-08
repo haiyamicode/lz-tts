@@ -24,7 +24,7 @@ from src.piper.hf_cache import resolve_hf_model_path
 from src.piper.preprocess import phonemize_text_for_speaker
 from src.piper.semantic import SemanticTokenizer, align_phone_features, build_bert_input
 from src.starling import utils
-from src.starling.utils.audio import mel_spectrogram, vocos_mel_spectrogram
+from src.starling.utils.audio import mel_spectrogram, normalize_audio_rms, vocos_mel_spectrogram
 from src.starling.utils.model import normalize
 
 log = utils.get_pylogger(__name__)
@@ -305,6 +305,13 @@ def _prepare_references(
         ref_id = str(ref.get("id") or Path(str(ref["path"])).stem)
         path = Path(str(ref["path"]))
         audio = _load_audio(path, sample_rate)
+        if bool(cfg.data.get("rms_normalize_audio", False)):
+            audio = normalize_audio_rms(
+                audio,
+                cfg.data.get("rms_target", 0.1),
+                cfg.data.get("rms_peak_limit", 0.99),
+                cfg.data.get("rms_eps", 1e-6),
+            )
         prompt_mel = _reference_prompt_mel(cfg, audio, sample_rate)
         original_frames = int(prompt_mel.shape[-1])
         max_frames = int(eval_cfg.get("prompt_mel_max_frames") or cfg.data.prompt_mel_max_frames or 0)
