@@ -790,7 +790,7 @@ def _engine_status(engine: str) -> dict[str, Any]:
     }
 
 
-def _wait_for_engine_ready(engine: str) -> None:
+def _wait_for_engine_ready(engine: str, *, timeout: float | None = None) -> None:
     if not _engine_enabled("starling" if engine == "starling" else engine):  # type: ignore[arg-type]
         raise HTTPException(status_code=503, detail=f"{engine} backend is disabled")
 
@@ -802,7 +802,13 @@ def _wait_for_engine_ready(engine: str) -> None:
 
     if state.status == "loading":
         _LOGGER.info("Waiting for %s backend readiness", engine)
-        state.ready.wait()
+        if not state.ready.wait(timeout=timeout):
+            elapsed = time.perf_counter() - state.started_at if state.started_at is not None else None
+            elapsed_text = f" after {elapsed:.1f}s" if elapsed is not None else ""
+            raise HTTPException(
+                status_code=503,
+                detail=f"{engine} backend is still loading{elapsed_text}",
+            )
 
     if state.status == "ready":
         return
@@ -811,8 +817,8 @@ def _wait_for_engine_ready(engine: str) -> None:
     raise HTTPException(status_code=503, detail=f"{engine} backend is still loading")
 
 
-async def _await_engine_ready(engine: str) -> None:
-    await asyncio.to_thread(_wait_for_engine_ready, engine)
+async def _await_engine_ready(engine: str, *, timeout: float | None = None) -> None:
+    await asyncio.to_thread(_wait_for_engine_ready, engine, timeout=timeout)
 
 
 def _separate_vietnamese_qwen_worker_enabled() -> bool:
@@ -3586,7 +3592,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     async def list_synthesize_voices():
         """List voices and locales supported by /synthesize endpoints."""
         if _engine_enabled("seed_vc"):
-            await _await_engine_ready("seed_vc")
+            await _await_engine_ready("seed_vc", timeout=15)
         locales, voices = _build_synthesize_voices_catalog()
         return SynthesizeVoicesResponse(locales=locales, voices=voices)
 

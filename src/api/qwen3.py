@@ -1688,10 +1688,7 @@ def _resolve_generation_settings_batch(
         dp_budget_language_inputs.append(resolved_languages[index].dp_language)
     dp_budget_info_list: list[dict[str, Any] | None] = [None] * len(reqs)
     if dp_budget_indices:
-        try:
-            budgets = predict_dp_budget_batch(dp_budget_texts, languages=dp_budget_language_inputs)
-        except Exception as e:
-            raise HTTPException(500, f"DP budget failed: {e}") from e
+        budgets = predict_dp_budget_batch(dp_budget_texts, languages=dp_budget_language_inputs)
         for request_index, budget_info in zip(dp_budget_indices, budgets):
             dp_budget_info_list[request_index] = budget_info
 

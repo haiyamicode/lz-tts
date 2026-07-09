@@ -623,10 +623,8 @@ async def generate_stream(
                 done_payload["max_new_tokens"] = max_new_tokens
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps(done_payload))
 
-        except Exception as e:
-            import traceback
-            err = {"type": "error", "message": str(e), "detail": traceback.format_exc()}
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps(err))
+        except Exception:
+            _LOGGER.exception("Qwen3 demo streaming generation failed")
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, None)
             if tmp_path and os.path.exists(tmp_path) and not tmp_is_cached:

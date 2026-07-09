@@ -7,8 +7,6 @@ import os
 import sys
 from typing import Any
 
-from fastapi import HTTPException
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,21 +33,6 @@ def _select_cuda_device(device: str) -> None:
 
     torch.cuda.set_device(index)
     _LOGGER.info("Qwen worker selected CUDA device=%s", normalized)
-
-
-def _error_response(exc: Exception) -> dict[str, Any]:
-    if isinstance(exc, HTTPException):
-        return {
-            "ok": False,
-            "status_code": exc.status_code,
-            "detail": exc.detail,
-        }
-    return {
-        "ok": False,
-        "status_code": 500,
-        "error": type(exc).__name__,
-        "detail": str(exc),
-    }
 
 
 def qwen_worker_main(
@@ -140,6 +123,6 @@ def qwen_worker_main(
                         "detail": f"unknown worker action: {action}",
                     }
                 )
-        except Exception as exc:
+        except Exception:
             _LOGGER.exception("Qwen worker action failed: %s", action)
-            response_queue.put({**_error_response(exc), "request_id": request_id})
+            raise

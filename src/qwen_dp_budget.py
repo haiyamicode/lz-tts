@@ -147,11 +147,16 @@ class QwenDpBudget:
             with config_path.open("r", encoding="utf-8") as f:
                 self._model_config = json.load(f)
 
-            model = VitsModel.load_from_checkpoint(
-                str(checkpoint_path),
-                dataset=None,
-                weights_only=False,
-            )
+            # Qwen/Transformers loading can leave PyTorch's default device as
+            # ``meta`` in this worker. Lightning then constructs VITS on meta and
+            # checkpoint copies become no-ops, so force real CPU allocation here.
+            with torch.device("cpu"):
+                model = VitsModel.load_from_checkpoint(
+                    str(checkpoint_path),
+                    dataset=None,
+                    weights_only=False,
+                    map_location="cpu",
+                )
             model.eval()
 
             model_g = model.model_g
@@ -178,12 +183,40 @@ class QwenDpBudget:
                     from src.piper.hf_cache import resolve_hf_model_path
 
                     semantic_path = resolve_hf_model_path(bert_model_name, require_weights=True)
-                    self._semantic_model = AutoModel.from_pretrained(semantic_path).to(self.device).eval()
+                    with torch.device("cpu"):
+                        semantic_model = AutoModel.from_pretrained(semantic_path)
+                    self._semantic_model = semantic_model.to(self.device).eval()
             elif checkpoint_uses_bert:
                 self._strip_bert_from_text_encoder(model_g)
 
+            meta_tensors = self._meta_tensor_names(model_g)
+            if meta_tensors:
+                preview = ", ".join(meta_tensors[:10])
+                suffix = (
+                    f", ... (+{len(meta_tensors) - 10} more)"
+                    if len(meta_tensors) > 10
+                    else ""
+                )
+                raise RuntimeError(
+                    "Qwen DP budget model still has meta tensors after CPU checkpoint load: "
+                    f"{preview}{suffix}"
+                )
             self._model = model_g.to(self.device).eval()
             gc.collect()
+
+    @staticmethod
+    def _meta_tensor_names(model: Any) -> list[str]:
+        names = [
+            f"parameter:{name}"
+            for name, param in model.named_parameters()
+            if getattr(param, "is_meta", False)
+        ]
+        names.extend(
+            f"buffer:{name}"
+            for name, buffer in model.named_buffers()
+            if getattr(buffer, "is_meta", False)
+        )
+        return names
 
     @staticmethod
     def _strip_bert_from_text_encoder(model_g: Any) -> None:
@@ -679,28 +712,35 @@ class QwenDpBudget:
     ) -> torch.Tensor:
         assert self._model is not None
         model = self._model
-        if bert_input is not None:
-            x_encoded, _m_p, _logs_p, x_mask = model.enc_p(
-                x,
-                x_lengths,
-                bert_input=bert_input,
-            )
-        else:
-            x_encoded, _m_p, _logs_p, x_mask = model.enc_p(x, x_lengths)
+        with torch.device(self.device):
+            if bert_input is not None:
+                x_encoded, _m_p, _logs_p, x_mask = model.enc_p(
+                    x,
+                    x_lengths,
+                    bert_input=bert_input,
+                )
+            else:
+                x_encoded, _m_p, _logs_p, x_mask = model.enc_p(x, x_lengths)
 
-        if model.n_speakers > 1:
-            g = model.emb_g(sid).unsqueeze(-1)
-        else:
-            g = None
+            if model.n_speakers > 1:
+                g = model.emb_g(sid).unsqueeze(-1)
+            else:
+                g = None
 
-        if model.use_sdp:
-            dp = model.sdp if model.use_duration_blend else model.dp
-            logw = dp(x_encoded, x_mask, g=g, reverse=True, noise_scale=self.config.noise_scale)
-        else:
-            logw = model.dp(x_encoded, x_mask, g=g)
-        w = torch.exp(logw) * x_mask * self.config.length_scale
-        w_ceil = torch.ceil(w)
-        return torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1)
+            if model.use_sdp:
+                dp = model.sdp if model.use_duration_blend else model.dp
+                logw = dp(
+                    x_encoded,
+                    x_mask,
+                    g=g,
+                    reverse=True,
+                    noise_scale=self.config.noise_scale,
+                )
+            else:
+                logw = model.dp(x_encoded, x_mask, g=g)
+            w = torch.exp(logw) * x_mask * self.config.length_scale
+            w_ceil = torch.ceil(w)
+            return torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1)
 
     def _empty_budget(self, language: str | None = None) -> dict[str, Any]:
         profile_language, profile = self._budget_profile(language)

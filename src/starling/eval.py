@@ -268,13 +268,14 @@ def _prepare_ood_samples(cfg: DictConfig, eval_cfg: DictConfig, device: torch.de
             bert_input["word2ph"][0].to(device),
             len(phoneme_ids),
         ).detach().float().cpu()
+        speaker_id = int(sample_cfg.get("speaker_id", row["speaker_id"]))
         samples.append(
             EvalSample(
                 sample_id=str(sample_cfg.get("id") or f"ood_{index:03d}_{_safe_id(speaker)}"),
                 kind="ood_text",
                 text=str(row["text"]),
                 speaker=speaker,
-                speaker_id=int(row["speaker_id"]),
+                speaker_id=speaker_id,
                 phoneme_ids=phoneme_ids,
                 semantic_features=semantic_features,
             )
