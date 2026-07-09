@@ -1,9 +1,9 @@
 """F5-style DiT estimator behind the native Matcha CFM interface.
 
 This module intentionally does not copy F5-TTS's text/audio prompt input
-interface or classifier-free guidance path. Matcha already expands text into a
-frame-level prior through MAS; this estimator only replaces the internal
-velocity-prediction network used by CFM.
+interface. Matcha already expands text into a frame-level prior through MAS;
+this estimator only replaces the internal velocity-prediction network used by
+CFM. Voice classifier-free guidance is handled by the CFM sampler.
 """
 
 from __future__ import annotations
@@ -261,8 +261,8 @@ class MatchaF5DiTDecoder(nn.Module):
         long_skip_connection: bool = True,
         checkpoint_activations: bool = False,
         global_cond_dim: int | None = None,
-        global_cond_scale: float = 1.0,
         prompt_mel_condition: bool = False,
+        concat_speaker_condition: bool = False,
     ):
         super().__init__()
         if dim != heads * dim_head:
@@ -273,8 +273,8 @@ class MatchaF5DiTDecoder(nn.Module):
         self.dim = dim
         self.depth = depth
         self.checkpoint_activations = checkpoint_activations
-        self.global_cond_scale = float(global_cond_scale)
         self.prompt_mel_condition = bool(prompt_mel_condition)
+        self.concat_speaker_condition = bool(concat_speaker_condition)
 
         self.input_proj = nn.Linear(in_channels, dim)
         self.conv_pos_embed = (
@@ -333,7 +333,7 @@ class MatchaF5DiTDecoder(nn.Module):
 
         h = torch.cat(inputs, dim=1)
         global_cond = spks
-        if spks is not None:
+        if self.concat_speaker_condition and spks is not None:
             spks = spks.unsqueeze(-1).expand(-1, -1, h.shape[-1])
             h = torch.cat((h, spks), dim=1)
         if h.shape[1] != self.in_channels:
@@ -351,7 +351,7 @@ class MatchaF5DiTDecoder(nn.Module):
         if self.global_cond_proj is not None:
             if global_cond is None:
                 raise ValueError("global_cond_dim is configured but no speaker condition was provided")
-            time = time + self.global_cond_proj(global_cond.to(device=time.device, dtype=time.dtype)) * self.global_cond_scale
+            time = time + self.global_cond_proj(global_cond.to(device=time.device, dtype=time.dtype))
         residual = h
         for block in self.transformer_blocks:
             if self.checkpoint_activations and self.training:

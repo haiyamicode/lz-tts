@@ -314,9 +314,6 @@ def _prepare_references(
             )
         prompt_mel = _reference_prompt_mel(cfg, audio, sample_rate)
         original_frames = int(prompt_mel.shape[-1])
-        max_frames = int(eval_cfg.get("prompt_mel_max_frames") or cfg.data.prompt_mel_max_frames or 0)
-        if max_frames > 0 and prompt_mel.shape[-1] > max_frames:
-            prompt_mel = prompt_mel[:, :max_frames]
         prompt_embedding = _extract_campplus(campplus, audio, sample_rate, device).cpu()
         out[ref_id] = {
             "path": str(path),
@@ -421,6 +418,7 @@ def _synthesise_one(
         prompt_mel=prompt_mel,
         prompt_mel_lengths=prompt_mel_lengths,
         prompt_embedding=prompt_embedding,
+        voice_cfg_scale=float(eval_cfg.get("voice_cfg_scale", 1.0)),
     )
     audio = vocoder.decode(output["mel"]).clamp(-1, 1).squeeze().detach().float().cpu().numpy()
     sf.write(wav_path, np.clip(audio, -1.0, 1.0), int(eval_cfg.get("sample_rate") or cfg.data.sample_rate), subtype="PCM_24")

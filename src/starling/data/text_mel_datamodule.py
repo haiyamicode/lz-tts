@@ -50,7 +50,6 @@ class TextMelDataModule(LightningDataModule):
         prompt_mel_enabled=False,
         prompt_mel_same_speaker_prob=1.0,
         prompt_mel_same_utterance_prob=0.05,
-        prompt_mel_max_frames=512,
         prompt_embedding_enabled=False,
         prompt_embedding_dim=192,
         speaker_auto_id=0,
@@ -93,7 +92,6 @@ class TextMelDataModule(LightningDataModule):
             self.hparams.prompt_mel_enabled,
             self.hparams.prompt_mel_same_speaker_prob,
             self.hparams.prompt_mel_same_utterance_prob,
-            self.hparams.prompt_mel_max_frames,
             self.hparams.prompt_embedding_enabled,
             self.hparams.prompt_embedding_dim,
             self.hparams.speaker_auto_id,
@@ -122,7 +120,6 @@ class TextMelDataModule(LightningDataModule):
             self.hparams.prompt_mel_enabled,
             1.0,
             0.0,
-            self.hparams.prompt_mel_max_frames,
             self.hparams.prompt_embedding_enabled,
             self.hparams.prompt_embedding_dim,
             self.hparams.speaker_auto_id,
@@ -187,7 +184,6 @@ class TextMelDataset(torch.utils.data.Dataset):
         prompt_mel_enabled=False,
         prompt_mel_same_speaker_prob=1.0,
         prompt_mel_same_utterance_prob=0.05,
-        prompt_mel_max_frames=512,
         prompt_embedding_enabled=False,
         prompt_embedding_dim=192,
         speaker_auto_id=0,
@@ -213,7 +209,6 @@ class TextMelDataset(torch.utils.data.Dataset):
         self.prompt_mel_enabled = prompt_mel_enabled
         self.prompt_mel_same_speaker_prob = float(prompt_mel_same_speaker_prob)
         self.prompt_mel_same_utterance_prob = float(prompt_mel_same_utterance_prob)
-        self.prompt_mel_max_frames = int(prompt_mel_max_frames or 0)
         self.prompt_embedding_enabled = prompt_embedding_enabled
         self.prompt_embedding_dim = int(prompt_embedding_dim)
         self.speaker_auto_id = int(speaker_auto_id)
@@ -280,13 +275,6 @@ class TextMelDataset(torch.utils.data.Dataset):
         self.prompt_candidates = all_candidates
         self.prompt_candidates_by_speaker = candidates
 
-    def _crop_prompt_mel(self, mel):
-        max_frames = self.prompt_mel_max_frames
-        if max_frames <= 0 or mel.shape[-1] <= max_frames:
-            return mel
-        start = self._prompt_rng.randint(0, mel.shape[-1] - max_frames)
-        return mel[:, start : start + max_frames]
-
     def get_prompt_mel(self, filepath_and_text, filepath):
         if not self.prompt_mel_enabled:
             return None
@@ -295,7 +283,7 @@ class TextMelDataset(torch.utils.data.Dataset):
                 "prompt_audio_path"
             )
             if explicit_prompt:
-                return self._crop_prompt_mel(self.get_mel(explicit_prompt))
+                return self.get_mel(explicit_prompt)
         speaker = self._speaker_from_row(filepath_and_text)
         prompt_path = filepath
         if speaker is not None and self._prompt_rng.random() < self.prompt_mel_same_speaker_prob:
@@ -305,7 +293,7 @@ class TextMelDataset(torch.utils.data.Dataset):
         if candidates and self._prompt_rng.random() >= self.prompt_mel_same_utterance_prob:
             alternatives = [candidate for candidate in candidates if candidate != filepath]
             prompt_path = self._prompt_rng.choice(alternatives or candidates)
-        return self._crop_prompt_mel(self.get_mel(prompt_path))
+        return self.get_mel(prompt_path)
 
     def get_prompt_embedding(self, filepath_and_text):
         if not self.prompt_embedding_enabled:

@@ -37,10 +37,10 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         prior_loss=True,
         use_precomputed_durations=False,
         freeze_spk_emb=False,
-        speaker_condition_scale=1.0,
-        prompt_condition_scale=1.0,
         prompt_mel_conditioning=None,
         prompt_embedding_encoder=None,
+        condition_dim=None,
+        voice_conditioning_cfg=None,
     ):
         super().__init__()
 
@@ -49,30 +49,35 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         self.n_vocab = n_vocab
         self.n_spks = n_spks
         self.spk_emb_dim = spk_emb_dim
+        self.condition_dim = int(spk_emb_dim if condition_dim is None else condition_dim)
         self.n_feats = n_feats
         self.out_size = out_size
         self.prior_loss = prior_loss
         self.use_precomputed_durations = use_precomputed_durations
-        self.speaker_condition_scale = float(speaker_condition_scale)
-        self.prompt_condition_scale = float(prompt_condition_scale)
         self.prompt_mel_enabled = bool(prompt_mel_conditioning and prompt_mel_conditioning.get("enabled", False))
         self.prompt_embedding_enabled = bool(prompt_embedding_encoder and prompt_embedding_encoder.get("enabled", False))
-        encoder_condition_n_spks = n_spks if n_spks > 1 else 1
-        decoder_condition_n_spks = n_spks if n_spks > 1 or self.prompt_embedding_enabled else 1
+        voice_conditioning_cfg = voice_conditioning_cfg or {}
+        self.voice_cfg_drop_prob = float(voice_conditioning_cfg.get("cfg_drop_prob", 0.0))
+        self.voice_cfg_inference_scale = float(voice_conditioning_cfg.get("inference_scale", 1.0))
+        if not 0.0 <= self.voice_cfg_drop_prob <= 1.0:
+            raise ValueError(f"voice_conditioning_cfg.cfg_drop_prob must be in [0, 1], got {self.voice_cfg_drop_prob}")
+        condition_enabled = n_spks > 1 or self.prompt_embedding_enabled
+        encoder_condition_n_spks = n_spks if n_spks > 1 else (2 if condition_enabled else 1)
+        decoder_condition_n_spks = n_spks if n_spks > 1 else (2 if condition_enabled else 1)
 
         if n_spks > 1:
-            self.spk_emb = torch.nn.Embedding(n_spks, spk_emb_dim)
+            self.spk_emb = torch.nn.Embedding(n_spks, self.condition_dim)
             if freeze_spk_emb:
                 self.spk_emb.weight.requires_grad_(False)
         if self.prompt_embedding_enabled:
-            input_dim = int(prompt_embedding_encoder.get("input_dim", spk_emb_dim))
-            hidden_dim = int(prompt_embedding_encoder.get("hidden_dim", max(spk_emb_dim * 4, input_dim)))
+            input_dim = int(prompt_embedding_encoder.get("input_dim", self.condition_dim))
+            hidden_dim = int(prompt_embedding_encoder.get("hidden_dim", max(self.condition_dim * 4, input_dim)))
             self.prompt_embedding_proj = torch.nn.Sequential(
                 torch.nn.LayerNorm(input_dim),
                 torch.nn.Linear(input_dim, hidden_dim),
                 torch.nn.SiLU(),
                 torch.nn.Dropout(prompt_embedding_encoder.get("dropout", 0.0)),
-                torch.nn.Linear(hidden_dim, spk_emb_dim),
+                torch.nn.Linear(hidden_dim, self.condition_dim),
             )
             if prompt_embedding_encoder.get("zero_init", False):
                 torch.nn.init.zeros_(self.prompt_embedding_proj[-1].weight)
@@ -84,7 +89,7 @@ class MatchaTTS(BaseLightningClass):  # 🍵
             encoder.duration_predictor_params,
             n_vocab,
             encoder_condition_n_spks,
-            spk_emb_dim,
+            self.condition_dim,
         )
 
         self.decoder = CFM(
@@ -93,22 +98,42 @@ class MatchaTTS(BaseLightningClass):  # 🍵
             cfm_params=cfm,
             decoder_params=decoder,
             n_spks=decoder_condition_n_spks,
-            spk_emb_dim=spk_emb_dim,
+            spk_emb_dim=self.condition_dim,
         )
 
         self.update_data_statistics(data_statistics)
 
-    def _conditions(self, spks=None, prompt_embedding=None):
-        cond = None
+    def _voice_condition_drop_mask(self, batch_size, device):
+        if not self.training or self.voice_cfg_drop_prob <= 0.0:
+            return None
+        return torch.rand(batch_size, device=device) < self.voice_cfg_drop_prob
+
+    @staticmethod
+    def _apply_voice_drop(x, voice_drop_mask):
+        if x is None or voice_drop_mask is None or not bool(voice_drop_mask.any()):
+            return x
+        x = x.clone()
+        x[voice_drop_mask] = 0
+        return x
+
+    def _conditions(self, spks=None, prompt_embedding=None, voice_drop_mask=None, return_parts=False):
+        speaker_cond = None
+        voice_cond = None
         if self.n_spks > 1:
             if spks is None:
                 raise ValueError("spks is required when n_spks > 1")
-            cond = self.spk_emb(spks.long()) * self.speaker_condition_scale
+            speaker_cond = self.spk_emb(spks.long())
         if self.prompt_embedding_enabled and prompt_embedding is not None:
-            dtype = cond.dtype if cond is not None else self.prompt_embedding_proj[1].weight.dtype
+            dtype = speaker_cond.dtype if speaker_cond is not None else self.prompt_embedding_proj[1].weight.dtype
             voice_cond = self.prompt_embedding_proj(prompt_embedding.to(device=self.device, dtype=dtype))
-            voice_cond = voice_cond * self.prompt_condition_scale
+            if voice_drop_mask is not None:
+                voice_cond = self._apply_voice_drop(voice_cond, voice_drop_mask)
+
+        cond = speaker_cond
+        if voice_cond is not None:
             cond = voice_cond if cond is None else cond + voice_cond.to(dtype=cond.dtype)
+        if return_parts:
+            return cond, speaker_cond, voice_cond
         return cond
 
     @torch.inference_mode()
@@ -126,6 +151,7 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         prompt_mel=None,
         prompt_mel_lengths=None,
         prompt_embedding=None,
+        voice_cfg_scale=None,
     ):
         """
         Generates mel-spectrogram from text. Returns:
@@ -164,7 +190,19 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         # For RTF computation
         t = dt.datetime.now()
 
-        spks = self._conditions(spks, prompt_embedding)
+        spks, speaker_cond, voice_cond = self._conditions(spks, prompt_embedding, return_parts=True)
+        if voice_cfg_scale is None:
+            voice_cfg_scale = self.voice_cfg_inference_scale
+        voice_cfg_scale = float(voice_cfg_scale)
+        cfg_spks = None
+        cfg_cond = None
+        if voice_cfg_scale != 1.0 and (voice_cond is not None or prompt_mel is not None):
+            cfg_spks = speaker_cond
+            if cfg_spks is None:
+                reference = voice_cond if voice_cond is not None else spks
+                if reference is not None:
+                    cfg_spks = torch.zeros_like(reference)
+            cfg_cond = {}
 
         # Get encoder_outputs `mu_x` and log-scaled token durations `logw`
         if self.encoder.use_sdp:
@@ -181,6 +219,7 @@ class MatchaTTS(BaseLightningClass):  # 🍵
                 x_mask,
                 sdp_ratio=sdp_ratio,
                 noise_scale_w=noise_scale_w,
+                condition=spks,
             )
         else:
             mu_x, logw, x_mask = self.encoder(x, x_lengths, spks, semantic_features=semantic_features)
@@ -210,6 +249,9 @@ class MatchaTTS(BaseLightningClass):  # 🍵
             spks,
             prompt_mel=prompt_mel,
             prompt_mel_lengths=prompt_mel_lengths,
+            voice_cfg_scale=voice_cfg_scale,
+            cfg_spks=cfg_spks,
+            cfg_cond=cfg_cond,
         )
         decoder_outputs = decoder_outputs[:, :, :y_max_length]
 
@@ -260,7 +302,8 @@ class MatchaTTS(BaseLightningClass):  # 🍵
             spks (torch.Tensor, optional): speaker ids.
                 shape: (batch_size,)
         """
-        spks = self._conditions(spks, prompt_embedding)
+        voice_drop_mask = self._voice_condition_drop_mask(x.shape[0], x.device)
+        spks = self._conditions(spks, prompt_embedding, voice_drop_mask=voice_drop_mask)
 
         # Get encoder_outputs `mu_x` and log-scaled token durations `logw`
         if self.encoder.use_sdp:
@@ -300,7 +343,12 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         logw_ = torch.log(1e-8 + target_durations) * x_mask
         dur_dp_loss = duration_loss(logw, logw_, x_lengths)
         if self.encoder.use_sdp:
-            dur_sdp_loss = self.encoder.stochastic_duration_loss(duration_hidden, x_mask, target_durations)
+            dur_sdp_loss = self.encoder.stochastic_duration_loss(
+                duration_hidden,
+                x_mask,
+                target_durations,
+                condition=spks,
+            )
             dur_loss = dur_dp_loss + dur_sdp_loss
         else:
             dur_sdp_loss = None
@@ -346,6 +394,7 @@ class MatchaTTS(BaseLightningClass):  # 🍵
             cond=cond,
             prompt_mel=prompt_mel,
             prompt_mel_lengths=prompt_mel_lengths,
+            prompt_drop_mask=voice_drop_mask,
         )
 
         if self.prior_loss:

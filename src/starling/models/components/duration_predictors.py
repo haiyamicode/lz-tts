@@ -9,6 +9,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from src.starling.models.components.conditioning import FiLM1d
+
 
 class LayerNorm(nn.Module):
     def __init__(self, channels: int, eps: float = 1e-5):
@@ -25,14 +27,24 @@ class LayerNorm(nn.Module):
 
 
 class DDSConv(nn.Module):
-    def __init__(self, channels: int, kernel_size: int, n_layers: int, p_dropout: float = 0.0):
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int,
+        n_layers: int,
+        p_dropout: float = 0.0,
+        condition_dim: int = 0,
+    ):
         super().__init__()
         self.n_layers = n_layers
+        self.condition_dim = int(condition_dim or 0)
         self.drop = nn.Dropout(p_dropout)
         self.convs_sep = nn.ModuleList()
         self.convs_1x1 = nn.ModuleList()
         self.norms_1 = nn.ModuleList()
         self.norms_2 = nn.ModuleList()
+        self.films_1 = nn.ModuleList()
+        self.films_2 = nn.ModuleList()
         for i in range(n_layers):
             dilation = kernel_size**i
             padding = (kernel_size * dilation - dilation) // 2
@@ -42,16 +54,28 @@ class DDSConv(nn.Module):
             self.convs_1x1.append(nn.Conv1d(channels, channels, 1))
             self.norms_1.append(LayerNorm(channels))
             self.norms_2.append(LayerNorm(channels))
+            self.films_1.append(FiLM1d(self.condition_dim, channels) if self.condition_dim > 0 else nn.Identity())
+            self.films_2.append(FiLM1d(self.condition_dim, channels) if self.condition_dim > 0 else nn.Identity())
 
-    def forward(self, x: torch.Tensor, x_mask: torch.Tensor, g: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_mask: torch.Tensor,
+        g: torch.Tensor | None = None,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if g is not None:
             x = x + g
         for i in range(self.n_layers):
             y = self.convs_sep[i](x * x_mask)
             y = self.norms_1[i](y)
+            if self.condition_dim > 0:
+                y = self.films_1[i](y, condition, x_mask)
             y = F.gelu(y)
             y = self.convs_1x1[i](y)
             y = self.norms_2[i](y)
+            if self.condition_dim > 0:
+                y = self.films_2[i](y, condition, x_mask)
             y = F.gelu(y)
             y = self.drop(y)
             x = x + y
@@ -255,21 +279,29 @@ class ConvFlow(nn.Module):
         n_layers: int,
         num_bins: int = 10,
         tail_bound: float = 5.0,
+        condition_dim: int = 0,
     ):
         super().__init__()
         self.num_bins = num_bins
         self.tail_bound = tail_bound
         self.half_channels = in_channels // 2
         self.pre = nn.Conv1d(self.half_channels, filter_channels, 1)
-        self.convs = DDSConv(filter_channels, kernel_size, n_layers, p_dropout=0.0)
+        self.convs = DDSConv(filter_channels, kernel_size, n_layers, p_dropout=0.0, condition_dim=condition_dim)
         self.proj = nn.Conv1d(filter_channels, self.half_channels * (num_bins * 3 - 1), 1)
         self.proj.weight.data.zero_()
         self.proj.bias.data.zero_()
 
-    def forward(self, x: torch.Tensor, x_mask: torch.Tensor, g: torch.Tensor | None = None, reverse: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_mask: torch.Tensor,
+        g: torch.Tensor | None = None,
+        reverse: bool = False,
+        condition: torch.Tensor | None = None,
+    ):
         x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
         h = self.pre(x0)
-        h = self.convs(h, x_mask, g=g)
+        h = self.convs(h, x_mask, g=g, condition=condition)
         h = self.proj(h) * x_mask
         b, c, t = x0.shape
         h = h.reshape(b, c, -1, t).permute(0, 1, 3, 2)
@@ -300,26 +332,40 @@ class StochasticDurationPredictor(nn.Module):
         kernel_size: int,
         p_dropout: float,
         n_flows: int = 4,
+        condition_dim: int = 0,
     ):
         super().__init__()
         filter_channels = in_channels
+        self.condition_dim = int(condition_dim or 0)
         self.log_flow = Log()
         self.flows = nn.ModuleList([ElementwiseAffine(2)])
         for _ in range(n_flows):
-            self.flows.append(ConvFlow(2, filter_channels, kernel_size, n_layers=3))
+            self.flows.append(ConvFlow(2, filter_channels, kernel_size, n_layers=3, condition_dim=self.condition_dim))
             self.flows.append(Flip())
 
         self.post_pre = nn.Conv1d(1, filter_channels, 1)
         self.post_proj = nn.Conv1d(filter_channels, filter_channels, 1)
-        self.post_convs = DDSConv(filter_channels, kernel_size, n_layers=3, p_dropout=p_dropout)
+        self.post_convs = DDSConv(
+            filter_channels,
+            kernel_size,
+            n_layers=3,
+            p_dropout=p_dropout,
+            condition_dim=self.condition_dim,
+        )
         self.post_flows = nn.ModuleList([ElementwiseAffine(2)])
         for _ in range(4):
-            self.post_flows.append(ConvFlow(2, filter_channels, kernel_size, n_layers=3))
+            self.post_flows.append(ConvFlow(2, filter_channels, kernel_size, n_layers=3, condition_dim=self.condition_dim))
             self.post_flows.append(Flip())
 
         self.pre = nn.Conv1d(in_channels, filter_channels, 1)
         self.proj = nn.Conv1d(filter_channels, filter_channels, 1)
-        self.convs = DDSConv(filter_channels, kernel_size, n_layers=3, p_dropout=p_dropout)
+        self.convs = DDSConv(
+            filter_channels,
+            kernel_size,
+            n_layers=3,
+            p_dropout=p_dropout,
+            condition_dim=self.condition_dim,
+        )
 
     def forward(
         self,
@@ -328,10 +374,11 @@ class StochasticDurationPredictor(nn.Module):
         w: torch.Tensor | None = None,
         reverse: bool = False,
         noise_scale: float = 1.0,
+        condition: torch.Tensor | None = None,
     ):
         x = torch.detach(x)
         x = self.pre(x)
-        x = self.convs(x, x_mask)
+        x = self.convs(x, x_mask, condition=condition)
         x = self.proj(x) * x_mask
 
         if reverse:
@@ -339,7 +386,7 @@ class StochasticDurationPredictor(nn.Module):
             flows = flows[:-2] + [flows[-1]]
             z = torch.randn(x.size(0), 2, x.size(2), dtype=x.dtype, device=x.device) * noise_scale
             for flow in flows:
-                z = flow(z, x_mask, g=x, reverse=True)
+                z = flow(z, x_mask, g=x, reverse=True, condition=condition)
             z0, _ = torch.split(z, [1, 1], 1)
             return z0 * x_mask
 
@@ -348,12 +395,12 @@ class StochasticDurationPredictor(nn.Module):
 
         logdet_tot_q = 0
         h_w = self.post_pre(w)
-        h_w = self.post_convs(h_w, x_mask)
+        h_w = self.post_convs(h_w, x_mask, condition=condition)
         h_w = self.post_proj(h_w) * x_mask
         e_q = torch.randn(w.size(0), 2, w.size(2), dtype=x.dtype, device=x.device) * x_mask
         z_q = e_q
         for flow in self.post_flows:
-            z_q, logdet_q = flow(z_q, x_mask, g=(x + h_w))
+            z_q, logdet_q = flow(z_q, x_mask, g=(x + h_w), condition=condition)
             logdet_tot_q += logdet_q
         z_u, z1 = torch.split(z_q, [1, 1], 1)
         u = torch.sigmoid(z_u) * x_mask
@@ -366,7 +413,7 @@ class StochasticDurationPredictor(nn.Module):
         logdet_tot += logdet
         z = torch.cat([z0, z1], 1)
         for flow in self.flows:
-            z, logdet = flow(z, x_mask, g=x)
+            z, logdet = flow(z, x_mask, g=x, condition=condition)
             logdet_tot += logdet
         nll = torch.sum(0.5 * (math.log(2 * math.pi) + (z**2)) * x_mask, [1, 2]) - logdet_tot
         return nll + logq

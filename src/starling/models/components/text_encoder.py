@@ -7,6 +7,7 @@ import torch.nn as nn  # pylint: disable=consider-using-from-import
 from einops import rearrange
 
 import src.starling.utils as utils  # pylint: disable=consider-using-from-import
+from src.starling.models.components.conditioning import FiLM1d
 from src.starling.models.components.duration_predictors import StochasticDurationPredictor
 from src.starling.utils.model import sequence_mask
 
@@ -69,27 +70,34 @@ class ConvReluNorm(nn.Module):
 
 
 class DurationPredictor(nn.Module):
-    def __init__(self, in_channels, filter_channels, kernel_size, p_dropout):
+    def __init__(self, in_channels, filter_channels, kernel_size, p_dropout, condition_dim=0):
         super().__init__()
         self.in_channels = in_channels
         self.filter_channels = filter_channels
         self.p_dropout = p_dropout
+        self.condition_dim = int(condition_dim or 0)
 
         self.drop = torch.nn.Dropout(p_dropout)
         self.conv_1 = torch.nn.Conv1d(in_channels, filter_channels, kernel_size, padding=kernel_size // 2)
         self.norm_1 = LayerNorm(filter_channels)
+        self.film_1 = FiLM1d(self.condition_dim, filter_channels) if self.condition_dim > 0 else None
         self.conv_2 = torch.nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size // 2)
         self.norm_2 = LayerNorm(filter_channels)
+        self.film_2 = FiLM1d(self.condition_dim, filter_channels) if self.condition_dim > 0 else None
         self.proj = torch.nn.Conv1d(filter_channels, 1, 1)
 
-    def forward(self, x, x_mask):
+    def forward(self, x, x_mask, condition=None):
         x = self.conv_1(x * x_mask)
         x = torch.relu(x)
         x = self.norm_1(x)
+        if self.film_1 is not None:
+            x = self.film_1(x, condition, x_mask)
         x = self.drop(x)
         x = self.conv_2(x * x_mask)
         x = torch.relu(x)
         x = self.norm_2(x)
+        if self.film_2 is not None:
+            x = self.film_2(x, condition, x_mask)
         x = self.drop(x)
         x = self.proj(x * x_mask)
         return x * x_mask
@@ -283,6 +291,7 @@ class Encoder(nn.Module):
         n_layers,
         kernel_size=1,
         p_dropout=0.0,
+        condition_dim=0,
         **kwargs,
     ):
         super().__init__()
@@ -292,15 +301,21 @@ class Encoder(nn.Module):
         self.n_layers = n_layers
         self.kernel_size = kernel_size
         self.p_dropout = p_dropout
+        self.condition_dim = int(condition_dim or 0)
 
         self.drop = torch.nn.Dropout(p_dropout)
         self.attn_layers = torch.nn.ModuleList()
         self.norm_layers_1 = torch.nn.ModuleList()
+        self.film_layers_1 = torch.nn.ModuleList()
         self.ffn_layers = torch.nn.ModuleList()
         self.norm_layers_2 = torch.nn.ModuleList()
+        self.film_layers_2 = torch.nn.ModuleList()
         for _ in range(self.n_layers):
             self.attn_layers.append(MultiHeadAttention(hidden_channels, hidden_channels, n_heads, p_dropout=p_dropout))
             self.norm_layers_1.append(LayerNorm(hidden_channels))
+            self.film_layers_1.append(
+                FiLM1d(self.condition_dim, hidden_channels) if self.condition_dim > 0 else torch.nn.Identity()
+            )
             self.ffn_layers.append(
                 FFN(
                     hidden_channels,
@@ -311,17 +326,24 @@ class Encoder(nn.Module):
                 )
             )
             self.norm_layers_2.append(LayerNorm(hidden_channels))
+            self.film_layers_2.append(
+                FiLM1d(self.condition_dim, hidden_channels) if self.condition_dim > 0 else torch.nn.Identity()
+            )
 
-    def forward(self, x, x_mask):
+    def forward(self, x, x_mask, condition=None):
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         for i in range(self.n_layers):
             x = x * x_mask
             y = self.attn_layers[i](x, x, attn_mask)
             y = self.drop(y)
             x = self.norm_layers_1[i](x + y)
+            if self.condition_dim > 0:
+                x = self.film_layers_1[i](x, condition, x_mask)
             y = self.ffn_layers[i](x, x_mask)
             y = self.drop(y)
             x = self.norm_layers_2[i](x + y)
+            if self.condition_dim > 0:
+                x = self.film_layers_2[i](x, condition, x_mask)
         x = x * x_mask
         return x
 
@@ -343,6 +365,7 @@ class TextEncoder(nn.Module):
         self.n_channels = encoder_params.n_channels
         self.spk_emb_dim = spk_emb_dim
         self.n_spks = n_spks
+        self.condition_dim = spk_emb_dim if n_spks > 1 else 0
         self.semantic_dim = int(getattr(encoder_params, "semantic_dim", 0) or 0)
         self.use_sdp = bool(getattr(duration_predictor_params, "use_sdp", False))
         self.duration_sdp_loss_weight = float(getattr(duration_predictor_params, "sdp_loss_weight", 1.0))
@@ -371,27 +394,31 @@ class TextEncoder(nn.Module):
             self.prenet = lambda x, x_mask: x
 
         self.encoder = Encoder(
-            encoder_params.n_channels + (spk_emb_dim if n_spks > 1 else 0),
+            encoder_params.n_channels,
             encoder_params.filter_channels,
             encoder_params.n_heads,
             encoder_params.n_layers,
             encoder_params.kernel_size,
             encoder_params.p_dropout,
+            condition_dim=self.condition_dim,
         )
 
-        self.proj_m = torch.nn.Conv1d(self.n_channels + (spk_emb_dim if n_spks > 1 else 0), self.n_feats, 1)
+        self.encoder_input_film = FiLM1d(self.condition_dim, self.n_channels) if self.condition_dim > 0 else None
+        self.proj_m = torch.nn.Conv1d(self.n_channels, self.n_feats, 1)
         self.proj_w = DurationPredictor(
-            self.n_channels + (spk_emb_dim if n_spks > 1 else 0),
+            self.n_channels,
             duration_predictor_params.filter_channels_dp,
             duration_predictor_params.kernel_size,
             duration_predictor_params.p_dropout,
+            condition_dim=self.condition_dim,
         )
         if self.use_sdp:
             self.proj_w_sdp = StochasticDurationPredictor(
-                self.n_channels + (spk_emb_dim if n_spks > 1 else 0),
+                self.n_channels,
                 duration_predictor_params.filter_channels_dp,
                 duration_predictor_params.kernel_size,
                 duration_predictor_params.p_dropout,
+                condition_dim=self.condition_dim,
             )
         else:
             self.proj_w_sdp = None
@@ -448,23 +475,23 @@ class TextEncoder(nn.Module):
         x_mask = torch.unsqueeze(sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
 
         x = self.prenet(x, x_mask)
-        if self.n_spks > 1:
-            x = torch.cat([x, spks.unsqueeze(-1).repeat(1, 1, x.shape[-1])], dim=1)
-        x = self.encoder(x, x_mask)
+        if self.encoder_input_film is not None:
+            x = self.encoder_input_film(x, spks, x_mask)
+        x = self.encoder(x, x_mask, condition=spks)
         mu = self.proj_m(x) * x_mask
 
         duration_hidden = torch.detach(x)
-        logw = self.proj_w(duration_hidden, x_mask)
+        logw = self.proj_w(duration_hidden, x_mask, condition=spks)
 
         if return_duration_hidden:
             return mu, logw, x_mask, duration_hidden
         return mu, logw, x_mask
 
-    def stochastic_duration_loss(self, duration_hidden, x_mask, target_durations):
+    def stochastic_duration_loss(self, duration_hidden, x_mask, target_durations, condition=None):
         if self.proj_w_sdp is None:
             raise RuntimeError("stochastic_duration_loss called while SDP is disabled")
         target_durations = target_durations.to(dtype=duration_hidden.dtype) * x_mask
-        loss = self.proj_w_sdp(duration_hidden, x_mask, target_durations)
+        loss = self.proj_w_sdp(duration_hidden, x_mask, target_durations, condition=condition)
         loss = torch.sum(loss) / torch.clamp_min(torch.sum(x_mask), 1.0)
         return loss * self.duration_sdp_loss_weight
 
@@ -476,6 +503,7 @@ class TextEncoder(nn.Module):
         x_mask,
         sdp_ratio=None,
         noise_scale_w=None,
+        condition=None,
     ):
         if self.proj_w_sdp is None:
             return logw_dp
@@ -484,5 +512,5 @@ class TextEncoder(nn.Module):
             return logw_dp
         ratio = min(ratio, 1.0)
         noise_scale = self.duration_sdp_noise_scale if noise_scale_w is None else float(noise_scale_w)
-        logw_sdp = self.proj_w_sdp(duration_hidden, x_mask, reverse=True, noise_scale=noise_scale)
+        logw_sdp = self.proj_w_sdp(duration_hidden, x_mask, reverse=True, noise_scale=noise_scale, condition=condition)
         return logw_sdp * ratio + logw_dp * (1.0 - ratio)
