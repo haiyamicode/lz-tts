@@ -14,6 +14,48 @@ from src.starling.utils.model import fix_len_compatibility, normalize
 from src.starling.utils.utils import intersperse
 
 
+def sample_same_utterance_reference(
+    audio,
+    sample_rate,
+    min_ratio,
+    max_ratio,
+    short_threshold_seconds,
+    short_ratio,
+    randomize=True,
+    rng=None,
+):
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+    if not 0 < min_ratio <= max_ratio <= 1:
+        raise ValueError(
+            f"Reference ratios must satisfy 0 < min <= max <= 1, got {min_ratio} and {max_ratio}"
+        )
+    if short_threshold_seconds < 0:
+        raise ValueError("short_threshold_seconds must be non-negative")
+    if not 0 < short_ratio <= 1:
+        raise ValueError(f"short_ratio must be in (0, 1], got {short_ratio}")
+
+    total_samples = int(audio.shape[-1])
+    if total_samples <= 0:
+        raise ValueError("Cannot sample a reference from empty audio")
+    rng = rng or random
+    duration_seconds = total_samples / sample_rate
+    if duration_seconds <= short_threshold_seconds:
+        ratio = short_ratio
+    elif randomize:
+        ratio = rng.uniform(min_ratio, max_ratio)
+    else:
+        ratio = (min_ratio + max_ratio) / 2
+
+    reference_samples = min(total_samples, max(1, round(total_samples * ratio)))
+    max_start = total_samples - reference_samples
+    if randomize and max_start > 0:
+        start = rng.randint(0, max_start)
+    else:
+        start = max_start // 2
+    return audio[..., start : start + reference_samples]
+
+
 def parse_filelist(filelist_path, split_char="|"):
     filelist_path = Path(filelist_path)
     with open(filelist_path, encoding="utf-8") as f:
@@ -52,6 +94,12 @@ class TextMelDataModule(LightningDataModule):
         prompt_mel_same_utterance_prob=0.05,
         prompt_embedding_enabled=False,
         prompt_embedding_dim=192,
+        use_same_utterance_as_reference=False,
+        same_utterance_reference_min_ratio=0.2,
+        same_utterance_reference_max_ratio=0.5,
+        same_utterance_reference_short_threshold_seconds=5.0,
+        same_utterance_reference_short_ratio=0.5,
+        same_utterance_reference_embedding_count=1,
         speaker_auto_id=0,
         speaker_auto_train_prob=0.0,
         rms_normalize_audio=False,
@@ -94,6 +142,13 @@ class TextMelDataModule(LightningDataModule):
             self.hparams.prompt_mel_same_utterance_prob,
             self.hparams.prompt_embedding_enabled,
             self.hparams.prompt_embedding_dim,
+            self.hparams.use_same_utterance_as_reference,
+            self.hparams.same_utterance_reference_min_ratio,
+            self.hparams.same_utterance_reference_max_ratio,
+            self.hparams.same_utterance_reference_short_threshold_seconds,
+            self.hparams.same_utterance_reference_short_ratio,
+            self.hparams.same_utterance_reference_embedding_count,
+            True,
             self.hparams.speaker_auto_id,
             self.hparams.speaker_auto_train_prob,
             self.hparams.rms_normalize_audio,
@@ -122,6 +177,13 @@ class TextMelDataModule(LightningDataModule):
             0.0,
             self.hparams.prompt_embedding_enabled,
             self.hparams.prompt_embedding_dim,
+            self.hparams.use_same_utterance_as_reference,
+            self.hparams.same_utterance_reference_min_ratio,
+            self.hparams.same_utterance_reference_max_ratio,
+            self.hparams.same_utterance_reference_short_threshold_seconds,
+            self.hparams.same_utterance_reference_short_ratio,
+            self.hparams.same_utterance_reference_embedding_count,
+            False,
             self.hparams.speaker_auto_id,
             0.0,
             self.hparams.rms_normalize_audio,
@@ -138,6 +200,9 @@ class TextMelDataModule(LightningDataModule):
             pin_memory=self.hparams.pin_memory,
             shuffle=True,
             collate_fn=TextMelBatchCollate(self.hparams.n_spks),
+            persistent_workers=bool(
+                self.hparams.num_workers and self.hparams.use_same_utterance_as_reference
+            ),
         )
 
     def val_dataloader(self):
@@ -148,6 +213,9 @@ class TextMelDataModule(LightningDataModule):
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
             collate_fn=TextMelBatchCollate(self.hparams.n_spks),
+            persistent_workers=bool(
+                self.hparams.num_workers and self.hparams.use_same_utterance_as_reference
+            ),
         )
 
     def teardown(self, stage: Optional[str] = None):
@@ -186,6 +254,13 @@ class TextMelDataset(torch.utils.data.Dataset):
         prompt_mel_same_utterance_prob=0.05,
         prompt_embedding_enabled=False,
         prompt_embedding_dim=192,
+        use_same_utterance_as_reference=False,
+        same_utterance_reference_min_ratio=0.2,
+        same_utterance_reference_max_ratio=0.5,
+        same_utterance_reference_short_threshold_seconds=5.0,
+        same_utterance_reference_short_ratio=0.5,
+        same_utterance_reference_embedding_count=1,
+        randomize_same_utterance_reference=True,
         speaker_auto_id=0,
         speaker_auto_prob=0.0,
         rms_normalize_audio=False,
@@ -211,6 +286,17 @@ class TextMelDataset(torch.utils.data.Dataset):
         self.prompt_mel_same_utterance_prob = float(prompt_mel_same_utterance_prob)
         self.prompt_embedding_enabled = prompt_embedding_enabled
         self.prompt_embedding_dim = int(prompt_embedding_dim)
+        self.use_same_utterance_as_reference = bool(use_same_utterance_as_reference)
+        self.same_utterance_reference_min_ratio = float(same_utterance_reference_min_ratio)
+        self.same_utterance_reference_max_ratio = float(same_utterance_reference_max_ratio)
+        self.same_utterance_reference_short_threshold_seconds = float(
+            same_utterance_reference_short_threshold_seconds
+        )
+        self.same_utterance_reference_short_ratio = float(same_utterance_reference_short_ratio)
+        self.same_utterance_reference_embedding_count = int(
+            same_utterance_reference_embedding_count
+        )
+        self.randomize_same_utterance_reference = bool(randomize_same_utterance_reference)
         self.speaker_auto_id = int(speaker_auto_id)
         self.speaker_auto_prob = float(speaker_auto_prob)
         self.rms_normalize_audio = bool(rms_normalize_audio)
@@ -221,6 +307,32 @@ class TextMelDataset(torch.utils.data.Dataset):
             raise ValueError(f"speaker_auto_prob must be between 0 and 1, got {self.speaker_auto_prob}")
         if self.n_spks > 1 and not 0 <= self.speaker_auto_id < self.n_spks:
             raise ValueError(f"speaker_auto_id={self.speaker_auto_id} is outside n_spks={self.n_spks}")
+        if not (
+            0
+            < self.same_utterance_reference_min_ratio
+            <= self.same_utterance_reference_max_ratio
+            <= 1
+        ):
+            raise ValueError(
+                "same-utterance reference ratios must satisfy "
+                f"0 < min <= max <= 1, got {self.same_utterance_reference_min_ratio} and "
+                f"{self.same_utterance_reference_max_ratio}"
+            )
+        if not 0 < self.same_utterance_reference_short_ratio <= 1:
+            raise ValueError(
+                "same_utterance_reference_short_ratio must be in (0, 1], got "
+                f"{self.same_utterance_reference_short_ratio}"
+            )
+        if self.same_utterance_reference_short_threshold_seconds < 0:
+            raise ValueError("same_utterance_reference_short_threshold_seconds must be non-negative")
+        if self.same_utterance_reference_embedding_count < 1:
+            raise ValueError("same_utterance_reference_embedding_count must be at least 1")
+        if self.use_same_utterance_as_reference and not (
+            self.prompt_mel_enabled or self.prompt_embedding_enabled
+        ):
+            raise ValueError(
+                "use_same_utterance_as_reference requires prompt mel or prompt embedding conditioning"
+            )
         self._prompt_rng = random.Random(seed)
         self._speaker_rng = random.Random(None if seed is None else int(seed) + 1)
         self.prompt_candidates = []
@@ -230,7 +342,7 @@ class TextMelDataset(torch.utils.data.Dataset):
             self.data_parameters = data_parameters
         else:
             self.data_parameters = {"mel_mean": 0, "mel_std": 1}
-        if self.prompt_mel_enabled:
+        if self.prompt_mel_enabled and not self.use_same_utterance_as_reference:
             self._build_prompt_candidates()
         random.seed(seed)
         random.shuffle(self.filepaths_and_text)
@@ -295,7 +407,7 @@ class TextMelDataset(torch.utils.data.Dataset):
             prompt_path = self._prompt_rng.choice(alternatives or candidates)
         return self.get_mel(prompt_path)
 
-    def get_prompt_embedding(self, filepath_and_text):
+    def get_prompt_embedding(self, filepath_and_text, randomize_bank=True):
         if not self.prompt_embedding_enabled:
             return None
         embedding_path = None
@@ -319,12 +431,61 @@ class TextMelDataset(torch.utils.data.Dataset):
         else:
             embedding = torch.from_numpy(np.load(embedding_path).astype(np.float32))
         if embedding.dim() == 2:
-            embedding = embedding[self._prompt_rng.randrange(embedding.shape[0])]
+            if (
+                self.use_same_utterance_as_reference
+                and embedding.shape[0] != self.same_utterance_reference_embedding_count
+            ):
+                raise ValueError(
+                    f"Expected {self.same_utterance_reference_embedding_count} prompt embeddings "
+                    f"at {embedding_path}, got {embedding.shape[0]}"
+                )
+            embedding_index = (
+                self._prompt_rng.randrange(embedding.shape[0]) if randomize_bank else 0
+            )
+            embedding = embedding[embedding_index]
         if embedding.dim() != 1:
             raise ValueError(f"Expected 1D prompt embedding at {embedding_path}, got {tuple(embedding.shape)}")
         if embedding.shape[0] != self.prompt_embedding_dim:
             raise ValueError(f"Expected prompt embedding dim {self.prompt_embedding_dim}, got {embedding.shape[0]}")
         return embedding
+
+    def _load_audio(self, filepath):
+        filepath = Path(filepath)
+        if filepath.suffix == ".pt":
+            audio = torch.load(filepath, map_location="cpu", weights_only=True).float()
+            sr = self.sample_rate
+        else:
+            audio, sr = ta.load(filepath)
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        if audio.shape[0] > 1:
+            audio = audio.mean(dim=0, keepdim=True)
+        if sr != self.sample_rate:
+            raise ValueError(f"Expected sample_rate={self.sample_rate}, got {sr} for {filepath}")
+        if self.rms_normalize_audio:
+            audio = normalize_audio_rms(audio, self.rms_target, self.rms_peak_limit, self.rms_eps)
+        return audio.contiguous()
+
+    def _same_utterance_reference_audio(self, audio):
+        return sample_same_utterance_reference(
+            audio,
+            self.sample_rate,
+            self.same_utterance_reference_min_ratio,
+            self.same_utterance_reference_max_ratio,
+            self.same_utterance_reference_short_threshold_seconds,
+            self.same_utterance_reference_short_ratio,
+            randomize=self.randomize_same_utterance_reference,
+            rng=self._prompt_rng,
+        )
+
+    def get_same_utterance_reference(self, filepath_and_text, audio):
+        audio = self._same_utterance_reference_audio(audio)
+        prompt_mel = self._audio_to_mel(audio) if self.prompt_mel_enabled else None
+        prompt_embedding = self.get_prompt_embedding(
+            filepath_and_text,
+            randomize_bank=self.randomize_same_utterance_reference,
+        )
+        return prompt_mel, prompt_embedding
 
     def get_datapoint(self, filepath_and_text):
         bert_features = None
@@ -358,9 +519,18 @@ class TextMelDataset(torch.utils.data.Dataset):
             text, cleaned_text = self.get_text(text, add_blank=self.add_blank)
         spk = self._maybe_use_auto_speaker(spk)
 
-        mel = self.get_mel(filepath)
-
         durations = self.get_durations(filepath, text) if self.load_durations else None
+
+        if self.use_same_utterance_as_reference:
+            audio = self._load_audio(filepath)
+            mel = self._audio_to_mel(audio)
+            prompt_mel, prompt_embedding = self.get_same_utterance_reference(
+                filepath_and_text, audio
+            )
+        else:
+            mel = self.get_mel(filepath)
+            prompt_mel = self.get_prompt_mel(filepath_and_text, filepath)
+            prompt_embedding = self.get_prompt_embedding(filepath_and_text)
 
         return {
             "x": text,
@@ -370,8 +540,8 @@ class TextMelDataset(torch.utils.data.Dataset):
             "x_text": cleaned_text,
             "durations": durations,
             "bert_features": bert_features,
-            "prompt_mel": self.get_prompt_mel(filepath_and_text, filepath),
-            "prompt_embedding": self.get_prompt_embedding(filepath_and_text),
+            "prompt_mel": prompt_mel,
+            "prompt_embedding": prompt_embedding,
         }
 
     def get_durations(self, filepath, text):
@@ -393,15 +563,9 @@ class TextMelDataset(torch.utils.data.Dataset):
         return durs
 
     def get_mel(self, filepath):
-        filepath = Path(filepath)
-        if filepath.suffix == ".pt":
-            audio = torch.load(filepath, map_location="cpu", weights_only=True)
-            sr = self.sample_rate
-        else:
-            audio, sr = ta.load(filepath)
-        assert sr == self.sample_rate, f"Expected sample_rate={self.sample_rate}, got {sr} for {filepath}"
-        if self.rms_normalize_audio:
-            audio = normalize_audio_rms(audio, self.rms_target, self.rms_peak_limit, self.rms_eps)
+        return self._audio_to_mel(self._load_audio(filepath))
+
+    def _audio_to_mel(self, audio):
         if self.mel_backend == "vocos_mel_24khz":
             mel = vocos_mel_spectrogram(
                 audio,

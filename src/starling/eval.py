@@ -243,10 +243,16 @@ def _prepare_ood_samples(cfg: DictConfig, eval_cfg: DictConfig, device: torch.de
     for index, sample_cfg in enumerate(ood_cfgs):
         text = str(sample_cfg["text"])
         speaker = str(sample_cfg.get("speaker") or sample_cfg.get("language") or "en")
+        language = str(sample_cfg.get("language") or speaker)
+        speaker_id = _resolve_configured_speaker_id(
+            cfg,
+            speaker,
+            explicit_speaker_id=sample_cfg.get("speaker_id"),
+        )
         row = phonemize_text_for_speaker(
             text,
             piper_config,
-            speaker_label=speaker,
+            speaker_label=language,
             neural=bool(preprocess_cfg.get("neural", True)),
         )
         phoneme_ids = [int(item) for item in row["phoneme_ids"]]
@@ -268,7 +274,6 @@ def _prepare_ood_samples(cfg: DictConfig, eval_cfg: DictConfig, device: torch.de
             bert_input["word2ph"][0].to(device),
             len(phoneme_ids),
         ).detach().float().cpu()
-        speaker_id = int(sample_cfg.get("speaker_id", row["speaker_id"]))
         samples.append(
             EvalSample(
                 sample_id=str(sample_cfg.get("id") or f"ood_{index:03d}_{_safe_id(speaker)}"),
@@ -281,6 +286,33 @@ def _prepare_ood_samples(cfg: DictConfig, eval_cfg: DictConfig, device: torch.de
             )
         )
     return samples
+
+
+def _resolve_configured_speaker_id(
+    cfg: DictConfig,
+    speaker: str,
+    explicit_speaker_id: int | None = None,
+) -> int:
+    if explicit_speaker_id is not None:
+        speaker_id = int(explicit_speaker_id)
+    else:
+        speaker_id_map = cfg.get("speaker_id_map") or {}
+        normalized_speaker = speaker.strip().lower()
+        normalized_map = {
+            str(label).strip().lower(): int(speaker_id)
+            for label, speaker_id in speaker_id_map.items()
+        }
+        if normalized_speaker not in normalized_map:
+            raise ValueError(f"No Starling training speaker ID configured for {speaker!r}")
+        speaker_id = normalized_map[normalized_speaker]
+
+    n_spks = int(cfg.model.n_spks)
+    if not 0 <= speaker_id < n_spks:
+        raise ValueError(
+            f"Starling speaker ID for {speaker!r} is outside model range: "
+            f"speaker_id={speaker_id}, n_spks={n_spks}"
+        )
+    return speaker_id
 
 
 def _prepare_references(
@@ -324,13 +356,22 @@ def _prepare_references(
             "prompt_original_frames": original_frames,
             "prompt_embedding": prompt_embedding,
             "sample_kinds": list(ref.get("sample_kinds") or []),
+            "source_split": str(ref.get("source_split") or ""),
+            "source_index": ref.get("source_index"),
         }
     return out
 
 
 def _reference_matches_sample(ref_data: dict[str, Any], sample: EvalSample) -> bool:
     sample_kinds = [str(item) for item in ref_data.get("sample_kinds") or []]
-    return not sample_kinds or sample.kind in sample_kinds
+    if sample_kinds and sample.kind not in sample_kinds:
+        return False
+
+    source_split = str(ref_data.get("source_split") or "")
+    source_index = ref_data.get("source_index")
+    if sample.kind.endswith("_dataset") and (source_split or source_index is not None):
+        return sample.source_split == source_split and sample.source_index == int(source_index)
+    return True
 
 
 def _load_audio(path: Path, sample_rate: int) -> torch.Tensor:
