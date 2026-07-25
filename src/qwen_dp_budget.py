@@ -16,6 +16,44 @@ import torch
 
 _LOGGER = logging.getLogger(__name__)
 
+_ALIGNMENT_TRIM_FRAME_MS = 20
+_ALIGNMENT_TRIM_HOP_MS = 10
+_ALIGNMENT_TRIM_PADDING_MS = 50
+_ALIGNMENT_TRIM_TOP_DB = 40.0
+_ALIGNMENT_TRIM_MIN_RMS = 1e-4
+
+
+def trim_boundary_silence(audio: np.ndarray, sample_rate: int) -> tuple[np.ndarray, int, int]:
+    """Trim low-energy audio at the boundaries while preserving internal pauses."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if audio.size == 0:
+        return audio, 0, 0
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+
+    frame_length = max(1, round(sample_rate * _ALIGNMENT_TRIM_FRAME_MS / 1000))
+    hop_length = max(1, round(sample_rate * _ALIGNMENT_TRIM_HOP_MS / 1000))
+    frame_starts = np.arange(0, audio.size, hop_length, dtype=np.int64)
+    frame_ends = np.minimum(frame_starts + frame_length, audio.size)
+
+    squared = np.square(audio, dtype=np.float64)
+    cumulative_energy = np.concatenate(([0.0], np.cumsum(squared)))
+    frame_energy = cumulative_energy[frame_ends] - cumulative_energy[frame_starts]
+    frame_rms = np.sqrt(frame_energy / (frame_ends - frame_starts))
+    peak_rms = float(frame_rms.max(initial=0.0))
+    threshold = max(
+        _ALIGNMENT_TRIM_MIN_RMS,
+        peak_rms * 10.0 ** (-_ALIGNMENT_TRIM_TOP_DB / 20.0),
+    )
+    active_frames = np.flatnonzero(frame_rms >= threshold)
+    if active_frames.size == 0:
+        return audio[:0], 0, 0
+
+    padding = round(sample_rate * _ALIGNMENT_TRIM_PADDING_MS / 1000)
+    start = max(0, int(frame_starts[active_frames[0]]) - padding)
+    end = min(audio.size, int(frame_ends[active_frames[-1]]) + padding)
+    return np.ascontiguousarray(audio[start:end]), start, end
+
 
 @dataclass(frozen=True)
 class DpBudgetConfig:
@@ -493,6 +531,11 @@ class QwenDpBudget:
             audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=target_sample_rate).astype(np.float32, copy=False)
 
         audio = np.clip(audio, -1.0, 1.0)
+        raw_audio_samples = int(audio.size)
+        audio, trim_start, trim_end = trim_boundary_silence(audio, target_sample_rate)
+        raw_audio_seconds = float(raw_audio_samples / target_sample_rate)
+        trim_head_seconds = float(trim_start / target_sample_rate)
+        trim_tail_seconds = float((raw_audio_samples - trim_end) / target_sample_rate)
         audio_seconds = float(audio.size / target_sample_rate)
 
         def invalid_alignment_result(
@@ -509,6 +552,9 @@ class QwenDpBudget:
                 "valid": False,
                 "reason": reason,
                 "audio_seconds": audio_seconds,
+                "raw_audio_seconds": raw_audio_seconds,
+                "trim_head_seconds": trim_head_seconds,
+                "trim_tail_seconds": trim_tail_seconds,
                 "expected_seconds": float(expected_seconds) if expected_seconds is not None else None,
                 "duration_ratio": float(duration_ratio) if duration_ratio is not None else None,
                 "duration_tolerance": float(duration_tolerance),
@@ -524,12 +570,18 @@ class QwenDpBudget:
                 result["alignment_error"] = alignment_error
             return result
 
+        if audio.size == 0:
+            return invalid_alignment_result("silent_audio", aligned_frames=0)
+
         if expected_seconds is not None and expected_seconds > 0:
             duration_ratio = audio_seconds / float(expected_seconds)
             if duration_ratio > 1.0 + duration_tolerance:
                 _LOGGER.info(
-                    "Qwen DP alignment validation rejected duration before alignment audio_seconds=%.2f expected_seconds=%.2f ratio=%.3f tolerance=%.3f phoneme_count=%d",
+                    "Qwen DP alignment validation rejected duration before alignment audio_seconds=%.2f raw_audio_seconds=%.2f trim_head_seconds=%.2f trim_tail_seconds=%.2f expected_seconds=%.2f ratio=%.3f tolerance=%.3f phoneme_count=%d",
                     audio_seconds,
+                    raw_audio_seconds,
+                    trim_head_seconds,
+                    trim_tail_seconds,
                     float(expected_seconds),
                     duration_ratio,
                     float(duration_tolerance),
@@ -621,6 +673,9 @@ class QwenDpBudget:
             "valid": valid,
             "reason": reason,
             "audio_seconds": audio_seconds,
+            "raw_audio_seconds": raw_audio_seconds,
+            "trim_head_seconds": trim_head_seconds,
+            "trim_tail_seconds": trim_tail_seconds,
             "expected_seconds": float(expected_seconds) if expected_seconds is not None else None,
             "duration_ratio": float(duration_ratio) if duration_ratio is not None else None,
             "duration_tolerance": float(duration_tolerance),

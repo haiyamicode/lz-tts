@@ -1,0 +1,91 @@
+defaults:
+  - override hydra/job_logging: disabled
+  - _self_
+
+seed: 20260724
+max_accepted_items: null
+output_dir: /mnt/bigdata/voxcpm2-self-sft-multilingual
+
+paths:
+  lz_tts_root: /mnt/data/lz-tts
+  nanovllm_voxcpm: /mnt/data/lz-tts/local/nanovllm-voxcpm
+
+model:
+  pretrained_path: /home/haiyami/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/bffb3df5a29440629464e5e839f4d214c8714c3d
+
+source:
+  root: /mnt/data/datasets/perpetual-multilingual-corpora
+  languages: [de, en, es, fr, it, ja, ko, pt, vi, zh]
+
+text_processing:
+  normalization_enabled: true
+  normalization_profile: spoken
+  context_replacements_enabled: true
+  context_replacer_device: cpu
+
+workers:
+  gpus: [0, 1, 2]
+  batch_size: 8
+  # GPU 0 also hosts the single ASR/MAS validator process.
+  gpu_memory_utilization: [0.70, 0.90, 0.90]
+  # The V100 SDPA fallback is not CUDA-graph capturable; keep graphs on the 3090.
+  enforce_eager: [true, false, true]
+
+generation:
+  samples_per_voice: 3
+  voice_anchor_selection: longest_text
+  temperature: 1.0
+  cfg_value: 2.0
+  inference_timesteps: 10
+  max_audio_seconds: 30.0
+  max_num_batched_tokens: 8192
+  max_model_len: 4096
+
+validation:
+  device: cuda:0
+  languages:
+    de: {locale: de-DE, asr: German}
+    en: {locale: en-US, asr: English}
+    es: {locale: es-ES, asr: Spanish}
+    fr: {locale: fr-FR, asr: French}
+    it: {locale: it-IT, asr: Italian}
+    ja: {locale: ja-JP, asr: Japanese}
+    ko: {locale: ko-KR, asr: Korean}
+    pt: {locale: pt-BR, asr: Portuguese}
+    vi: {locale: vi-VN, asr: Vietnamese}
+    zh: {locale: zh-CN, asr: Chinese}
+  mas:
+    checkpoint: /mnt/data/lz-tts/data/lzspeech-sparrow/model.ckpt
+    duration_tolerance: 0.35
+    noise_scale: 0.8
+    length_scale: 1.0
+    duration_samples: 32
+  wer:
+    max_error_rate: 0.30
+  asr:
+    model: Qwen/Qwen3-ASR-1.7B
+    dtype: float16
+    attn_implementation: sdpa
+    batch_size: 24
+    max_new_tokens: 256
+  scoreq:
+    model_path: /home/haiyami/.cache/scoreq/onnx-models/adapt_nr_synthetic.onnx
+    cpu_threads: 4
+    thresholds:
+      de: 2.7
+      en: 3.2
+      es: 3.0
+      fr: 3.0
+      it: 3.0
+      ja: 2.0
+      ko: 3.2
+      pt: 3.0
+      vi: 2.4
+      zh: 3.0
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false

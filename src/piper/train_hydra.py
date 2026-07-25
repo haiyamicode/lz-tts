@@ -69,7 +69,11 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
-@hydra.main(version_base=None, config_path="../../configs/piper", config_name="train")
+@hydra.main(
+    version_base=None,
+    config_path="../../local/configs/piper",
+    config_name="train",
+)
 def main(cfg: DictConfig) -> None:
     logging.basicConfig(level=logging.INFO)
     args = _args_from_config(cfg)

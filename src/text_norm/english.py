@@ -37,6 +37,7 @@ _TIME_RE = re.compile(
         (?=\b|[^A-Za-z0-9]|$)""",
     re.IGNORECASE | re.X,
 )
+_ROUND_THE_CLOCK_RE = re.compile(r"(?<![\w/])24\s*/\s*7(?![\w/])")
 
 
 def _expand_abbreviations(text: str) -> str:
@@ -126,6 +127,7 @@ def _expand_time_english(text: str) -> str:
 
 def normalize_english(text: str) -> str:
     text = text.lower()
+    text = _ROUND_THE_CLOCK_RE.sub("twenty four seven", text)
     text = _expand_time_english(text)
     text = re.sub(_CURRENCY_RE, _expand_currency, text)
     return _expand_abbreviations(text)

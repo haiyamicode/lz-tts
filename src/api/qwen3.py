@@ -845,44 +845,14 @@ def get_qwen_model_for_language(language: str) -> Any:
     return get_model()
 
 
-def _apply_context_replacements(text: str, dp_language: str) -> str:
-    """Apply context-aware text replacements (e.g. AI -> ây ai) if enabled."""
-    if not QWEN_CONTEXT_REPLACEMENTS_ENABLED:
-        return text
-    from ..piper.context_replacer import get_replacer
-    replacer = get_replacer()
-    return replacer.apply_replacements(text, language=dp_language)
-
-
-def _apply_context_replacements_batch(texts: list[str], dp_languages: list[str]) -> list[str]:
-    """Apply context-aware text replacements for a batch of texts."""
-    if not QWEN_CONTEXT_REPLACEMENTS_ENABLED:
-        return texts
-    from ..piper.context_replacer import get_replacer
-    replacer = get_replacer()
-    unique_langs = set(dp_languages)
-    results = list(texts)
-    for lang in unique_langs:
-        indices = [i for i, l in enumerate(dp_languages) if l == lang]
-        lang_texts = [texts[i] for i in indices]
-        replaced = replacer.apply_replacements_many(lang_texts, language=lang)
-        for i, new_text in zip(indices, replaced):
-            results[i] = new_text
-    return results
-
-
-def _normalize_qwen_text(text: str, dp_language: str) -> str:
-    from ..text_norm import normalize_text
-
-    return normalize_text(text, dp_language)
-
-
 def _prepare_qwen_texts_batch(texts: list[str], dp_languages: list[str]) -> list[str]:
-    normalized = [
-        _normalize_qwen_text(text, dp_language)
-        for text, dp_language in zip(texts, dp_languages)
-    ]
-    return _apply_context_replacements_batch(normalized, dp_languages)
+    from ..text_norm import prepare_tts_texts
+
+    return prepare_tts_texts(
+        texts,
+        dp_languages,
+        context_replacements_enabled=QWEN_CONTEXT_REPLACEMENTS_ENABLED,
+    )
 
 
 def _preload_worker(include_dp_budget: bool) -> None:
