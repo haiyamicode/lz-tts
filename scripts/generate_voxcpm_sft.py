@@ -324,9 +324,9 @@ class ScoreQ:
 
 
 def _build_validator(cfg: DictConfig) -> Any:
-    from src.qwen_dp_budget import DpBudgetConfig, QwenDpBudget
+    from src.duration_alignment import DpBudgetConfig, DurationAlignmentValidator
 
-    validator = QwenDpBudget(
+    validator = DurationAlignmentValidator(
         DpBudgetConfig(
             checkpoint=_absolute(cfg.validation.mas.checkpoint),
             device=str(cfg.validation.device),

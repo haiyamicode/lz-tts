@@ -1,6 +1,6 @@
 import numpy as np
 
-from src.qwen_dp_budget import trim_boundary_silence
+from src.duration_alignment import trim_boundary_silence
 
 
 def _tone(sample_rate: int, seconds: float, amplitude: float = 0.2) -> np.ndarray:

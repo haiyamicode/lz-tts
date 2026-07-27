@@ -7,7 +7,6 @@ import asyncio
 import contextlib
 import gc
 import hashlib
-import importlib.util
 import io
 import json
 import logging
@@ -19,14 +18,11 @@ import sys
 import threading
 import time
 import httpx
-import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-import multiprocessing as mp
-from multiprocessing.connection import wait as mp_connection_wait
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal, Optional
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import numpy as np
 import torch
@@ -34,7 +30,7 @@ from asgi_compression import BrotliAlgorithm, CompressionMiddleware, GzipAlgorit
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, Response
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
 from pydub import AudioSegment
@@ -42,11 +38,10 @@ from pydub import AudioSegment
 from ..multilingual_splitter import MultilingualSplitter
 from ..piper import PiperInference
 from ..ssml import BreakSegment, TextSegment, generate_silence, parse_ssml
+from ..text_norm import normalize_spoken_text
 from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
 from ..matcha_inference import MatchaBatchRequest
 from ..matcha_inference import MatchaBatcher as ProductionStarlingBatcher
-from . import qwen3
-from .qwen_worker import qwen_worker_main
 from .request_decompression import RequestDecompressionMiddleware
 from .audio_utils import _audio_to_mp3_bytes, _audio_to_wav_bytes, _resample_audio
 from .model_workers import seed_vc_worker_main, sparrow_worker_main, starling_worker_main
@@ -58,6 +53,7 @@ from .seed_vc_backend import (
     SeedVCRequest,
 )
 from .rvc import RVCBackend, RVCSettings
+from .voxcpm_runtime import VoxCPMRuntime
 from .worker_common import WorkerProcessClient
 
 logging.basicConfig(
@@ -162,10 +158,6 @@ def _request_api_key(request: Request) -> str:
     return (request.headers.get("X-Api-Key") or request.query_params.get("api_key") or "").strip()
 
 
-def _is_browser_demo_path(path: str) -> bool:
-    return path == "/qwen3/demo" or path.startswith("/qwen3/demo/")
-
-
 def _render_llms_txt(request: Request) -> str:
     template = LLMS_TEMPLATE_PATH.read_text(encoding="utf-8")
     base_url = str(request.base_url).rstrip("/")
@@ -206,7 +198,7 @@ class EngineEnableConfig(BaseModel):
     """Global engine switches. Disabled engines are not mounted or loaded."""
 
     pipertts: bool = Field(default_factory=lambda: _env_bool("PIPER_TTS_ENABLED", True))
-    qwen3: bool = Field(default_factory=lambda: _env_bool("QWEN_TTS_ENABLED", True))
+    voxcpm: bool = Field(default_factory=lambda: _env_bool("VOXCPM_ENABLED", False))
     starling: bool = Field(default_factory=lambda: _env_bool("STARLING_TTS_ENABLED", _env_bool("MATCHA_TTS_ENABLED", False)))
     matcha: bool = Field(default_factory=lambda: _env_bool("MATCHA_TTS_ENABLED", False))
     seed_vc: bool = Field(default_factory=lambda: _env_bool("SEED_VC_ENABLED", True))
@@ -227,10 +219,48 @@ class PiperTTSConfig(BaseModel):
     model_config_overrides: dict[str, ModelConfig] = Field(default_factory=dict, alias="model_config")
 
 
-class QwenTTSConfig(qwen3.QwenSettings):
-    """Qwen3 TTS engine configuration."""
+class VoxCPMDurationBudgetConfig(BaseModel):
+    """Sparrow DP settings used to derive a VoxCPM generation limit per text."""
 
-    enabled: bool = Field(default_factory=lambda: _env_bool("QWEN_TTS_ENABLED", True))
+    enabled: bool = True
+    preload: bool = True
+    use_bert: bool = False
+    checkpoint: str = "data/lzspeech-sparrow/model.ckpt"
+    config_path: Optional[str] = None
+    device: str = "cuda:0"
+    language: str = "multilingual"
+    noise_scale: float = Field(default=0.8, ge=0)
+    length_scale: float = Field(default=1.0, gt=0)
+    token_rate: float = Field(default=6.25, gt=0)
+    samples: int = Field(default=32, ge=1)
+    upper_quantile: float = Field(default=0.90, ge=0, le=1)
+    min_margin: float = Field(default=1.0, gt=0)
+    max_margin: float = Field(default=1.35, gt=0)
+    min_extra_tokens: int = Field(default=0, ge=0)
+    max_extra_tokens: int = Field(default=38, ge=0)
+    language_profiles: dict[str, dict[str, float | int]] = Field(default_factory=dict)
+
+
+class VoxCPMConfig(BaseModel):
+    """Optimized nano-vLLM VoxCPM2 serving configuration."""
+
+    enabled: bool = Field(default_factory=lambda: _env_bool("VOXCPM_ENABLED", False))
+    preload: bool = Field(default_factory=lambda: _env_bool("VOXCPM_PRELOAD", True))
+    model_id: Literal["voxcpm"] = "voxcpm"
+    model_path: str = Field(default_factory=lambda: os.environ.get("VOXCPM_MODEL_PATH", "data/voxcpm2-stable"))
+    device: int = Field(default_factory=lambda: int(os.environ.get("VOXCPM_DEVICE", "1")), ge=0)
+    inference_timesteps: int = Field(default=10, ge=1)
+    max_num_batched_tokens: int = Field(default=8192, ge=1)
+    max_num_seqs: int = Field(default=12, ge=1)
+    max_model_len: int = Field(default=4096, ge=1)
+    gpu_memory_utilization: float = Field(default=0.62, gt=0, le=1)
+    num_kvcache_blocks: int = Field(default=192, ge=1)
+    enforce_eager: bool = False
+    fallback_max_generate_length: int = Field(default=4096, ge=1)
+    duration_budget: VoxCPMDurationBudgetConfig = Field(default_factory=VoxCPMDurationBudgetConfig)
+    temperature: float = Field(default=1.0, gt=0)
+    cfg_value: float = Field(default=2.0, ge=0)
+    reference_cache_size: int = Field(default=128, ge=1)
 
 
 class MatchaConfig(BaseModel):
@@ -325,7 +355,7 @@ class ServerConfig(BaseModel):
 
     engines: EngineEnableConfig = Field(default_factory=EngineEnableConfig)
     pipertts: PiperTTSConfig = Field(default_factory=PiperTTSConfig)
-    qwen: QwenTTSConfig = Field(default_factory=QwenTTSConfig)
+    voxcpm: VoxCPMConfig = Field(default_factory=VoxCPMConfig)
     starling: MatchaConfig = Field(default_factory=MatchaConfig)
     matcha: MatchaConfig = Field(default_factory=MatchaConfig)
     seed_vc: SeedVCConfig = Field(default_factory=SeedVCConfig)
@@ -356,9 +386,14 @@ class SynthesizeRequest(BaseModel):
     text: Optional[str] = Field(None, description="Plain text to synthesize (mutually exclusive with ssml)")
     ssml: Optional[str] = Field(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)")
     voice_id: Optional[str] = Field(None, description="Public voice id from data/seed-vc/voice_ids.txt, e.g. msa.en-US.AvaMultilingual")
-    sample_url: Optional[str] = Field(None, description="Reference sample URL; output is converted to this voice with Seed-VC")
+    sample_url: Optional[str] = Field(
+        None,
+        description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
+    )
     rvc_model: Optional[str] = Field(None, alias="rvcModel", description="Optional RVC model filename to apply as the final conversion step")
     language: Optional[str] = Field(None, description="Force full locale for the entire input, e.g. en-GB")
+    model: Optional[str] = Field(None, description="Per-request synthesis model")
+    seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
     style: Optional[str] = Field(None, description="Seed-VC speech style for voice_id synthesis")
     style_intensity: Optional[float] = Field(None, alias="styleIntensity", description="Seed-VC speech style intensity")
     options: Optional[SparrowSynthesizeOptions] = Field(None, description="Sparrow/VITS-specific synthesis options")
@@ -374,10 +409,14 @@ class BatchSynthesizeInputItem(BaseModel):
     text: Optional[str] = Field(None, description="Plain text to synthesize")
     ssml: Optional[str] = Field(None, description="SSML input is not supported for batched synthesis")
     voice_id: Optional[str] = Field(None, description="Public voice id from data/seed-vc/voice_ids.txt, e.g. msa.en-US.AvaMultilingual")
-    sample_url: Optional[str] = Field(None, description="Reference sample URL; output is converted to this voice with Seed-VC")
+    sample_url: Optional[str] = Field(
+        None,
+        description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
+    )
     rvc_model: Optional[str] = Field(None, alias="rvcModel", description="Optional RVC model filename to apply as the final conversion step")
     language: Optional[str] = Field(None, description="Force full locale for this item, e.g. en-GB")
-    model: Optional[str] = Field(None, description="Model to use for direct Sparrow batching")
+    model: Optional[str] = Field(None, description="Per-item synthesis model")
+    seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
     style: Optional[str] = Field(None, description="Seed-VC speech style for voice_id synthesis")
     style_intensity: Optional[float] = Field(None, alias="styleIntensity", description="Seed-VC speech style intensity")
     options: Optional[SparrowSynthesizeOptions] = Field(None, description="Sparrow/VITS-specific synthesis options")
@@ -396,6 +435,7 @@ class BatchSynthesizeRequest(BaseModel):
 @dataclass(frozen=True)
 class _SharedBatchSynthesizeRequest:
     texts: list[str]
+    seeds: list[int | None] | None = None
     voice_id: str | None = None
     sample_url: str | None = None
     rvc_model: str | None = None
@@ -564,20 +604,13 @@ _seed_vc_backend: "_SeedVCBackend | None" = None
 _rvc_backend: "RVCBackend | None" = None
 _seed_vc_supported_voice_ids: set[str] | None = None
 _seed_vc_voice_ids: set[str] | None = None
-_qwen_worker_processes: dict[str, mp.Process | None] = {"primary": None, "vietnamese": None}
-_qwen_worker_requests: dict[str, Any | None] = {"primary": None, "vietnamese": None}
-_qwen_worker_responses: dict[str, Any | None] = {"primary": None, "vietnamese": None}
-_qwen_worker_locks: dict[str, threading.Lock] = {
-    "primary": threading.Lock(),
-    "vietnamese": threading.Lock(),
-}
-_qwen_worker_start_lock = threading.Lock()
 _sparrow_worker: WorkerProcessClient | None = None
 _sparrow_model_info: dict[str, dict[str, Any]] = {}
 _starling_worker: WorkerProcessClient | None = None
 _starling_info: dict[str, Any] = {}
 _seed_vc_worker: WorkerProcessClient | None = None
 _seed_vc_info: dict[str, Any] = {}
+_voxcpm_runtime: VoxCPMRuntime | None = None
 _startup_loader_task: asyncio.Task | None = None
 
 
@@ -593,7 +626,7 @@ class _EngineLoadState:
 
 _engine_load_states: dict[str, _EngineLoadState] = {
     name: _EngineLoadState(name=name, ready=threading.Event())
-    for name in ("pipertts", "qwen3", "starling", "seed_vc", "rvc")
+    for name in ("pipertts", "voxcpm", "starling", "seed_vc", "rvc")
 }
 
 _inference_counter = 0
@@ -714,9 +747,7 @@ def _get_base_language(speaker_or_locale: str) -> str:
 def _load_config() -> ServerConfig:
     """Load server configuration from local/server.json."""
     if not CONFIG_PATH.exists():
-        config = ServerConfig()
-        qwen3.apply_env_overrides(config.qwen)
-        return config
+        return ServerConfig()
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if "starling" not in data and "matcha" in data:
@@ -724,18 +755,34 @@ def _load_config() -> ServerConfig:
     engines = data.get("engines")
     if isinstance(engines, dict) and "starling" not in engines and "matcha" in engines:
         engines["starling"] = engines["matcha"]
-    config = ServerConfig(**data)
-    qwen3.apply_env_overrides(config.qwen)
-    return config
+    return ServerConfig(**data)
 
 
-def _engine_enabled(engine: Literal["pipertts", "qwen3", "starling", "matcha", "seed_vc", "rvc"], config: ServerConfig | None = None) -> bool:
+def _engine_enabled(
+    engine: Literal["pipertts", "voxcpm", "starling", "matcha", "seed_vc", "rvc"],
+    config: ServerConfig | None = None,
+) -> bool:
     cfg = config or _server_config
     if engine == "starling":
         return bool(cfg.engines.starling or cfg.engines.matcha)
     if engine == "matcha":
         return bool(cfg.engines.matcha or cfg.engines.starling)
     return bool(getattr(cfg.engines, engine))
+
+
+def _is_voxcpm_model(model: str | None) -> bool:
+    if model is None:
+        return False
+    return model.strip().lower() == _server_config.voxcpm.model_id
+
+
+def _resolved_synthesize_model(body_model: str | None, query_model: str | None) -> str | None:
+    if body_model and query_model and body_model != query_model:
+        raise HTTPException(
+            status_code=400,
+            detail="Conflicting 'model' values in request body and query string",
+        )
+    return body_model or query_model
 
 
 def _engine_state(engine: str) -> _EngineLoadState:
@@ -819,269 +866,6 @@ def _wait_for_engine_ready(engine: str, *, timeout: float | None = None) -> None
 
 async def _await_engine_ready(engine: str, *, timeout: float | None = None) -> None:
     await asyncio.to_thread(_wait_for_engine_ready, engine, timeout=timeout)
-
-
-def _separate_vietnamese_qwen_worker_enabled() -> bool:
-    return bool(
-        _server_config.qwen.vietnamese_model.strip()
-        and _server_config.qwen.vietnamese_device.strip()
-        and _server_config.qwen.vietnamese_device.strip() != _server_config.qwen.device.strip()
-    )
-
-
-def _qwen_worker_settings(worker_name: str) -> dict[str, Any]:
-    settings = _server_config.qwen.model_dump(mode="json")
-    settings["asr"] = {**settings.get("asr", {}), "enabled": False, "preload": False}
-    if worker_name == "primary" and _separate_vietnamese_qwen_worker_enabled():
-        settings["vietnamese_model"] = ""
-        settings["viet_lora_model"] = ""
-        settings["vietnamese_device"] = ""
-        return settings
-    if worker_name == "vietnamese":
-        if not _separate_vietnamese_qwen_worker_enabled():
-            raise RuntimeError("Separate Vietnamese Qwen worker is not configured")
-        settings["model"] = _server_config.qwen.vietnamese_model
-        settings["device"] = _server_config.qwen.vietnamese_device
-        settings["dp_budget"] = {
-            **settings.get("dp_budget", {}),
-            "device": _server_config.qwen.vietnamese_device,
-        }
-        settings["disable_cuda_graph"] = _server_config.qwen.vietnamese_disable_cuda_graph
-        settings["vietnamese_model"] = ""
-        settings["viet_lora_model"] = ""
-        settings["vietnamese_device"] = ""
-        return settings
-    return settings
-
-
-def _qwen_worker_name_for_request(req: qwen3.SynthesizeRequest) -> str:
-    if not _separate_vietnamese_qwen_worker_enabled():
-        return "primary"
-    resolved = qwen3.resolve_qwen_language(req.text, req.language, req.language_code)
-    return "vietnamese" if qwen3._is_vietnamese_qwen_language(resolved.qwen_language) else "primary"
-
-
-def _qwen_worker_groups_for_batch(
-    req: qwen3.BatchSynthesizeRequest,
-) -> OrderedDict[str, list[tuple[int, qwen3.SynthesizeRequest]]]:
-    groups: OrderedDict[str, list[tuple[int, qwen3.SynthesizeRequest]]] = OrderedDict()
-    for index, item in enumerate(req.items):
-        worker_name = _qwen_worker_name_for_request(item)
-        groups.setdefault(worker_name, []).append((index, item))
-    return groups
-
-
-def _call_qwen_batch_worker(
-    worker_name: str,
-    indexed_items: list[tuple[int, qwen3.SynthesizeRequest]],
-) -> list[tuple[int, qwen3.BatchSynthesizeItem]]:
-    req = qwen3.BatchSynthesizeRequest(items=[item for _, item in indexed_items])
-    result = _call_qwen_worker(
-        "synthesize_batch",
-        req.model_dump(mode="json"),
-        worker_name=worker_name,
-    )
-    data = result.get("data")
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=502, detail=f"Qwen3 {worker_name} worker returned invalid batch data")
-    response = qwen3.BatchSynthesizeResponse(**data)
-    if len(response.items) != len(indexed_items):
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Qwen3 {worker_name} worker returned {len(response.items)} batch items "
-                f"for {len(indexed_items)} requests"
-            ),
-        )
-    return [
-        (original_index, item)
-        for (original_index, _), item in zip(indexed_items, response.items)
-    ]
-
-
-def _prepare_qwen_request_for_worker(req: qwen3.SynthesizeRequest) -> qwen3.SynthesizeRequest:
-    if req.random_voice_embedding:
-        return req
-    settings = qwen3._resolve_generation_settings(req)
-    _, prompt_text, xvec_only = qwen3._resolve_voice_prompt(req, settings)
-    return req.model_copy(update={"voice_text": prompt_text, "xvec_only": xvec_only})
-
-
-def _prepare_qwen_batch_for_worker(req: qwen3.BatchSynthesizeRequest) -> qwen3.BatchSynthesizeRequest:
-    settings_list = qwen3._resolve_generation_settings_batch(req.items)
-    items = []
-    for item, settings in zip(req.items, settings_list):
-        if item.random_voice_embedding:
-            items.append(item)
-            continue
-        _, prompt_text, xvec_only = qwen3._resolve_voice_prompt(item, settings)
-        items.append(item.model_copy(update={"voice_text": prompt_text, "xvec_only": xvec_only}))
-    return req.model_copy(update={"items": items})
-
-
-def _start_qwen_worker(worker_name: str = "primary") -> None:
-    """Start the isolated Qwen worker process."""
-    if worker_name == "vietnamese" and not _separate_vietnamese_qwen_worker_enabled():
-        return
-    with _qwen_worker_start_lock:
-        process = _qwen_worker_processes.get(worker_name)
-        if process is not None and process.is_alive():
-            return
-
-        ctx = mp.get_context("spawn")
-        requests = ctx.Queue()
-        responses = ctx.Queue()
-        settings = _qwen_worker_settings(worker_name)
-        process = ctx.Process(
-            target=qwen_worker_main,
-            args=(settings, requests, responses, worker_name),
-            name=f"lz-tts-qwen-{worker_name}-worker",
-            daemon=False,
-        )
-        _qwen_worker_requests[worker_name] = requests
-        _qwen_worker_responses[worker_name] = responses
-        _qwen_worker_processes[worker_name] = process
-        process.start()
-
-
-def _stop_qwen_worker(worker_name: str | None = None) -> None:
-    """Stop the isolated Qwen worker process."""
-    with _qwen_worker_start_lock:
-        worker_names = [worker_name] if worker_name else list(_qwen_worker_processes.keys())
-        for name in worker_names:
-            process = _qwen_worker_processes.get(name)
-            requests = _qwen_worker_requests.get(name)
-            if process is not None and process.is_alive() and requests is not None:
-                try:
-                    requests.put({"action": "shutdown", "payload": None})
-                    process.join(timeout=10)
-                except Exception:
-                    _LOGGER.exception("Failed graceful Qwen worker shutdown name=%s", name)
-            if process is not None and process.is_alive():
-                process.terminate()
-                process.join(timeout=10)
-            _qwen_worker_processes[name] = None
-            _qwen_worker_requests[name] = None
-            _qwen_worker_responses[name] = None
-
-
-def _call_qwen_worker(
-    action: str,
-    payload: Any | None = None,
-    *,
-    wait_ready: bool = True,
-    worker_name: str = "primary",
-) -> dict[str, Any]:
-    """Call the Qwen worker process and return its serialized response."""
-    if not _engine_enabled("qwen3"):
-        raise HTTPException(status_code=503, detail="Qwen3 TTS backend is disabled")
-    if wait_ready:
-        _wait_for_engine_ready("qwen3")
-    _start_qwen_worker(worker_name)
-    process = _qwen_worker_processes.get(worker_name)
-    requests = _qwen_worker_requests.get(worker_name)
-    responses = _qwen_worker_responses.get(worker_name)
-    if (
-        process is None
-        or requests is None
-        or responses is None
-        or not process.is_alive()
-    ):
-        raise HTTPException(status_code=503, detail=f"Qwen3 {worker_name} worker is not running")
-
-    request_id = uuid.uuid4().hex
-    _qwen_worker_locks[worker_name].acquire()
-    started = time.perf_counter()
-    _LOGGER.info("Qwen worker request start name=%s action=%s request_id=%s", worker_name, action, request_id)
-    try:
-        requests.put({"request_id": request_id, "action": action, "payload": payload})
-        response_reader = getattr(responses, "_reader", None)
-        if response_reader is None:
-            raise HTTPException(status_code=502, detail=f"Qwen3 {worker_name} worker response queue is not readable")
-        while True:
-            ready = mp_connection_wait([response_reader, process.sentinel])
-            if response_reader not in ready:
-                process.join()
-                exit_detail = _process_exit_description(process.exitcode)
-                with _qwen_worker_start_lock:
-                    if _qwen_worker_processes.get(worker_name) is process:
-                        _qwen_worker_processes[worker_name] = None
-                        _qwen_worker_requests[worker_name] = None
-                        _qwen_worker_responses[worker_name] = None
-                _LOGGER.error(
-                    "Qwen worker exited without response name=%s action=%s request_id=%s %s elapsed=%.2fs",
-                    worker_name,
-                    action,
-                    request_id,
-                    exit_detail,
-                    time.perf_counter() - started,
-                )
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Qwen3 {worker_name} worker exited without response ({exit_detail})",
-                )
-            response = responses.get()
-            if not isinstance(response, dict):
-                raise HTTPException(status_code=502, detail="Qwen3 worker returned invalid response")
-            if response.get("request_id") == request_id:
-                break
-            _LOGGER.warning(
-                "Discarding stale Qwen worker response name=%s action=%s expected_request_id=%s got_request_id=%s",
-                worker_name,
-                action,
-                request_id,
-                response.get("request_id"),
-            )
-    finally:
-        _qwen_worker_locks[worker_name].release()
-
-    _LOGGER.info(
-        "Qwen worker request done name=%s action=%s request_id=%s elapsed=%.2fs",
-        worker_name,
-        action,
-        request_id,
-        time.perf_counter() - started,
-    )
-    if response.get("ok"):
-        return response
-
-    status_code = int(response.get("status_code") or 500)
-    detail = response.get("detail") or response.get("error") or "Qwen3 worker failed"
-    raise HTTPException(status_code=status_code, detail=detail)
-
-
-def _qwen_worker_status() -> dict[str, Any]:
-    """Best-effort Qwen status without loading Qwen in the parent process."""
-    if not _engine_enabled("qwen3"):
-        return {"enabled": False}
-    state = _engine_status("qwen3")
-    if state["status"] != "ready":
-        return {"enabled": True, "worker": state["status"], **state}
-    worker_names = ["primary"]
-    if _separate_vietnamese_qwen_worker_enabled():
-        worker_names.append("vietnamese")
-    workers: dict[str, Any] = {}
-    for worker_name in worker_names:
-        try:
-            response = _call_qwen_worker("health", wait_ready=False, worker_name=worker_name)
-            data = response.get("data")
-            workers[worker_name] = data if isinstance(data, dict) else {"worker": "invalid_response"}
-        except HTTPException as exc:
-            detail = str(exc.detail)
-            workers[worker_name] = {
-                "worker": "busy" if exc.status_code == 504 and "request slot" in detail else "error",
-                "status_code": exc.status_code,
-                "detail": detail,
-            }
-    primary = workers.get("primary")
-    return {
-        **state,
-        "enabled": True,
-        "worker": primary.get("worker") if isinstance(primary, dict) else "unknown",
-        "separate_vietnamese_worker": _separate_vietnamese_qwen_worker_enabled(),
-        "workers": workers,
-    }
-
 
 
 def _worker_settings_data() -> dict[str, Any]:
@@ -2993,18 +2777,161 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
     )
 
 
+def _prepare_voxcpm_input(text: str, language: str | None) -> tuple[str, str]:
+    if language is not None:
+        return normalize_spoken_text(text, language), language
+
+    result = _get_multilingual_splitter().split(text)
+    main_language = result.main_language or "en"
+    prepared_segments = []
+    for segment in result.segments:
+        segment_text = segment.text.strip()
+        if not segment_text:
+            continue
+        segment_language = (
+            segment.language
+            if segment.language and segment.language != "und"
+            else main_language
+        )
+        prepared_segments.append(normalize_spoken_text(segment_text, segment_language))
+    prepared_text = (
+        " ".join(prepared_segments)
+        if prepared_segments
+        else normalize_spoken_text(text, main_language)
+    )
+    return prepared_text, main_language
+
+
+def _prepare_voxcpm_text(text: str, language: str | None) -> str:
+    return _prepare_voxcpm_input(text, language)[0]
+
+
+def _get_voxcpm_runtime() -> VoxCPMRuntime:
+    if _voxcpm_runtime is None:
+        raise HTTPException(status_code=503, detail="VoxCPM backend was not loaded at startup")
+    return _voxcpm_runtime
+
+
+async def _download_voxcpm_reference(sample_url: str) -> tuple[bytes, str]:
+    parsed = urlsplit(sample_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="VoxCPM sample_url must use http or https")
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            response = await client.get(sample_url)
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=400, detail=f"Could not fetch VoxCPM sample_url: {exc}") from exc
+
+    audio = response.content
+    if not audio:
+        raise HTTPException(status_code=400, detail="VoxCPM sample_url returned an empty response")
+    suffix = Path(parsed.path).suffix.lower().lstrip(".")
+    return audio, suffix or "wav"
+
+
+async def synthesize_voxcpm_batch(request: _SharedBatchSynthesizeRequest) -> BatchSynthesizeResponse:
+    """Synthesize one compatible request group with optimized nano-vLLM."""
+    if not _engine_enabled("voxcpm"):
+        raise HTTPException(status_code=503, detail="VoxCPM backend is disabled")
+    if request.voice_id is not None:
+        raise HTTPException(status_code=400, detail="VoxCPM model routing does not support voice_id")
+    if request.options is not None:
+        raise HTTPException(status_code=400, detail="Sparrow options are not valid for VoxCPM")
+
+    texts = [text.strip() for text in request.texts]
+    if any(not text for text in texts):
+        raise HTTPException(status_code=400, detail="all texts must be non-empty")
+
+    await _await_engine_ready("voxcpm")
+    runtime = _get_voxcpm_runtime()
+    prepared_inputs = [
+        _prepare_voxcpm_input(text, request.language)
+        for text in texts
+    ]
+    prepared_texts = [prepared_text for prepared_text, _ in prepared_inputs]
+    dp_languages = [dp_language for _, dp_language in prepared_inputs]
+    reference_audio: bytes | None = None
+    reference_format = "wav"
+    if request.sample_url is not None:
+        reference_audio, reference_format = await _download_voxcpm_reference(request.sample_url)
+
+    started = time.perf_counter()
+    audios = await runtime.synthesize_batch(
+        prepared_texts,
+        languages=dp_languages,
+        seeds=request.seeds,
+        reference_audio=reference_audio,
+        reference_format=reference_format,
+    )
+    generation_wall_seconds = time.perf_counter() - started
+    sample_rate = runtime.sample_rate
+
+    items = []
+    for text, audio in zip(texts, audios):
+        audio_seconds = float(len(audio)) / sample_rate if sample_rate else 0.0
+        encoded = (
+            _audio_to_mp3_bytes(audio, sample_rate)
+            if request.format == "mp3"
+            else _audio_to_wav_bytes(audio, sample_rate)
+        )
+        items.append(
+            BatchSynthesizeItem(
+                text=text,
+                audio_base64=base64.b64encode(encoded).decode("ascii"),
+                sample_rate=sample_rate,
+                audio_seconds=audio_seconds,
+            )
+        )
+
+    audio_seconds_total = sum(item.audio_seconds for item in items)
+    wall_seconds = time.perf_counter() - started
+    _log_synthesize_batch_stage(
+        "voxcpm_batch_done",
+        model=_server_config.voxcpm.model_id,
+        item_count=len(items),
+        sample_rate=sample_rate,
+        generation_wall_seconds=round(generation_wall_seconds, 6),
+        wall_seconds=round(wall_seconds, 6),
+        audio_seconds=round(audio_seconds_total, 6),
+        rtf=round(wall_seconds / audio_seconds_total, 6) if audio_seconds_total else 0.0,
+    )
+    response = BatchSynthesizeResponse(
+        items=items,
+        count=len(items),
+        model=_server_config.voxcpm.model_id,
+        speaker=None,
+        wall_seconds=wall_seconds,
+        audio_seconds_total=audio_seconds_total,
+        rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
+    )
+    return await _apply_rvc_to_synthesize_response(
+        response,
+        rvc_model=request.rvc_model,
+        output_format=request.format,
+    )
+
+
 def _batch_item_group_key(item: BatchSynthesizeInputItem) -> tuple[Any, ...]:
     options_key = None
     if item.options is not None:
         options_key = json.dumps(item.options.model_dump(mode="json"), sort_keys=True)
-    kind = "voice" if item.voice_id is not None else "sparrow"
+    model_key = item.model
+    if item.voice_id is not None:
+        kind = "voice"
+    elif _is_voxcpm_model(item.model):
+        kind = "voxcpm"
+        model_key = _server_config.voxcpm.model_id
+    else:
+        kind = "sparrow"
     return (
         kind,
         item.voice_id,
         item.sample_url,
         item.rvc_model,
         item.language,
-        item.model,
+        model_key,
         item.style,
         item.style_intensity,
         options_key,
@@ -3024,8 +2951,10 @@ def _validate_batch_item(item: BatchSynthesizeInputItem, item_idx: int) -> str:
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: Use either 'voice_id' or 'sample_url', not both")
     if item.voice_id is not None and item.model is not None:
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: Use either 'voice_id' or 'model', not both")
-    if item.language is not None and item.model is not None:
+    if item.language is not None and item.model is not None and not _is_voxcpm_model(item.model):
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: Use either 'language' or 'model', not both")
+    if item.seed is not None and not _is_voxcpm_model(item.model):
+        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'seed' requires model='voxcpm'")
     if item.sample_url is not None and _seed_vc_style_requested(item):
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'style' and 'styleIntensity' require 'voice_id'")
     if item.voice_id is None and _seed_vc_style_requested(item):
@@ -3037,6 +2966,7 @@ def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, 
     first = records[0][1]
     return _SharedBatchSynthesizeRequest(
         texts=[text for _, _, text in records],
+        seeds=[item.seed for _, item, _ in records],
         voice_id=first.voice_id,
         sample_url=first.sample_url,
         rvc_model=first.rvc_model,
@@ -3100,8 +3030,12 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
             format=shared_request.format,
         )
         if shared_request.voice_id is not None:
+            await _await_engine_ready("pipertts")
             group_result = await synthesize_configured_voice_batch(shared_request)
+        elif _is_voxcpm_model(shared_request.model):
+            group_result = await synthesize_voxcpm_batch(shared_request)
         elif shared_request.language is not None:
+            await _await_engine_ready("pipertts")
             _, forced_speaker, forced_model = _resolve_forced_language(shared_request.language)
             group_result = await synthesize_sparrow_batch(
                 _SharedBatchSynthesizeRequest(
@@ -3116,8 +3050,10 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
                 speaker=forced_speaker,
             )
         elif shared_request.model is not None:
+            await _await_engine_ready("pipertts")
             group_result = await synthesize_sparrow_batch(shared_request)
         else:
+            await _await_engine_ready("pipertts")
             group_result = await synthesize_multilingual_sparrow_batch(shared_request)
 
         _log_synthesize_batch_stage(
@@ -3177,7 +3113,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     if config is None:
         config = _load_config()
     _server_config = config
-    qwen3.configure(_server_config.qwen)
 
     app = FastAPI(
         title="LZ-TTS API",
@@ -3200,9 +3135,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         provided_api_key = _request_api_key(request)
         _scrub_api_key_query_param(request)
 
-        if _is_browser_demo_path(request.url.path):
-            return await call_next(request)
-
         expected_api_key = _configured_api_key()
         if not expected_api_key:
             return JSONResponse(
@@ -3215,61 +3147,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 content={"detail": "Invalid or missing API key"},
             )
         return await call_next(request)
-
-    if _engine_enabled("qwen3", config):
-        _mount_qwen_demo(app)
-
-        @app.get("/qwen3/health")
-        async def qwen3_health():
-            return await asyncio.to_thread(_qwen_worker_status)
-
-        @app.post("/qwen3/synthesize")
-        async def qwen3_synthesize(request: Request):
-            payload = await request.json()
-            req = qwen3.SynthesizeRequest(**payload)
-            await _await_engine_ready("qwen3")
-            req = await asyncio.to_thread(_prepare_qwen_request_for_worker, req)
-            worker_name = _qwen_worker_name_for_request(req)
-            result = await asyncio.to_thread(
-                _call_qwen_worker,
-                "synthesize",
-                req.model_dump(mode="json"),
-                worker_name=worker_name,
-            )
-            media_type = str(result.get("media_type") or "audio/mpeg")
-            content = result.get("content") or b""
-            if not isinstance(content, bytes):
-                raise HTTPException(status_code=502, detail="Qwen3 worker returned invalid audio")
-            return _binary_response(content, media_type)
-
-        @app.post("/qwen3/synthesize/batch", response_model=qwen3.BatchSynthesizeResponse)
-        @app.post("/qwen3/synthesize-batch", response_model=qwen3.BatchSynthesizeResponse)
-        async def qwen3_synthesize_batch(request: Request):
-            started = time.perf_counter()
-            payload = await request.json()
-            req = qwen3.BatchSynthesizeRequest(**payload)
-            await _await_engine_ready("qwen3")
-            req = await asyncio.to_thread(_prepare_qwen_batch_for_worker, req)
-            worker_groups = _qwen_worker_groups_for_batch(req)
-            results = await asyncio.gather(
-                *(
-                    asyncio.to_thread(_call_qwen_batch_worker, worker_name, indexed_items)
-                    for worker_name, indexed_items in worker_groups.items()
-                )
-            )
-            items: list[qwen3.BatchSynthesizeItem | None] = [None] * len(req.items)
-            for worker_items in results:
-                for index, item in worker_items:
-                    items[index] = item
-            final_items = [item for item in items if item is not None]
-            if len(final_items) != len(req.items):
-                raise HTTPException(status_code=502, detail="Qwen3 worker batch response was incomplete")
-            return qwen3.BatchSynthesizeResponse(
-                items=final_items,
-                count=len(final_items),
-                wall_seconds=time.perf_counter() - started,
-                audio_seconds_total=sum(item.audio_seconds for item in final_items),
-            )
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -3295,6 +3172,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         """Schedule enabled model engines to load in background worker processes."""
         global _speaker_routes, _lang_speaker_map, _splitter, _splitter_languages
         global _starling_backend, _starling_batcher, _seed_vc_backend, _rvc_backend
+        global _voxcpm_runtime
         global _seed_vc_supported_voice_ids, _seed_vc_voice_ids
         global _sparrow_model_info, _starling_info, _seed_vc_info
         global _startup_loader_task
@@ -3304,9 +3182,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         with _logged_startup_step("reset_runtime_state"):
             if _startup_loader_task is not None and not _startup_loader_task.done():
                 _startup_loader_task.cancel()
+            if _voxcpm_runtime is not None:
+                await _voxcpm_runtime.stop()
+                _voxcpm_runtime = None
             _stop_model_workers()
-            _stop_qwen_worker()
-            qwen3.stop_reference_transcription_worker()
             _inference_cache.clear()
             _lang_speaker_map.clear()
             _speaker_routes.clear()
@@ -3360,56 +3239,23 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             else:
                 _LOGGER.info("PiperTTS backend disabled")
 
-            if _engine_enabled("qwen3"):
-                async def start_qwen() -> None:
+            if _engine_enabled("voxcpm"):
+                async def start_voxcpm() -> None:
+                    global _voxcpm_runtime
                     with _logged_startup_step(
-                        "qwen3_worker",
-                        model=_server_config.qwen.model,
-                        device=_server_config.qwen.device,
-                        separate_vietnamese_worker=_separate_vietnamese_qwen_worker_enabled(),
-                        vietnamese_model=_server_config.qwen.vietnamese_model,
-                        vietnamese_device=_server_config.qwen.vietnamese_device,
-                        dtype=_server_config.qwen.dtype,
-                        dp_budget=_server_config.qwen.dp_budget.enabled,
-                        asr_model=_server_config.qwen.asr.model,
-                        asr_device=_server_config.qwen.asr.device,
-                        asr_isolated=_server_config.qwen.asr.isolated,
+                        "voxcpm_nanovllm",
+                        model=_server_config.voxcpm.model_path,
+                        model_id=_server_config.voxcpm.model_id,
+                        device=_server_config.voxcpm.device,
+                        kv_blocks=_server_config.voxcpm.num_kvcache_blocks,
                     ):
-                        worker_names = ["primary"]
-                        if _separate_vietnamese_qwen_worker_enabled():
-                            worker_names.append("vietnamese")
+                        runtime = VoxCPMRuntime(_server_config.voxcpm.model_dump(mode="python"))
+                        await runtime.start()
+                        _voxcpm_runtime = runtime
 
-                        async def start_tts_workers() -> None:
-                            for worker_name in worker_names:
-                                _start_qwen_worker(worker_name)
-                            for worker_name in worker_names:
-                                _LOGGER.info("Checking Qwen worker health name=%s", worker_name)
-                                await asyncio.to_thread(
-                                    _call_qwen_worker,
-                                    "health",
-                                    None,
-                                    wait_ready=False,
-                                    worker_name=worker_name,
-                                )
-                                _LOGGER.info("Qwen worker health ok name=%s", worker_name)
-
-                        async def start_asr_worker() -> None:
-                            if not (_server_config.qwen.asr.enabled and _server_config.qwen.asr.preload):
-                                return
-                            _LOGGER.info(
-                                "Preloading Qwen ASR model model=%s device=%s isolated=%s",
-                                _server_config.qwen.asr.model,
-                                _server_config.qwen.asr.device,
-                                _server_config.qwen.asr.isolated,
-                            )
-                            await asyncio.to_thread(qwen3.preload_reference_transcription_model)
-                            _LOGGER.info("Qwen ASR preload ok")
-
-                        await asyncio.gather(start_tts_workers(), start_asr_worker())
-
-                startup_tasks.append(asyncio.create_task(run_loader("qwen3", start_qwen)))
+                startup_tasks.append(asyncio.create_task(run_loader("voxcpm", start_voxcpm)))
             else:
-                _LOGGER.info("Qwen3 TTS backend disabled")
+                _LOGGER.info("VoxCPM backend disabled")
 
             if _engine_enabled("starling"):
                 async def start_starling() -> None:
@@ -3490,21 +3336,20 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     async def shutdown_event():
-        global _startup_loader_task
+        global _startup_loader_task, _voxcpm_runtime
         if _startup_loader_task is not None and not _startup_loader_task.done():
             _startup_loader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await _startup_loader_task
         _startup_loader_task = None
+        if _voxcpm_runtime is not None:
+            await _voxcpm_runtime.stop()
+            _voxcpm_runtime = None
         _stop_model_workers()
-        _stop_qwen_worker()
-        qwen3.stop_reference_transcription_worker()
 
     @app.get("/")
     async def health():
         """Health check and server info."""
-        qwen_status = await asyncio.to_thread(_qwen_worker_status) if _engine_enabled("qwen3") else {}
-
         # Build speaker list with locale mappings
         speakers = []
         seen_locales: set[str] = set()
@@ -3536,7 +3381,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "version": "0.1.0",
             "engines": {
                 "pipertts": _engine_enabled("pipertts"),
-                "qwen3": _engine_enabled("qwen3"),
+                "voxcpm": _engine_enabled("voxcpm"),
                 "starling": _engine_enabled("starling"),
                 "seed_vc": _engine_enabled("seed_vc"),
                 "rvc": _engine_enabled("rvc"),
@@ -3549,10 +3394,19 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 "max_models_in_cache": _server_config.pipertts.max_models_in_cache,
                 "default_model": _server_config.pipertts.default_model,
             },
-            "qwen3": {
-                "enabled": _engine_enabled("qwen3"),
-                **qwen_status,
-                "asr": qwen3.reference_transcription_status(),
+            "voxcpm": {
+                "enabled": _engine_enabled("voxcpm"),
+                **_engine_status("voxcpm"),
+                "loaded": _voxcpm_runtime is not None,
+                "model": _server_config.voxcpm.model_id,
+                "model_path": _server_config.voxcpm.model_path,
+                "device": _server_config.voxcpm.device,
+                "num_kvcache_blocks": _server_config.voxcpm.num_kvcache_blocks,
+                "sample_rate": (
+                    _voxcpm_runtime.sample_rate
+                    if _voxcpm_runtime is not None
+                    else None
+                ),
             },
             "starling": {
                 "enabled": _engine_enabled("starling"),
@@ -3826,15 +3680,41 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Provide either 'text' or 'ssml', not both")
         if not request.text and not request.ssml:
             raise HTTPException(status_code=400, detail="Must provide either 'text' or 'ssml'")
-        if request.language is not None and model is not None:
+        if request.language is not None and model is not None and not _is_voxcpm_model(model):
             raise HTTPException(status_code=400, detail="Use either 'language' or 'model', not both")
-        if not _engine_enabled("pipertts"):
-            raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
-        await _await_engine_ready("pipertts")
+        if request.seed is not None and not _is_voxcpm_model(model):
+            raise HTTPException(status_code=400, detail="'seed' requires model='voxcpm'")
         if request.sample_url is not None and request.voice_id is not None:
             raise HTTPException(status_code=400, detail="Use either 'voice_id' or 'sample_url', not both")
         if request.sample_url is not None and _seed_vc_style_requested(request):
             raise HTTPException(status_code=400, detail="'style' and 'styleIntensity' require 'voice_id'")
+        if _is_voxcpm_model(model):
+            if request.ssml is not None:
+                raise HTTPException(status_code=400, detail="VoxCPM synthesis supports plain text only")
+            if request.voice_id is not None:
+                raise HTTPException(status_code=400, detail="VoxCPM model routing does not support voice_id")
+            if _seed_vc_style_requested(request):
+                raise HTTPException(status_code=400, detail="'style' and 'styleIntensity' require 'voice_id'")
+            result = await synthesize_voxcpm_batch(
+                _SharedBatchSynthesizeRequest(
+                    texts=[request.text or ""],
+                    seeds=[request.seed],
+                    sample_url=request.sample_url,
+                    rvc_model=request.rvc_model,
+                    language=request.language,
+                    model=model,
+                    options=request.options,
+                    format=request.format,
+                    neural=request.neural,
+                )
+            )
+            audio_bytes = base64.b64decode(result.items[0].audio_base64)
+            media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
+            return _binary_response(audio_bytes, media_type)
+
+        if not _engine_enabled("pipertts"):
+            raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
+        await _await_engine_ready("pipertts")
         if request.voice_id is not None:
             if model is not None:
                 raise HTTPException(status_code=400, detail="Use either 'voice_id' or 'model', not both")
@@ -3916,7 +3796,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     async def synthesize(
         request: SynthesizeRequest,
         fastapi_request: Request,
-        model: str = Query(None, description="Model to use (overrides auto routing)"),
+        model_query: str = Query(None, alias="model", description="Legacy query-string model override"),
     ):
         """Synthesize text or SSML to speech.
 
@@ -3926,6 +3806,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         Use `language` to force one supported locale for the entire text.
         """
         started = time.perf_counter()
+        model = _resolved_synthesize_model(request.model, model_query)
         _log_synthesize_request(
             route=fastapi_request.url.path,
             method=fastapi_request.method,
@@ -3991,7 +3872,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             input_data=_request_model_input(request),
         )
         try:
-            await _await_engine_ready("pipertts")
             result = await synthesize_mixed_batch(request)
         except HTTPException as exc:
             _log_synthesize_request(
@@ -4039,7 +3919,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         ssml: Optional[str] = Query(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)"),
         model: str = Query(None, description="Model to use (overrides auto routing)"),
         voice_id: Optional[str] = Query(None, description="Public voice id from data/seed-vc/voice_ids.txt"),
-        sample_url: Optional[str] = Query(None, description="Reference sample URL; output is converted to this voice with Seed-VC"),
+        sample_url: Optional[str] = Query(
+            None,
+            description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
+        ),
         rvc_model: Annotated[
             Optional[str],
             Query(alias="rvcModel", description="Optional RVC model filename to apply as the final conversion step"),
@@ -4159,87 +4042,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         return response
 
     return app
-
-
-class _BasicAuthWrapper:
-    def __init__(self, app, username: str, password: str):
-        self.app = app
-        self.username = username
-        self.password = password
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        auth_header = ""
-        for key, value in scope.get("headers", []):
-            if key.lower() == b"authorization":
-                auth_header = value.decode("latin1")
-                break
-
-        if not _basic_auth_matches(auth_header, self.username, self.password):
-            response = _basic_auth_challenge()
-            await response(scope, receive, send)
-            return
-
-        await self.app(scope, receive, send)
-
-
-def _basic_auth_matches(auth_header: str, username: str, password: str) -> bool:
-    if not auth_header.startswith("Basic "):
-        return False
-    try:
-        decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
-        submitted_username, submitted_password = decoded.split(":", 1)
-    except Exception:
-        return False
-    return secrets.compare_digest(submitted_username, username) and secrets.compare_digest(
-        submitted_password,
-        password,
-    )
-
-
-def _basic_auth_challenge() -> Response:
-    return Response(
-        "Unauthorized",
-        status_code=401,
-        headers={"WWW-Authenticate": 'Basic realm="qwen3-demo"'},
-    )
-
-
-def _mount_qwen_demo(app: FastAPI) -> None:
-    """Mount the bundled faster-qwen3-tts demo inside this server."""
-    if not qwen3.env_bool("QWEN_TTS_DEMO", True):
-        return
-
-    demo_password = os.environ.get("QWEN_TTS_DEMO_PASSWORD")
-    if not demo_password:
-        _LOGGER.warning("Qwen3 demo disabled: QWEN_TTS_DEMO_PASSWORD is not set")
-        return
-
-    demo_server = Path(__file__).resolve().parents[1] / "qwen3_demo" / "server.py"
-    if not demo_server.exists():
-        _LOGGER.warning("Qwen3 demo server not found: %s", demo_server)
-        return
-
-    os.environ["LZ_TTS_EMBEDDED_DEMO"] = "1"
-    spec = importlib.util.spec_from_file_location("lz_tts_faster_qwen3_demo", demo_server)
-    if spec is None or spec.loader is None:
-        _LOGGER.warning("Could not load Qwen3 demo server: %s", demo_server)
-        return
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    @app.get("/qwen3/demo", include_in_schema=False)
-    async def qwen_demo_entrypoint(request: Request):
-        if not _basic_auth_matches(request.headers.get("authorization", ""), "admin", demo_password):
-            return _basic_auth_challenge()
-        return RedirectResponse("/qwen3/demo/")
-
-    app.mount("/qwen3/demo", _BasicAuthWrapper(module.app, "admin", demo_password))
-    _LOGGER.info("Mounted Qwen3 demo at /qwen3/demo")
 
 
 app = create_app()

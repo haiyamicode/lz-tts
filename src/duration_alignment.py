@@ -1,4 +1,4 @@
-"""Duration-predictor budget for Qwen3-TTS codec-token caps."""
+"""Sparrow duration prediction and monotonic-alignment validation."""
 
 from __future__ import annotations
 
@@ -132,7 +132,7 @@ def parse_language_profiles(raw: str) -> dict[str, dict[str, float | int]]:
         return {}
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
-        raise ValueError("QWEN_DP_BUDGET_LANGUAGE_PROFILES must be a JSON object")
+        raise ValueError("duration alignment language profiles must be a JSON object")
 
     profiles: dict[str, dict[str, float | int]] = {}
     for language, values in parsed.items():
@@ -149,8 +149,8 @@ def parse_language_profiles(raw: str) -> dict[str, dict[str, float | int]]:
     return profiles
 
 
-class QwenDpBudget:
-    """Predict a conservative Qwen codec-token cap from duration samples."""
+class DurationAlignmentValidator:
+    """Predict speech duration and validate monotonic phoneme alignment."""
 
     def __init__(self, config: DpBudgetConfig | None = None):
         self.config = config or DpBudgetConfig()
@@ -174,18 +174,18 @@ class QwenDpBudget:
 
             checkpoint_path = Path(self.config.checkpoint)
             config_path = Path(self.config.config_path) if self.config.config_path else checkpoint_path.parent / "config.json"
-            _LOGGER.info("Loading Qwen DP budget checkpoint=%s config=%s", checkpoint_path, config_path)
+            _LOGGER.info("Loading duration alignment checkpoint=%s config=%s", checkpoint_path, config_path)
             if not checkpoint_path.exists():
-                raise FileNotFoundError(f"Qwen DP budget checkpoint not found: {checkpoint_path}")
+                raise FileNotFoundError(f"Duration alignment checkpoint not found: {checkpoint_path}")
             if not config_path.exists():
                 raise FileNotFoundError(
-                    f"Qwen DP budget config not found: {config_path} "
+                    f"Duration alignment config not found: {config_path} "
                     f"(checkpoint={checkpoint_path})"
                 )
             with config_path.open("r", encoding="utf-8") as f:
                 self._model_config = json.load(f)
 
-            # Qwen/Transformers loading can leave PyTorch's default device as
+            # Transformers loading can leave PyTorch's default device as
             # ``meta`` in this worker. Lightning then constructs VITS on meta and
             # checkpoint copies become no-ops, so force real CPU allocation here.
             with torch.device("cpu"):
@@ -236,7 +236,7 @@ class QwenDpBudget:
                     else ""
                 )
                 raise RuntimeError(
-                    "Qwen DP budget model still has meta tensors after CPU checkpoint load: "
+                    "Duration alignment model still has meta tensors after CPU checkpoint load: "
                     f"{preview}{suffix}"
                 )
             self._model = model_g.to(self.device).eval()
@@ -494,7 +494,7 @@ class QwenDpBudget:
         assert self._model is not None
         model = self._model
         if getattr(model, "enc_q", None) is None or getattr(model, "flow", None) is None:
-            raise RuntimeError("Qwen DP alignment validation requires enc_q/flow; enable_alignment_validation is false")
+            raise RuntimeError("Alignment validation requires enc_q/flow; enable_alignment_validation is false")
 
         from src.piper.preprocess import phonemize_text_for_infer
         from src.piper.vits import monotonic_align
@@ -577,7 +577,7 @@ class QwenDpBudget:
             duration_ratio = audio_seconds / float(expected_seconds)
             if duration_ratio > 1.0 + duration_tolerance:
                 _LOGGER.info(
-                    "Qwen DP alignment validation rejected duration before alignment audio_seconds=%.2f raw_audio_seconds=%.2f trim_head_seconds=%.2f trim_tail_seconds=%.2f expected_seconds=%.2f ratio=%.3f tolerance=%.3f phoneme_count=%d",
+                    "Alignment validation rejected duration before alignment audio_seconds=%.2f raw_audio_seconds=%.2f trim_head_seconds=%.2f trim_tail_seconds=%.2f expected_seconds=%.2f ratio=%.3f tolerance=%.3f phoneme_count=%d",
                     audio_seconds,
                     raw_audio_seconds,
                     trim_head_seconds,

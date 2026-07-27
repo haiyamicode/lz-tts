@@ -2159,6 +2159,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "ffmpeg-normalize" },
     { name = "ffmpeg-python" },
+    { name = "flash-attn" },
     { name = "fugashi" },
     { name = "funasr" },
     { name = "g2p-en" },
@@ -2183,6 +2184,7 @@ dependencies = [
     { name = "monotonic-align" },
     { name = "munch" },
     { name = "nano-parakeet" },
+    { name = "nano-vllm-voxcpm" },
     { name = "numpy" },
     { name = "onnxruntime-gpu" },
     { name = "peft" },
@@ -2199,7 +2201,6 @@ dependencies = [
     { name = "pytorch-lightning" },
     { name = "pyworld" },
     { name = "qwen-asr" },
-    { name = "qwen-tts" },
     { name = "rapidfuzz" },
     { name = "regex" },
     { name = "resemblyzer" },
@@ -2229,13 +2230,6 @@ dependencies = [
     { name = "zstandard" },
 ]
 
-[package.optional-dependencies]
-qwen-flash = [
-    { name = "flash-attn" },
-    { name = "ninja" },
-    { name = "packaging" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "anyascii", specifier = "==0.3.2" },
@@ -2258,7 +2252,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0,<0.116" },
     { name = "ffmpeg-normalize", specifier = ">=1.37.8" },
     { name = "ffmpeg-python", specifier = ">=0.2.0" },
-    { name = "flash-attn", marker = "extra == 'qwen-flash'", path = "data/runtime-wheels/flash_attn-2.8.3.post1-cp310-cp310-linux_x86_64.whl" },
+    { name = "flash-attn", path = "data/runtime-wheels/flash_attn-2.8.3.post1-cp310-cp310-linux_x86_64.whl" },
     { name = "fugashi", specifier = ">=1.5.0,<1.6" },
     { name = "funasr", specifier = ">=1.3.3" },
     { name = "g2p-en", specifier = "==2.1.0" },
@@ -2283,10 +2277,9 @@ requires-dist = [
     { name = "monotonic-align", specifier = ">=1.0.0" },
     { name = "munch", specifier = ">=4.0.0" },
     { name = "nano-parakeet", specifier = ">=0.2.1" },
-    { name = "ninja", marker = "extra == 'qwen-flash'", specifier = ">=1.13.0" },
+    { name = "nano-vllm-voxcpm", specifier = "==2.0.3" },
     { name = "numpy", specifier = "==1.23.5" },
     { name = "onnxruntime-gpu", specifier = ">=1.23.2" },
-    { name = "packaging", marker = "extra == 'qwen-flash'", specifier = ">=23.2" },
     { name = "peft", specifier = ">=0.19.1" },
     { name = "phonemizer", specifier = ">=3.3.0" },
     { name = "piper-phonemize", directory = "src/phonemizer" },
@@ -2301,7 +2294,6 @@ requires-dist = [
     { name = "pytorch-lightning", specifier = "==2.6.0" },
     { name = "pyworld", specifier = "==0.3.2" },
     { name = "qwen-asr", specifier = ">=0.0.6" },
-    { name = "qwen-tts", specifier = ">=0.1.1" },
     { name = "rapidfuzz", specifier = ">=3.14.3" },
     { name = "regex", specifier = ">=2026.1,<2027" },
     { name = "resemblyzer", specifier = ">=0.1.4" },
@@ -2330,7 +2322,6 @@ requires-dist = [
     { name = "wordfreq", specifier = ">=3.1.0,<3.2" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
-provides-extras = ["qwen-flash"]
 
 [[package]]
 name = "markdown"
@@ -2610,6 +2601,30 @@ wheels = [
 ]
 
 [[package]]
+name = "nano-vllm-voxcpm"
+version = "2.0.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "flash-attn", marker = "sys_platform != 'win32'" },
+    { name = "librosa" },
+    { name = "numpy" },
+    { name = "pydantic" },
+    { name = "soundfile" },
+    { name = "torch" },
+    { name = "torchaudio" },
+    { name = "torchcodec" },
+    { name = "tqdm" },
+    { name = "transformers" },
+    { name = "triton", marker = "sys_platform != 'win32'" },
+    { name = "triton-windows", marker = "sys_platform == 'win32'" },
+    { name = "xxhash" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a7/2e/f01bcab9fea13977979f55681ad965c93b3c78b50dc0bb08aadcc55c6cc3/nano_vllm_voxcpm-2.0.3.tar.gz", hash = "sha256:52a00c919c5ffa26269b70b475d996fc57568383b2acd572d26472151d2a9805", size = 437782, upload-time = "2026-07-16T12:16:42.128Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/15/33/8f5b93ddbc7cc48d85a4b61a848eba3de463b3261ac56b5428b8cecb6b5d/nano_vllm_voxcpm-2.0.3-py3-none-any.whl", hash = "sha256:27b6ac08aad056580d7bca325ff02facc8122d327f0958f7752dfef44f1235fb", size = 129602, upload-time = "2026-07-16T12:16:40.643Z" },
+]
+
+[[package]]
 name = "networkx"
 version = "2.8.8"
 source = { registry = "https://pypi.org/simple" }
@@ -2860,26 +2875,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/09/48/6388f1bb9da707110532cb70ec4d2822858ddfb44f1cdf1233c20a80ea4b/omegaconf-2.3.0.tar.gz", hash = "sha256:d5d4b6d29955cc50ad50c46dc269bcd92c6e00f5f90d23ab5fee7bfca4ba4cc7", size = 3298120, upload-time = "2022-12-08T20:59:22.753Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e3/94/1843518e420fa3ed6919835845df698c7e27e183cb997394e4a670973a65/omegaconf-2.3.0-py3-none-any.whl", hash = "sha256:7b4df175cdb08ba400f45cae3bdcae7ba8365db4d165fc65fd04b050ab63b46b", size = 79500, upload-time = "2022-12-08T20:59:19.686Z" },
-]
-
-[[package]]
-name = "onnxruntime"
-version = "1.23.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "coloredlogs" },
-    { name = "flatbuffers" },
-    { name = "numpy" },
-    { name = "packaging" },
-    { name = "protobuf" },
-    { name = "sympy" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/35/d6/311b1afea060015b56c742f3531168c1644650767f27ef40062569960587/onnxruntime-1.23.2-cp310-cp310-macosx_13_0_arm64.whl", hash = "sha256:a7730122afe186a784660f6ec5807138bf9d792fa1df76556b27307ea9ebcbe3", size = 17195934, upload-time = "2025-10-27T23:06:14.143Z" },
-    { url = "https://files.pythonhosted.org/packages/db/db/81bf3d7cecfbfed9092b6b4052e857a769d62ed90561b410014e0aae18db/onnxruntime-1.23.2-cp310-cp310-macosx_13_0_x86_64.whl", hash = "sha256:b28740f4ecef1738ea8f807461dd541b8287d5650b5be33bca7b474e3cbd1f36", size = 19153079, upload-time = "2025-10-27T23:05:57.686Z" },
-    { url = "https://files.pythonhosted.org/packages/2e/4d/a382452b17cf70a2313153c520ea4c96ab670c996cb3a95cc5d5ac7bfdac/onnxruntime-1.23.2-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8f7d1fe034090a1e371b7f3ca9d3ccae2fabae8c1d8844fb7371d1ea38e8e8d2", size = 15219883, upload-time = "2025-10-22T03:46:21.66Z" },
-    { url = "https://files.pythonhosted.org/packages/fb/56/179bf90679984c85b417664c26aae4f427cba7514bd2d65c43b181b7b08b/onnxruntime-1.23.2-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4ca88747e708e5c67337b0f65eed4b7d0dd70d22ac332038c9fc4635760018f7", size = 17370357, upload-time = "2025-10-22T03:46:57.968Z" },
-    { url = "https://files.pythonhosted.org/packages/cd/6d/738e50c47c2fd285b1e6c8083f15dac1a5f6199213378a5f14092497296d/onnxruntime-1.23.2-cp310-cp310-win_amd64.whl", hash = "sha256:0be6a37a45e6719db5120e9986fcd30ea205ac8103fd1fb74b6c33348327a0cc", size = 13467651, upload-time = "2025-10-27T23:06:11.904Z" },
 ]
 
 [[package]]
@@ -3669,26 +3664,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a2/27/81a51b10ef6d1a4f158498089530eb4307689d75adf6bd34f6632eda3099/qwen_omni_utils-0.0.9.tar.gz", hash = "sha256:c598269c7069afb4d154f8ea523972e8d8794a978fffed89cb4d87c326f97447", size = 8632, upload-time = "2026-02-10T09:45:30.538Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/38/a8/dfc07e5b9005decbd2f08ac564250775fea9526473ae1bc90fbf45e8036f/qwen_omni_utils-0.0.9-py3-none-any.whl", hash = "sha256:f111db07af669c83333411c5177131e18e831fe666d6a55a1af263952ada8939", size = 9657, upload-time = "2026-02-10T09:45:28.888Z" },
-]
-
-[[package]]
-name = "qwen-tts"
-version = "0.1.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "accelerate" },
-    { name = "einops" },
-    { name = "gradio" },
-    { name = "librosa" },
-    { name = "onnxruntime" },
-    { name = "soundfile" },
-    { name = "sox" },
-    { name = "torchaudio" },
-    { name = "transformers" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/39/5d/b339c4f34f22ce838d39d1c015bbad103cd4003f6826ac3afaf1553973a0/qwen_tts-0.1.1.tar.gz", hash = "sha256:afba5fa235806a6883f46a389e67540b46f8a55da457216bf1d7342903814780", size = 114131, upload-time = "2026-02-06T04:10:53.454Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/31/01/95f3ae26f5b7eb2105f69ad2c15af5a28b9ebdd1258a0b27541f5ebd6225/qwen_tts-0.1.1-py3-none-any.whl", hash = "sha256:11a290d8dabc7ef91a90c54478c8ab19b3edb1d85c0882313721892bdc4af15d", size = 113529, upload-time = "2026-02-06T04:10:51.716Z" },
 ]
 
 [[package]]
@@ -4496,7 +4471,19 @@ name = "triton"
 version = "3.5.1"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/2e/f95e673222afa2c7f0c687d8913e98fcf2589ef0b1405de76894e37fe18f/triton-3.5.1-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f63e34dcb32d7bd3a1d0195f60f30d2aee8b08a69a0424189b71017e23dfc3d2", size = 159821655, upload-time = "2025-11-11T17:51:44.09Z" },
     { url = "https://files.pythonhosted.org/packages/fd/6e/676ab5019b4dde8b9b7bab71245102fc02778ef3df48218b298686b9ffd6/triton-3.5.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5fc53d849f879911ea13f4a877243afc513187bc7ee92d1f2c0f1ba3169e3c94", size = 170320692, upload-time = "2025-11-11T17:40:46.074Z" },
+]
+
+[[package]]
+name = "triton-windows"
+version = "3.4.0.post21"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "setuptools" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9d/77/58e419d467770ccabe83650f22e35cd5cba7e8fe23294fb49621d3c2aa57/triton_windows-3.4.0.post21-cp310-cp310-win_amd64.whl", hash = "sha256:b5d12acb71d8fb4af8baff7588b5d26614bbe383888c22ab27b50948dc3baa82", size = 42672843, upload-time = "2025-10-17T05:09:05.38Z" },
 ]
 
 [[package]]
