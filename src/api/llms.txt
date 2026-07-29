@@ -30,7 +30,6 @@ Request Body (JSON):
   "ssml": "<speak>SSML content</speak>",
   "voice_id": "msa.en-US.AvaMultilingual",
   "sample_url": "https://example.com/ref.mp3",
-  "rvcModel": "mrbeast.pth",
   "language": "en-GB",
   "style": "empathetic",
   "styleIntensity": 0.5,
@@ -51,7 +50,6 @@ Rules:
 - Provide exactly one of `text` or `ssml`.
 - Use `voice_id` for configured voices. Supported ids are listed by `GET /synthesize/voices`.
 - Use `sample_url` to synthesize normally with Sparrow, then convert the result to the sample voice with Seed-VC. Do not combine with `voice_id`, `style`, or `styleIntensity`.
-- Use `rvcModel` to run an RVC conversion as the final step after Sparrow and any Seed-VC conversion.
 - Use `language` with a full locale such as `en-US`, `en-GB`, `ja-JP`, or `zh-CN` to force the whole input into that locale. Unsupported locales are rejected.
 - Without `language`, multilingual auto-routing is used.
 - `style` and `styleIntensity` require `voice_id` and must exactly match a cached Seed-VC embedding.
@@ -67,7 +65,6 @@ Request Body (JSON):
     {
       "text": "First text",
       "voice_id": "msa.en-US.AvaMultilingual",
-      "rvcModel": "mrbeast.pth",
       "language": "en-US",
       "format": "mp3",
       "neural": true,
@@ -90,7 +87,6 @@ Rules:
 - `ssml` is not supported in `/synthesize/batch`; use plain `text`.
 - Per item, use either `voice_id`, `sample_url`, or direct Sparrow routing, not conflicting combinations.
 - `style` and `styleIntensity` require `voice_id`.
-- `rvcModel` is optional per item and runs after the item has been synthesized and optionally converted by Seed-VC. Items with the same compatible settings and `rvcModel` are grouped into one RVC batch call.
 
 Response Body (JSON):
 ```json
@@ -120,7 +116,6 @@ Query Parameters:
 - `ssml`: SSML to synthesize.
 - `voice_id`: Configured voice id.
 - `sample_url`: Reference sample URL for Seed-VC conversion.
-- `rvcModel`: Optional RVC model filename to apply as the final conversion step.
 - `language`: Full locale used for forced routing of entire input.
 - `style`: Seed-VC style for `voice_id` synthesis.
 - `styleIntensity`: Seed-VC style intensity for `voice_id` synthesis.
@@ -146,9 +141,6 @@ Response:
 - `POST /find-voice`: Lookup voice ID from a reference URL.
 - `POST /enhance`: Download, normalize, enhance, and return a reference sample.
 - `GET /seed-vc/status`: Seed-VC backend status.
-- `GET /rvc/status`: RVC backend status.
-- `GET /rvc/models`: RVC model list.
-- `POST /rvc/convert`: RVC voice conversion.
 
 ## Examples
 

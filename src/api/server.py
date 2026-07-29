@@ -7,7 +7,6 @@ import asyncio
 import contextlib
 import gc
 import hashlib
-import io
 import json
 import logging
 import os
@@ -33,7 +32,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
-from pydub import AudioSegment
 
 from ..multilingual_splitter import MultilingualSplitter
 from ..piper import PiperInference
@@ -52,7 +50,6 @@ from .seed_vc_backend import (
     SeedVCFindVoiceRequest,
     SeedVCRequest,
 )
-from .rvc import RVCBackend, RVCSettings
 from .voxcpm_runtime import VoxCPMRuntime
 from .worker_common import WorkerProcessClient
 
@@ -202,7 +199,6 @@ class EngineEnableConfig(BaseModel):
     starling: bool = Field(default_factory=lambda: _env_bool("STARLING_TTS_ENABLED", _env_bool("MATCHA_TTS_ENABLED", False)))
     matcha: bool = Field(default_factory=lambda: _env_bool("MATCHA_TTS_ENABLED", False))
     seed_vc: bool = Field(default_factory=lambda: _env_bool("SEED_VC_ENABLED", True))
-    rvc: bool = Field(default_factory=lambda: _env_bool("RVC_ENABLED", False))
 
 
 class PiperTTSConfig(BaseModel):
@@ -336,20 +332,6 @@ class SeedVCConfig(BaseModel):
     )
 
 
-class RVCConfig(BaseModel):
-    """RVC voice conversion engine configuration."""
-
-    enabled: bool = Field(default_factory=lambda: _env_bool("RVC_ENABLED", False))
-    preload: bool = Field(default_factory=lambda: _env_bool("RVC_PRELOAD", False))
-    cache_size: int = Field(default_factory=lambda: int(os.environ.get("RVC_CACHE_SIZE", "5")), ge=1)
-    preload_models: list[str] = Field(default_factory=list)
-    default_f0_method: str = Field(default_factory=lambda: os.environ.get("RVC_F0_METHOD", "rmvpe"))
-    default_pitch: int = Field(default_factory=lambda: int(os.environ.get("RVC_PITCH", "0")))
-    default_index_rate: float = Field(default_factory=lambda: float(os.environ.get("RVC_INDEX_RATE", "0.0")))
-    default_rms_mix_rate: float = Field(default_factory=lambda: float(os.environ.get("RVC_RMS_MIX_RATE", "0.25")))
-    default_protect: float = Field(default_factory=lambda: float(os.environ.get("RVC_PROTECT", "0.33")))
-
-
 class ServerConfig(BaseModel):
     """Server configuration."""
 
@@ -359,7 +341,6 @@ class ServerConfig(BaseModel):
     starling: MatchaConfig = Field(default_factory=MatchaConfig)
     matcha: MatchaConfig = Field(default_factory=MatchaConfig)
     seed_vc: SeedVCConfig = Field(default_factory=SeedVCConfig)
-    rvc: RVCConfig = Field(default_factory=RVCConfig)
 
 
 class SparrowSynthesizeOptions(BaseModel):
@@ -390,7 +371,6 @@ class SynthesizeRequest(BaseModel):
         None,
         description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
     )
-    rvc_model: Optional[str] = Field(None, alias="rvcModel", description="Optional RVC model filename to apply as the final conversion step")
     language: Optional[str] = Field(None, description="Force full locale for the entire input, e.g. en-GB")
     model: Optional[str] = Field(None, description="Per-request synthesis model")
     seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
@@ -413,7 +393,6 @@ class BatchSynthesizeInputItem(BaseModel):
         None,
         description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
     )
-    rvc_model: Optional[str] = Field(None, alias="rvcModel", description="Optional RVC model filename to apply as the final conversion step")
     language: Optional[str] = Field(None, description="Force full locale for this item, e.g. en-GB")
     model: Optional[str] = Field(None, description="Per-item synthesis model")
     seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
@@ -438,7 +417,6 @@ class _SharedBatchSynthesizeRequest:
     seeds: list[int | None] | None = None
     voice_id: str | None = None
     sample_url: str | None = None
-    rvc_model: str | None = None
     language: str | None = None
     model: str | None = None
     style: str | None = None
@@ -478,52 +456,6 @@ class MatchaSynthesizeRequest(BaseModel):
     temperature: Optional[float] = None
     length_scale: Optional[float] = None
 
-
-
-class RVCConvertRequest(BaseModel):
-    """Request body for RVC voice conversion."""
-
-    model_config = {"populate_by_name": True}
-
-    audio: str = Field(..., description="Base64 encoded source audio")
-    model: str = Field(..., alias="model_name", description="RVC model filename (e.g., 'mrbeast.pth', 'trump.pth')")
-    f0_method: str = Field("rmvpe", description="Pitch extraction method (pm, harvest, crepe, rmvpe)")
-    pitch: int = Field(0, description="Pitch shift in semitones")
-    index_rate: float = Field(0.0, description="FAISS index blending rate 0-1 (0 = no index)")
-    rms_mix_rate: float = Field(0.25, description="Volume envelope mix rate 0-1")
-    protect: float = Field(0.33, description="Protect voiceless consonants 0-0.5")
-    format: Literal["wav", "mp3"] = Field("wav", description="Output audio format (wav or mp3)")
-
-
-class RVCBatchConvertItem(BaseModel):
-    """One source item for batched RVC conversion."""
-
-    audio: str = Field(..., description="Base64 encoded source audio")
-
-
-class RVCBatchConvertRequest(BaseModel):
-    """Request body for real batched RVC voice conversion."""
-
-    model_config = {"populate_by_name": True}
-
-    items: list[RVCBatchConvertItem] = Field(..., min_length=1, max_length=64)
-    model: str = Field(..., alias="model_name", description="RVC model filename (e.g., 'mrbeast.pth')")
-    f0_method: str = Field("rmvpe", description="Pitch extraction method (pm, harvest, crepe, rmvpe)")
-    pitch: int = Field(0, description="Pitch shift in semitones")
-    index_rate: float = Field(0.0, description="FAISS index blending rate 0-1 (0 = no index)")
-    rms_mix_rate: float = Field(0.25, description="Volume envelope mix rate 0-1")
-    protect: float = Field(0.33, description="Protect voiceless consonants 0-0.5")
-    format: Literal["wav", "mp3"] = Field("wav", description="Output audio format (wav or mp3)")
-
-
-class RVCBatchConvertResponseItem(BaseModel):
-    audio_base64: str
-    sample_rate: int
-
-
-class RVCBatchConvertResponse(BaseModel):
-    items: list[RVCBatchConvertResponseItem]
-    count: int
 
 
 class SynthesizeVoiceInfo(BaseModel):
@@ -601,7 +533,6 @@ _splitter_languages: tuple[str, ...] | None = None
 _starling_backend: "ProductionStarlingBackend | None" = None
 _starling_batcher: "ProductionStarlingBatcher | None" = None
 _seed_vc_backend: "_SeedVCBackend | None" = None
-_rvc_backend: "RVCBackend | None" = None
 _seed_vc_supported_voice_ids: set[str] | None = None
 _seed_vc_voice_ids: set[str] | None = None
 _sparrow_worker: WorkerProcessClient | None = None
@@ -626,7 +557,7 @@ class _EngineLoadState:
 
 _engine_load_states: dict[str, _EngineLoadState] = {
     name: _EngineLoadState(name=name, ready=threading.Event())
-    for name in ("pipertts", "voxcpm", "starling", "seed_vc", "rvc")
+    for name in ("pipertts", "voxcpm", "starling", "seed_vc")
 }
 
 _inference_counter = 0
@@ -759,7 +690,7 @@ def _load_config() -> ServerConfig:
 
 
 def _engine_enabled(
-    engine: Literal["pipertts", "voxcpm", "starling", "matcha", "seed_vc", "rvc"],
+    engine: Literal["pipertts", "voxcpm", "starling", "matcha", "seed_vc"],
     config: ServerConfig | None = None,
 ) -> bool:
     cfg = config or _server_config
@@ -1527,127 +1458,6 @@ async def _convert_generated_audio_to_sample_batch(
     return converted, backend.sample_rate
 
 
-def _encoded_audio_duration_seconds(audio_bytes: bytes, output_format: Literal["wav", "mp3"], fallback: float) -> float:
-    try:
-        if output_format == "mp3":
-            return float(AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3").duration_seconds)
-        import soundfile as sf  # pylint: disable=import-outside-toplevel
-
-        info = sf.info(io.BytesIO(audio_bytes))
-        return float(info.frames) / float(info.samplerate) if info.samplerate else fallback
-    except Exception:
-        return fallback
-
-
-async def _convert_encoded_audio_rvc_batch(
-    *,
-    audio_items: list[bytes],
-    rvc_model: str | None,
-    output_format: Literal["wav", "mp3"],
-) -> list[tuple[bytes, int]]:
-    if rvc_model is None:
-        raise ValueError("rvc_model is required")
-    if not audio_items:
-        return []
-
-    await _await_engine_ready("rvc")
-    backend = _get_rvc_backend()
-    started = time.perf_counter()
-    _log_synthesize_batch_stage(
-        "rvc_batch_start",
-        model=rvc_model,
-        count=len(audio_items),
-        output_format=output_format,
-    )
-    try:
-        converted = await asyncio.to_thread(
-            backend.convert_batch,
-            audio_items=audio_items,
-            model=rvc_model,
-            f0_method=backend.settings.default_f0_method,
-            pitch=backend.settings.default_pitch,
-            index_rate=backend.settings.default_index_rate,
-            rms_mix_rate=backend.settings.default_rms_mix_rate,
-            protect=backend.settings.default_protect,
-            output_format=output_format,
-        )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    _log_synthesize_batch_stage(
-        "rvc_batch_done",
-        model=rvc_model,
-        count=len(converted),
-        wall_seconds=round(time.perf_counter() - started, 6),
-    )
-    return converted
-
-
-async def _apply_rvc_to_synthesize_response(
-    response: BatchSynthesizeResponse,
-    *,
-    rvc_model: str | None,
-    output_format: Literal["wav", "mp3"],
-) -> BatchSynthesizeResponse:
-    if rvc_model is None:
-        return response
-
-    audio_items = [base64.b64decode(item.audio_base64) for item in response.items]
-    started = time.perf_counter()
-    converted = await _convert_encoded_audio_rvc_batch(
-        audio_items=audio_items,
-        rvc_model=rvc_model,
-        output_format=output_format,
-    )
-    if len(converted) != len(response.items):
-        raise RuntimeError("internal RVC batch response count mismatch")
-
-    items: list[BatchSynthesizeItem] = []
-    audio_seconds_total = 0.0
-    for original, (audio_bytes, sample_rate) in zip(response.items, converted):
-        audio_seconds = _encoded_audio_duration_seconds(audio_bytes, output_format, original.audio_seconds)
-        audio_seconds_total += audio_seconds
-        items.append(
-            BatchSynthesizeItem(
-                text=original.text,
-                audio_base64=base64.b64encode(audio_bytes).decode("ascii"),
-                sample_rate=sample_rate,
-                audio_seconds=audio_seconds,
-            )
-        )
-
-    wall_seconds = response.wall_seconds + (time.perf_counter() - started)
-    return response.model_copy(
-        update={
-            "items": items,
-            "wall_seconds": wall_seconds,
-            "audio_seconds_total": audio_seconds_total,
-            "rtf": (wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
-            "model": f"{response.model}+rvc:{rvc_model}",
-        }
-    )
-
-
-async def _apply_rvc_to_encoded_audio(
-    *,
-    audio_bytes: bytes,
-    rvc_model: str | None,
-    output_format: Literal["wav", "mp3"],
-) -> tuple[bytes, int] | None:
-    if rvc_model is None:
-        return None
-    converted = await _convert_encoded_audio_rvc_batch(
-        audio_items=[audio_bytes],
-        rvc_model=rvc_model,
-        output_format=output_format,
-    )
-    if len(converted) != 1:
-        raise RuntimeError("internal RVC response count mismatch")
-    return converted[0]
-
-
 def _resolve_internal_speaker(model_name: str, speaker: str | None, inference: PiperInference) -> str | None:
     if speaker is None or not str(speaker).strip() or str(speaker).lower() == "und":
         return None
@@ -2026,11 +1836,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         audio_seconds_total=audio_seconds_total,
         rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
     )
-    return await _apply_rvc_to_synthesize_response(
-        response,
-        rvc_model=request.rvc_model,
-        output_format=request.format,
-    )
+    return response
 
 
 async def _synthesize_configured_voice(request: SynthesizeRequest) -> Response:
@@ -2045,7 +1851,6 @@ async def _synthesize_configured_voice(request: SynthesizeRequest) -> Response:
             language=request.language,
             style=request.style,
             style_intensity=request.style_intensity,
-            rvc_model=request.rvc_model,
             options=request.options,
             format=request.format,
             neural=request.neural,
@@ -2420,31 +2225,6 @@ def _get_seed_vc_backend() -> _SeedVCBackend:
     return _seed_vc_backend
 
 
-def _build_rvc_backend(settings: RVCConfig) -> RVCBackend:
-    backend = RVCBackend(RVCSettings(
-        enabled=True,
-        preload=settings.preload,
-        cache_size=settings.cache_size,
-        preload_models=settings.preload_models,
-        default_f0_method=settings.default_f0_method,
-        default_pitch=settings.default_pitch,
-        default_index_rate=settings.default_index_rate,
-        default_rms_mix_rate=settings.default_rms_mix_rate,
-        default_protect=settings.default_protect,
-    ))
-    backend.preload_models(settings.preload_models)
-    return backend
-
-
-def _get_rvc_backend() -> RVCBackend:
-    if not _engine_enabled("rvc"):
-        raise HTTPException(status_code=503, detail="RVC backend is disabled")
-    _wait_for_engine_ready("rvc")
-    if _rvc_backend is None:
-        raise HTTPException(status_code=503, detail="RVC backend was not loaded at startup")
-    return _rvc_backend
-
-
 async def synthesize_sparrow_batch(
     request: _SharedBatchSynthesizeRequest,
     *,
@@ -2555,11 +2335,7 @@ async def synthesize_sparrow_batch(
             audio_seconds_total=audio_seconds_total,
             rtf=(total_wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
         )
-        return await _apply_rvc_to_synthesize_response(
-            response,
-            rvc_model=request.rvc_model,
-            output_format=request.format,
-        )
+        return response
 
     items: list[BatchSynthesizeItem] = []
     audio_seconds_total = 0.0
@@ -2588,11 +2364,7 @@ async def synthesize_sparrow_batch(
         audio_seconds_total=audio_seconds_total,
         rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
     )
-    return await _apply_rvc_to_synthesize_response(
-        response,
-        rvc_model=request.rvc_model,
-        output_format=request.format,
-    )
+    return response
 
 
 async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeRequest) -> BatchSynthesizeResponse:
@@ -2735,11 +2507,7 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
             audio_seconds_total=audio_seconds_total,
             rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
         )
-        return await _apply_rvc_to_synthesize_response(
-            response,
-            rvc_model=request.rvc_model,
-            output_format=request.format,
-        )
+        return response
 
     items: list[BatchSynthesizeItem] = []
     audio_seconds_total = 0.0
@@ -2770,11 +2538,7 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
         audio_seconds_total=audio_seconds_total,
         rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
     )
-    return await _apply_rvc_to_synthesize_response(
-        response,
-        rvc_model=request.rvc_model,
-        output_format=request.format,
-    )
+    return response
 
 
 def _prepare_voxcpm_input(text: str, language: str | None) -> tuple[str, str]:
@@ -2906,11 +2670,7 @@ async def synthesize_voxcpm_batch(request: _SharedBatchSynthesizeRequest) -> Bat
         audio_seconds_total=audio_seconds_total,
         rtf=(wall_seconds / audio_seconds_total) if audio_seconds_total else 0.0,
     )
-    return await _apply_rvc_to_synthesize_response(
-        response,
-        rvc_model=request.rvc_model,
-        output_format=request.format,
-    )
+    return response
 
 
 def _batch_item_group_key(item: BatchSynthesizeInputItem) -> tuple[Any, ...]:
@@ -2929,7 +2689,6 @@ def _batch_item_group_key(item: BatchSynthesizeInputItem) -> tuple[Any, ...]:
         kind,
         item.voice_id,
         item.sample_url,
-        item.rvc_model,
         item.language,
         model_key,
         item.style,
@@ -2969,7 +2728,6 @@ def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, 
         seeds=[item.seed for _, item, _ in records],
         voice_id=first.voice_id,
         sample_url=first.sample_url,
-        rvc_model=first.rvc_model,
         language=first.language,
         model=first.model,
         style=first.style,
@@ -2999,7 +2757,6 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
                 "count": len(records),
                 "voice_id": records[0][1].voice_id,
                 "sample_url": bool(records[0][1].sample_url),
-                "rvcModel": records[0][1].rvc_model,
                 "language": records[0][1].language,
                 "model": records[0][1].model,
                 "style": records[0][1].style,
@@ -3024,7 +2781,6 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
             item_count=len(records),
             voice_id=shared_request.voice_id,
             sample_url=bool(shared_request.sample_url),
-            rvcModel=shared_request.rvc_model,
             language=shared_request.language,
             model=shared_request.model,
             format=shared_request.format,
@@ -3041,7 +2797,6 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
                 _SharedBatchSynthesizeRequest(
                     texts=shared_request.texts,
                     sample_url=shared_request.sample_url,
-                    rvc_model=shared_request.rvc_model,
                     model=forced_model,
                     options=shared_request.options,
                     format=shared_request.format,
@@ -3074,7 +2829,6 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
             output_count=len(group_result.items),
             voice_id=shared_request.voice_id,
             sample_url=bool(shared_request.sample_url),
-            rvcModel=shared_request.rvc_model,
             language=shared_request.language,
             model=group_result.model,
             speaker=group_result.speaker,
@@ -3171,7 +2925,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     async def startup_event():
         """Schedule enabled model engines to load in background worker processes."""
         global _speaker_routes, _lang_speaker_map, _splitter, _splitter_languages
-        global _starling_backend, _starling_batcher, _seed_vc_backend, _rvc_backend
+        global _starling_backend, _starling_batcher, _seed_vc_backend
         global _voxcpm_runtime
         global _seed_vc_supported_voice_ids, _seed_vc_voice_ids
         global _sparrow_model_info, _starling_info, _seed_vc_info
@@ -3194,7 +2948,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             _starling_backend = None
             _starling_batcher = None
             _seed_vc_backend = None
-            _rvc_backend = None
             _seed_vc_supported_voice_ids = None
             _seed_vc_voice_ids = None
             _sparrow_model_info = {}
@@ -3301,20 +3054,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             else:
                 _LOGGER.info("Seed-VC backend disabled")
 
-            if _engine_enabled("rvc"):
-                async def start_rvc() -> None:
-                    global _rvc_backend
-                    with _logged_startup_step(
-                        "rvc",
-                        cache_size=_server_config.rvc.cache_size,
-                        preload_models=_server_config.rvc.preload_models,
-                    ):
-                        _rvc_backend = await asyncio.to_thread(_build_rvc_backend, _server_config.rvc)
-
-                startup_tasks.append(asyncio.create_task(run_loader("rvc", start_rvc)))
-            else:
-                _LOGGER.info("RVC backend disabled")
-
             if startup_tasks:
                 await asyncio.gather(*startup_tasks)
             _LOGGER.info("Loaded server background models elapsed=%.2fs", time.perf_counter() - load_started)
@@ -3384,7 +3123,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 "voxcpm": _engine_enabled("voxcpm"),
                 "starling": _engine_enabled("starling"),
                 "seed_vc": _engine_enabled("seed_vc"),
-                "rvc": _engine_enabled("rvc"),
             },
             "pipertts": {
                 "enabled": _engine_enabled("pipertts"),
@@ -3428,11 +3166,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 "root": _server_config.seed_vc.root,
                 "runtime_root": _server_config.seed_vc.runtime_root,
                 "presets": sorted(_SeedVCBackend.model_presets),
-            },
-            "rvc": {
-                "enabled": _engine_enabled("rvc"),
-                **_engine_status("rvc"),
-                "loaded": _rvc_backend is not None,
             },
             "speakers": speakers,
         }
@@ -3568,109 +3301,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         _maybe_cleanup_gpu()
         return _binary_response(mp3_bytes, "audio/mpeg")
 
-    @app.get("/rvc/status")
-    async def rvc_status():
-        """RVC voice conversion backend status."""
-        backend = _rvc_backend
-        if backend is None:
-            return {
-                "enabled": _engine_enabled("rvc"),
-                **_engine_status("rvc"),
-                "loaded": False,
-                "available_models": [],
-            }
-        return {**_engine_status("rvc"), **backend.status()}
-
-    @app.get("/rvc/models", response_model=list[str])
-    async def rvc_models():
-        """List available RVC model weights."""
-        await _await_engine_ready("rvc")
-        backend = _get_rvc_backend()
-        return backend.list_models()
-
-    @app.post("/rvc/convert")
-    async def rvc_convert(request: RVCConvertRequest):
-        """Convert audio through an RVC voice model.
-
-        Provide ``audio`` as base64-encoded source audio.
-        Returns converted audio in the requested ``format``.
-        """
-        if not request.audio:
-            raise HTTPException(status_code=400, detail="audio is required")
-        try:
-            await _await_engine_ready("rvc")
-            audio_bytes = base64.b64decode(request.audio)
-            backend = _get_rvc_backend()
-            result_bytes, sr = await asyncio.to_thread(
-                backend.convert,
-                audio_bytes=audio_bytes,
-                model=request.model,
-                f0_method=request.f0_method,
-                pitch=request.pitch,
-                index_rate=request.index_rate,
-                rms_mix_rate=request.rms_mix_rate,
-                protect=request.protect,
-                output_format=request.format,
-            )
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _LOGGER.exception("RVC conversion failed")
-            raise HTTPException(status_code=500, detail=f"RVC conversion failed: {exc}") from exc
-
-        media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
-        _maybe_cleanup_gpu()
-        return _binary_response(result_bytes, media_type)
-
-    @app.post("/rvc/convert/batch", response_model=RVCBatchConvertResponse)
-    async def rvc_convert_batch(request: RVCBatchConvertRequest):
-        """Convert multiple audio items through one real RVC batch call."""
-        if any(not item.audio for item in request.items):
-            raise HTTPException(status_code=400, detail="all items must include audio")
-        if request.index_rate != 0:
-            raise HTTPException(
-                status_code=400,
-                detail="RVC real batch conversion does not support index_rate != 0",
-            )
-        try:
-            await _await_engine_ready("rvc")
-            audio_items = [base64.b64decode(item.audio) for item in request.items]
-            backend = _get_rvc_backend()
-            converted = await asyncio.to_thread(
-                backend.convert_batch,
-                audio_items=audio_items,
-                model=request.model,
-                f0_method=request.f0_method,
-                pitch=request.pitch,
-                index_rate=request.index_rate,
-                rms_mix_rate=request.rms_mix_rate,
-                protect=request.protect,
-                output_format=request.format,
-            )
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _LOGGER.exception("RVC batch conversion failed")
-            raise HTTPException(status_code=500, detail=f"RVC batch conversion failed: {exc}") from exc
-
-        _maybe_cleanup_gpu()
-        return RVCBatchConvertResponse(
-            items=[
-                RVCBatchConvertResponseItem(
-                    audio_base64=base64.b64encode(audio_bytes).decode("ascii"),
-                    sample_rate=sample_rate,
-                )
-                for audio_bytes, sample_rate in converted
-            ],
-            count=len(converted),
-        )
-
     async def _handle_synthesize(
         request: SynthesizeRequest,
         model: str | None = None,
@@ -3700,7 +3330,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     texts=[request.text or ""],
                     seeds=[request.seed],
                     sample_url=request.sample_url,
-                    rvc_model=request.rvc_model,
                     language=request.language,
                     model=model,
                     options=request.options,
@@ -3754,7 +3383,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             sample_rate = inference.sample_rate
 
         if request.sample_url is not None:
-            converted, converted_sample_rate = await _convert_generated_audio_to_sample_batch(
+            converted, _ = await _convert_generated_audio_to_sample_batch(
                 source_audios=[audio],
                 source_sample_rates=[sample_rate],
                 sample_url=request.sample_url,
@@ -3762,14 +3391,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             )
             audio_bytes, _ = converted[0]
             media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
-            sample_rate = converted_sample_rate
-            rvc_result = await _apply_rvc_to_encoded_audio(
-                audio_bytes=audio_bytes,
-                rvc_model=request.rvc_model,
-                output_format=request.format,
-            )
-            if rvc_result is not None:
-                audio_bytes, sample_rate = rvc_result
             _maybe_cleanup_gpu()
             return _binary_response(audio_bytes, media_type)
 
@@ -3780,14 +3401,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         else:
             audio_bytes = _audio_to_wav_bytes(audio, sample_rate)
             media_type = "audio/wav"
-
-        rvc_result = await _apply_rvc_to_encoded_audio(
-            audio_bytes=audio_bytes,
-            rvc_model=request.rvc_model,
-            output_format=request.format,
-        )
-        if rvc_result is not None:
-            audio_bytes, sample_rate = rvc_result
 
         _maybe_cleanup_gpu()
         return _binary_response(audio_bytes, media_type)
@@ -3923,10 +3536,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             None,
             description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
         ),
-        rvc_model: Annotated[
-            Optional[str],
-            Query(alias="rvcModel", description="Optional RVC model filename to apply as the final conversion step"),
-        ] = None,
         language: Optional[str] = Query(None, description="Force full locale for the entire text, e.g. en-GB"),
         style: Optional[str] = Query(None, description="Seed-VC speech style for voice_id synthesis"),
         style_intensity: Annotated[
@@ -3953,7 +3562,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "model": model,
             "voice_id": voice_id,
             "sample_url": sample_url,
-            "rvcModel": rvc_model,
             "language": language,
             "style": style,
             "styleIntensity": style_intensity,
@@ -3993,7 +3601,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             ssml=ssml,
             voice_id=voice_id,
             sample_url=sample_url,
-            rvc_model=rvc_model,
             language=language,
             style=style,
             style_intensity=style_intensity,
