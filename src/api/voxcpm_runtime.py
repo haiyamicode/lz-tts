@@ -157,14 +157,19 @@ class VoxCPMRuntime:
         if self.server is None:
             raise RuntimeError("VoxCPM runtime is not started")
 
-        cache_key = hashlib.sha256(audio).hexdigest()
+        cache_key = f"{audio_format}:{hashlib.sha256(audio).hexdigest()}"
         async with self._reference_cache_lock:
             cached = self._reference_latents.get(cache_key)
             if cached is not None:
                 self._reference_latents.move_to_end(cache_key)
                 return cached
 
-            latents = await self.server.encode_latents(audio, audio_format)
+        latents = await self.server.encode_latents(audio, audio_format)
+        async with self._reference_cache_lock:
+            cached = self._reference_latents.get(cache_key)
+            if cached is not None:
+                self._reference_latents.move_to_end(cache_key)
+                return cached
             self._reference_latents[cache_key] = latents
             cache_size = int(self.settings["reference_cache_size"])
             while len(self._reference_latents) > cache_size:
@@ -206,6 +211,8 @@ class VoxCPMRuntime:
         seeds: Sequence[int | None] | None = None,
         reference_audio: bytes | None = None,
         reference_format: str = "wav",
+        reference_audios: Sequence[bytes | None] | None = None,
+        reference_formats: Sequence[str] | None = None,
     ) -> list[np.ndarray]:
         """Submit every item concurrently so nano-vLLM can schedule a real batch."""
         if not texts:
@@ -218,12 +225,40 @@ class VoxCPMRuntime:
             seeds = [None] * len(texts)
         if len(seeds) != len(texts):
             raise ValueError("seeds length must match texts length")
+        if reference_audio is not None and reference_audios is not None:
+            raise ValueError("use either reference_audio or reference_audios, not both")
+        if reference_audios is None:
+            reference_audios = [reference_audio] * len(texts)
+        if len(reference_audios) != len(texts):
+            raise ValueError("reference_audios length must match texts length")
+        if reference_formats is None:
+            reference_formats = [reference_format] * len(texts)
+        if len(reference_formats) != len(texts):
+            raise ValueError("reference_formats length must match texts length")
+
         generation_limits, _budgets = await self._predict_generation_limits(texts, languages)
-        reference_latents = (
-            await self._encode_reference(reference_audio, reference_format)
-            if reference_audio is not None
-            else None
+
+        unique_references: dict[tuple[str, str], tuple[bytes, str]] = {}
+        reference_keys: list[tuple[str, str] | None] = []
+        for audio, audio_format in zip(reference_audios, reference_formats):
+            if audio is None:
+                reference_keys.append(None)
+                continue
+            key = (hashlib.sha256(audio).hexdigest(), audio_format)
+            unique_references.setdefault(key, (audio, audio_format))
+            reference_keys.append(key)
+
+        encoded_references = await asyncio.gather(
+            *(
+                self._encode_reference(audio, audio_format)
+                for audio, audio_format in unique_references.values()
+            )
         )
+        reference_latents_by_key = dict(zip(unique_references, encoded_references))
+        reference_latents = [
+            reference_latents_by_key[key] if key is not None else None
+            for key in reference_keys
+        ]
         return list(
             await asyncio.gather(
                 *(
@@ -231,9 +266,14 @@ class VoxCPMRuntime:
                         text,
                         max_generate_length=max_generate_length,
                         seed=seed,
-                        ref_audio_latents=reference_latents,
+                        ref_audio_latents=item_reference_latents,
                     )
-                    for text, max_generate_length, seed in zip(texts, generation_limits, seeds)
+                    for text, max_generate_length, seed, item_reference_latents in zip(
+                        texts,
+                        generation_limits,
+                        seeds,
+                        reference_latents,
+                    )
                 )
             )
         )

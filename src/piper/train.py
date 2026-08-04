@@ -132,8 +132,14 @@ def train_from_args(
         num_speakers = int(config["num_speakers"])
         sample_rate = int(config["audio"]["sample_rate"])
         speaker_id_map = config.get("speaker_id_map") or {}
+        dataset_speaker_embedding_init_map = (
+            config.get("speaker_embedding_init_map") or {}
+        )
 
     model_args = vars(args).copy()
+    speaker_embedding_init_map = model_args.pop("speaker_embedding_init_map", None)
+    if speaker_embedding_init_map is None:
+        speaker_embedding_init_map = dataset_speaker_embedding_init_map
     apply_quality_preset(model_args, args.quality)
 
     model = VitsModel(
@@ -160,7 +166,11 @@ def train_from_args(
         )
 
     if args.init_from_checkpoint:
-        initialize_from_checkpoint(model, args.init_from_checkpoint)
+        initialize_from_checkpoint(
+            model,
+            args.init_from_checkpoint,
+            speaker_embedding_init_map=speaker_embedding_init_map,
+        )
 
     if args.init_partial_from_checkpoint:
         initialize_compatible_generator_from_checkpoint(
@@ -168,6 +178,7 @@ def train_from_args(
             args.init_partial_from_checkpoint,
             include_prefixes=tuple(args.init_partial_include_prefixes or ()),
             exclude_prefixes=tuple(args.init_partial_exclude_prefixes or ()),
+            speaker_embedding_init_map=speaker_embedding_init_map,
         )
 
     callbacks = []
@@ -330,7 +341,10 @@ def load_state_dict(model, saved_state_dict, allow_speaker_mismatch: bool = Fals
 
 
 def initialize_from_checkpoint(
-    model: VitsModel, checkpoint_path: str | Path, expect_multispeaker: bool = True
+    model: VitsModel,
+    checkpoint_path: str | Path,
+    expect_multispeaker: bool = True,
+    speaker_embedding_init_map: dict[str, str] | None = None,
 ) -> None:
     if expect_multispeaker:
         _LOGGER.info("Initializing model weights from %s", checkpoint_path)
@@ -357,14 +371,25 @@ def initialize_from_checkpoint(
     generator_state = source_model.model_g.state_dict()
 
     remapped_embedding = _remap_speaker_embeddings(
-        model, generator_state, source_map, target_map, str(checkpoint_path)
+        model,
+        generator_state,
+        source_map,
+        target_map,
+        str(checkpoint_path),
+        speaker_embedding_init_map=speaker_embedding_init_map,
     )
     if remapped_embedding is not None:
         generator_state = dict(generator_state)
         generator_state["emb_g.weight"] = remapped_embedding
 
     load_state_dict(model.model_g, generator_state, allow_speaker_mismatch=True)
-    load_state_dict(model.model_d, source_model.model_d.state_dict())
+    if source_model.model_d is not None and model.model_d is not None:
+        load_state_dict(model.model_d, source_model.model_d.state_dict())
+    elif model.model_d is not None:
+        _LOGGER.info(
+            "Checkpoint has no discriminator weights; initializing the "
+            "training discriminator from scratch"
+        )
 
 
 def initialize_compatible_generator_from_checkpoint(
@@ -372,6 +397,7 @@ def initialize_compatible_generator_from_checkpoint(
     checkpoint_path: str | Path,
     include_prefixes: tuple[str, ...] = (),
     exclude_prefixes: tuple[str, ...] = ("dec.",),
+    speaker_embedding_init_map: dict[str, str] | None = None,
 ) -> None:
     _LOGGER.info("Partially initializing whitelisted model_g weights from %s", checkpoint_path)
     if include_prefixes:
@@ -405,6 +431,7 @@ def initialize_compatible_generator_from_checkpoint(
         _extract_speaker_map_from_checkpoint_hparams(checkpoint_hparams),
         _extract_speaker_map(model.hparams),
         str(checkpoint_path),
+        speaker_embedding_init_map=speaker_embedding_init_map,
     )
     if remapped_embedding is not None:
         source_state["emb_g.weight"] = remapped_embedding
@@ -564,7 +591,12 @@ def _normalize_speaker_map(raw_map):
 
 
 def _remap_speaker_embeddings(
-    model: VitsModel, source_state, source_map, target_map, source_label: str
+    model: VitsModel,
+    source_state,
+    source_map,
+    target_map,
+    source_label: str,
+    speaker_embedding_init_map: dict[str, str] | None = None,
 ):
     if (
         "emb_g.weight" not in source_state
@@ -579,14 +611,22 @@ def _remap_speaker_embeddings(
 
     if source_map and target_map:
         source_lookup = {speaker: idx for speaker, idx in source_map.items()}
+        init_map = {
+            str(target): str(source)
+            for target, source in (speaker_embedding_init_map or {}).items()
+        }
+        copied_initializers = []
         for speaker, target_idx in target_map.items():
-            source_idx = source_lookup.get(speaker)
+            source_speaker = init_map.get(speaker, speaker)
+            source_idx = source_lookup.get(source_speaker)
             if source_idx is None:
                 continue
             if source_idx >= saved_weight.shape[0] or target_idx >= new_weight.shape[0]:
                 continue
             new_weight[target_idx] = saved_weight[source_idx]
             copied += 1
+            if source_speaker != speaker:
+                copied_initializers.append(f"{speaker}<-{source_speaker}")
 
         dropped = sorted(set(source_map) - set(target_map))
         added = sorted(set(target_map) - set(source_map))
@@ -594,6 +634,12 @@ def _remap_speaker_embeddings(
             _LOGGER.info("Dropping %s speaker(s): %s", len(dropped), ", ".join(dropped))
         if added:
             _LOGGER.info("Initializing new speaker(s): %s", ", ".join(added))
+        if copied_initializers:
+            _LOGGER.info(
+                "One-time initialized %s speaker embedding(s) from existing rows: %s",
+                len(copied_initializers),
+                ", ".join(copied_initializers),
+            )
         _LOGGER.info("Copied %s/%s speaker embedding(s)", copied, len(target_map))
     else:
         count = min(saved_weight.shape[0], new_weight.shape[0])

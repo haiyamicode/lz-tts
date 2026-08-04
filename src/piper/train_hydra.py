@@ -54,6 +54,7 @@ _DEFAULTS: dict[str, Any] = {
     "init_partial_from_checkpoint": None,
     "init_partial_include_prefixes": None,
     "init_partial_exclude_prefixes": ("dec.",),
+    "speaker_embedding_init_map": None,
     "utmos_enabled": False,
     "utmos_every_n_epochs": 10,
     "utmos_num_samples": 10,

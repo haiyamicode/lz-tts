@@ -47,7 +47,10 @@ def parse_args():
     )
     parser.add_argument(
         "--model",
-        help="Specific model directory to upload (e.g., 'lzspeech-enzhja-1000-bert'). If not specified, uploads all models.",
+        help=(
+            "Specific model directory or top-level data file to upload "
+            "(e.g., 'seed-vc' or 'voice-presets.json'). If omitted, uploads all data."
+        ),
     )
     parser.add_argument(
         "--force",
@@ -164,11 +167,27 @@ def upload_data_to_s3(
 
     # Determine which models to upload
     if model_name:
-        model_dirs = [data_dir / model_name]
-        if not model_dirs[0].exists():
-            print(f"Error: Model directory not found: {model_dirs[0]}")
+        selected_path = data_dir / model_name
+        if not selected_path.exists():
+            print(f"Error: Data path not found: {selected_path}")
             return 1
+        if selected_path.is_file():
+            s3_key = f"{s3_data_path}/{selected_path.relative_to(data_dir)}"
+            result = upload_file(
+                s3_client,
+                selected_path,
+                bucket,
+                s3_key,
+                str(selected_path.relative_to(data_dir)),
+                force,
+                dry_run,
+            )
+            failed = int(result == "failed")
+            print(f"Upload complete: {result}")
+            return 1 if failed else 0
+        model_dirs = [selected_path]
     else:
+        top_level_files = sorted(path for path in data_dir.iterdir() if path.is_file())
         all_dirs = {d.name: d for d in data_dir.iterdir() if d.is_dir()}
         model_dirs = [
             all_dirs.pop(name)
@@ -176,8 +195,8 @@ def upload_data_to_s3(
             if name in all_dirs
         ]
         model_dirs.extend(all_dirs[name] for name in sorted(all_dirs))
-        if not model_dirs:
-            print(f"No model directories found in {data_dir}")
+        if not model_dirs and not top_level_files:
+            print(f"No data files or model directories found in {data_dir}")
             return 0
 
     print(f"Uploading from: {data_dir}/")
@@ -188,6 +207,27 @@ def upload_data_to_s3(
     would_upload = 0
     skipped = 0
     failed = 0
+
+    if not model_name:
+        for file_path in top_level_files:
+            relative_path = file_path.relative_to(data_dir)
+            result = upload_file(
+                s3_client,
+                file_path,
+                bucket,
+                f"{s3_data_path}/{relative_path}",
+                str(relative_path),
+                force,
+                dry_run,
+            )
+            if result == "uploaded":
+                uploaded += 1
+            elif result == "would_upload":
+                would_upload += 1
+            elif result == "skipped":
+                skipped += 1
+            elif result == "failed":
+                failed += 1
 
     for model_dir in sorted(model_dirs):
         print(f"\n=== Processing {model_dir.name} ===")

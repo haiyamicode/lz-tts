@@ -16,7 +16,7 @@ class _FakeServer:
 
     async def encode_latents(self, audio: bytes, audio_format: str) -> bytes:
         self.encoded.append((audio, audio_format))
-        return b"reference-latents"
+        return b"latents:" + audio
 
     async def generate(self, **kwargs):
         self.references.append(kwargs["ref_audio_latents"])
@@ -80,7 +80,7 @@ async def _test_reference_audio_uses_native_voxcpm_latents_and_cache() -> None:
 
     assert len(first) == 2
     assert server.encoded == [(b"wav-data", "wav")]
-    assert server.references == [b"reference-latents"] * 3
+    assert server.references == [b"latents:wav-data"] * 3
     assert server.generation_limits == [17, 29, 17]
     assert server.seeds == [101, 202, None]
     assert duration_budget.calls == [
@@ -104,3 +104,30 @@ async def _test_disabled_duration_budget_uses_explicit_fallback() -> None:
     await runtime.synthesize_batch(["one", "two"], languages=["en", "de"])
 
     assert server.generation_limits == [321, 321]
+
+
+def test_per_item_references_are_encoded_once_and_routed_independently() -> None:
+    asyncio.run(_test_per_item_references_are_encoded_once_and_routed_independently())
+
+
+async def _test_per_item_references_are_encoded_once_and_routed_independently() -> None:
+    runtime = VoxCPMRuntime(_settings())
+    runtime._duration_budget = _FakeDurationBudget()
+    server = _FakeServer()
+    runtime.server = server
+
+    await runtime.synthesize_batch(
+        ["first", "second", "third"],
+        reference_audios=[b"voice-a", b"voice-b", b"voice-a"],
+        reference_formats=["wav", "mp3", "wav"],
+    )
+
+    assert server.encoded == [
+        (b"voice-a", "wav"),
+        (b"voice-b", "mp3"),
+    ]
+    assert server.references == [
+        b"latents:voice-a",
+        b"latents:voice-b",
+        b"latents:voice-a",
+    ]

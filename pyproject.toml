@@ -94,6 +94,10 @@ dependencies = [
     "qwen-asr>=0.0.6",
     "nano-vllm-voxcpm==2.0.3",
     "flash-attn>=2.8.3.post1",
+    "lao2ipa>=1.0.0",
+    "khmerphonemizer>=0.0.3",
+    "epitran>=1.35.2",
+    "km-num2text>=1.0.1",
 ]
 
 [build-system]
@@ -122,3 +126,4 @@ flash-attn = { MAX_JOBS = "24" }
 [tool.uv.sources]
 piper-phonemize = { path = "./src/phonemizer" }
 flash-attn = { path = "data/runtime-wheels/flash_attn-2.8.3.post1-cp310-cp310-linux_x86_64.whl" }
+epitran = { git = "https://github.com/dmort27/epitran.git", rev = "3ed96fd7d10f6f5eec75ba1deb10700fcaafe43f" }

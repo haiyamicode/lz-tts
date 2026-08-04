@@ -19,6 +19,7 @@ from piper_phonemize import (
 from ..multilingual_splitter import MultilingualSplitter
 from ..text_norm import normalize_text as _normalize_written_text
 from .heteronym import get_resolver as _get_heteronym_resolver
+from .language_frontends import get_language_frontend, has_language_frontend
 
 
 def _load_model_config(config_path):
@@ -809,7 +810,31 @@ def _phonemize_korean_with_mapping(
     return [sentence], [mappings]
 
 
+def _phonemize_registered_frontend(
+    text: str,
+    voice: str,
+    casing_fn,
+) -> Optional[Tuple[list, Optional[List[List[int]]], str]]:
+    frontend = get_language_frontend(voice)
+    if frontend is None:
+        return None
+
+    processed_text = casing_fn(_normalize_text_for_mapping(text, voice))
+    phonemes, word_spans = frontend(processed_text)
+    _validate_word_spans(
+        phonemes,
+        word_spans,
+        processed_text,
+        f"voice={voice}",
+    )
+    return phonemes, word_spans, processed_text
+
+
 def _phonemize_espeak_for_voice(text: str, voice: str, casing_fn, espeak_data) -> list:
+    frontend_result = _phonemize_registered_frontend(text, voice, casing_fn)
+    if frontend_result is not None:
+        return frontend_result[0]
+
     norm_text = _normalize_text_for_voice(text, voice)
     sent_ph = _phonemize_espeak_with_reset(casing_fn(norm_text), voice, espeak_data)
     return [p for sent in sent_ph for p in sent]
@@ -883,6 +908,10 @@ def _phonemize_espeak_for_voice_with_spans(
     casing_fn,
     espeak_data,
 ) -> Tuple[list, Optional[List[List[int]]], str]:
+    frontend_result = _phonemize_registered_frontend(text, voice, casing_fn)
+    if frontend_result is not None:
+        return frontend_result
+
     norm_text = _normalize_text_for_mapping(text, voice)
     processed_text = casing_fn(norm_text)
     sent_ph, sent_word_mapping = _phonemize_espeak_with_mapping(
@@ -986,20 +1015,29 @@ def _map_cld2_to_espeak(lang_code: str, primary_voice: str = "en-us") -> str:
     if code == "en":
         return primary_voice
 
+    if code == "pt-br":
+        return "pt-BR"
+
     if base == "yue" or code in ("zh-hk", "zh-yue"):
         return "yue"
 
     if base in ("zh", "cmn"):
         return "cmn-latn-pinyin"
 
-    if base in ("jv", "su"):
+    if base in ("fil", "jv", "su"):
         return "id"
+
+    if base == "so":
+        return "om"
+
+    if has_language_frontend(base):
+        return base
+
+    if base == "zu":
+        return "tn"
 
     if base == "gl":
         return "es"
-
-    if base == "mn":
-        return "ru"
 
     return base
 

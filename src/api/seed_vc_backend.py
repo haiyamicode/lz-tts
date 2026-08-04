@@ -181,10 +181,12 @@ class SeedVCBackend:
             self.to_mel = lambda x: mel_spectrogram(x, **mel_fn_args)
 
             embeddings_path = _resolve_project_path(self.settings.embeddings_hdf5_path)
-            if embeddings_path.exists():
-                self.cached_embeddings = HDF5EmbeddingLoader(embeddings_path, cache_size=self.settings.embedding_cache_size)
-            else:
+            if not embeddings_path.is_file():
                 raise RuntimeError(f"Seed-VC embeddings file not found: {embeddings_path}")
+            self.cached_embeddings = HDF5EmbeddingLoader(
+                embeddings_path,
+                cache_size=self.settings.embedding_cache_size,
+            )
 
             try:
                 from find_voice import find_base_voice  # pylint: disable=import-outside-toplevel
@@ -199,7 +201,11 @@ class SeedVCBackend:
 
             self.find_base_voice = find_base_voice
             self.process_file = process_file
-            _LOGGER.info("Seed-VC backend ready: sr=%d cached_embeddings=%s", self.sample_rate, bool(self.cached_embeddings))
+            _LOGGER.info(
+                "Seed-VC backend ready: sr=%d cached_embeddings=%d",
+                self.sample_rate,
+                len(self.cached_embeddings),
+            )
 
     def _prepare_model_dict(self, model_dict: dict[str, Any]) -> None:
         for key in model_dict:

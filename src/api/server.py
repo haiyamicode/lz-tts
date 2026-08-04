@@ -89,10 +89,10 @@ DATA_DIR = Path("data")
 CONFIG_PATH = Path(os.environ.get("LZ_TTS_SERVER_CONFIG", "local/server.json"))
 LLMS_TEMPLATE_PATH = Path(__file__).with_name("llms.txt")
 DEFAULT_MODEL = "lzspeech-sparrow"
+PUBLIC_SPARROW_MODEL = "sparrow"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SEED_VC_ROOT = PROJECT_ROOT / "data" / "seed-vc"
 SEED_VC_RUNTIME_ROOT = PROJECT_ROOT / "src" / "seed_vc_runtime"
-SEED_VC_VOICE_IDS_PATH = SEED_VC_ROOT / "voice_ids.txt"
 MATCHA_LANGUAGE_ID_MAP = {
     "en": 1,
     "ar": 2,
@@ -257,6 +257,7 @@ class VoxCPMConfig(BaseModel):
     temperature: float = Field(default=1.0, gt=0)
     cfg_value: float = Field(default=2.0, ge=0)
     reference_cache_size: int = Field(default=128, ge=1)
+    preset_voice_catalog_path: str = "data/voice-presets.json"
 
 
 class MatchaConfig(BaseModel):
@@ -308,7 +309,10 @@ class SeedVCConfig(BaseModel):
     runtime_root: str = Field(default_factory=lambda: os.environ.get("SEED_VC_RUNTIME_ROOT", "src/seed_vc_runtime"))
     root: str = Field(default_factory=lambda: os.environ.get("SEED_VC_ROOT", "data/seed-vc"))
     embeddings_hdf5_path: str = Field(
-        default_factory=lambda: os.environ.get("SEED_VC_EMBEDDINGS_HDF5", "data/seed-vc/embeddings/vtts_embeddings.h5")
+        default_factory=lambda: os.environ.get(
+            "SEED_VC_EMBEDDINGS_HDF5",
+            "data/seed-vc/embeddings/vtts_embeddings_sparrow_fallback.h5",
+        )
     )
     tmp_dir: str = Field(default_factory=lambda: os.environ.get("SEED_VC_TMP_DIR", "data/seed-vc/tmp"))
     output_dir: str = Field(default_factory=lambda: os.environ.get("SEED_VC_OUTPUT_DIR", "data/seed-vc/output"))
@@ -316,7 +320,10 @@ class SeedVCConfig(BaseModel):
         default_factory=lambda: os.environ.get("SEED_VC_VOICE_SAMPLES_DIR", "data/seed-vc/voice-samples")
     )
     fp16: bool = Field(default_factory=lambda: _env_bool("SEED_VC_FP16", True))
-    embedding_cache_size: int = Field(default_factory=lambda: int(os.environ.get("SEED_VC_EMBEDDING_CACHE_SIZE", "256")), ge=1)
+    embedding_cache_size: int = Field(
+        default_factory=lambda: int(os.environ.get("SEED_VC_EMBEDDING_CACHE_SIZE", "64")),
+        ge=1,
+    )
     estimator_cache_batch_size: int = Field(
         default_factory=lambda: int(os.environ.get("SEED_VC_ESTIMATOR_CACHE_BATCH_SIZE", "8")),
         ge=1,
@@ -366,16 +373,22 @@ class SynthesizeRequest(BaseModel):
 
     text: Optional[str] = Field(None, description="Plain text to synthesize (mutually exclusive with ssml)")
     ssml: Optional[str] = Field(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)")
-    voice_id: Optional[str] = Field(None, description="Public voice id from data/seed-vc/voice_ids.txt, e.g. msa.en-US.AvaMultilingual")
+    voice_id: Optional[str] = Field(None, description="Configured preset voice id, e.g. msa.en-US.AvaMultilingual")
     sample_url: Optional[str] = Field(
         None,
         description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
     )
+    reference_version: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        description="Opaque reference revision or content hash used for cache invalidation; requires sample_url",
+    )
     language: Optional[str] = Field(None, description="Force full locale for the entire input, e.g. en-GB")
-    model: Optional[str] = Field(None, description="Per-request synthesis model")
+    model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
     seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
-    style: Optional[str] = Field(None, description="Seed-VC speech style for voice_id synthesis")
-    style_intensity: Optional[float] = Field(None, alias="styleIntensity", description="Seed-VC speech style intensity")
+    style: Optional[str] = Field(None, description="Preset reference style for voice_id synthesis")
+    style_intensity: Optional[float] = Field(None, alias="styleIntensity", description="Legacy preset style intensity")
     options: Optional[SparrowSynthesizeOptions] = Field(None, description="Sparrow/VITS-specific synthesis options")
     format: Literal["wav", "mp3"] = Field("wav", description="Output audio format (wav or mp3)")
     neural: bool = Field(True, description="Use neural heteronym disambiguation for more accurate pronunciation of ambiguous words")
@@ -388,16 +401,22 @@ class BatchSynthesizeInputItem(BaseModel):
 
     text: Optional[str] = Field(None, description="Plain text to synthesize")
     ssml: Optional[str] = Field(None, description="SSML input is not supported for batched synthesis")
-    voice_id: Optional[str] = Field(None, description="Public voice id from data/seed-vc/voice_ids.txt, e.g. msa.en-US.AvaMultilingual")
+    voice_id: Optional[str] = Field(None, description="Configured preset voice id, e.g. msa.en-US.AvaMultilingual")
     sample_url: Optional[str] = Field(
         None,
         description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
     )
+    reference_version: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        description="Opaque reference revision or content hash used for cache invalidation; requires sample_url",
+    )
     language: Optional[str] = Field(None, description="Force full locale for this item, e.g. en-GB")
-    model: Optional[str] = Field(None, description="Per-item synthesis model")
+    model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
     seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
-    style: Optional[str] = Field(None, description="Seed-VC speech style for voice_id synthesis")
-    style_intensity: Optional[float] = Field(None, alias="styleIntensity", description="Seed-VC speech style intensity")
+    style: Optional[str] = Field(None, description="Preset reference style for voice_id synthesis")
+    style_intensity: Optional[float] = Field(None, alias="styleIntensity", description="Legacy preset style intensity")
     options: Optional[SparrowSynthesizeOptions] = Field(None, description="Sparrow/VITS-specific synthesis options")
     format: Literal["wav", "mp3"] = Field("wav", description="Output audio encoding")
     neural: bool = Field(True, description="Use neural heteronym disambiguation")
@@ -417,7 +436,9 @@ class _SharedBatchSynthesizeRequest:
     seeds: list[int | None] | None = None
     voice_id: str | None = None
     sample_url: str | None = None
+    reference_version: str | None = None
     language: str | None = None
+    languages: list[str | None] | None = None
     model: str | None = None
     style: str | None = None
     style_intensity: float | None = None
@@ -533,8 +554,6 @@ _splitter_languages: tuple[str, ...] | None = None
 _starling_backend: "ProductionStarlingBackend | None" = None
 _starling_batcher: "ProductionStarlingBatcher | None" = None
 _seed_vc_backend: "_SeedVCBackend | None" = None
-_seed_vc_supported_voice_ids: set[str] | None = None
-_seed_vc_voice_ids: set[str] | None = None
 _sparrow_worker: WorkerProcessClient | None = None
 _sparrow_model_info: dict[str, dict[str, Any]] = {}
 _starling_worker: WorkerProcessClient | None = None
@@ -542,6 +561,16 @@ _starling_info: dict[str, Any] = {}
 _seed_vc_worker: WorkerProcessClient | None = None
 _seed_vc_info: dict[str, Any] = {}
 _voxcpm_runtime: VoxCPMRuntime | None = None
+_voxcpm_reference_download_cache: OrderedDict[
+    tuple[str, str], tuple[bytes, str]
+] = OrderedDict()
+_voxcpm_reference_download_tasks: dict[
+    tuple[str, str], asyncio.Task[tuple[bytes, str]]
+] = {}
+_voxcpm_reference_download_lock = asyncio.Lock()
+_voice_preset_catalog: dict[str, dict[str, Any]] | None = None
+_voxcpm_preset_voices: dict[str, dict[str, Any]] | None = None
+_seed_vc_fallback_voices: dict[str, dict[str, Any]] | None = None
 _startup_loader_task: asyncio.Task | None = None
 
 
@@ -707,13 +736,48 @@ def _is_voxcpm_model(model: str | None) -> bool:
     return model.strip().lower() == _server_config.voxcpm.model_id
 
 
+def _public_model_name(model: str) -> str:
+    """Collapse internal Sparrow checkpoints into one public model family."""
+    return PUBLIC_SPARROW_MODEL if model in _allowed_models() else model
+
+
+def _public_model_names(models: list[str]) -> list[str]:
+    return list(dict.fromkeys(_public_model_name(model) for model in models))
+
+
+def _resolve_api_model(model: str | None) -> str | None:
+    """Resolve a public API model family to its internal serving model."""
+    if model is None:
+        return None
+
+    normalized = model.strip().lower()
+    if normalized in {PUBLIC_SPARROW_MODEL, DEFAULT_MODEL}:
+        return PUBLIC_SPARROW_MODEL
+    if _is_voxcpm_model(normalized):
+        return _server_config.voxcpm.model_id
+    if model in _allowed_models():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Internal Sparrow model {model!r} is not exposed; use model='sparrow' "
+                "with language or voice_id routing"
+            ),
+        )
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unsupported model {model!r}; supported public models: ['sparrow', '{_server_config.voxcpm.model_id}']",
+    )
+
+
 def _resolved_synthesize_model(body_model: str | None, query_model: str | None) -> str | None:
-    if body_model and query_model and body_model != query_model:
+    resolved_body = _resolve_api_model(body_model)
+    resolved_query = _resolve_api_model(query_model)
+    if resolved_body and resolved_query and resolved_body != resolved_query:
         raise HTTPException(
             status_code=400,
             detail="Conflicting 'model' values in request body and query string",
         )
-    return body_model or query_model
+    return resolved_body or resolved_query
 
 
 def _engine_state(engine: str) -> _EngineLoadState:
@@ -1254,6 +1318,314 @@ def _configured_root_voice_for_voice_id(voice_id: str | None) -> RootVoiceConfig
     return None
 
 
+@dataclass(frozen=True)
+class _VoxCPMPresetReference:
+    voice_id: str
+    style: str
+    url: str | None = None
+    path: Path | None = None
+
+
+def _load_voice_preset_catalog() -> dict[str, dict[str, Any]]:
+    global _voice_preset_catalog
+    if _voice_preset_catalog is not None:
+        return _voice_preset_catalog
+    catalog_path = _resolve_project_path(_server_config.voxcpm.preset_voice_catalog_path)
+    try:
+        payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Failed to load preset voice catalog {catalog_path}: {exc}") from exc
+
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise RuntimeError(f"Preset voice catalog {catalog_path} must have version 1")
+    voices = payload.get("voices")
+    if not isinstance(voices, list):
+        raise RuntimeError(f"Preset voice catalog {catalog_path} must contain a voices array")
+
+    catalog: dict[str, dict[str, Any]] = {}
+    for entry in voices:
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"Preset voice catalog {catalog_path} contains a non-object voice")
+        voice_id = entry.get("id")
+        language = entry.get("language")
+        pipeline = entry.get("pipeline")
+        if not isinstance(voice_id, str) or not voice_id:
+            raise RuntimeError(f"Preset voice catalog {catalog_path} contains an invalid voice id")
+        if voice_id in catalog:
+            raise RuntimeError(f"Preset voice catalog {catalog_path} contains duplicate voice {voice_id!r}")
+        if not isinstance(language, str) or not language:
+            raise RuntimeError(f"Preset voice {voice_id!r} has no language")
+        if pipeline == "voxcpm":
+            references = entry.get("references")
+            if not isinstance(references, dict) or "general" not in references:
+                raise RuntimeError(f"VoxCPM preset voice {voice_id!r} has no general reference")
+            for style, reference in references.items():
+                if not isinstance(style, str) or not style or not isinstance(reference, dict):
+                    raise RuntimeError(f"VoxCPM preset voice {voice_id!r} has an invalid reference")
+                url = reference.get("url")
+                path = reference.get("path")
+                if bool(url) == bool(path):
+                    raise RuntimeError(
+                        f"VoxCPM preset voice {voice_id!r} style {style!r} must define exactly one URL or path"
+                    )
+                if url and (not isinstance(url, str) or not url.startswith(("https://", "http://"))):
+                    raise RuntimeError(f"VoxCPM preset voice {voice_id!r} style {style!r} has an invalid URL")
+                if path:
+                    reference_path = _resolve_project_path(path)
+                    if not reference_path.is_file():
+                        raise RuntimeError(
+                            f"VoxCPM preset voice {voice_id!r} style {style!r} path does not exist: "
+                            f"{reference_path}"
+                        )
+        elif pipeline == "sparrow_seed_vc":
+            if entry.get("embedding_style") != "general":
+                raise RuntimeError(f"Seed-VC preset voice {voice_id!r} must use the general embedding")
+        else:
+            raise RuntimeError(f"Preset voice {voice_id!r} has unsupported pipeline {pipeline!r}")
+        catalog[voice_id] = entry
+
+    if not catalog:
+        raise RuntimeError(f"Preset voice catalog {catalog_path} contains no voices")
+    _voice_preset_catalog = catalog
+    _LOGGER.info(
+        "Loaded production voice preset catalog path=%s voices=%d voxcpm=%d seed_vc=%d",
+        catalog_path,
+        len(catalog),
+        sum(entry["pipeline"] == "voxcpm" for entry in catalog.values()),
+        sum(entry["pipeline"] == "sparrow_seed_vc" for entry in catalog.values()),
+    )
+    return catalog
+
+
+def _load_voxcpm_preset_voices() -> dict[str, dict[str, Any]]:
+    global _voxcpm_preset_voices
+    if _voxcpm_preset_voices is None:
+        _voxcpm_preset_voices = {
+            voice_id: entry
+            for voice_id, entry in _load_voice_preset_catalog().items()
+            if entry["pipeline"] == "voxcpm"
+        }
+    return _voxcpm_preset_voices
+
+
+def _seed_vc_fallback_language_codes() -> set[str]:
+    return {
+        _get_base_language(entry["language"])
+        for entry in _load_seed_vc_fallback_voices().values()
+    }
+
+
+def _load_seed_vc_fallback_voices() -> dict[str, dict[str, Any]]:
+    global _seed_vc_fallback_voices
+    if _seed_vc_fallback_voices is not None:
+        return _seed_vc_fallback_voices
+    fallback_voices = {
+        voice_id: entry
+        for voice_id, entry in _load_voice_preset_catalog().items()
+        if entry["pipeline"] == "sparrow_seed_vc"
+    }
+
+    if not fallback_voices:
+        raise RuntimeError("Preset voice catalog contains no Seed-VC fallback voices")
+    _seed_vc_fallback_voices = fallback_voices
+    return fallback_voices
+
+
+def _is_seed_vc_fallback_voice(voice_id: str | None) -> bool:
+    return bool(voice_id) and voice_id in _load_seed_vc_fallback_voices()
+
+
+def _validate_seed_vc_fallback_embeddings(worker_info: dict[str, Any]) -> None:
+    fallback_voices = _load_seed_vc_fallback_voices()
+    available_keys = set(worker_info.get("embedding_keys") or [])
+    expected_keys = {f"{voice_id}.general" for voice_id in fallback_voices}
+    missing_keys = sorted(expected_keys - available_keys)
+    if missing_keys:
+        raise RuntimeError(f"Seed-VC fallback embeddings are missing keys: {missing_keys}")
+
+    unroutable_languages = sorted(
+        language
+        for language in _seed_vc_fallback_language_codes()
+        if not _is_supported_sparrow_locale(language)
+    )
+    if unroutable_languages:
+        raise RuntimeError(f"Seed-VC fallback languages are not routable by Sparrow: {unroutable_languages}")
+
+    _LOGGER.info(
+        "Validated Seed-VC fallback catalog languages=%s voices=%d embeddings=%d",
+        sorted(_seed_vc_fallback_language_codes()),
+        len(fallback_voices),
+        len(available_keys),
+    )
+
+
+def _configured_voice_ids() -> set[str]:
+    voice_ids = {config.voice_id for config in _server_config.pipertts.root_voices.values()}
+    if _engine_enabled("voxcpm"):
+        voice_ids.update(_load_voxcpm_preset_voices())
+    if _engine_enabled("seed_vc"):
+        voice_ids.update(_load_seed_vc_fallback_voices())
+    return voice_ids
+
+
+def _resolve_voxcpm_preset_reference(voice_id: str, requested_style: str | None) -> _VoxCPMPresetReference:
+    entry = _load_voxcpm_preset_voices().get(voice_id)
+    if entry is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported VoxCPM preset voice_id {voice_id!r}")
+
+    style = (requested_style or "general").strip() or "general"
+    references = entry["references"]
+    reference = references.get(style)
+    if reference is None and entry.get("style_fallback") == "general":
+        reference = references.get("general")
+    if reference is None:
+        available = sorted(references)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Voice {voice_id!r} has no reference sample for style {style!r}; available styles: {available}",
+        )
+    url = reference.get("url")
+    path = reference.get("path")
+    return _VoxCPMPresetReference(
+        voice_id=voice_id,
+        style=style,
+        url=url,
+        path=_resolve_project_path(path) if path else None,
+    )
+
+
+async def _synthesize_voxcpm_preset_batch(
+    request: _SharedBatchSynthesizeRequest,
+) -> BatchSynthesizeResponse:
+    if request.voice_id is None:
+        raise HTTPException(status_code=400, detail="voice_id is required for preset voice synthesis")
+
+    return await _synthesize_voxcpm_preset_inputs(
+        texts=request.texts,
+        seeds=request.seeds or [None] * len(request.texts),
+        voice_ids=[request.voice_id] * len(request.texts),
+        languages=request.languages or [request.language] * len(request.texts),
+        styles=[request.style] * len(request.texts),
+        style_intensities=[request.style_intensity] * len(request.texts),
+        options=request.options,
+        output_format=request.format,
+        neural=request.neural,
+    )
+
+
+async def _load_voxcpm_preset_reference(
+    reference: _VoxCPMPresetReference,
+) -> tuple[bytes, str]:
+    if reference.path is not None:
+        audio = await asyncio.to_thread(reference.path.read_bytes)
+        return audio, reference.path.suffix.lower().lstrip(".") or "wav"
+    if reference.url is not None:
+        return await _download_voxcpm_reference(reference.url)
+    raise RuntimeError(f"VoxCPM preset voice {reference.voice_id!r} has no reference source")
+
+
+async def _synthesize_voxcpm_preset_inputs(
+    *,
+    texts: list[str],
+    seeds: list[int | None],
+    voice_ids: list[str],
+    languages: list[str | None],
+    styles: list[str | None],
+    style_intensities: list[float | None],
+    options: SparrowSynthesizeOptions | None,
+    output_format: Literal["wav", "mp3"],
+    neural: bool,
+) -> BatchSynthesizeResponse:
+    item_count = len(texts)
+    per_item_values = {
+        "seeds": seeds,
+        "voice_ids": voice_ids,
+        "languages": languages,
+        "styles": styles,
+        "style_intensities": style_intensities,
+    }
+    for name, values in per_item_values.items():
+        if len(values) != item_count:
+            raise RuntimeError(f"{name} length must match preset VoxCPM texts length")
+
+    references = [
+        _resolve_voxcpm_preset_reference(voice_id, style)
+        for voice_id, style in zip(voice_ids, styles)
+    ]
+    unique_references: dict[tuple[str, str], _VoxCPMPresetReference] = {}
+    reference_keys: list[tuple[str, str]] = []
+    for reference in references:
+        if reference.path is not None:
+            key = ("path", str(reference.path))
+        elif reference.url is not None:
+            key = ("url", reference.url)
+        else:
+            raise RuntimeError(f"VoxCPM preset voice {reference.voice_id!r} has no reference source")
+        unique_references.setdefault(key, reference)
+        reference_keys.append(key)
+
+    loaded_references = await asyncio.gather(
+        *(_load_voxcpm_preset_reference(reference) for reference in unique_references.values())
+    )
+    loaded_by_key = dict(zip(unique_references, loaded_references))
+    reference_audios = [loaded_by_key[key][0] for key in reference_keys]
+    reference_formats = [loaded_by_key[key][1] for key in reference_keys]
+
+    for voice_id, reference, intensity in zip(voice_ids, references, style_intensities):
+        if intensity not in {None, 1.0}:
+            _LOGGER.info(
+                "Ignoring legacy styleIntensity for VoxCPM preset voice_id=%s style=%s intensity=%s",
+                voice_id,
+                reference.style,
+                intensity,
+            )
+
+    _log_synthesize_batch_stage(
+        "configured_voice_routing",
+        pipeline="voxcpm_preset",
+        voice_ids=voice_ids,
+        styles=[reference.style for reference in references],
+        reference_urls=[reference.url for reference in references],
+        reference_paths=[
+            str(reference.path) if reference.path is not None else None
+            for reference in references
+        ],
+        item_count=item_count,
+    )
+    result = await synthesize_voxcpm_batch(
+        _SharedBatchSynthesizeRequest(
+            texts=texts,
+            seeds=seeds,
+            languages=languages,
+            model=_server_config.voxcpm.model_id,
+            options=options,
+            format=output_format,
+            neural=neural,
+        ),
+        reference_audios=reference_audios,
+        reference_formats=reference_formats,
+    )
+    unique_voice_ids = set(voice_ids)
+    model = f"voice_id:{voice_ids[0]}" if len(unique_voice_ids) == 1 else "voxcpm:mixed-presets"
+    return result.model_copy(update={"model": model, "speaker": None})
+
+
+async def _synthesize_voxcpm_preset_items(
+    records: list[tuple[int, BatchSynthesizeInputItem, str]],
+) -> BatchSynthesizeResponse:
+    return await _synthesize_voxcpm_preset_inputs(
+        texts=[text for _, _, text in records],
+        seeds=[item.seed for _, item, _ in records],
+        voice_ids=[item.voice_id or "" for _, item, _ in records],
+        languages=[item.language for _, item, _ in records],
+        styles=[item.style for _, item, _ in records],
+        style_intensities=[item.style_intensity for _, item, _ in records],
+        options=records[0][1].options,
+        output_format=records[0][1].format,
+        neural=records[0][1].neural,
+    )
+
+
 def _default_root_voice() -> RootVoiceConfig | None:
     for config in _server_config.pipertts.root_voices.values():
         if config.languages is None:
@@ -1282,39 +1654,8 @@ def _root_voice_can_synthesize_language(config: RootVoiceConfig, language: str |
     return False
 
 
-def _seed_vc_base_id(embedding_key: str) -> str:
-    parts = embedding_key.split(".")
-    if len(parts) < 3:
-        return embedding_key
-    return ".".join(parts[:3])
-
-
-def _load_seed_vc_voice_ids() -> set[str]:
-    global _seed_vc_voice_ids
-    if _seed_vc_voice_ids is not None:
-        return _seed_vc_voice_ids
-
-    if not SEED_VC_VOICE_IDS_PATH.exists():
-        raise RuntimeError(f"Seed-VC voice id list not found: {SEED_VC_VOICE_IDS_PATH}")
-
-    try:
-        _seed_vc_voice_ids = {
-            line.strip()
-            for line in SEED_VC_VOICE_IDS_PATH.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        }
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        raise RuntimeError(f"Failed to load Seed-VC voice id list {SEED_VC_VOICE_IDS_PATH}: {exc}") from exc
-    if not _seed_vc_voice_ids:
-        raise RuntimeError(f"Seed-VC voice id list is empty: {SEED_VC_VOICE_IDS_PATH}")
-    return _seed_vc_voice_ids
-
-
 def _build_synthesize_voices_catalog() -> tuple[list[str], list[SynthesizeVoiceInfo]]:
-    supported_voice_ids = set(cfg.voice_id for cfg in _server_config.pipertts.root_voices.values())
-
-    if _engine_enabled("seed_vc"):
-        supported_voice_ids.update(_get_seed_vc_supported_voice_ids())
+    supported_voice_ids = _configured_voice_ids()
 
     supported_locales = _supported_sparrow_locales()
     locales = sorted({
@@ -1336,46 +1677,6 @@ def _build_synthesize_voices_catalog() -> tuple[list[str], list[SynthesizeVoiceI
         for voice_id in sorted(supported_voice_ids)
     ]
     return unique_locales, voices
-
-
-def _get_seed_vc_supported_voice_ids() -> set[str]:
-    global _seed_vc_supported_voice_ids
-    if _seed_vc_supported_voice_ids is not None:
-        return _seed_vc_supported_voice_ids
-
-    supported = {cfg.voice_id for cfg in _server_config.pipertts.root_voices.values()}
-    if _seed_vc_info.get("embedding_keys"):
-        embedding_keys = list(_seed_vc_info.get("embedding_keys") or [])
-    else:
-        backend = _get_seed_vc_backend()
-        embedding_keys = list(backend.cached_embeddings.keys()) if backend.cached_embeddings else []
-    emb_ids = {_seed_vc_base_id(key) for key in embedding_keys}
-    if not emb_ids:
-        raise RuntimeError("Seed-VC backend loaded without cached embeddings")
-
-    configured_ids = _load_seed_vc_voice_ids()
-    all_seed_vc_ids = configured_ids & emb_ids
-    missing_embeddings = configured_ids - emb_ids
-    if missing_embeddings:
-        raise RuntimeError(
-            "Seed-VC voice id manifest contains id(s) without cached embeddings: "
-            f"count={len(missing_embeddings)} first={sorted(missing_embeddings)[:10]}"
-        )
-    seed_vc_supported = {
-        voice_id
-        for voice_id in all_seed_vc_ids
-        if (locale := _extract_locale_from_voice_id(voice_id))
-        and _is_supported_sparrow_locale(locale)
-    }
-    if not seed_vc_supported:
-        raise RuntimeError(
-            "Seed-VC voice catalog resolved to zero supported embedding-backed voices "
-            f"(manifest={SEED_VC_VOICE_IDS_PATH}, embeddings={len(emb_ids)})"
-        )
-    supported.update(seed_vc_supported)
-
-    _seed_vc_supported_voice_ids = supported
-    return _seed_vc_supported_voice_ids
 
 
 def _synth_kwargs_from_request(request: SynthesizeRequest | BatchSynthesizeInputItem | _SharedBatchSynthesizeRequest) -> dict[str, float]:
@@ -1402,8 +1703,9 @@ def _seed_vc_style_requested(request: SynthesizeRequest | BatchSynthesizeInputIt
     return style != "general" or intensity != 1.0
 
 
-def _seed_vc_sample_id(sample_url: str) -> str:
-    return f"synthesize-sample-{hashlib.sha256(sample_url.encode()).hexdigest()[:16]}"
+def _seed_vc_sample_id(sample_url: str, reference_version: str | None = None) -> str:
+    identity = f"{sample_url}\0{reference_version or ''}"
+    return f"synthesize-sample-{hashlib.sha256(identity.encode()).hexdigest()[:16]}"
 
 
 def _seed_vc_chunk_batch_size(backend: SeedVCBackend) -> int:
@@ -1415,6 +1717,7 @@ async def _convert_generated_audio_to_sample_batch(
     source_audios: list[np.ndarray],
     source_sample_rates: list[int],
     sample_url: str,
+    reference_version: str | None,
     output_format: Literal["wav", "mp3"],
 ) -> tuple[list[tuple[bytes, float]], int]:
     await _await_engine_ready("seed_vc")
@@ -1422,7 +1725,7 @@ async def _convert_generated_audio_to_sample_batch(
     sample_request = SeedVCRequest(
         audio="",
         reference_url=sample_url,
-        id=_seed_vc_sample_id(sample_url),
+        id=_seed_vc_sample_id(sample_url, reference_version),
         style="general",
         intensity=1.0,
     )
@@ -1529,8 +1832,6 @@ def _plan_text_segments(
 
 
 async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeRequest) -> BatchSynthesizeResponse:
-    if not _engine_enabled("pipertts"):
-        raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
     if request.voice_id is None:
         raise HTTPException(status_code=400, detail="voice_id is required for configured voice synthesis")
     if request.sample_url is not None:
@@ -1538,46 +1839,70 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
     if request.model is not None:
         raise HTTPException(status_code=400, detail="Use either 'voice_id' or 'model', not both")
 
+    root_voice = _configured_root_voice_for_voice_id(request.voice_id)
+    seed_vc_fallback = root_voice is None and _is_seed_vc_fallback_voice(request.voice_id)
+    if root_voice is None and not seed_vc_fallback:
+        return await _synthesize_voxcpm_preset_batch(request)
+
+    if not _engine_enabled("pipertts"):
+        raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
+    if any(seed is not None for seed in request.seeds or []):
+        raise HTTPException(status_code=400, detail="'seed' is only supported by VoxCPM preset voices")
+    if root_voice is not None and _seed_vc_style_requested(request):
+        raise HTTPException(status_code=400, detail="Native Sparrow root voices do not support preset styles")
+
     texts = [text.strip() for text in request.texts]
     if any(not text for text in texts):
         raise HTTPException(status_code=400, detail="all texts must be non-empty")
 
-    await _await_engine_ready("seed_vc")
-    supported_voice_ids = _get_seed_vc_supported_voice_ids()
+    await _await_engine_ready("pipertts")
+    supported_voice_ids = _configured_voice_ids()
     if request.voice_id not in supported_voice_ids:
         supported = sorted(supported_voice_ids)
         raise HTTPException(status_code=400, detail=f"Unsupported voice_id {request.voice_id!r}; supported voices: {supported}")
 
-    forced_language = _normalize_locale_with_region(request.language) if request.language is not None else None
+    requested_language = request.language
+    if requested_language is None and seed_vc_fallback:
+        requested_language = str(_load_seed_vc_fallback_voices()[request.voice_id].get("language") or "")
+    elif requested_language is None and root_voice is not None and root_voice.languages:
+        # A locale-specific root voice should use its configured language even
+        # when the client omits `language`. Script/language detection is not
+        # reliable for every LFL language (for example, Latin-script Bosnian).
+        if len(root_voice.languages) == 1:
+            requested_language = root_voice.languages[0]
+
+    forced_language = _normalize_locale_with_region(requested_language) if requested_language else None
+    if forced_language is not None and not _is_supported_sparrow_locale(forced_language):
+        base_language = _get_base_language(forced_language)
+        if seed_vc_fallback and _is_supported_sparrow_locale(base_language):
+            forced_language = base_language
     if forced_language is not None:
         _resolve_forced_language(forced_language)
 
-    root_voice = _configured_root_voice_for_voice_id(request.voice_id)
-    primary_speaker: str | None = None
+    primary_speaker: str | None = (
+        forced_language
+        if forced_language is not None
+        else root_voice.speaker if root_voice is not None else None
+    )
     style, style_intensity = _seed_vc_style_from_request(request)
-    style_requested = _seed_vc_style_requested(request)
-    if root_voice is not None:
-        primary_speaker = forced_language if forced_language is not None else root_voice.speaker
-        convert_all = forced_language is not None and not _root_voice_can_synthesize_language(root_voice, forced_language)
-    else:
-        convert_all = True
-
-    if style_requested:
-        convert_all = True
-    if convert_all:
+    if seed_vc_fallback:
+        await _await_engine_ready("seed_vc")
         try:
-            _get_seed_vc_backend()._resolve_exact_cached_embeddings(request.voice_id, style, style_intensity)
+            _get_seed_vc_backend()._resolve_exact_cached_embeddings(
+                request.voice_id,
+                style,
+                style_intensity,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     started = time.perf_counter()
     synth_kwargs = _synth_kwargs_from_request(request)
     item_segments: list[list[dict[str, Any]]] = []
-    convert_item = [convert_all for _ in texts]
     segment_groups: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
 
     for item_idx, text in enumerate(texts):
-        segments, languages = _plan_text_segments(
+        segments, _ = _plan_text_segments(
             text,
             primary_speaker,
             forced_language=forced_language,
@@ -1594,18 +1919,10 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
                     if fallback_root_voice.speaker is not None:
                         segment["speaker"] = fallback_root_voice.speaker
                     segment["model"] = fallback_root_voice.model
-        if root_voice is not None and any(not _root_voice_can_synthesize_language(root_voice, language) for language in languages):
-            convert_item[item_idx] = True
         item_segments.append(segments)
         for segment_idx, segment in enumerate(segments):
             record = {**segment, "item_idx": item_idx, "segment_idx": segment_idx}
             segment_groups.setdefault(segment["model"], []).append(record)
-
-    if any(convert_item):
-        try:
-            _get_seed_vc_backend()._resolve_exact_cached_embeddings(request.voice_id, style, style_intensity)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     _log_synthesize_batch_stage(
         "configured_voice_routing",
@@ -1617,10 +1934,12 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         root_voice_speaker=root_voice.speaker if root_voice is not None else None,
         root_voice_languages=root_voice.languages if root_voice is not None else None,
         primary_speaker=primary_speaker,
-        style_requested=style_requested,
+        seed_vc_fallback=seed_vc_fallback,
+        style=style,
+        style_intensity=style_intensity,
         item_count=len(texts),
         item_segment_counts=[len(segments) for segments in item_segments],
-        convert_indices=[idx for idx, value in enumerate(convert_item) if value],
+        convert_indices=list(range(len(texts))) if seed_vc_fallback else [],
         model_groups=[
             {
                 "model": model_name,
@@ -1756,25 +2075,19 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         for idx, audio in enumerate(item_audios)
     ]
 
-    convert_indices = [idx for idx, should_convert in enumerate(convert_item) if should_convert]
-    if convert_indices:
+    if seed_vc_fallback:
         backend = _get_seed_vc_backend()
-        try:
-            backend._resolve_exact_cached_embeddings(request.voice_id, style, style_intensity)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         vc_source_rate = backend.sample_rate
         vc_source_audios = [
-            _resample_audio(item_audios[idx], item_source_sample_rates[idx], vc_source_rate)
-            for idx in convert_indices
+            _resample_audio(audio, source_rate, vc_source_rate)
+            for audio, source_rate in zip(item_audios, item_source_sample_rates)
         ]
         vc_started = time.perf_counter()
         _log_synthesize_batch_stage(
             "seed_vc_voice_batch_start",
-            pipeline="configured_voice",
+            pipeline="sparrow_seed_vc_fallback",
             voice_id=request.voice_id,
             count=len(vc_source_audios),
-            item_indices=convert_indices,
             style=style,
             style_intensity=style_intensity,
             output_format=request.format,
@@ -1793,16 +2106,16 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         )
         _log_synthesize_batch_stage(
             "seed_vc_voice_batch_done",
-            pipeline="configured_voice",
+            pipeline="sparrow_seed_vc_fallback",
             voice_id=request.voice_id,
             output_count=len(converted),
             wall_seconds=round(time.perf_counter() - vc_started, 6),
             output_sample_rate=backend.sample_rate,
         )
-        for item_idx, (audio_bytes, audio_seconds) in zip(convert_indices, converted):
-            encoded_items[item_idx] = audio_bytes
-            item_sample_rates[item_idx] = backend.sample_rate
-            item_audio_seconds[item_idx] = audio_seconds
+        for idx, (audio_bytes, audio_seconds) in enumerate(converted):
+            encoded_items[idx] = audio_bytes
+            item_sample_rates[idx] = backend.sample_rate
+            item_audio_seconds[idx] = audio_seconds
 
     for idx, audio in enumerate(item_audios):
         if encoded_items[idx] is not None:
@@ -1830,7 +2143,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
     response = BatchSynthesizeResponse(
         items=items,
         count=len(items),
-        model=f"voice_id:{request.voice_id}",
+        model=_public_model_name(root_voice.model) if root_voice is not None else PUBLIC_SPARROW_MODEL,
         speaker=primary_speaker,
         wall_seconds=wall_seconds,
         audio_seconds_total=audio_seconds_total,
@@ -1847,6 +2160,7 @@ async def _synthesize_configured_voice(request: SynthesizeRequest) -> Response:
     batch_result = await synthesize_configured_voice_batch(
         _SharedBatchSynthesizeRequest(
             texts=[request.text],
+            seeds=[request.seed],
             voice_id=request.voice_id,
             language=request.language,
             style=request.style,
@@ -2056,17 +2370,6 @@ def _is_starling_model(model_name: str | None) -> bool:
     return bool(model_name) and str(model_name).lower() in {"lzspeech-starling", "starling"}
 
 
-class _CachedEmbeddingKeysProxy:
-    def __init__(self, keys: list[str]):
-        self._keys = list(keys)
-
-    def keys(self) -> list[str]:
-        return list(self._keys)
-
-    def __bool__(self) -> bool:
-        return bool(self._keys)
-
-
 class _SeedVCBackendProxy:
     """Parent-process proxy for a Seed-VC worker-owned backend."""
 
@@ -2084,7 +2387,7 @@ class _SeedVCBackendProxy:
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.voice_samples_dir.mkdir(parents=True, exist_ok=True)
-        self.cached_embeddings = _CachedEmbeddingKeysProxy(list(info.get("embedding_keys") or []))
+        self.cached_embeddings = None
 
     async def _fetch_sample(self, request: SeedVCRequest) -> Path:
         response = await asyncio.to_thread(
@@ -2311,6 +2614,7 @@ async def synthesize_sparrow_batch(
             source_audios=audios,
             source_sample_rates=[sample_rate for _ in audios],
             sample_url=request.sample_url,
+            reference_version=request.reference_version,
             output_format=request.format,
         )
         items = []
@@ -2329,7 +2633,7 @@ async def synthesize_sparrow_batch(
         response = BatchSynthesizeResponse(
             items=items,
             count=len(items),
-            model=model_name,
+            model=PUBLIC_SPARROW_MODEL,
             speaker=resolved_speaker,
             wall_seconds=total_wall_seconds,
             audio_seconds_total=audio_seconds_total,
@@ -2358,7 +2662,7 @@ async def synthesize_sparrow_batch(
     response = BatchSynthesizeResponse(
         items=items,
         count=len(items),
-        model=model_name,
+        model=PUBLIC_SPARROW_MODEL,
         speaker=resolved_speaker,
         wall_seconds=wall_seconds,
         audio_seconds_total=audio_seconds_total,
@@ -2373,7 +2677,7 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
         raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
     if request.voice_id is not None:
         raise HTTPException(status_code=400, detail="voice_id requests must use configured voice synthesis")
-    if request.model is not None:
+    if request.model not in {None, PUBLIC_SPARROW_MODEL}:
         raise HTTPException(status_code=400, detail="model-specific requests must use direct Sparrow batching")
     if request.sample_url is not None and _seed_vc_style_requested(request):
         raise HTTPException(status_code=400, detail="'style' and 'styleIntensity' require 'voice_id'")
@@ -2483,6 +2787,7 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
             source_audios=item_audios,
             source_sample_rates=item_sample_rates,
             sample_url=request.sample_url,
+            reference_version=request.reference_version,
             output_format=request.format,
         )
         items = []
@@ -2501,7 +2806,7 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
         response = BatchSynthesizeResponse(
             items=items,
             count=len(items),
-            model="auto",
+            model=PUBLIC_SPARROW_MODEL,
             speaker=None,
             wall_seconds=wall_seconds,
             audio_seconds_total=audio_seconds_total,
@@ -2532,7 +2837,7 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
     response = BatchSynthesizeResponse(
         items=items,
         count=len(items),
-        model="auto",
+        model=PUBLIC_SPARROW_MODEL,
         speaker=None,
         wall_seconds=wall_seconds,
         audio_seconds_total=audio_seconds_total,
@@ -2576,7 +2881,7 @@ def _get_voxcpm_runtime() -> VoxCPMRuntime:
     return _voxcpm_runtime
 
 
-async def _download_voxcpm_reference(sample_url: str) -> tuple[bytes, str]:
+async def _fetch_voxcpm_reference(sample_url: str) -> tuple[bytes, str]:
     parsed = urlsplit(sample_url)
     if parsed.scheme not in {"http", "https"}:
         raise HTTPException(status_code=400, detail="VoxCPM sample_url must use http or https")
@@ -2595,7 +2900,53 @@ async def _download_voxcpm_reference(sample_url: str) -> tuple[bytes, str]:
     return audio, suffix or "wav"
 
 
-async def synthesize_voxcpm_batch(request: _SharedBatchSynthesizeRequest) -> BatchSynthesizeResponse:
+async def _download_voxcpm_reference(
+    sample_url: str,
+    reference_version: str | None = None,
+) -> tuple[bytes, str]:
+    if reference_version is None:
+        return await _fetch_voxcpm_reference(sample_url)
+
+    cache_key = (sample_url, reference_version)
+    async with _voxcpm_reference_download_lock:
+        cached = _voxcpm_reference_download_cache.get(cache_key)
+        if cached is not None:
+            _voxcpm_reference_download_cache.move_to_end(cache_key)
+            return cached
+        task = _voxcpm_reference_download_tasks.get(cache_key)
+        if task is None:
+            task = asyncio.create_task(_fetch_voxcpm_reference(sample_url))
+            _voxcpm_reference_download_tasks[cache_key] = task
+
+    try:
+        loaded = await asyncio.shield(task)
+    except BaseException:
+        async with _voxcpm_reference_download_lock:
+            if _voxcpm_reference_download_tasks.get(cache_key) is task and task.done():
+                _voxcpm_reference_download_tasks.pop(cache_key, None)
+        raise
+
+    async with _voxcpm_reference_download_lock:
+        _voxcpm_reference_download_tasks.pop(cache_key, None)
+        cached = _voxcpm_reference_download_cache.get(cache_key)
+        if cached is not None:
+            _voxcpm_reference_download_cache.move_to_end(cache_key)
+            return cached
+        _voxcpm_reference_download_cache[cache_key] = loaded
+        cache_size = int(_server_config.voxcpm.reference_cache_size)
+        while len(_voxcpm_reference_download_cache) > cache_size:
+            _voxcpm_reference_download_cache.popitem(last=False)
+    return loaded
+
+
+async def synthesize_voxcpm_batch(
+    request: _SharedBatchSynthesizeRequest,
+    *,
+    reference_audio: bytes | None = None,
+    reference_format: str | None = None,
+    reference_audios: list[bytes | None] | None = None,
+    reference_formats: list[str] | None = None,
+) -> BatchSynthesizeResponse:
     """Synthesize one compatible request group with optimized nano-vLLM."""
     if not _engine_enabled("voxcpm"):
         raise HTTPException(status_code=503, detail="VoxCPM backend is disabled")
@@ -2607,19 +2958,28 @@ async def synthesize_voxcpm_batch(request: _SharedBatchSynthesizeRequest) -> Bat
     texts = [text.strip() for text in request.texts]
     if any(not text for text in texts):
         raise HTTPException(status_code=400, detail="all texts must be non-empty")
+    languages = request.languages or [request.language] * len(texts)
+    if len(languages) != len(texts):
+        raise HTTPException(status_code=400, detail="VoxCPM languages length must match texts length")
 
     await _await_engine_ready("voxcpm")
     runtime = _get_voxcpm_runtime()
     prepared_inputs = [
-        _prepare_voxcpm_input(text, request.language)
-        for text in texts
+        _prepare_voxcpm_input(text, language)
+        for text, language in zip(texts, languages)
     ]
     prepared_texts = [prepared_text for prepared_text, _ in prepared_inputs]
     dp_languages = [dp_language for _, dp_language in prepared_inputs]
-    reference_audio: bytes | None = None
-    reference_format = "wav"
+    if reference_audio is not None and reference_audios is not None:
+        raise HTTPException(status_code=400, detail="VoxCPM received both shared and per-item reference audio")
+    if request.sample_url is not None and (reference_audio is not None or reference_audios is not None):
+        raise HTTPException(status_code=400, detail="VoxCPM received both inline and URL reference audio")
+    resolved_reference_format = reference_format or "wav"
     if request.sample_url is not None:
-        reference_audio, reference_format = await _download_voxcpm_reference(request.sample_url)
+        reference_audio, resolved_reference_format = await _download_voxcpm_reference(
+            request.sample_url,
+            request.reference_version,
+        )
 
     started = time.perf_counter()
     audios = await runtime.synthesize_batch(
@@ -2627,7 +2987,9 @@ async def synthesize_voxcpm_batch(request: _SharedBatchSynthesizeRequest) -> Bat
         languages=dp_languages,
         seeds=request.seeds,
         reference_audio=reference_audio,
-        reference_format=reference_format,
+        reference_format=resolved_reference_format,
+        reference_audios=reference_audios,
+        reference_formats=reference_formats,
     )
     generation_wall_seconds = time.perf_counter() - started
     sample_rate = runtime.sample_rate
@@ -2673,22 +3035,79 @@ async def synthesize_voxcpm_batch(request: _SharedBatchSynthesizeRequest) -> Bat
     return response
 
 
+async def _synthesize_voxcpm_items(
+    records: list[tuple[int, BatchSynthesizeInputItem, str]],
+) -> BatchSynthesizeResponse:
+    reference_keys = [
+        (item.sample_url, item.reference_version)
+        for _, item, _ in records
+    ]
+    unique_keys = list(
+        dict.fromkeys(key for key in reference_keys if key[0] is not None)
+    )
+    loaded_references = await asyncio.gather(
+        *(
+            _download_voxcpm_reference(sample_url, reference_version)
+            for sample_url, reference_version in unique_keys
+            if sample_url is not None
+        )
+    )
+    loaded_by_key = dict(zip(unique_keys, loaded_references))
+    reference_audios = [
+        loaded_by_key[key][0] if key[0] is not None else None
+        for key in reference_keys
+    ]
+    reference_formats = [
+        loaded_by_key[key][1] if key[0] is not None else "wav"
+        for key in reference_keys
+    ]
+    first = records[0][1]
+    return await synthesize_voxcpm_batch(
+        _SharedBatchSynthesizeRequest(
+            texts=[text for _, _, text in records],
+            seeds=[item.seed for _, item, _ in records],
+            languages=[item.language for _, item, _ in records],
+            model=_server_config.voxcpm.model_id,
+            options=first.options,
+            format=first.format,
+            neural=first.neural,
+        ),
+        reference_audios=reference_audios,
+        reference_formats=reference_formats,
+    )
+
+
 def _batch_item_group_key(item: BatchSynthesizeInputItem) -> tuple[Any, ...]:
     options_key = None
     if item.options is not None:
         options_key = json.dumps(item.options.model_dump(mode="json"), sort_keys=True)
     model_key = item.model
     if item.voice_id is not None:
+        if (
+            _configured_root_voice_for_voice_id(item.voice_id) is None
+            and not _is_seed_vc_fallback_voice(item.voice_id)
+        ):
+            return (
+                "voxcpm_preset",
+                options_key,
+                item.format,
+                item.neural,
+            )
         kind = "voice"
     elif _is_voxcpm_model(item.model):
-        kind = "voxcpm"
-        model_key = _server_config.voxcpm.model_id
+        return (
+            "voxcpm",
+            options_key,
+            item.format,
+            item.neural,
+        )
     else:
         kind = "sparrow"
     return (
         kind,
         item.voice_id,
         item.sample_url,
+        item.reference_version,
         item.language,
         model_key,
         item.style,
@@ -2708,11 +3127,18 @@ def _validate_batch_item(item: BatchSynthesizeInputItem, item_idx: int) -> str:
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: text is required")
     if item.sample_url is not None and item.voice_id is not None:
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: Use either 'voice_id' or 'sample_url', not both")
+    if item.reference_version is not None and item.sample_url is None:
+        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'reference_version' requires 'sample_url'")
     if item.voice_id is not None and item.model is not None:
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: Use either 'voice_id' or 'model', not both")
     if item.language is not None and item.model is not None and not _is_voxcpm_model(item.model):
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: Use either 'language' or 'model', not both")
-    if item.seed is not None and not _is_voxcpm_model(item.model):
+    seed_uses_voxcpm_preset = (
+        item.voice_id is not None
+        and _configured_root_voice_for_voice_id(item.voice_id) is None
+        and not _is_seed_vc_fallback_voice(item.voice_id)
+    )
+    if item.seed is not None and not _is_voxcpm_model(item.model) and not seed_uses_voxcpm_preset:
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'seed' requires model='voxcpm'")
     if item.sample_url is not None and _seed_vc_style_requested(item):
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'style' and 'styleIntensity' require 'voice_id'")
@@ -2728,8 +3154,10 @@ def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, 
         seeds=[item.seed for _, item, _ in records],
         voice_id=first.voice_id,
         sample_url=first.sample_url,
+        reference_version=first.reference_version,
         language=first.language,
-        model=first.model,
+        languages=[item.language for _, item, _ in records],
+        model=_resolve_api_model(first.model),
         style=first.style,
         style_intensity=first.style_intensity,
         options=first.options,
@@ -2755,9 +3183,9 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
                 "group_index": group_idx,
                 "item_indices": [item_idx for item_idx, _, _ in records],
                 "count": len(records),
-                "voice_id": records[0][1].voice_id,
+                "voice_ids": [item.voice_id for _, item, _ in records],
                 "sample_url": bool(records[0][1].sample_url),
-                "language": records[0][1].language,
+                "languages": [item.language for _, item, _ in records],
                 "model": records[0][1].model,
                 "style": records[0][1].style,
                 "styleIntensity": records[0][1].style_intensity,
@@ -2773,23 +3201,29 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
 
     for group_idx, records in enumerate(groups.values()):
         shared_request = _shared_batch_from_items(records)
+        is_voxcpm_preset_group = (
+            records[0][1].voice_id is not None
+            and _configured_root_voice_for_voice_id(records[0][1].voice_id) is None
+            and not _is_seed_vc_fallback_voice(records[0][1].voice_id)
+        )
         group_started = time.perf_counter()
         _log_synthesize_batch_stage(
             "group_start",
             group_index=group_idx,
             item_indices=[item_idx for item_idx, _, _ in records],
             item_count=len(records),
-            voice_id=shared_request.voice_id,
+            voice_ids=[item.voice_id for _, item, _ in records],
             sample_url=bool(shared_request.sample_url),
-            language=shared_request.language,
+            languages=[item.language for _, item, _ in records],
             model=shared_request.model,
             format=shared_request.format,
         )
-        if shared_request.voice_id is not None:
-            await _await_engine_ready("pipertts")
+        if is_voxcpm_preset_group:
+            group_result = await _synthesize_voxcpm_preset_items(records)
+        elif shared_request.voice_id is not None:
             group_result = await synthesize_configured_voice_batch(shared_request)
         elif _is_voxcpm_model(shared_request.model):
-            group_result = await synthesize_voxcpm_batch(shared_request)
+            group_result = await _synthesize_voxcpm_items(records)
         elif shared_request.language is not None:
             await _await_engine_ready("pipertts")
             _, forced_speaker, forced_model = _resolve_forced_language(shared_request.language)
@@ -2804,6 +3238,9 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
                 ),
                 speaker=forced_speaker,
             )
+        elif shared_request.model == PUBLIC_SPARROW_MODEL:
+            await _await_engine_ready("pipertts")
+            group_result = await synthesize_multilingual_sparrow_batch(shared_request)
         elif shared_request.model is not None:
             await _await_engine_ready("pipertts")
             group_result = await synthesize_sparrow_batch(shared_request)
@@ -2926,8 +3363,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         """Schedule enabled model engines to load in background worker processes."""
         global _speaker_routes, _lang_speaker_map, _splitter, _splitter_languages
         global _starling_backend, _starling_batcher, _seed_vc_backend
-        global _voxcpm_runtime
-        global _seed_vc_supported_voice_ids, _seed_vc_voice_ids
+        global _voxcpm_runtime, _voice_preset_catalog, _voxcpm_preset_voices, _seed_vc_fallback_voices
         global _sparrow_model_info, _starling_info, _seed_vc_info
         global _startup_loader_task
 
@@ -2939,6 +3375,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             if _voxcpm_runtime is not None:
                 await _voxcpm_runtime.stop()
                 _voxcpm_runtime = None
+            _voice_preset_catalog = None
+            _voxcpm_preset_voices = None
+            _seed_vc_fallback_voices = None
             _stop_model_workers()
             _inference_cache.clear()
             _lang_speaker_map.clear()
@@ -2948,8 +3387,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             _starling_backend = None
             _starling_batcher = None
             _seed_vc_backend = None
-            _seed_vc_supported_voice_ids = None
-            _seed_vc_voice_ids = None
             _sparrow_model_info = {}
             _starling_info = {}
             _seed_vc_info = {}
@@ -3030,25 +3467,17 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
             if _engine_enabled("seed_vc"):
                 async def start_seed_vc() -> None:
-                    global _seed_vc_info, _seed_vc_supported_voice_ids
+                    global _seed_vc_info
                     with _logged_startup_step(
                         "seed_vc_worker",
                         device=_server_config.seed_vc.device,
                         root=_server_config.seed_vc.root,
-                        embeddings=_server_config.seed_vc.embeddings_hdf5_path,
                     ):
                         worker = _ensure_seed_vc_worker()
                         worker.start()
                         response = await asyncio.to_thread(worker.call, "health")
                         _seed_vc_info = dict(response.get("data") or {})
-                        _LOGGER.info("Loading Seed-VC voice catalog manifest=%s", SEED_VC_VOICE_IDS_PATH)
-                        catalog_started = time.perf_counter()
-                        _seed_vc_supported_voice_ids = _get_seed_vc_supported_voice_ids()
-                        _LOGGER.info(
-                            "Loaded Seed-VC voice catalog voices=%d elapsed=%.2fs",
-                            len(_seed_vc_supported_voice_ids),
-                            time.perf_counter() - catalog_started,
-                        )
+                        _validate_seed_vc_fallback_embeddings(_seed_vc_info)
 
                 startup_tasks.append(asyncio.create_task(run_loader("seed_vc", start_seed_vc)))
             else:
@@ -3075,7 +3504,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     async def shutdown_event():
-        global _startup_loader_task, _voxcpm_runtime
+        global _startup_loader_task, _voxcpm_runtime, _voice_preset_catalog
+        global _voxcpm_preset_voices, _seed_vc_fallback_voices
         if _startup_loader_task is not None and not _startup_loader_task.done():
             _startup_loader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -3084,6 +3514,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if _voxcpm_runtime is not None:
             await _voxcpm_runtime.stop()
             _voxcpm_runtime = None
+        _voice_preset_catalog = None
+        _voxcpm_preset_voices = None
+        _seed_vc_fallback_voices = None
         _stop_model_workers()
 
     @app.get("/")
@@ -3099,7 +3532,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 speakers.append({
                     "locale": locale,
                     "speaker": speaker,
-                    "model": model,
+                    "model": _public_model_name(model),
                     "speaker_id": sid,
                 })
                 seen_locales.add(locale)
@@ -3109,7 +3542,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 speakers.append({
                     "locale": speaker,
                     "speaker": speaker,
-                    "model": model,
+                    "model": _public_model_name(model),
                     "speaker_id": sid,
                 })
 
@@ -3127,10 +3560,12 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "pipertts": {
                 "enabled": _engine_enabled("pipertts"),
                 **_engine_status("pipertts"),
-                "models_loaded": list(_sparrow_model_info.keys()) if _sparrow_worker is not None else list(_inference_cache.keys()),
-                "models_enabled": _allowed_models(),
+                "models_loaded": _public_model_names(
+                    list(_sparrow_model_info.keys()) if _sparrow_worker is not None else list(_inference_cache.keys())
+                ),
+                "models_enabled": _public_model_names(_allowed_models()),
                 "max_models_in_cache": _server_config.pipertts.max_models_in_cache,
-                "default_model": _server_config.pipertts.default_model,
+                "default_model": PUBLIC_SPARROW_MODEL,
             },
             "voxcpm": {
                 "enabled": _engine_enabled("voxcpm"),
@@ -3312,10 +3747,17 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Must provide either 'text' or 'ssml'")
         if request.language is not None and model is not None and not _is_voxcpm_model(model):
             raise HTTPException(status_code=400, detail="Use either 'language' or 'model', not both")
-        if request.seed is not None and not _is_voxcpm_model(model):
+        seed_uses_voxcpm_preset = (
+            request.voice_id is not None
+            and _configured_root_voice_for_voice_id(request.voice_id) is None
+            and not _is_seed_vc_fallback_voice(request.voice_id)
+        )
+        if request.seed is not None and not _is_voxcpm_model(model) and not seed_uses_voxcpm_preset:
             raise HTTPException(status_code=400, detail="'seed' requires model='voxcpm'")
         if request.sample_url is not None and request.voice_id is not None:
             raise HTTPException(status_code=400, detail="Use either 'voice_id' or 'sample_url', not both")
+        if request.reference_version is not None and request.sample_url is None:
+            raise HTTPException(status_code=400, detail="'reference_version' requires 'sample_url'")
         if request.sample_url is not None and _seed_vc_style_requested(request):
             raise HTTPException(status_code=400, detail="'style' and 'styleIntensity' require 'voice_id'")
         if _is_voxcpm_model(model):
@@ -3330,6 +3772,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     texts=[request.text or ""],
                     seeds=[request.seed],
                     sample_url=request.sample_url,
+                    reference_version=request.reference_version,
                     language=request.language,
                     model=model,
                     options=request.options,
@@ -3341,9 +3784,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
             return _binary_response(audio_bytes, media_type)
 
-        if not _engine_enabled("pipertts"):
-            raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
-        await _await_engine_ready("pipertts")
         if request.voice_id is not None:
             if model is not None:
                 raise HTTPException(status_code=400, detail="Use either 'voice_id' or 'model', not both")
@@ -3353,6 +3793,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if _seed_vc_style_requested(request):
             raise HTTPException(status_code=400, detail="'style' and 'styleIntensity' require 'voice_id'")
 
+        if not _engine_enabled("pipertts"):
+            raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
+        await _await_engine_ready("pipertts")
         synth_kwargs = _synth_kwargs_from_request(request)
 
         if request.ssml:
@@ -3361,7 +3804,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 language=request.language,
                 **synth_kwargs,
             )
-        elif model is None:
+        elif model is None or model == PUBLIC_SPARROW_MODEL:
             audio, sample_rate = _synthesize_multilingual(
                 request.text,
                 language=request.language,
@@ -3387,6 +3830,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 source_audios=[audio],
                 source_sample_rates=[sample_rate],
                 sample_url=request.sample_url,
+                reference_version=request.reference_version,
                 output_format=request.format,
             )
             audio_bytes, _ = converted[0]
@@ -3530,11 +3974,17 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         fastapi_request: Request,
         text: Optional[str] = Query(None, description="Plain text to synthesize (mutually exclusive with ssml)"),
         ssml: Optional[str] = Query(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)"),
-        model: str = Query(None, description="Model to use (overrides auto routing)"),
-        voice_id: Optional[str] = Query(None, description="Public voice id from data/seed-vc/voice_ids.txt"),
+        model: str = Query(None, description="Public model family, e.g. sparrow or voxcpm"),
+        voice_id: Optional[str] = Query(None, description="Configured preset voice id"),
         sample_url: Optional[str] = Query(
             None,
             description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
+        ),
+        reference_version: Optional[str] = Query(
+            None,
+            min_length=1,
+            max_length=256,
+            description="Opaque reference revision or content hash used for cache invalidation",
         ),
         language: Optional[str] = Query(None, description="Force full locale for the entire text, e.g. en-GB"),
         style: Optional[str] = Query(None, description="Seed-VC speech style for voice_id synthesis"),
@@ -3556,12 +4006,14 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         By default, text is split by language and routed automatically.
         """
         started = time.perf_counter()
+        resolved_model = _resolved_synthesize_model(None, model)
         get_input = {
             "text": text,
             "ssml": ssml,
             "model": model,
             "voice_id": voice_id,
             "sample_url": sample_url,
+            "reference_version": reference_version,
             "language": language,
             "style": style,
             "styleIntensity": style_intensity,
@@ -3601,6 +4053,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             ssml=ssml,
             voice_id=voice_id,
             sample_url=sample_url,
+            reference_version=reference_version,
             language=language,
             style=style,
             style_intensity=style_intensity,
@@ -3609,7 +4062,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             neural=neural,
         )
         try:
-            response = await _handle_synthesize(synth_request, model=model)
+            response = await _handle_synthesize(synth_request, model=resolved_model)
         except HTTPException as exc:
             _log_synthesize_request(
                 route=fastapi_request.url.path,

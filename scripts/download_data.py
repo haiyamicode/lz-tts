@@ -170,8 +170,6 @@ def sync_data_from_s3(
             rel = key[len(s3_data_path) + 1:]
             if not rel:
                 continue
-            if "/" not in rel:
-                continue
             model_name = rel.split('/')[0]
             if name_filter and name_filter not in model_name:
                 continue

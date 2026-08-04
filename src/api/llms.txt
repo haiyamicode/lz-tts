@@ -30,6 +30,7 @@ Request Body (JSON):
   "ssml": "<speak>SSML content</speak>",
   "voice_id": "msa.en-US.AvaMultilingual",
   "sample_url": "https://example.com/ref.mp3",
+  "reference_version": "sha256:0123456789abcdef",
   "language": "en-GB",
   "style": "empathetic",
   "styleIntensity": 0.5,
@@ -50,6 +51,7 @@ Rules:
 - Provide exactly one of `text` or `ssml`.
 - Use `voice_id` for configured voices. Supported ids are listed by `GET /synthesize/voices`.
 - Use `sample_url` to synthesize normally with Sparrow, then convert the result to the sample voice with Seed-VC. Do not combine with `voice_id`, `style`, or `styleIntensity`.
+- `reference_version` is an opaque revision or content hash for `sample_url`. Stable values reuse cached reference data; changing the value forces a refresh.
 - Use `language` with a full locale such as `en-US`, `en-GB`, `ja-JP`, or `zh-CN` to force the whole input into that locale. Unsupported locales are rejected.
 - Without `language`, multilingual auto-routing is used.
 - `style` and `styleIntensity` require `voice_id` and must exactly match a cached Seed-VC embedding.
@@ -116,13 +118,14 @@ Query Parameters:
 - `ssml`: SSML to synthesize.
 - `voice_id`: Configured voice id.
 - `sample_url`: Reference sample URL for Seed-VC conversion.
+- `reference_version`: Opaque revision or content hash used to cache and invalidate `sample_url`.
 - `language`: Full locale used for forced routing of entire input.
 - `style`: Seed-VC style for `voice_id` synthesis.
 - `styleIntensity`: Seed-VC style intensity for `voice_id` synthesis.
 - `options`: Sparrow options as JSON.
 - `format`: `wav` or `mp3`.
 - `neural`: `true` or `false`.
-- `model`: Specific model to use.
+- `model`: Model family (`sparrow` or `voxcpm`).
 
 ### GET /synthesize/voices
 List supported voice IDs and supported full locales for `/synthesize` APIs.

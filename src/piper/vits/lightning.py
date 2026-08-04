@@ -119,7 +119,6 @@ class VitsModel(pl.LightningModule):
                 str(key): int(value) for key, value in speaker_id_map.items()
             }
         self.hparams.speaker_id_map = speaker_id_map
-
         if (self.hparams.num_speakers > 1) and (self.hparams.gin_channels <= 0):
             # Default gin_channels for multi-speaker model
             self.hparams.gin_channels = 512
@@ -569,10 +568,63 @@ class VitsModel(pl.LightningModule):
             loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
 
             self.log("loss_gen_all", loss_gen_all)
+            self.log("loss_gen", loss_gen)
+            self.log("loss_fm", loss_fm)
+            self.log("loss_mel", loss_mel)
+            self.log("loss_kl", loss_kl)
             self.log("loss_dur", loss_dur)
             if loss_dur_sdp is not None and loss_dur_dp is not None:
                 self.log("loss_dur_sdp", loss_dur_sdp)
                 self.log("loss_dur_dp", loss_dur_dp)
+
+            loss_components = {
+                "loss_gen": loss_gen,
+                "loss_fm": loss_fm,
+                "loss_mel": loss_mel,
+                "loss_dur": loss_dur,
+                "loss_kl": loss_kl,
+            }
+            nonfinite = {
+                name: float(value.detach().float().cpu())
+                for name, value in loss_components.items()
+                if not bool(torch.isfinite(value).all())
+            }
+            if nonfinite:
+                speaker_values = (
+                    sorted(set(int(value) for value in speaker_ids.detach().cpu().view(-1)))
+                    if speaker_ids is not None
+                    else []
+                )
+                tensor_ranges = {}
+                for name, value in {
+                    "z_p": z_p,
+                    "logs_q": logs_q,
+                    "m_p": m_p,
+                    "logs_p": logs_p,
+                    "z_mask": z_mask,
+                }.items():
+                    value_float = value.detach().float()
+                    finite_values = value_float[torch.isfinite(value_float)]
+                    tensor_ranges[name] = {
+                        "min": (
+                            float(finite_values.min().cpu())
+                            if finite_values.numel()
+                            else float("nan")
+                        ),
+                        "max": (
+                            float(finite_values.max().cpu())
+                            if finite_values.numel()
+                            else float("nan")
+                        ),
+                        "nonfinite": int(
+                            (~torch.isfinite(value_float)).sum().cpu()
+                        ),
+                    }
+                raise FloatingPointError(
+                    "Non-finite generator loss component(s): "
+                    f"{nonfinite}; batch_speaker_ids={speaker_values}; "
+                    f"latent_ranges={tensor_ranges}"
+                )
 
             return loss_gen_all
 

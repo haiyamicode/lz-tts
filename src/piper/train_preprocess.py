@@ -34,6 +34,7 @@ from ..text_norm import normalize_text as _normalize_written_text
 
 from .norm_audio import cache_norm_audio, make_silence_detector
 from .preprocess import (
+    _map_cld2_to_espeak as _runtime_map_cld2_to_espeak,
     _phonemize_espeak_for_voice_with_spans as _runtime_phonemize_espeak_for_voice_with_spans,
     _phonemize_multilingual_with_spans as _runtime_phonemize_multilingual_with_spans,
 )
@@ -254,6 +255,7 @@ def main() -> None:
 
     configured_speaker_ids: Dict[str, int] = {}
     configured_language_speakers: Dict[str, str] = {}
+    configured_speaker_embedding_init_map: Dict[str, str] = {}
     configured_num_speakers: Optional[int] = None
     if speaker_config:
         configured_speaker_ids = {
@@ -263,6 +265,12 @@ def main() -> None:
         configured_language_speakers = {
             str(label): str(speaker)
             for label, speaker in (speaker_config.get("language_speakers") or {}).items()
+        }
+        configured_speaker_embedding_init_map = {
+            str(target): str(source)
+            for target, source in (
+                speaker_config.get("speaker_embedding_init_map") or {}
+            ).items()
         }
         raw_num_speakers = speaker_config.get("num_speakers")
         if isinstance(raw_num_speakers, int):
@@ -305,6 +313,7 @@ def main() -> None:
                 else (len(speaker_ids) if speaker_ids else len(speaker_counts)),
                 "speaker_id_map": speaker_ids,
                 "language_speakers": language_speakers,
+                "speaker_embedding_init_map": configured_speaker_embedding_init_map,
                 "piper_version": _VERSION,
             },
             config_file,
@@ -758,54 +767,8 @@ def _phonemize_espeak_for_voice_with_spans(
 
 
 def _map_cld2_to_espeak(lang_code: str, primary_voice: str = "en-us") -> str:
-    """Map language code to an espeak-ng voice in a simple, predictable way.
-
-    - Normalize to lowercase, replace '_' with '-'
-    - Take the base language (split on '-')
-    - Special-cases: Chinese -> 'cmn-latn-pinyin'; plain 'en' -> primary voice
-    - Otherwise return the base code directly (most espeak voices match base code)
-    """
-    if not lang_code:
-        return "en-us"
-
-    code = lang_code.strip().lower().replace("_", "-")
-    base = code.split("-", 1)[0] if code else "en"
-
-    if code in ("en-us", "en-us+f3", "en-us+f4"):
-        return code
-
-    if code in ("en-gb", "en-uk"):
-        return "en-gb-x-rp"
-
-    if code.startswith("en-gb-"):
-        return code
-
-    if code == "en":
-        return primary_voice
-
-    # Cantonese: zh-HK, zh-yue, yue -> espeak "yue" voice
-    if base == "yue" or code in ("zh-hk", "zh-yue"):
-        return "yue"
-
-    if base in ("zh", "cmn"):
-        # Use eSpeak's Mandarin Pinyin voice code
-        return "cmn-latn-pinyin"
-
-    # Languages not directly supported by packaged eSpeak-ng data.
-    # Fall back to the closest available voice instead of erroring.
-    if base in ("jv", "su"):
-        # Javanese / Sundanese -> approximate with Indonesian
-        return "id"
-
-    if base == "gl":
-        # Galician -> approximate with Spanish
-        return "es"
-
-    if base == "mn":
-        # Mongolian -> approximate with Russian
-        return "ru"
-
-    return base
+    """Use the runtime voice map so training and inference cannot diverge."""
+    return _runtime_map_cld2_to_espeak(lang_code, primary_voice)
 
 
 def _select_voice_for_span(lang_code: str, primary_voice: str) -> str:

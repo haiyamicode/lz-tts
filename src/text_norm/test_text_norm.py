@@ -10,6 +10,38 @@ from src.text_norm import (
 
 
 class TestTextNorm(unittest.TestCase):
+    def test_assamese_normalizes_known_nukta_spellings(self):
+        decomposed = "\u09af\u09bc \u09a1\u09bc \u09a2\u09bc"
+        precomposed = "\u09df \u09dc \u09dd"
+        expected = "\u09df \u09f0 \u09f0\u09cd\u09b9"
+
+        self.assertEqual(normalize_text(decomposed, "as-IN"), expected)
+        self.assertEqual(normalize_text(precomposed, "asm"), expected)
+
+    def test_thai_normalizes_decomposed_sara_am(self):
+        self.assertEqual(normalize_text("น้\u0e4d\u0e32", "th-TH"), "น้ำ")
+
+    def test_khmer_verbalizes_numbers_and_percent(self):
+        self.assertEqual(
+            normalize_text("ឆ្នាំ២០២៦ មាន ១៥%", "km-KH"),
+            "ឆ្នាំពីរពាន់ម្ភៃប្រាំមួយ មាន ដប់ប្រាំ ភាគរយ",
+        )
+
+    def test_khmer_handles_grouped_and_dotted_numbers(self):
+        self.assertEqual(
+            normalize_text("១២០ ០០០ និង ៨.៨.៨.៨", "khm"),
+            (
+                "មួយសែនពីរម៉ឺន និង ប្រាំបី ចុច ប្រាំបី ចុច "
+                "ប្រាំបី ចុច ប្រាំបី"
+            ),
+        )
+
+    def test_khmer_verbalizes_arithmetic_operators(self):
+        self.assertEqual(
+            normalize_text("២ + ៣ = ៥ និង ១០ - ៤ = ៦", "km"),
+            "ពីរ បូក បី ស្មើ ប្រាំ និង ដប់ ដក បួន ស្មើ ប្រាំមួយ",
+        )
+
     def test_english_time_preserves_following_space(self):
         self.assertEqual(
             normalize_text("Meet at 14:05 on 21st St.", "en-us"),
