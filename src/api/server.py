@@ -258,6 +258,10 @@ class VoxCPMConfig(BaseModel):
     cfg_value: float = Field(default=2.0, ge=0)
     reference_cache_size: int = Field(default=128, ge=1)
     preset_voice_catalog_path: str = "data/voice-presets.json"
+    applicable_loras: dict[str, str] = Field(default_factory=dict)
+    max_concurrent_loras: int = Field(default=3, ge=1)
+    max_loras_per_request: int = Field(default=2, ge=1)
+    lora_composition_cache_path: str = "cache/voxcpm-lora-compositions"
 
 
 class MatchaConfig(BaseModel):
@@ -387,6 +391,10 @@ class SynthesizeRequest(BaseModel):
     language: Optional[str] = Field(None, description="Force full locale for the entire input, e.g. en-GB")
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
     seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
+    voxcpm_loras: list[str] = Field(
+        default_factory=list,
+        description="Configured VoxCPM LoRA names to apply",
+    )
     style: Optional[str] = Field(None, description="Preset reference style for voice_id synthesis")
     style_intensity: Optional[float] = Field(None, alias="styleIntensity", description="Legacy preset style intensity")
     options: Optional[SparrowSynthesizeOptions] = Field(None, description="Sparrow/VITS-specific synthesis options")
@@ -415,6 +423,10 @@ class BatchSynthesizeInputItem(BaseModel):
     language: Optional[str] = Field(None, description="Force full locale for this item, e.g. en-GB")
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
     seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
+    voxcpm_loras: list[str] = Field(
+        default_factory=list,
+        description="Configured VoxCPM LoRA names to apply",
+    )
     style: Optional[str] = Field(None, description="Preset reference style for voice_id synthesis")
     style_intensity: Optional[float] = Field(None, alias="styleIntensity", description="Legacy preset style intensity")
     options: Optional[SparrowSynthesizeOptions] = Field(None, description="Sparrow/VITS-specific synthesis options")
@@ -440,11 +452,32 @@ class _SharedBatchSynthesizeRequest:
     language: str | None = None
     languages: list[str | None] | None = None
     model: str | None = None
+    voxcpm_loras: tuple[str, ...] = ()
     style: str | None = None
     style_intensity: float | None = None
     options: SparrowSynthesizeOptions | None = None
     format: Literal["wav", "mp3"] = "wav"
     neural: bool = True
+
+
+@dataclass(frozen=True)
+class _BatchCompatibilityKey:
+    """Collision-safe identity for one backend-compatible request configuration."""
+
+    digest: str
+    canonical_config: str
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> _BatchCompatibilityKey:
+        canonical_config = json.dumps(
+            config,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(canonical_config.encode("utf-8")).hexdigest()
+        return cls(digest=digest, canonical_config=canonical_config)
 
 
 class BatchSynthesizeItem(BaseModel):
@@ -1507,6 +1540,7 @@ async def _synthesize_voxcpm_preset_batch(
         languages=request.languages or [request.language] * len(request.texts),
         styles=[request.style] * len(request.texts),
         style_intensities=[request.style_intensity] * len(request.texts),
+        voxcpm_loras=request.voxcpm_loras,
         options=request.options,
         output_format=request.format,
         neural=request.neural,
@@ -1532,6 +1566,7 @@ async def _synthesize_voxcpm_preset_inputs(
     languages: list[str | None],
     styles: list[str | None],
     style_intensities: list[float | None],
+    voxcpm_loras: tuple[str, ...],
     options: SparrowSynthesizeOptions | None,
     output_format: Literal["wav", "mp3"],
     neural: bool,
@@ -1598,6 +1633,7 @@ async def _synthesize_voxcpm_preset_inputs(
             seeds=seeds,
             languages=languages,
             model=_server_config.voxcpm.model_id,
+            voxcpm_loras=voxcpm_loras,
             options=options,
             format=output_format,
             neural=neural,
@@ -1620,6 +1656,7 @@ async def _synthesize_voxcpm_preset_items(
         languages=[item.language for _, item, _ in records],
         styles=[item.style for _, item, _ in records],
         style_intensities=[item.style_intensity for _, item, _ in records],
+        voxcpm_loras=tuple(records[0][1].voxcpm_loras),
         options=records[0][1].options,
         output_format=records[0][1].format,
         neural=records[0][1].neural,
@@ -2163,6 +2200,7 @@ async def _synthesize_configured_voice(request: SynthesizeRequest) -> Response:
             seeds=[request.seed],
             voice_id=request.voice_id,
             language=request.language,
+            voxcpm_loras=tuple(request.voxcpm_loras),
             style=request.style,
             style_intensity=request.style_intensity,
             options=request.options,
@@ -2881,6 +2919,28 @@ def _get_voxcpm_runtime() -> VoxCPMRuntime:
     return _voxcpm_runtime
 
 
+def _resolve_voxcpm_lora_names(lora_names: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    names = list(lora_names)
+    if not names:
+        return ()
+    if len(names) != len(set(names)):
+        raise HTTPException(status_code=400, detail="voxcpm_loras must not contain duplicates")
+    max_loras = _server_config.voxcpm.max_loras_per_request
+    if len(names) > max_loras:
+        raise HTTPException(
+            status_code=400,
+            detail=f"voxcpm_loras supports at most {max_loras} entries per request",
+        )
+    unknown = sorted(name for name in names if not name or name not in _server_config.voxcpm.applicable_loras)
+    if unknown:
+        available = sorted(_server_config.voxcpm.applicable_loras)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported VoxCPM LoRAs {unknown}; available: {available}",
+        )
+    return tuple(names)
+
+
 async def _fetch_voxcpm_reference(sample_url: str) -> tuple[bytes, str]:
     parsed = urlsplit(sample_url)
     if parsed.scheme not in {"http", "https"}:
@@ -2964,6 +3024,11 @@ async def synthesize_voxcpm_batch(
 
     await _await_engine_ready("voxcpm")
     runtime = _get_voxcpm_runtime()
+    requested_loras = _resolve_voxcpm_lora_names(request.voxcpm_loras)
+    try:
+        lora_name = await runtime.resolve_lora_combination(requested_loras)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Could not apply VoxCPM LoRAs: {exc}") from exc
     prepared_inputs = [
         _prepare_voxcpm_input(text, language)
         for text, language in zip(texts, languages)
@@ -2990,6 +3055,7 @@ async def synthesize_voxcpm_batch(
         reference_format=resolved_reference_format,
         reference_audios=reference_audios,
         reference_formats=reference_formats,
+        lora_names=[lora_name] * len(prepared_texts),
     )
     generation_wall_seconds = time.perf_counter() - started
     sample_rate = runtime.sample_rate
@@ -3068,6 +3134,7 @@ async def _synthesize_voxcpm_items(
             seeds=[item.seed for _, item, _ in records],
             languages=[item.language for _, item, _ in records],
             model=_server_config.voxcpm.model_id,
+            voxcpm_loras=tuple(first.voxcpm_loras),
             options=first.options,
             format=first.format,
             neural=first.neural,
@@ -3077,45 +3144,62 @@ async def _synthesize_voxcpm_items(
     )
 
 
-def _batch_item_group_key(item: BatchSynthesizeInputItem) -> tuple[Any, ...]:
-    options_key = None
-    if item.options is not None:
-        options_key = json.dumps(item.options.model_dump(mode="json"), sort_keys=True)
-    model_key = item.model
+def _batch_item_pipeline(item: BatchSynthesizeInputItem) -> str:
     if item.voice_id is not None:
         if (
             _configured_root_voice_for_voice_id(item.voice_id) is None
             and not _is_seed_vc_fallback_voice(item.voice_id)
         ):
-            return (
-                "voxcpm_preset",
-                options_key,
-                item.format,
-                item.neural,
-            )
-        kind = "voice"
-    elif _is_voxcpm_model(item.model):
-        return (
-            "voxcpm",
-            options_key,
-            item.format,
-            item.neural,
-        )
-    else:
-        kind = "sparrow"
-    return (
-        kind,
-        item.voice_id,
-        item.sample_url,
-        item.reference_version,
-        item.language,
-        model_key,
-        item.style,
-        item.style_intensity,
-        options_key,
-        item.format,
-        item.neural,
+            return "voxcpm_preset"
+        return "configured_voice"
+    if _is_voxcpm_model(item.model):
+        return "voxcpm"
+    if item.language is not None:
+        return "sparrow_forced_language"
+    return "sparrow"
+
+
+_BATCH_PER_ITEM_FIELDS = frozenset({"text", "ssml", "seed"})
+_BATCH_PIPELINE_PER_ITEM_FIELDS = {
+    "voxcpm": frozenset({"sample_url", "reference_version", "language"}),
+    "voxcpm_preset": frozenset({"voice_id", "language", "style", "style_intensity"}),
+}
+
+
+def _batch_item_compatibility_key(item: BatchSynthesizeInputItem) -> _BatchCompatibilityKey:
+    """Hash every setting that must be shared by one backend batch call."""
+    pipeline = _batch_item_pipeline(item)
+    per_item_fields = _BATCH_PER_ITEM_FIELDS | _BATCH_PIPELINE_PER_ITEM_FIELDS.get(
+        pipeline,
+        frozenset(),
     )
+    config = {
+        key: value
+        for key, value in item.model_dump(mode="json").items()
+        if key not in per_item_fields
+    }
+    config["pipeline"] = pipeline
+
+    # LoRA composition is additive, so request order does not affect inference.
+    config["voxcpm_loras"] = sorted(config["voxcpm_loras"])
+    if config.get("language") is not None:
+        config["language"] = _normalize_locale_with_region(config["language"])
+    if pipeline == "voxcpm":
+        config["model"] = _server_config.voxcpm.model_id
+    elif pipeline == "sparrow":
+        config["model"] = _resolve_api_model(item.model) or PUBLIC_SPARROW_MODEL
+    if pipeline == "configured_voice" and _is_seed_vc_fallback_voice(item.voice_id):
+        config["style"], config["style_intensity"] = _seed_vc_style_from_request(item)
+
+    if pipeline.startswith("sparrow") or pipeline == "configured_voice":
+        effective_options = {
+            key: value
+            for key, value in (config.get("options") or {}).items()
+            if value is not None
+        }
+        config["options"] = effective_options or None
+
+    return _BatchCompatibilityKey.from_config(config)
 
 
 def _validate_batch_item(item: BatchSynthesizeInputItem, item_idx: int) -> str:
@@ -3140,6 +3224,13 @@ def _validate_batch_item(item: BatchSynthesizeInputItem, item_idx: int) -> str:
     )
     if item.seed is not None and not _is_voxcpm_model(item.model) and not seed_uses_voxcpm_preset:
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'seed' requires model='voxcpm'")
+    if item.voxcpm_loras and not _is_voxcpm_model(item.model) and not seed_uses_voxcpm_preset:
+        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'voxcpm_loras' requires model='voxcpm'")
+    if item.voxcpm_loras:
+        try:
+            _resolve_voxcpm_lora_names(item.voxcpm_loras)
+        except HTTPException as exc:
+            raise HTTPException(status_code=exc.status_code, detail=f"items[{item_idx}]: {exc.detail}") from exc
     if item.sample_url is not None and _seed_vc_style_requested(item):
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'style' and 'styleIntensity' require 'voice_id'")
     if item.voice_id is None and _seed_vc_style_requested(item):
@@ -3158,6 +3249,7 @@ def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, 
         language=first.language,
         languages=[item.language for _, item, _ in records],
         model=_resolve_api_model(first.model),
+        voxcpm_loras=tuple(first.voxcpm_loras),
         style=first.style,
         style_intensity=first.style_intensity,
         options=first.options,
@@ -3169,10 +3261,14 @@ def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, 
 async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthesizeResponse:
     """Group independent /synthesize-shaped inputs and run compatible real batches."""
     started = time.perf_counter()
-    groups: OrderedDict[tuple[Any, ...], list[tuple[int, BatchSynthesizeInputItem, str]]] = OrderedDict()
+    groups: OrderedDict[
+        _BatchCompatibilityKey,
+        list[tuple[int, BatchSynthesizeInputItem, str]],
+    ] = OrderedDict()
     for item_idx, item in enumerate(request.items):
         text = _validate_batch_item(item, item_idx)
-        groups.setdefault(_batch_item_group_key(item), []).append((item_idx, item, text))
+        key = _batch_item_compatibility_key(item)
+        groups.setdefault(key, []).append((item_idx, item, text))
 
     _log_synthesize_batch_stage(
         "request_grouping",
@@ -3181,6 +3277,7 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
         groups=[
             {
                 "group_index": group_idx,
+                "config_hash": key.digest,
                 "item_indices": [item_idx for item_idx, _, _ in records],
                 "count": len(records),
                 "voice_ids": [item.voice_id for _, item, _ in records],
@@ -3192,14 +3289,14 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
                 "format": records[0][1].format,
                 "neural": records[0][1].neural,
             }
-            for group_idx, records in enumerate(groups.values())
+            for group_idx, (key, records) in enumerate(groups.items())
         ],
     )
 
     output_items: list[BatchSynthesizeItem | None] = [None for _ in request.items]
     group_results: list[BatchSynthesizeResponse] = []
 
-    for group_idx, records in enumerate(groups.values()):
+    for group_idx, (compatibility_key, records) in enumerate(groups.items()):
         shared_request = _shared_batch_from_items(records)
         is_voxcpm_preset_group = (
             records[0][1].voice_id is not None
@@ -3210,6 +3307,7 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
         _log_synthesize_batch_stage(
             "group_start",
             group_index=group_idx,
+            config_hash=compatibility_key.digest,
             item_indices=[item_idx for item_idx, _, _ in records],
             item_count=len(records),
             voice_ids=[item.voice_id for _, item, _ in records],
@@ -3251,6 +3349,7 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
         _log_synthesize_batch_stage(
             "group_done",
             group_index=group_idx,
+            config_hash=compatibility_key.digest,
             item_count=len(records),
             output_count=len(group_result.items),
             model=group_result.model,
@@ -3754,6 +3853,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         )
         if request.seed is not None and not _is_voxcpm_model(model) and not seed_uses_voxcpm_preset:
             raise HTTPException(status_code=400, detail="'seed' requires model='voxcpm'")
+        if request.voxcpm_loras and not _is_voxcpm_model(model) and not seed_uses_voxcpm_preset:
+            raise HTTPException(status_code=400, detail="'voxcpm_loras' requires model='voxcpm'")
+        if request.voxcpm_loras:
+            _resolve_voxcpm_lora_names(request.voxcpm_loras)
         if request.sample_url is not None and request.voice_id is not None:
             raise HTTPException(status_code=400, detail="Use either 'voice_id' or 'sample_url', not both")
         if request.reference_version is not None and request.sample_url is None:
@@ -3775,6 +3878,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     reference_version=request.reference_version,
                     language=request.language,
                     model=model,
+                    voxcpm_loras=tuple(request.voxcpm_loras),
                     options=request.options,
                     format=request.format,
                     neural=request.neural,
@@ -3987,6 +4091,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             description="Opaque reference revision or content hash used for cache invalidation",
         ),
         language: Optional[str] = Query(None, description="Force full locale for the entire text, e.g. en-GB"),
+        voxcpm_loras: Optional[list[str]] = Query(
+            None,
+            description="Configured VoxCPM LoRA name; repeat the query parameter to provide a list",
+        ),
         style: Optional[str] = Query(None, description="Seed-VC speech style for voice_id synthesis"),
         style_intensity: Annotated[
             Optional[float],
@@ -4015,6 +4123,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "sample_url": sample_url,
             "reference_version": reference_version,
             "language": language,
+            "voxcpm_loras": voxcpm_loras or [],
             "style": style,
             "styleIntensity": style_intensity,
             "options": options,
@@ -4055,6 +4164,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             sample_url=sample_url,
             reference_version=reference_version,
             language=language,
+            voxcpm_loras=voxcpm_loras or [],
             style=style,
             style_intensity=style_intensity,
             options=parsed_options,

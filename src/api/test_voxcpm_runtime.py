@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import tempfile
+from pathlib import Path
 
 import numpy as np
 
@@ -13,6 +16,7 @@ class _FakeServer:
         self.references: list[bytes | None] = []
         self.generation_limits: list[int] = []
         self.seeds: list[int | None] = []
+        self.lora_names: list[str | None] = []
 
     async def encode_latents(self, audio: bytes, audio_format: str) -> bytes:
         self.encoded.append((audio, audio_format))
@@ -22,6 +26,7 @@ class _FakeServer:
         self.references.append(kwargs["ref_audio_latents"])
         self.generation_limits.append(kwargs["max_generate_length"])
         self.seeds.append(kwargs.get("seed"))
+        self.lora_names.append(kwargs.get("lora_name"))
         yield np.ones(16, dtype=np.float32)
 
 
@@ -83,6 +88,7 @@ async def _test_reference_audio_uses_native_voxcpm_latents_and_cache() -> None:
     assert server.references == [b"latents:wav-data"] * 3
     assert server.generation_limits == [17, 29, 17]
     assert server.seeds == [101, 202, None]
+    assert server.lora_names == [None, None, None]
     assert duration_budget.calls == [
         (["first", "second"], ["en", "vi"]),
         (["third"], [None]),
@@ -131,3 +137,84 @@ async def _test_per_item_references_are_encoded_once_and_routed_independently() 
         b"latents:voice-b",
         b"latents:voice-a",
     ]
+
+
+def test_lora_names_are_forwarded_per_item() -> None:
+    asyncio.run(_test_lora_names_are_forwarded_per_item())
+
+
+async def _test_lora_names_are_forwarded_per_item() -> None:
+    runtime = VoxCPMRuntime(_settings())
+    runtime._duration_budget = _FakeDurationBudget()
+    runtime._available_loras = {"accent-en-GB", "accent-en-US"}
+    server = _FakeServer()
+    runtime.server = server
+
+    await runtime.synthesize_batch(
+        ["first", "second"],
+        lora_names=["accent-en-GB", "accent-en-US"],
+    )
+
+    assert server.lora_names == ["accent-en-GB", "accent-en-US"]
+
+
+def test_runtime_canonicalizes_fused_qkv_target_order() -> None:
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        checkpoint = Path(temporary_directory) / "accent"
+        checkpoint.mkdir()
+        (checkpoint / "lora_config.json").write_text(
+            json.dumps(
+                {
+                    "lora_config": {
+                        "enable_lm": True,
+                        "enable_dit": False,
+                        "enable_proj": False,
+                        "r": 64,
+                        "alpha": 64,
+                        "target_modules_lm": ["q_proj", "v_proj", "k_proj", "o_proj"],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (checkpoint / "lora_weights.safetensors").touch()
+        settings = _settings()
+        settings["applicable_loras"] = {"accent": str(checkpoint)}
+        settings["max_concurrent_loras"] = 3
+        settings["max_loras_per_request"] = 2
+
+        config = VoxCPMRuntime(settings)._load_lora_runtime_config()
+
+    assert config.target_modules_lm == ["q_proj", "k_proj", "v_proj", "o_proj"]
+    assert config.max_loras == 3
+
+
+def test_runtime_reserves_rank_only_for_the_per_request_composition_limit() -> None:
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        configured = {}
+        for index, rank in enumerate((16, 32, 64)):
+            checkpoint = Path(temporary_directory) / f"adapter-{index}"
+            checkpoint.mkdir()
+            (checkpoint / "lora_config.json").write_text(
+                json.dumps(
+                    {
+                        "lora_config": {
+                            "enable_lm": True,
+                            "r": rank,
+                            "alpha": rank,
+                            "target_modules_lm": ["q_proj"],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (checkpoint / "lora_weights.safetensors").touch()
+            configured[f"adapter-{index}"] = str(checkpoint)
+
+        settings = _settings()
+        settings["applicable_loras"] = configured
+        settings["max_concurrent_loras"] = 3
+        settings["max_loras_per_request"] = 2
+        config = VoxCPMRuntime(settings)._load_lora_runtime_config()
+
+    assert config.max_lora_rank == 96

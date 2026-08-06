@@ -195,8 +195,8 @@ async def _worker_async(
     input_queue: Any,
     output_queue: Any,
 ) -> None:
-    sys.path.insert(0, worker_config["nanovllm_path"])
-    from nanovllm_voxcpm import VoxCPM
+    sys.path.insert(0, worker_config["lz_tts_root"])
+    from src.nanovllm_voxcpm import VoxCPM
 
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible_devices != str(gpu):
@@ -785,8 +785,8 @@ def _summary(
 
 @hydra.main(
     version_base=None,
-    config_path="../local/configs/voxcpm",
-    config_name="sft_generate",
+    config_path=None,
+    config_name=None,
 )
 def main(cfg: DictConfig) -> None:
     if not torch.cuda.is_available():
@@ -795,7 +795,6 @@ def main(cfg: DictConfig) -> None:
     lz_tts_root = _absolute(cfg.paths.lz_tts_root)
     sys.path.insert(0, str(lz_tts_root))
     model_path = _absolute(cfg.model.pretrained_path)
-    nanovllm_path = _absolute(cfg.paths.nanovllm_voxcpm)
     output_dir = _absolute(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -932,8 +931,8 @@ def main(cfg: DictConfig) -> None:
             zip(gpu_ids, memory_utilizations, enforce_eager_values)
         ):
             worker_config = {
+                "lz_tts_root": str(lz_tts_root),
                 "model_path": str(model_path),
-                "nanovllm_path": str(nanovllm_path),
                 "inference_timesteps": int(cfg.generation.inference_timesteps),
                 "max_num_batched_tokens": int(
                     cfg.generation.max_num_batched_tokens

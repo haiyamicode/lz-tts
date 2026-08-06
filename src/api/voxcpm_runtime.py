@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -14,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from .voxcpm_lora import compose_voxcpm_loras
 
 _LOGGER = logging.getLogger(__name__)
 _KV_BLOCKS_ENV = "NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"
@@ -31,18 +33,91 @@ class VoxCPMRuntime:
         self._duration_budget: Any | None = None
         self._duration_budget_init_lock = threading.Lock()
         self._duration_budget_predict_lock = asyncio.Lock()
+        self._available_loras: set[str] = set()
+        self._lora_paths: dict[str, Path] = {}
+        self._lora_combinations: dict[tuple[str, ...], str] = {}
+        self._lora_composition_lock = asyncio.Lock()
+
+    @staticmethod
+    def _resolve_path(path: str) -> Path:
+        resolved = Path(path).expanduser()
+        return resolved if resolved.is_absolute() else Path.cwd() / resolved
+
+    def _load_lora_runtime_config(self) -> Any | None:
+        configured = dict(self.settings.get("applicable_loras") or {})
+        if not configured:
+            return None
+
+        from src.nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig
+
+        configs: list[dict[str, Any]] = []
+        for name, path in configured.items():
+            checkpoint_path = self._resolve_path(str(path))
+            config_path = checkpoint_path / "lora_config.json"
+            weights_path = checkpoint_path / "lora_weights.safetensors"
+            if not config_path.is_file() or not weights_path.is_file():
+                raise FileNotFoundError(
+                    f"Configured VoxCPM LoRA {name!r} must contain lora_config.json "
+                    f"and lora_weights.safetensors: {checkpoint_path}"
+                )
+            with config_path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            lora_config = payload.get("lora_config")
+            if not isinstance(lora_config, dict):
+                raise TypeError(
+                    f"Invalid VoxCPM LoRA config for {name!r}: {config_path}"
+                )
+            configs.append(lora_config)
+
+        def union_list(key: str) -> list[str]:
+            return list(
+                dict.fromkeys(
+                    item for config in configs for item in config.get(key, [])
+                )
+            )
+
+        def canonical_qkv_targets(key: str) -> list[str]:
+            targets = union_list(key)
+            qkv_targets = ("q_proj", "k_proj", "v_proj")
+            enabled = set(targets)
+            return [target for target in qkv_targets if target in enabled] + [
+                target for target in targets if target not in qkv_targets
+            ]
+
+        ranks = [int(config.get("r", config.get("rank", 0))) for config in configs]
+        if any(rank <= 0 for rank in ranks):
+            raise ValueError("Configured VoxCPM LoRAs must declare a positive rank")
+        max_loras_per_request = int(self.settings.get("max_loras_per_request", 2))
+        if max_loras_per_request <= 0:
+            raise ValueError("voxcpm.max_loras_per_request must be greater than zero")
+        max_rank = sum(sorted(ranks, reverse=True)[:max_loras_per_request])
+        return LoRAConfig(
+            enable_lm=any(bool(config.get("enable_lm")) for config in configs),
+            enable_dit=any(bool(config.get("enable_dit")) for config in configs),
+            enable_proj=any(bool(config.get("enable_proj")) for config in configs),
+            max_loras=int(self.settings.get("max_concurrent_loras", 3)),
+            max_lora_rank=max_rank,
+            target_modules_lm=canonical_qkv_targets("target_modules_lm"),
+            target_modules_dit=canonical_qkv_targets("target_modules_dit"),
+            target_proj_modules=union_list("target_proj_modules"),
+        )
 
     async def start(self) -> None:
         if self.server is not None:
             return
 
-        from nanovllm_voxcpm import VoxCPM
+        from src.nanovllm_voxcpm import VoxCPM
 
         num_kvcache_blocks = int(self.settings["num_kvcache_blocks"])
         if num_kvcache_blocks <= 0:
             raise ValueError("voxcpm.num_kvcache_blocks must be greater than zero")
         os.environ[_KV_BLOCKS_ENV] = str(num_kvcache_blocks)
 
+        configured_loras = dict(self.settings.get("applicable_loras") or {})
+        self._lora_paths = {
+            name: self._resolve_path(str(path))
+            for name, path in configured_loras.items()
+        }
         self.server = VoxCPM.from_pretrained(
             model=str(self.settings["model_path"]),
             devices=[int(self.settings["device"])],
@@ -52,8 +127,13 @@ class VoxCPMRuntime:
             max_model_len=int(self.settings["max_model_len"]),
             gpu_memory_utilization=float(self.settings["gpu_memory_utilization"]),
             enforce_eager=bool(self.settings["enforce_eager"]),
+            lora_config=self._load_lora_runtime_config(),
         )
         await self.server.wait_for_ready()
+        for name, path in configured_loras.items():
+            await self.server.register_lora(name, str(self._resolve_path(str(path))))
+            self._available_loras.add(name)
+            self._lora_combinations[(name,)] = name
         model_info = await self.server.get_model_info()
         self.sample_rate = int(model_info["sample_rate"])
         duration_settings = self.settings["duration_budget"]
@@ -61,12 +141,13 @@ class VoxCPMRuntime:
             await asyncio.to_thread(self._get_duration_budget)
         _LOGGER.info(
             "VoxCPM nano-vLLM ready model=%s device=%s sample_rate=%d "
-            "kv_blocks=%d max_num_seqs=%d",
+            "kv_blocks=%d max_num_seqs=%d loras=%s",
             self.settings["model_path"],
             self.settings["device"],
             self.sample_rate,
             num_kvcache_blocks,
             self.settings["max_num_seqs"],
+            sorted(self._available_loras),
         )
 
     async def stop(self) -> None:
@@ -74,8 +155,58 @@ class VoxCPMRuntime:
         self.server = None
         self._duration_budget = None
         self._reference_latents.clear()
+        self._available_loras.clear()
+        self._lora_paths.clear()
+        self._lora_combinations.clear()
         if server is not None:
             await server.stop()
+
+    async def resolve_lora_combination(self, lora_names: Sequence[str]) -> str | None:
+        if not lora_names:
+            return None
+        names = tuple(sorted(lora_names))
+        max_loras = int(self.settings.get("max_loras_per_request", 2))
+        if len(names) > max_loras:
+            raise ValueError(
+                f"VoxCPM supports at most {max_loras} LoRAs per request"
+            )
+        unknown = sorted(set(names) - self._lora_paths.keys())
+        if unknown:
+            raise ValueError(f"VoxCPM LoRAs are not configured: {unknown}")
+        cached = self._lora_combinations.get(names)
+        if cached is not None:
+            return cached
+        if self.server is None:
+            raise RuntimeError("VoxCPM runtime is not started")
+
+        async with self._lora_composition_lock:
+            cached = self._lora_combinations.get(names)
+            if cached is not None:
+                return cached
+            digest = hashlib.sha256("\0".join(names).encode("utf-8")).hexdigest()[:16]
+            runtime_name = f"combined-{digest}"
+            cache_root = self._resolve_path(
+                str(
+                    self.settings.get(
+                        "lora_composition_cache_path", "cache/voxcpm-lora-compositions"
+                    )
+                )
+            )
+            output_path = cache_root / runtime_name
+            await asyncio.to_thread(
+                compose_voxcpm_loras,
+                [self._lora_paths[name] for name in names],
+                output_path,
+            )
+            await self.server.register_lora(runtime_name, str(output_path))
+            self._available_loras.add(runtime_name)
+            self._lora_combinations[names] = runtime_name
+            _LOGGER.info(
+                "Registered composed VoxCPM LoRA name=%s components=%s",
+                runtime_name,
+                names,
+            )
+            return runtime_name
 
     def _get_duration_budget(self) -> Any:
         if self._duration_budget is not None:
@@ -84,7 +215,10 @@ class VoxCPMRuntime:
             if self._duration_budget is not None:
                 return self._duration_budget
 
-            from src.duration_alignment import DpBudgetConfig, DurationAlignmentValidator
+            from src.duration_alignment import (
+                DpBudgetConfig,
+                DurationAlignmentValidator,
+            )
 
             settings = self.settings["duration_budget"]
             config_path = settings.get("config_path")
@@ -183,6 +317,7 @@ class VoxCPMRuntime:
         max_generate_length: int,
         seed: int | None = None,
         ref_audio_latents: bytes | None = None,
+        lora_name: str | None = None,
     ) -> np.ndarray:
         if self.server is None:
             raise RuntimeError("VoxCPM runtime is not started")
@@ -192,6 +327,7 @@ class VoxCPMRuntime:
             "temperature": float(self.settings["temperature"]),
             "cfg_value": float(self.settings["cfg_value"]),
             "ref_audio_latents": ref_audio_latents,
+            "lora_name": lora_name,
         }
         if seed is not None:
             generation_kwargs["seed"] = seed
@@ -213,6 +349,7 @@ class VoxCPMRuntime:
         reference_format: str = "wav",
         reference_audios: Sequence[bytes | None] | None = None,
         reference_formats: Sequence[str] | None = None,
+        lora_names: Sequence[str | None] | None = None,
     ) -> list[np.ndarray]:
         """Submit every item concurrently so nano-vLLM can schedule a real batch."""
         if not texts:
@@ -225,6 +362,15 @@ class VoxCPMRuntime:
             seeds = [None] * len(texts)
         if len(seeds) != len(texts):
             raise ValueError("seeds length must match texts length")
+        if lora_names is None:
+            lora_names = [None] * len(texts)
+        if len(lora_names) != len(texts):
+            raise ValueError("lora_names length must match texts length")
+        unknown_loras = sorted(
+            {name for name in lora_names if name is not None} - self._available_loras
+        )
+        if unknown_loras:
+            raise ValueError(f"VoxCPM LoRAs are not registered: {unknown_loras}")
         if reference_audio is not None and reference_audios is not None:
             raise ValueError("use either reference_audio or reference_audios, not both")
         if reference_audios is None:
@@ -236,7 +382,9 @@ class VoxCPMRuntime:
         if len(reference_formats) != len(texts):
             raise ValueError("reference_formats length must match texts length")
 
-        generation_limits, _budgets = await self._predict_generation_limits(texts, languages)
+        generation_limits, _budgets = await self._predict_generation_limits(
+            texts, languages
+        )
 
         unique_references: dict[tuple[str, str], tuple[bytes, str]] = {}
         reference_keys: list[tuple[str, str] | None] = []
@@ -267,12 +415,14 @@ class VoxCPMRuntime:
                         max_generate_length=max_generate_length,
                         seed=seed,
                         ref_audio_latents=item_reference_latents,
+                        lora_name=lora_name,
                     )
-                    for text, max_generate_length, seed, item_reference_latents in zip(
+                    for text, max_generate_length, seed, item_reference_latents, lora_name in zip(
                         texts,
                         generation_limits,
                         seeds,
                         reference_latents,
+                        lora_names,
                     )
                 )
             )
