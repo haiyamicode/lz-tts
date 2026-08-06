@@ -55,6 +55,79 @@ def trim_boundary_silence(audio: np.ndarray, sample_rate: int) -> tuple[np.ndarr
     return np.ascontiguousarray(audio[start:end]), start, end
 
 
+def alignment_word_timestamps(
+    *,
+    text: str,
+    phonemes: list[str],
+    word_spans: list[list[int]] | None,
+    token_durations_frames: torch.Tensor,
+    hop_length: int,
+    sample_rate: int,
+    trim_start_samples: int = 0,
+) -> list[dict[str, Any]]:
+    """Convert a VITS MAS path into word timestamps.
+
+    Piper's text tensor contains BOS, padding tokens between phonemes, and EOS,
+    while ``word_spans`` refers to the pre-ID phoneme list. Building the token
+    boundary table with ``phoneme_ids_espeak`` keeps the conversion correct if
+    an unsupported phoneme is omitted from the ID sequence.
+    """
+    if not word_spans:
+        return []
+    if hop_length <= 0 or sample_rate <= 0:
+        raise ValueError("hop_length and sample_rate must be positive")
+
+    from piper_phonemize import phoneme_ids_espeak
+
+    durations = token_durations_frames.detach().cpu().to(dtype=torch.int64).reshape(-1)
+    frame_boundaries = torch.cat(
+        [torch.zeros(1, dtype=torch.int64), torch.cumsum(durations, dim=0)]
+    )
+    # The ID sequence has BOS + one PAD after every retained phoneme + EOS.
+    # Encode one phoneme at a time so this remains linear in utterance length;
+    # an unsupported phoneme contributes no IDs and therefore no boundary move.
+    token_boundaries = [2]
+    for phoneme in phonemes:
+        encoded_phoneme = phoneme_ids_espeak([phoneme])
+        token_boundaries.append(token_boundaries[-1] + max(0, len(encoded_phoneme) - 3))
+    frame_seconds = hop_length / sample_rate
+    trim_start_seconds = trim_start_samples / sample_rate
+
+    words: list[dict[str, Any]] = []
+    for raw_span in word_spans:
+        if len(raw_span) != 4:
+            raise ValueError(f"Invalid word span: {raw_span!r}")
+        text_start, text_end, phoneme_start, phoneme_end = map(int, raw_span)
+        if not (0 <= phoneme_start <= phoneme_end <= len(phonemes)):
+            raise ValueError(f"Word span exceeds phoneme sequence: {raw_span!r}")
+
+        token_start = token_boundaries[phoneme_start]
+        token_end = token_boundaries[phoneme_end]
+        if token_end > durations.numel():
+            raise ValueError(
+                f"Word span maps past MAS token sequence: {raw_span!r} -> "
+                f"[{token_start}, {token_end}) of {durations.numel()}"
+            )
+        start_frame = int(frame_boundaries[token_start].item())
+        end_frame = int(frame_boundaries[token_end].item())
+        words.append(
+            {
+                "text": text[text_start:text_end],
+                "text_start": text_start,
+                "text_end": text_end,
+                "phoneme_start": phoneme_start,
+                "phoneme_end": phoneme_end,
+                "token_start": token_start,
+                "token_end": token_end,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "start_seconds": trim_start_seconds + start_frame * frame_seconds,
+                "end_seconds": trim_start_seconds + end_frame * frame_seconds,
+            }
+        )
+    return words
+
+
 @dataclass(frozen=True)
 class DpBudgetConfig:
     checkpoint: Path = Path("data/lzspeech-sparrow/model.ckpt")
@@ -489,6 +562,7 @@ class DurationAlignmentValidator:
         expected_seconds: float | None = None,
         duration_tolerance: float = 0.25,
         reject_zero_phoneme_duration: bool = True,
+        include_word_timestamps: bool = False,
     ) -> dict[str, Any]:
         self.load()
         assert self._model is not None
@@ -668,7 +742,7 @@ class DurationAlignmentValidator:
         elif not duration_valid:
             reason = "duration_out_of_range"
 
-        return {
+        result = {
             "enabled": True,
             "valid": valid,
             "reason": reason,
@@ -688,6 +762,18 @@ class DurationAlignmentValidator:
             "speaker_id": speaker_id,
             "sample_rate": target_sample_rate,
         }
+        if include_word_timestamps:
+            result["word_timestamps"] = alignment_word_timestamps(
+                text=str(phoneme_result.get("text") or text),
+                phonemes=list(phoneme_result.get("phonemes") or []),
+                word_spans=phoneme_result.get("word_spans"),
+                token_durations_frames=active_durations,
+                hop_length=hop_length,
+                sample_rate=target_sample_rate,
+                trim_start_samples=trim_start,
+            )
+            result["frame_seconds"] = hop_length / target_sample_rate
+        return result
 
     def _bert_input(
         self,
