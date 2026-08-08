@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import gc
 import hashlib
+import io
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import numpy as np
 import torch
+import soundfile as sf
 from asgi_compression import BrotliAlgorithm, CompressionMiddleware, GzipAlgorithm, ZstdAlgorithm
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -35,7 +37,9 @@ from pydantic import BaseModel, Field, ValidationError
 
 from ..multilingual_splitter import MultilingualSplitter
 from ..piper import PiperInference
-from ..ssml import BreakSegment, TextSegment, generate_silence, parse_ssml
+from ..ctc_forced_alignment import CtcAlignmentConfig, CtcForcedAligner, CtcLanguageSpan
+from ..ssml import PronunciationOperation, SSMLDocument, parse_ssml
+from ..ssml_postprocessing import insert_ssml_breaks, splice_pronunciations
 from ..text_norm import normalize_spoken_text
 from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
 from ..matcha_inference import MatchaBatchRequest
@@ -343,6 +347,16 @@ class SeedVCConfig(BaseModel):
     )
 
 
+class SSMLConfig(BaseModel):
+    """Alignment and splice settings for actionable SSML elements."""
+
+    enabled: bool = True
+    ctc_model: str = "MahmoudAshraf/mms-300m-1130-forced-aligner"
+    ctc_device: str = Field(default_factory=lambda: os.environ.get("SSML_CTC_DEVICE", "cuda:0"))
+    ctc_dtype: str = Field(default_factory=lambda: os.environ.get("SSML_CTC_DTYPE", "float16"))
+    crossfade_seconds: float = Field(default=0.01, ge=0.0, le=0.1)
+
+
 class ServerConfig(BaseModel):
     """Server configuration."""
 
@@ -352,6 +366,7 @@ class ServerConfig(BaseModel):
     starling: MatchaConfig = Field(default_factory=MatchaConfig)
     matcha: MatchaConfig = Field(default_factory=MatchaConfig)
     seed_vc: SeedVCConfig = Field(default_factory=SeedVCConfig)
+    ssml: SSMLConfig = Field(default_factory=SSMLConfig)
 
 
 class SparrowSynthesizeOptions(BaseModel):
@@ -605,6 +620,7 @@ _voice_preset_catalog: dict[str, dict[str, Any]] | None = None
 _voxcpm_preset_voices: dict[str, dict[str, Any]] | None = None
 _seed_vc_fallback_voices: dict[str, dict[str, Any]] | None = None
 _startup_loader_task: asyncio.Task | None = None
+_ssml_aligner: CtcForcedAligner | None = None
 
 
 @dataclass
@@ -1127,6 +1143,30 @@ class _SparrowInferenceProxy:
         self.sample_rate = int(data.get("sample_rate") or self.sample_rate)
         return data.get("audio")
 
+    def synthesize_with_ipa_overrides(
+        self,
+        text: str,
+        overrides: Any,
+        *,
+        speaker: Any = None,
+        neural: bool = True,
+        **synth_kwargs: Any,
+    ) -> np.ndarray:
+        response = _ensure_sparrow_worker().call(
+            "synthesize_with_ipa_overrides",
+            {
+                "model": self.model,
+                "text": text,
+                "overrides": list(overrides),
+                "speaker": speaker,
+                "neural": neural,
+                "synth_kwargs": synth_kwargs,
+            },
+        )
+        data = response.get("data") or {}
+        self.sample_rate = int(data.get("sample_rate") or self.sample_rate)
+        return data.get("audio")
+
 
 def _get_inference(model: str) -> PiperInference:
     """Get an already loaded inference instance for a model."""
@@ -1280,6 +1320,7 @@ def _synthesize_multilingual(
     noise_scale: Optional[float] = None,
     length_scale: Optional[float] = None,
     noise_w: Optional[float] = None,
+    sdp_ratio: Optional[float] = None,
     neural: bool = True,
 ) -> tuple[np.ndarray, int]:
     """Synthesize multilingual text using multiple models.
@@ -1302,6 +1343,8 @@ def _synthesize_multilingual(
         synth_kwargs["length_scale"] = length_scale
     if noise_w is not None:
         synth_kwargs["noise_w"] = noise_w
+    if sdp_ratio is not None:
+        synth_kwargs["sdp_ratio"] = sdp_ratio
 
     # First pass: compute routing plan
     routing_plan, _ = _plan_text_segments(
@@ -2190,8 +2233,6 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
 
 
 async def _synthesize_configured_voice(request: SynthesizeRequest) -> Response:
-    if request.ssml:
-        raise HTTPException(status_code=400, detail="voice-id synthesis currently supports plain text only")
     if not request.text:
         raise HTTPException(status_code=400, detail="text is required for voice-id synthesis")
     batch_result = await synthesize_configured_voice_batch(
@@ -2213,153 +2254,240 @@ async def _synthesize_configured_voice(request: SynthesizeRequest) -> Response:
     return _binary_response(audio_bytes, media_type)
 
 
-def _synthesize_ssml(
-    ssml_text: str,
-    global_speaker: Optional[str] = None,
-    primary_speaker: Optional[str] = None,
-    language: Optional[str] = None,
-    noise_scale: Optional[float] = None,
-    length_scale: Optional[float] = None,
-    noise_w: Optional[float] = None,
-) -> tuple[np.ndarray, int]:
-    """Synthesize SSML text with break and multilingual support.
+def _decode_wav_bytes(audio_bytes: bytes) -> tuple[np.ndarray, int]:
+    audio, sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+    if audio.shape[1] > 1:
+        audio = audio.mean(axis=1, dtype=np.float32)
+    else:
+        audio = audio[:, 0]
+    return audio.astype(np.float32, copy=False), int(sample_rate)
 
-    Args:
-        ssml_text: SSML string to synthesize.
-        global_speaker: If set, overrides all segment speakers.
-        primary_speaker: If set, use this speaker for segments matching its base language.
-        language: If set, force SSML text segments without explicit speaker to this locale.
 
-    Returns (audio, sample_rate).
-    """
-    splitter = _get_multilingual_splitter()
+def _get_ssml_aligner() -> CtcForcedAligner:
+    global _ssml_aligner
+    settings = _server_config.ssml
+    if not settings.enabled:
+        raise HTTPException(status_code=503, detail="SSML audio operations are disabled")
+    if _ssml_aligner is None:
+        _ssml_aligner = CtcForcedAligner(
+            CtcAlignmentConfig(
+                model=settings.ctc_model,
+                device=settings.ctc_device,
+                dtype=settings.ctc_dtype,
+            )
+        )
+    return _ssml_aligner
 
-    if language is not None:
-        forced_locale, forced_speaker, forced_model = _resolve_forced_language(language)
 
-    segments = parse_ssml(ssml_text)
+def _ssml_language_plan(text: str, forced_language: str | None) -> tuple[str, list[CtcLanguageSpan]]:
+    if forced_language:
+        language = _normalize_locale_with_region(forced_language)
+        return language, [CtcLanguageSpan(0, len(text), language)]
 
-    # Extract base language from primary_speaker if provided
-    primary_lang = _get_base_language(primary_speaker) if primary_speaker else None
-    if primary_speaker is not None:
-        _resolve_speaker_and_model(primary_speaker, explicit=True)
+    result = _get_multilingual_splitter().split(text)
+    main_language = result.main_language or "en"
+    spans: list[CtcLanguageSpan] = []
+    cursor = 0
 
-    synth_kwargs = {}
-    if noise_scale is not None:
-        synth_kwargs["noise_scale"] = noise_scale
-    if length_scale is not None:
-        synth_kwargs["length_scale"] = length_scale
-    if noise_w is not None:
-        synth_kwargs["noise_w"] = noise_w
-
-    # Build routing plan
-    routing_plan: list[dict] = []
-
-    for seg in segments:
-        if isinstance(seg, BreakSegment):
-            routing_plan.append({"type": "break", "duration_ms": seg.duration_ms})
-        elif isinstance(seg, TextSegment):
-            seg_text = seg.text.strip()
-            if not seg_text:
-                continue
-
-            # Determine speaker: global override > segment speaker > primary speaker > auto-detect
-            if global_speaker is not None:
-                # Global override - applies to ALL segments
-                resolved_speaker, model_name = _resolve_speaker_and_model(global_speaker, explicit=True)
-                routing_plan.append({
-                    "type": "text",
-                    "speaker": resolved_speaker,
-                    "model": model_name,
-                    "text": seg_text,
-                })
-            elif seg.speaker is not None:
-                # Segment-level speaker from <voice name="...">
-                resolved_speaker, model_name = _resolve_speaker_and_model(seg.speaker, explicit=True)
-                routing_plan.append({
-                    "type": "text",
-                    "speaker": resolved_speaker,
-                    "model": model_name,
-                    "text": seg_text,
-                })
-            else:
-                # Auto-detect: run through multilingual splitter
-                if language is not None:
-                    lang = forced_locale
-                    routing_plan.append({
-                        "type": "text",
-                        "lang": lang,
-                        "speaker": forced_speaker,
-                        "model": forced_model,
-                        "text": seg_text,
-                    })
-                    continue
-
-                result = splitter.split(seg_text)
-                main_lang = result.main_language or "en"
-
-                for lang_seg in result.segments:
-                    lang_text = lang_seg.text.strip()
-                    if not lang_text:
-                        continue
-
-                    detected_lang = (lang_seg.language if lang_seg.language and lang_seg.language != "und" else main_lang) or "en"
-                    lang = _routable_detected_language(detected_lang, main_lang)
-
-                    # Use primary_speaker if language matches, otherwise normal resolution
-                    if primary_speaker and _get_base_language(lang) == primary_lang:
-                        speaker, model_name = _resolve_speaker_and_model(primary_speaker, explicit=True)
-                    else:
-                        speaker, model_name = _resolve_speaker_and_model(lang)
-
-                    routing_plan.append({
-                        "type": "text",
-                        "lang": lang,
-                        "speaker": speaker,
-                        "model": model_name,
-                        "text": lang_text,
-                    })
-
-    # Log routing plan (text segments only, truncated)
-    log_plan = []
-    for p in routing_plan:
-        if p["type"] == "text":
-            log_plan.append({
-                **{k: v for k, v in p.items() if k != "text"},
-                "text": p["text"][:50] + ("..." if len(p["text"]) > 50 else ""),
-            })
+    def append_span(start: int, end: int, language: str) -> None:
+        if end <= start:
+            return
+        if spans and spans[-1].source_end == start and spans[-1].language == language:
+            previous = spans[-1]
+            spans[-1] = CtcLanguageSpan(previous.source_start, end, language)
         else:
-            log_plan.append(p)
-    _LOGGER.info("SSML routing: %s", json.dumps(log_plan, ensure_ascii=False))
+            spans.append(CtcLanguageSpan(start, end, language))
 
-    # Synthesize
-    audio_parts: list[np.ndarray] = []
-    sample_rate = 22050
+    for segment in sorted(result.segments, key=lambda item: item.start):
+        if segment.start > cursor:
+            append_span(cursor, segment.start, main_language)
+        detected = segment.language if segment.language and segment.language != "und" else main_language
+        language = _routable_detected_language(detected, main_language)
+        append_span(segment.start, segment.end, language)
+        cursor = max(cursor, segment.end)
+    if cursor < len(text):
+        append_span(cursor, len(text), main_language)
+    if not spans:
+        spans = [CtcLanguageSpan(0, len(text), main_language)]
+    return main_language, spans
 
-    for plan in routing_plan:
-        if plan["type"] == "break":
-            silence = generate_silence(plan["duration_ms"], sample_rate)
-            audio_parts.append(silence)
-        elif plan["type"] == "text":
-            speaker = plan["speaker"]
-            model_name = plan["model"]
 
-            inference = _get_inference(model_name)
-            sample_rate = inference.sample_rate
+async def _align_ssml_audio(
+    text: str,
+    audio: np.ndarray,
+    sample_rate: int,
+    forced_language: str | None,
+) -> list[dict[str, Any]]:
+    language, language_spans = _ssml_language_plan(text, forced_language)
+    result = await asyncio.to_thread(
+        _get_ssml_aligner().align_words,
+        text,
+        audio,
+        sample_rate,
+        language=language,
+        language_spans=language_spans,
+    )
+    if not result.get("valid") or not result.get("word_timestamps"):
+        raise ValueError(f"Could not force-align SSML audio: {result.get('reason') or 'unknown error'}")
+    return list(result["word_timestamps"])
 
-            speaker = _resolve_internal_speaker(model_name, speaker, inference)
 
-            _LOGGER.info("Synthesizing: speaker=%s, text=%r, synth_kwargs=%s", speaker, plan["text"], synth_kwargs)
-            audio = inference.synthesize_span(plan["text"], speaker=speaker, **synth_kwargs)
-            audio_parts.append(audio)
+def _language_at_source_position(text: str, position: int, forced_language: str | None) -> str:
+    if forced_language:
+        return _normalize_locale_with_region(forced_language)
+    result = _get_multilingual_splitter().split(text)
+    main_language = result.main_language or "en"
+    for segment in result.segments:
+        if segment.start <= position < segment.end:
+            detected = segment.language if segment.language and segment.language != "und" else main_language
+            return _routable_detected_language(detected, main_language)
+    return main_language
 
-    if not audio_parts:
-        return np.array([], dtype=np.int16), sample_rate
 
-    if len(audio_parts) == 1:
-        return audio_parts[0], sample_rate
+def _ssml_sparrow_route(
+    request: SynthesizeRequest,
+    text: str,
+    operation: PronunciationOperation,
+    resolved_model: str | None,
+) -> tuple[str | None, str]:
+    language = _language_at_source_position(text, operation.start, request.language)
+    _locale, speaker, model_name = _resolve_forced_language(language)
+    root_voice = _configured_root_voice_for_voice_id(request.voice_id)
+    if root_voice is not None and _root_voice_can_synthesize_language(root_voice, language):
+        return root_voice.speaker, root_voice.model
+    if resolved_model and resolved_model not in {
+        PUBLIC_SPARROW_MODEL,
+        _server_config.voxcpm.model_id,
+    }:
+        return None, resolved_model
+    return speaker, model_name
 
-    return np.concatenate(audio_parts, axis=0), sample_rate
+
+async def _render_ssml_pronunciations(
+    request: SynthesizeRequest,
+    document: SSMLDocument,
+    resolved_model: str | None,
+) -> tuple[list[np.ndarray], list[int]]:
+    await _await_engine_ready("pipertts")
+    synth_kwargs = _synth_kwargs_from_request(request)
+    audios: list[np.ndarray] = []
+    sample_rates: list[int] = []
+    for operation in document.pronunciations:
+        speaker, model_name = _ssml_sparrow_route(
+            request,
+            document.text,
+            operation,
+            resolved_model,
+        )
+        inference = _get_inference(model_name)
+        internal_speaker = _resolve_internal_speaker(model_name, speaker, inference)
+        audio = await asyncio.to_thread(
+            inference.synthesize_with_ipa_overrides,
+            document.text,
+            [(operation.start, operation.end, operation.phonemes)],
+            speaker=internal_speaker,
+            neural=request.neural,
+            **synth_kwargs,
+        )
+        audios.append(audio)
+        sample_rates.append(inference.sample_rate)
+    return audios, sample_rates
+
+
+async def _match_ssml_replacements_to_baseline_voice(
+    source_audios: list[np.ndarray],
+    source_sample_rates: list[int],
+    baseline_audio: np.ndarray,
+    baseline_sample_rate: int,
+) -> tuple[list[np.ndarray], int]:
+    await _await_engine_ready("seed_vc")
+    backend = _get_seed_vc_backend()
+    vc_rate = backend.sample_rate
+    converted_sources = [
+        _resample_audio(audio, sample_rate, vc_rate)
+        for audio, sample_rate in zip(source_audios, source_sample_rates)
+    ]
+    reference_path = backend.tmp_dir / f"ssml-reference-{secrets.token_hex(12)}.wav"
+    try:
+        reference_path.write_bytes(_audio_to_wav_bytes(baseline_audio, baseline_sample_rate))
+        converted = await asyncio.to_thread(
+            backend.convert_generated_audio_reference_batch,
+            converted_sources,
+            vc_rate,
+            reference_path,
+            None,
+            "wav",
+            _seed_vc_chunk_batch_size(backend),
+        )
+    finally:
+        reference_path.unlink(missing_ok=True)
+
+    decoded: list[np.ndarray] = []
+    output_rate = backend.sample_rate
+    for audio_bytes, _duration in converted:
+        audio, decoded_rate = _decode_wav_bytes(audio_bytes)
+        if decoded_rate != output_rate:
+            audio = _resample_audio(audio, decoded_rate, output_rate)
+        decoded.append(audio)
+    return decoded, output_rate
+
+
+async def _postprocess_ssml_response(
+    request: SynthesizeRequest,
+    document: SSMLDocument,
+    baseline_response: Response,
+    resolved_model: str | None,
+) -> Response:
+    baseline_audio, sample_rate = _decode_wav_bytes(bytes(baseline_response.body))
+    audio = baseline_audio
+
+    if document.pronunciations:
+        direct_audios, direct_rates = await _render_ssml_pronunciations(
+            request,
+            document,
+            resolved_model,
+        )
+        replacement_audios, replacement_rate = await _match_ssml_replacements_to_baseline_voice(
+            direct_audios,
+            direct_rates,
+            baseline_audio,
+            sample_rate,
+        )
+        if replacement_rate != sample_rate:
+            replacement_audios = [
+                _resample_audio(item, replacement_rate, sample_rate)
+                for item in replacement_audios
+            ]
+        baseline_timestamps = await _align_ssml_audio(
+            document.text, baseline_audio, sample_rate, request.language
+        )
+        replacement_timestamps = [
+            await _align_ssml_audio(document.text, item, sample_rate, request.language)
+            for item in replacement_audios
+        ]
+        audio, _report = splice_pronunciations(
+            baseline_audio,
+            replacement_audios,
+            sample_rate,
+            document.pronunciations,
+            baseline_timestamps,
+            replacement_timestamps,
+            crossfade_seconds=_server_config.ssml.crossfade_seconds,
+        )
+
+    if document.breaks:
+        timestamps = await _align_ssml_audio(document.text, audio, sample_rate, request.language)
+        audio, _report = insert_ssml_breaks(
+            document.text,
+            audio,
+            sample_rate,
+            document.breaks,
+            timestamps,
+        )
+
+    if request.format == "mp3":
+        return _binary_response(_audio_to_mp3_bytes(audio, sample_rate), "audio/mpeg")
+    return _binary_response(_audio_to_wav_bytes(audio, sample_rate), "audio/wav")
 
 
 
@@ -3398,11 +3526,12 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
 
 def create_app(config: ServerConfig | None = None) -> FastAPI:
     """Create the FastAPI application."""
-    global _server_config, _speaker_routes
+    global _server_config, _speaker_routes, _ssml_aligner
 
     if config is None:
         config = _load_config()
     _server_config = config
+    _ssml_aligner = None
 
     app = FastAPI(
         title="LZ-TTS API",
@@ -3844,6 +3973,33 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Provide either 'text' or 'ssml', not both")
         if not request.text and not request.ssml:
             raise HTTPException(status_code=400, detail="Must provide either 'text' or 'ssml'")
+        if request.ssml is not None:
+            try:
+                document = parse_ssml(request.ssml)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            has_operations = bool(document.operations)
+            plain_request = request.model_copy(
+                update={
+                    "text": document.text,
+                    "ssml": None,
+                    "format": "wav" if has_operations else request.format,
+                }
+            )
+            baseline_response = await _handle_synthesize(plain_request, model=model)
+            if not has_operations:
+                return baseline_response
+            try:
+                return await _postprocess_ssml_response(
+                    request,
+                    document,
+                    baseline_response,
+                    model,
+                )
+            except HTTPException:
+                raise
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         if request.language is not None and model is not None and not _is_voxcpm_model(model):
             raise HTTPException(status_code=400, detail="Use either 'language' or 'model', not both")
         seed_uses_voxcpm_preset = (
@@ -3864,8 +4020,6 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if request.sample_url is not None and _seed_vc_style_requested(request):
             raise HTTPException(status_code=400, detail="'style' and 'styleIntensity' require 'voice_id'")
         if _is_voxcpm_model(model):
-            if request.ssml is not None:
-                raise HTTPException(status_code=400, detail="VoxCPM synthesis supports plain text only")
             if request.voice_id is not None:
                 raise HTTPException(status_code=400, detail="VoxCPM model routing does not support voice_id")
             if _seed_vc_style_requested(request):
@@ -3902,13 +4056,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         await _await_engine_ready("pipertts")
         synth_kwargs = _synth_kwargs_from_request(request)
 
-        if request.ssml:
-            audio, sample_rate = _synthesize_ssml(
-                request.ssml,
-                language=request.language,
-                **synth_kwargs,
-            )
-        elif model is None or model == PUBLIC_SPARROW_MODEL:
+        if model is None or model == PUBLIC_SPARROW_MODEL:
             audio, sample_rate = _synthesize_multilingual(
                 request.text,
                 language=request.language,

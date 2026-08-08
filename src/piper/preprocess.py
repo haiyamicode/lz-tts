@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from collections import Counter
 from ctypes import CFUNCTYPE, POINTER, Structure, Union, c_char, c_int, c_short, c_uint, c_void_p
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -20,6 +21,7 @@ from ..multilingual_splitter import MultilingualSplitter
 from ..text_norm import normalize_text as _normalize_written_text
 from .heteronym import get_resolver as _get_heteronym_resolver
 from .language_frontends import get_language_frontend, has_language_frontend
+from .word_segmentation import icu_word_spans as _icu_word_spans
 
 
 def _load_model_config(config_path):
@@ -484,45 +486,8 @@ def _normalize_japanese_text(text: str) -> str:
     return " ".join(reading for _, _, reading in _japanese_reading_tokens(text))
 
 
-def _utf16_offset_to_py_index(text: str) -> Dict[int, int]:
-    offsets = {0: 0}
-    offset = 0
-    for index, ch in enumerate(text):
-        offset += 2 if ord(ch) > 0xFFFF else 1
-        offsets[offset] = index + 1
-    return offsets
-
-
 def _has_lexical_text(text: str) -> bool:
     return any(ch.isalpha() or ch.isnumeric() for ch in text)
-
-
-def _icu_word_spans(text: str, voice: str) -> List[Tuple[int, int, str]]:
-    from icu import BreakIterator, Locale
-
-    locale_name = (voice or "und").replace("-", "_")
-    iterator = BreakIterator.createWordInstance(Locale(locale_name))
-    iterator.setText(text)
-    utf16_to_py = _utf16_offset_to_py_index(text)
-
-    spans: List[Tuple[int, int, str]] = []
-    start16 = iterator.first()
-    for end16 in iterator:
-        status = iterator.getRuleStatus()
-        start = utf16_to_py.get(start16)
-        end = utf16_to_py.get(end16)
-        start16 = end16
-
-        if start is None or end is None or end <= start:
-            continue
-
-        piece = text[start:end]
-        if status == 0 or not _has_lexical_text(piece):
-            continue
-
-        spans.append((start, end, piece))
-
-    return spans
 
 
 def _extend_anchor_text_end(text: str, end: int) -> int:
@@ -1546,6 +1511,11 @@ def phonemize_spans_with_speakers(
                 "speaker_id": int(spk_id),
                 "text": semantic_text,
                 "word_spans": word_spans,
+                "language": lang,
+                "voice": voice,
+                "source_text": span_text,
+                "source_start": seg.start,
+                "source_end": seg.end,
             }
         )
 
@@ -1628,6 +1598,8 @@ def phonemize_text_for_speaker(
         "speaker_id": int(spk_id),
         "text": semantic_text,
         "word_spans": word_spans,
+        "voice": voice,
+        "source_text": text,
     }
 
 
@@ -1672,6 +1644,148 @@ def phonemize_texts_for_speaker(
                 "speaker_id": spk_id,
                 "text": semantic_text,
                 "word_spans": word_spans,
+                "voice": voice,
+                "source_text": text,
             }
         )
     return outputs
+
+
+def _normalized_override_bounds(
+    source_text: str,
+    source_start: int,
+    source_end: int,
+    voice: str,
+    normalized_text: str,
+) -> Tuple[int, int]:
+    """Map source offsets through the same text normalization as phonemization.
+
+    The normalizers can expand text before the frontend creates word mappings
+    (for example ``Dr.`` to ``doctor``).  Private-use sentinels let us carry an
+    exact source boundary through that transformation without guessing from
+    string similarity or assuming normalization preserves string length.
+    """
+    sentinels: list[str] = []
+    for codepoint in range(0xE000, 0xF900):
+        candidate = chr(codepoint)
+        if candidate not in source_text:
+            sentinels.append(candidate)
+            if len(sentinels) == 2:
+                break
+    if len(sentinels) != 2:
+        raise ValueError("Could not reserve text-normalization sentinels for an IPA override")
+    opening, closing = sentinels[:2]
+    marked = (
+        source_text[:source_start]
+        + opening
+        + source_text[source_start:source_end]
+        + closing
+        + source_text[source_end:]
+    )
+    normalized_marked = _normalize_text_for_mapping(marked, voice)
+    if normalized_marked.count(opening) != 1 or normalized_marked.count(closing) != 1:
+        raise ValueError("Text normalization did not preserve IPA override boundaries")
+    normalized_start = normalized_marked.index(opening)
+    normalized_end_with_marker = normalized_marked.index(closing)
+    if normalized_start >= normalized_end_with_marker:
+        raise ValueError("Text normalization produced an empty IPA override")
+    unmarked = normalized_marked.replace(opening, "").replace(closing, "")
+    if unmarked != normalized_text:
+        raise ValueError("Could not map IPA override through text normalization exactly")
+    return normalized_start, normalized_end_with_marker - 1
+
+
+def apply_ipa_overrides(
+    spans: List[Dict[str, object]],
+    overrides: List[Tuple[int, int, str]],
+) -> List[Dict[str, object]]:
+    """Replace mapped phonemes for exact source-text spans with IPA.
+
+    ``phonemize_spans_with_speakers`` records each language span's source
+    offsets, while a forced-speaker result represents the complete source
+    string.  Overrides must stay within one such span and must not cut through
+    a frontend word mapping; accepting a partial mapping would silently replace
+    phonemes outside the SSML ``<phoneme>`` element.
+    """
+    prepared = [dict(span) for span in spans]
+    ordered = sorted(overrides, key=lambda item: (item[0], item[1]))
+    for index, (start, end, ipa) in enumerate(ordered):
+        if not 0 <= start < end or not ipa:
+            raise ValueError(f"Invalid IPA override [{start}, {end})")
+        if index and start < ordered[index - 1][1]:
+            raise ValueError("IPA pronunciation spans must not overlap")
+
+    assigned: set[int] = set()
+    for span_index, span in enumerate(prepared):
+        source_start = int(span.get("source_start", 0))
+        source_end = int(span.get("source_end", source_start + len(str(span.get("text", "")))))
+        source_text = str(span.get("source_text", span.get("text", "")))
+        normalized_text = str(span.get("text", ""))
+        voice = str(span.get("voice", span.get("language", "en-us")))
+        local_overrides = [
+            (
+                override_index,
+                *_normalized_override_bounds(
+                    source_text,
+                    start - source_start,
+                    end - source_start,
+                    voice,
+                    normalized_text,
+                ),
+                ipa,
+            )
+            for override_index, (start, end, ipa) in enumerate(ordered)
+            if source_start <= start and end <= source_end
+        ]
+        if not local_overrides:
+            continue
+
+        phonemes = list(span.get("phonemes") or [])
+        mappings = [list(map(int, mapping)) for mapping in (span.get("word_spans") or [])]
+        if not mappings:
+            raise ValueError("Sparrow frontend returned no text-to-phoneme mapping for an IPA override")
+
+        for override_index, local_start, local_end, ipa in reversed(local_overrides):
+            selected_indices = [
+                mapping_index
+                for mapping_index, mapping in enumerate(mappings)
+                if mapping[1] > local_start and mapping[0] < local_end
+            ]
+            if not selected_indices:
+                raise ValueError(
+                    f"IPA override [{local_start}, {local_end}) does not cover a pronounced text unit"
+                )
+            first_index, last_index = selected_indices[0], selected_indices[-1]
+            first, last = mappings[first_index], mappings[last_index]
+            if first[0] < local_start or last[1] > local_end:
+                raise ValueError(
+                    "SSML <phoneme> boundary cuts through a frontend word; wrap the complete word"
+                )
+
+            phoneme_start, phoneme_end = first[2], last[3]
+            replacement = list(ipa)
+            missing: Counter[str] = Counter()
+            phoneme_ids_espeak(replacement, missing_phonemes=missing)
+            if missing:
+                unsupported = ", ".join(repr(value) for value in sorted(missing))
+                raise ValueError(f"IPA override contains unsupported Sparrow phonemes: {unsupported}")
+
+            phonemes[phoneme_start:phoneme_end] = replacement
+            shift = len(replacement) - (phoneme_end - phoneme_start)
+            replacement_mapping = [local_start, local_end, phoneme_start, phoneme_start + len(replacement)]
+            mappings[first_index : last_index + 1] = [replacement_mapping]
+            for mapping in mappings[first_index + 1 :]:
+                mapping[2] += shift
+                mapping[3] += shift
+            assigned.add(override_index)
+
+        span["phonemes"] = phonemes
+        span["phoneme_ids"] = phoneme_ids_espeak(phonemes)
+        span["word_spans"] = mappings
+        prepared[span_index] = span
+
+    missing_overrides = sorted(set(range(len(ordered))) - assigned)
+    if missing_overrides:
+        start, end, _ipa = ordered[missing_overrides[0]]
+        raise ValueError(f"IPA override [{start}, {end}) crosses a Sparrow language span")
+    return prepared

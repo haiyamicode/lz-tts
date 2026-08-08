@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from .hf_cache import resolve_hf_model_path
+from .word_segmentation import icu_word_spans as _icu_word_spans
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -162,43 +163,6 @@ class ContextReplacerClassifier(nn.Module):
         mask = mask.bool()
         lengths = mask.sum(dim=1, keepdim=True).clamp(min=1)
         return (values * mask.unsqueeze(-1)).sum(dim=1) / lengths
-
-
-def _utf16_offset_to_py_index(text: str) -> Dict[int, int]:
-    offsets = {0: 0}
-    offset = 0
-    for index, ch in enumerate(text):
-        offset += 2 if ord(ch) > 0xFFFF else 1
-        offsets[offset] = index + 1
-    return offsets
-
-
-def _icu_word_spans(text: str, locale: str = "und") -> List[Tuple[int, int, str]]:
-    from icu import BreakIterator, Locale
-
-    locale_name = locale.replace("-", "_")
-    iterator = BreakIterator.createWordInstance(Locale(locale_name))
-    iterator.setText(text)
-    utf16_to_py = _utf16_offset_to_py_index(text)
-
-    spans: List[Tuple[int, int, str]] = []
-    start16 = iterator.first()
-    for end16 in iterator:
-        status = iterator.getRuleStatus()
-        start = utf16_to_py.get(start16)
-        end = utf16_to_py.get(end16)
-        start16 = end16
-
-        if start is None or end is None or end <= start:
-            continue
-
-        piece = text[start:end]
-        if status == 0 or not any(ch.isalpha() or ch.isnumeric() for ch in piece):
-            continue
-
-        spans.append((start, end, piece))
-
-    return spans
 
 
 def _segment_and_find_matches(

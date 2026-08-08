@@ -428,6 +428,47 @@ class PiperInference:
             neural=neural,
         )[0]
 
+    def synthesize_with_ipa_overrides(
+        self,
+        text: str,
+        overrides: Sequence[tuple[int, int, str]],
+        speaker: Optional[str] = None,
+        noise_scale: Optional[float] = None,
+        length_scale: Optional[float] = None,
+        noise_w: Optional[float] = None,
+        sdp_ratio: Optional[float] = None,
+        neural: bool = True,
+    ) -> np.ndarray:
+        """Synthesize full-context speech with exact IPA source-span overrides."""
+        if not overrides:
+            return self.synthesize_span(
+                text,
+                speaker=speaker,
+                noise_scale=noise_scale,
+                length_scale=length_scale,
+                noise_w=noise_w,
+                sdp_ratio=sdp_ratio,
+                neural=neural,
+            )
+
+        from .preprocess import apply_ipa_overrides
+
+        spans = self.phonemize(text, speaker=speaker, neural=neural)
+        if speaker is not None:
+            spans[0]["source_start"] = 0
+            spans[0]["source_end"] = len(text)
+        prepared = apply_ipa_overrides(spans, list(overrides))
+        scales = self._inference_scales(
+            noise_scale=noise_scale,
+            length_scale=length_scale,
+            noise_w=noise_w,
+            sdp_ratio=sdp_ratio,
+        )
+        outputs = self._infer_prepared_span_batch(prepared, scales)
+        if not outputs:
+            return np.zeros(0, dtype=np.int16)
+        return outputs[0] if len(outputs) == 1 else np.concatenate(outputs)
+
     def synthesize_batch(
         self,
         texts: Sequence[str],
