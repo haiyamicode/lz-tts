@@ -112,10 +112,6 @@ def _expand_time(match: re.Match[str]) -> str:
 
 def _expand_time_english(text: str) -> str:
     def replace(match: re.Match[str]) -> str:
-        original_hour = int(match.group(1))
-        if match.group(7) is None and 0 < original_hour <= 12:
-            return match.group(0)
-
         expanded = _expand_time(match)
         if match.group(0)[-1:].isspace():
             expanded += " "

@@ -313,8 +313,19 @@ class PiperInference:
         spans: list[dict],
         scales: list[float],
     ) -> list[np.ndarray]:
+        outputs, _token_durations = self._infer_prepared_span_batch_with_durations(
+            spans,
+            scales,
+        )
+        return outputs
+
+    def _infer_prepared_span_batch_with_durations(
+        self,
+        spans: list[dict],
+        scales: list[float],
+    ) -> tuple[list[np.ndarray], list[torch.Tensor]]:
         if not spans:
-            return []
+            return [], []
 
         phoneme_ids = [span["phoneme_ids"] for span in spans]
         phoneme_lengths = [len(ids) for ids in phoneme_ids]
@@ -337,7 +348,7 @@ class PiperInference:
             dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
             enabled=self.fp16,
         ):
-            audio, _attn, y_mask, _ = self.model.model_g.infer(
+            audio, attn, y_mask, _ = self.model.model_g.infer(
                 text_tensor,
                 text_lengths,
                 sid=sid,
@@ -354,9 +365,17 @@ class PiperInference:
         audio_i16 = audio_float_to_int16(audio.detach().float().cpu().numpy())
 
         outputs: list[np.ndarray] = []
+        token_durations: list[torch.Tensor] = []
         for idx, sample_len in enumerate(sample_lengths):
             outputs.append(audio_i16[idx].reshape(-1)[: int(sample_len)])
-        return outputs
+            frame_len = int(frame_lengths[idx])
+            token_durations.append(
+                attn[idx, 0, :frame_len, : phoneme_lengths[idx]]
+                .sum(dim=0)
+                .detach()
+                .cpu()
+            )
+        return outputs, token_durations
 
     def phonemize(
         self,
@@ -438,10 +457,11 @@ class PiperInference:
         noise_w: Optional[float] = None,
         sdp_ratio: Optional[float] = None,
         neural: bool = True,
-    ) -> np.ndarray:
+        return_alignment: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, list[dict]]:
         """Synthesize full-context speech with exact IPA source-span overrides."""
         if not overrides:
-            return self.synthesize_span(
+            audio = self.synthesize_span(
                 text,
                 speaker=speaker,
                 noise_scale=noise_scale,
@@ -450,6 +470,7 @@ class PiperInference:
                 sdp_ratio=sdp_ratio,
                 neural=neural,
             )
+            return (audio, []) if return_alignment else audio
 
         from .preprocess import apply_ipa_overrides
 
@@ -457,17 +478,77 @@ class PiperInference:
         if speaker is not None:
             spans[0]["source_start"] = 0
             spans[0]["source_end"] = len(text)
-        prepared = apply_ipa_overrides(spans, list(overrides))
+
+        def phonemize_fragment(fragment: str, voice: str) -> list[str]:
+            if not fragment:
+                return []
+            fragment_spans = self.phonemize(
+                fragment,
+                speaker=voice,
+                neural=neural,
+            )
+            return [
+                phoneme
+                for fragment_span in fragment_spans
+                for phoneme in fragment_span.get("phonemes", [])
+            ]
+
+        prepared = apply_ipa_overrides(
+            spans,
+            list(overrides),
+            partial_word_phonemizer=phonemize_fragment,
+        )
         scales = self._inference_scales(
             noise_scale=noise_scale,
             length_scale=length_scale,
             noise_w=noise_w,
             sdp_ratio=sdp_ratio,
         )
-        outputs = self._infer_prepared_span_batch(prepared, scales)
+        if return_alignment:
+            from src.duration_alignment import alignment_word_timestamps
+
+            outputs, token_durations = self._infer_prepared_span_batch_with_durations(
+                prepared,
+                scales,
+            )
+            hop_length = int(
+                np.prod(getattr(self.model.model_g, "upsample_rates", (256,)))
+            )
+            timestamps: list[dict] = []
+            sample_offset = 0
+            for prepared_span, span_audio, durations in zip(
+                prepared,
+                outputs,
+                token_durations,
+                strict=True,
+            ):
+                source_start = int(prepared_span.get("source_start", 0))
+                offset_seconds = sample_offset / self.sample_rate
+                for timestamp in alignment_word_timestamps(
+                    text=str(prepared_span.get("text", "")),
+                    phonemes=list(prepared_span.get("phonemes") or []),
+                    word_spans=prepared_span.get("word_spans"),
+                    token_durations_frames=durations,
+                    hop_length=hop_length,
+                    sample_rate=self.sample_rate,
+                ):
+                    timestamps.append(
+                        {
+                            **timestamp,
+                            "source_start": source_start + int(timestamp["text_start"]),
+                            "source_end": source_start + int(timestamp["text_end"]),
+                            "start_seconds": offset_seconds + float(timestamp["start_seconds"]),
+                            "end_seconds": offset_seconds + float(timestamp["end_seconds"]),
+                        }
+                    )
+                sample_offset += int(span_audio.size)
+        else:
+            outputs = self._infer_prepared_span_batch(prepared, scales)
         if not outputs:
-            return np.zeros(0, dtype=np.int16)
-        return outputs[0] if len(outputs) == 1 else np.concatenate(outputs)
+            audio = np.zeros(0, dtype=np.int16)
+        else:
+            audio = outputs[0] if len(outputs) == 1 else np.concatenate(outputs)
+        return (audio, timestamps) if return_alignment else audio
 
     def synthesize_batch(
         self,

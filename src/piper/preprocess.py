@@ -1695,17 +1695,66 @@ def _normalized_override_bounds(
     return normalized_start, normalized_end_with_marker - 1
 
 
+def _phoneme_edit_distance(left: List[str], right: List[str]) -> int:
+    previous = list(range(len(right) + 1))
+    for left_index, left_value in enumerate(left, start=1):
+        current = [left_index]
+        for right_index, right_value in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[right_index] + 1,
+                    previous[right_index - 1] + (left_value != right_value),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def _align_partial_override_phonemes(
+    mapped_phonemes: List[str],
+    selected_phonemes: List[str],
+    *,
+    selected_text_start: int,
+    selected_text_end: int,
+    mapped_text_length: int,
+) -> Tuple[int, int]:
+    """Locate a wrapped text fragment inside its frontend phoneme unit."""
+    phoneme_count = len(mapped_phonemes)
+    if not phoneme_count:
+        return 0, 0
+
+    text_length = max(1, mapped_text_length)
+    expected_start = phoneme_count * selected_text_start / text_length
+    expected_end = phoneme_count * selected_text_end / text_length
+    best: Optional[Tuple[float, int, int]] = None
+    for start in range(phoneme_count + 1):
+        for end in range(start, phoneme_count + 1):
+            candidate = mapped_phonemes[start:end]
+            edit_scale = max(1, len(selected_phonemes), len(candidate))
+            edit_score = _phoneme_edit_distance(selected_phonemes, candidate) / edit_scale
+            position_score = (
+                abs(start - expected_start) + abs(end - expected_end)
+            ) / phoneme_count
+            score = edit_score + (0.15 * position_score)
+            ranked = (score, start, end)
+            if best is None or ranked < best:
+                best = ranked
+    assert best is not None
+    return best[1], best[2]
+
+
 def apply_ipa_overrides(
     spans: List[Dict[str, object]],
     overrides: List[Tuple[int, int, str]],
+    partial_word_phonemizer=None,
 ) -> List[Dict[str, object]]:
     """Replace mapped phonemes for exact source-text spans with IPA.
 
     ``phonemize_spans_with_speakers`` records each language span's source
     offsets, while a forced-speaker result represents the complete source
-    string.  Overrides must stay within one such span and must not cut through
-    a frontend word mapping; accepting a partial mapping would silently replace
-    phonemes outside the SSML ``<phoneme>`` element.
+    string. Partial frontend words are rebuilt from their untouched fragments
+    when ``partial_word_phonemizer`` is provided.
     """
     prepared = [dict(span) for span in spans]
     ordered = sorted(overrides, key=lambda item: (item[0], item[1]))
@@ -1757,13 +1806,40 @@ def apply_ipa_overrides(
                 )
             first_index, last_index = selected_indices[0], selected_indices[-1]
             first, last = mappings[first_index], mappings[last_index]
+            replacement_start = local_start
+            replacement_end = local_end
+            replacement = list(ipa)
             if first[0] < local_start or last[1] > local_end:
+                if partial_word_phonemizer is None:
+                    raise ValueError(
+                        "SSML <phoneme> boundary cuts through a frontend word and "
+                        "no partial-word phonemizer was provided"
+                    )
+                mapped_text = normalized_text[first[0] : last[1]]
+                selected_text = normalized_text[local_start:local_end]
+                mapped_phonemes = phonemes[first[2] : last[3]]
+                selected_phonemes = list(partial_word_phonemizer(selected_text, voice))
+                selected_start, selected_end = _align_partial_override_phonemes(
+                    mapped_phonemes,
+                    selected_phonemes,
+                    selected_text_start=local_start - first[0],
+                    selected_text_end=local_end - first[0],
+                    mapped_text_length=len(mapped_text),
+                )
+                replacement = (
+                    mapped_phonemes[:selected_start]
+                    + replacement
+                    + mapped_phonemes[selected_end:]
+                )
+                replacement_start = first[0]
+                replacement_end = last[1]
+
+            if not replacement:
                 raise ValueError(
-                    "SSML <phoneme> boundary cuts through a frontend word; wrap the complete word"
+                    "IPA override and its preserved frontend fragments produced no phonemes"
                 )
 
             phoneme_start, phoneme_end = first[2], last[3]
-            replacement = list(ipa)
             missing: Counter[str] = Counter()
             phoneme_ids_espeak(replacement, missing_phonemes=missing)
             if missing:
@@ -1772,7 +1848,12 @@ def apply_ipa_overrides(
 
             phonemes[phoneme_start:phoneme_end] = replacement
             shift = len(replacement) - (phoneme_end - phoneme_start)
-            replacement_mapping = [local_start, local_end, phoneme_start, phoneme_start + len(replacement)]
+            replacement_mapping = [
+                replacement_start,
+                replacement_end,
+                phoneme_start,
+                phoneme_start + len(replacement),
+            ]
             mappings[first_index : last_index + 1] = [replacement_mapping]
             for mapping in mappings[first_index + 1 :]:
                 mapping[2] += shift

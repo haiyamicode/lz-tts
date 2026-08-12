@@ -29,7 +29,7 @@ def test_apply_ipa_overrides_rewrites_exact_mapping_and_shifts_following_spans()
     assert result[0]["phoneme_ids"]
 
 
-def test_apply_ipa_overrides_rejects_partial_frontend_word() -> None:
+def test_apply_ipa_overrides_preserves_partial_frontend_word_fragments() -> None:
     spans = [
         {
             "text": "saoirse",
@@ -37,12 +37,40 @@ def test_apply_ipa_overrides_rejects_partial_frontend_word() -> None:
             "voice": "en-us",
             "source_start": 0,
             "source_end": 7,
-            "phonemes": list("sirsha"),
-            "word_spans": [[0, 7, 0, 6]],
+            "phonemes": list("sɜʃə"),
+            "word_spans": [[0, 7, 0, 4]],
         }
     ]
-    with pytest.raises(ValueError, match="complete word"):
-        apply_ipa_overrides(spans, [(0, 3, "sɜː")])
+    result = apply_ipa_overrides(
+        spans,
+        [(0, 3, "sɜː")],
+        partial_word_phonemizer=lambda _text, _voice: list("saʊ"),
+    )
+
+    assert result[0]["phonemes"] == list("sɜːʃə")
+    assert result[0]["word_spans"] == [[0, 7, 0, 5]]
+
+
+def test_apply_ipa_overrides_preserves_unwrapped_suffix_from_original_mapping() -> None:
+    spans = [
+        {
+            "text": "cat's",
+            "source_text": "cat's",
+            "voice": "en-us",
+            "source_start": 0,
+            "source_end": 5,
+            "phonemes": list("kæts"),
+            "word_spans": [[0, 5, 0, 4]],
+        }
+    ]
+    result = apply_ipa_overrides(
+        spans,
+        [(0, 3, "kæt")],
+        partial_word_phonemizer=lambda _text, _voice: list("kæt"),
+    )
+
+    assert result[0]["phonemes"] == list("kæts")
+    assert result[0]["word_spans"] == [[0, 5, 0, 4]]
 
 
 def test_apply_ipa_overrides_rejects_cross_language_span() -> None:

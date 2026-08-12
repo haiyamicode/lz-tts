@@ -48,14 +48,14 @@ class TestTextNorm(unittest.TestCase):
             "meet at two oh five p.m. on 21st st.",
         )
 
-    def test_english_bare_clock_time_does_not_invent_meridiem(self):
+    def test_english_bare_clock_time_expands_without_meridiem(self):
         self.assertEqual(
             normalize_text("The briefing starts at 9:30 tomorrow morning.", "en-us"),
-            "the briefing starts at 9:30 tomorrow morning.",
+            "the briefing starts at nine thirty tomorrow morning.",
         )
         self.assertEqual(
             normalize_text("Does boarding start at 7:45?", "en-us"),
-            "does boarding start at 7:45?",
+            "does boarding start at seven forty-five?",
         )
 
     def test_english_explicit_meridiem_is_preserved(self):
