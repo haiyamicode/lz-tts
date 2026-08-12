@@ -5,6 +5,7 @@ import dataclasses
 import itertools
 import json
 import logging
+import math
 import os
 import unicodedata
 import re
@@ -203,14 +204,15 @@ def main() -> None:
     else:
         make_dataset = ljspeech_dataset
 
-    # Count speakers (from dataset only)
+    # Materialize once so the expected result count and submitted work cannot
+    # diverge if the source changes or a dataset iterator is stateful.
     _LOGGER.debug("Counting number of speakers/utterances in the dataset")
+    utterances = list(make_dataset(args))
     speaker_counts: "Counter[str]" = Counter()
-    num_utterances = 0
-    for utt in make_dataset(args):
+    for utt in utterances:
         speaker = utt.speaker or ""
         speaker_counts[speaker] += 1
-        num_utterances += 1
+    num_utterances = len(utterances)
 
     assert num_utterances > 0, "No utterances found"
 
@@ -327,7 +329,9 @@ def main() -> None:
 
     assert args.max_workers is not None
 
-    batch_size = max(1, int(num_utterances / (args.max_workers * 2)))
+    # Keep work units small enough that grouped languages or cache misses do not
+    # leave one process handling the entire slow tail while the others sit idle.
+    batch_size = max(1, min(64, math.ceil(num_utterances / (args.max_workers * 8))))
     queue_in: "Queue[Iterable[Utterance]]" = JoinableQueue()
     queue_out: "Queue[Optional[Utterance]]" = Queue()
 
@@ -394,7 +398,7 @@ def main() -> None:
     drain_thread.start()
 
     dataset_order = 0
-    for utt_batch in batched(make_dataset(args), batch_size):
+    for utt_batch in batched(utterances, batch_size):
         ordered_batch = []
         for utt in utt_batch:
             setattr(utt, "_dataset_order", dataset_order)
@@ -402,7 +406,21 @@ def main() -> None:
             ordered_batch.append(utt)
         queue_in.put(ordered_batch)
 
-    results_done.wait()
+    while not results_done.wait(timeout=1.0):
+        failed_workers = [
+            proc for proc in processes if proc.exitcode not in (None, 0)
+        ]
+        if failed_workers:
+            for proc in processes:
+                if proc.is_alive():
+                    proc.terminate()
+            failed = ", ".join(
+                f"pid={proc.pid} exitcode={proc.exitcode}"
+                for proc in failed_workers
+            )
+            raise RuntimeError(
+                f"Preprocessing worker exited before returning all results: {failed}"
+            )
     drain_thread.join()
     if drain_error:
         raise drain_error
@@ -1172,7 +1190,7 @@ def _iter_ljspeech_metadata_rows(metadata_path: Path) -> Iterable[Tuple[int, Lis
             if not line:
                 continue
 
-            row = line.split("|", 2)
+            row = next(csv.reader([line], delimiter="|"))
             if len(row) < 2:
                 raise ValueError(
                     f"Expected filename|text or filename|speaker|text at "

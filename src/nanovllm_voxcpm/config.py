@@ -21,6 +21,7 @@ class Config(Generic[T]):
     model_config: T | None = None
     devices: List[int] | None = None
     lora_config: Any = None  # Optional[LoRAConfig]
+    ipa_adapter_path: str | None = None
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

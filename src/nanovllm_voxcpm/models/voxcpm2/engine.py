@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import hashlib
+import struct
 
 import numpy as np
 import torch
@@ -11,6 +13,29 @@ from src.nanovllm_voxcpm.models.voxcpm2.config import VoxCPM2Config
 from src.nanovllm_voxcpm.models.voxcpm2.lora_loader import load_voxcpm2_lora_checkpoint
 from src.nanovllm_voxcpm.models.voxcpm2.runner import RunnerTask, VoxCPM2Payload, VoxCPM2Runner
 from src.nanovllm_voxcpm.models.voxcpm2.utils import mask_multichar_chinese_tokens
+from src.voxcpm_ipa_adapter import sparrow_phoneme_ids
+
+
+def _ipa_cache_namespace(controls: list[dict]) -> bytes:
+    digest = hashlib.sha256(b"voxcpm2-ipa-controls-v1")
+    for control in controls:
+        target_ipa = str(control["target_ipa"]).encode("utf-8")
+        digest.update(struct.pack("<I", len(target_ipa)))
+        digest.update(target_ipa)
+        digest.update(
+            struct.pack(
+                "<qq?qq",
+                int(control["controlled_start"]),
+                int(control["controlled_end"]),
+                bool(control.get("audio_enabled", True)),
+                int(control.get("start_patch", -1)),
+                int(control.get("target_patch_count", -1)),
+            )
+        )
+        gates = np.asarray(control.get("gates", ()), dtype="<f4")
+        digest.update(struct.pack("<I", gates.size))
+        digest.update(gates.tobytes())
+    return digest.digest()
 
 
 @dataclass
@@ -25,6 +50,15 @@ class VoxCPM2SeqPayload:
     max_generate_length: int | None = None
     seed: int | None = None
     seed_step: int = 0
+    ipa_memories: np.ndarray | None = None
+    ipa_memory_mask: np.ndarray | None = None
+    ipa_prefill_to_control: np.ndarray | None = None
+    ipa_prefill_progress: np.ndarray | None = None
+    ipa_prefill_gate: np.ndarray | None = None
+    ipa_audio_to_control: np.ndarray | None = None
+    ipa_audio_progress: np.ndarray | None = None
+    ipa_audio_gate: np.ndarray | None = None
+    min_generate_length: int = 0
 
 
 class VoxCPM2Engine(LLMEngineBase):
@@ -46,6 +80,15 @@ class VoxCPM2Engine(LLMEngineBase):
         return super().register_lora(name, payload)
 
     def preprocess_seq(self, seq: Sequence[VoxCPM2SeqPayload], is_prefill: bool) -> RunnerTask[VoxCPM2Payload]:
+        payload = seq.custom_payload
+        audio_index = payload.seed_step
+        audio_active = (
+            payload.ipa_audio_to_control is not None
+            and audio_index < payload.ipa_audio_to_control.shape[0]
+        )
+        terminal_control = int(payload.ipa_audio_to_control[audio_index]) if audio_active else -1
+        terminal_progress = float(payload.ipa_audio_progress[audio_index]) if audio_active else 0.0
+        terminal_gate = float(payload.ipa_audio_gate[audio_index]) if audio_active else 0.0
         if is_prefill:
             if len(seq.custom_payload.feats) > 1:
                 feats = np.concatenate(seq.custom_payload.feats, axis=0)
@@ -65,6 +108,23 @@ class VoxCPM2Engine(LLMEngineBase):
                     padding_decode=seq.custom_payload.decode_pad,
                     seed=seq.custom_payload.seed,
                     seed_step=seq.custom_payload.seed_step,
+                    ipa_memories=payload.ipa_memories,
+                    ipa_memory_mask=payload.ipa_memory_mask,
+                    ipa_transformer_to_control=(
+                        payload.ipa_prefill_to_control[seq.num_cached_tokens :]
+                        if payload.ipa_prefill_to_control is not None else None
+                    ),
+                    ipa_transformer_progress=(
+                        payload.ipa_prefill_progress[seq.num_cached_tokens :]
+                        if payload.ipa_prefill_progress is not None else None
+                    ),
+                    ipa_transformer_gate=(
+                        payload.ipa_prefill_gate[seq.num_cached_tokens :]
+                        if payload.ipa_prefill_gate is not None else None
+                    ),
+                    ipa_terminal_to_control=terminal_control,
+                    ipa_terminal_progress=terminal_progress,
+                    ipa_terminal_gate=terminal_gate,
                 ),
                 adapter_id=seq.adapter_id,
             )
@@ -83,6 +143,14 @@ class VoxCPM2Engine(LLMEngineBase):
                 padding_decode=seq.custom_payload.decode_pad,
                 seed=seq.custom_payload.seed,
                 seed_step=seq.custom_payload.seed_step,
+                ipa_memories=payload.ipa_memories,
+                ipa_memory_mask=payload.ipa_memory_mask,
+                ipa_transformer_to_control=np.array([terminal_control], dtype=np.int64),
+                ipa_transformer_progress=np.array([terminal_progress], dtype=np.float32),
+                ipa_transformer_gate=np.array([terminal_gate], dtype=np.float32),
+                ipa_terminal_to_control=terminal_control,
+                ipa_terminal_progress=terminal_progress,
+                ipa_terminal_gate=terminal_gate,
             ),
             adapter_id=seq.adapter_id,
         )
@@ -96,8 +164,7 @@ class VoxCPM2Engine(LLMEngineBase):
         seq.custom_payload.feats.append(latents[None])
         seq.custom_payload.text_tokens.append(0)
         seq.custom_payload.feat_masks.append(True)
-        if seq.custom_payload.seed is not None and seq.custom_payload.seed >= 0:
-            seq.custom_payload.seed_step += 1
+        seq.custom_payload.seed_step += 1
         seq.custom_payload.generated_waveforms.append(waveforms)
 
         latents = latents.reshape(-1, self.feat_dim)
@@ -108,7 +175,7 @@ class VoxCPM2Engine(LLMEngineBase):
         else:
             seq.custom_payload.decode_pad = latents[-self.n_decode_pad_frames :]
 
-        if stop_flag == 1:
+        if stop_flag == 1 and seq.custom_payload.seed_step >= seq.custom_payload.min_generate_length:
             seq.stoped = True
         elif (
             seq.custom_payload.max_generate_length is not None
@@ -128,15 +195,82 @@ class VoxCPM2Engine(LLMEngineBase):
         cfg_value: float = 1.0,
         lora_name: str | None = None,
         seed: int | None = None,
+        ipa_controls: list[dict] | None = None,
+        min_generate_length: int = 0,
     ):
         if max_generate_length < 1:
             raise ValueError(f"max_generate_length must be >= 1, got {max_generate_length}")
 
-        text_tokens = self.tokenizer(prompt_text + target_text) + [self.audio_start_token]
+        combined_text = prompt_text + target_text
+        raw_text_tokens = self.tokenizer(combined_text)
+        text_tokens = raw_text_tokens + [self.audio_start_token]
         audio_feat = np.zeros((len(text_tokens), self.patch_size, self.feat_dim), dtype=np.float32)
         feat_masks = [False for _ in range(len(text_tokens))]
         hash_tokens = [t for t in text_tokens]
         decode_pad = None
+        ipa_memories = None
+        ipa_memory_mask = None
+        ipa_prefill_to_control = None
+        ipa_prefill_progress = None
+        ipa_prefill_gate = None
+        ipa_audio_to_control = None
+        ipa_audio_progress = None
+        ipa_audio_gate = None
+        cache_namespace = None
+
+        if ipa_controls:
+            if prompt_text:
+                raise ValueError("IPA controls with prompt_text are not supported")
+            encoded = self.tokenizer.tokenizer(
+                target_text, add_special_tokens=False, return_offsets_mapping=True
+            )
+            offsets = list(encoded["offset_mapping"])
+            if list(encoded["input_ids"]) != raw_text_tokens:
+                raise ValueError("IPA span tokenization differs from VoxCPM target tokenization")
+            ipa_prefill_to_control = np.full(len(text_tokens), -1, dtype=np.int64)
+            ipa_prefill_progress = np.zeros(len(text_tokens), dtype=np.float32)
+            ipa_prefill_gate = np.zeros(len(text_tokens), dtype=np.float32)
+            ipa_audio_to_control = np.full(max_generate_length, -1, dtype=np.int64)
+            ipa_audio_progress = np.zeros(max_generate_length, dtype=np.float32)
+            ipa_audio_gate = np.zeros(max_generate_length, dtype=np.float32)
+            phoneme_ids: list[list[int]] = []
+            for control_index, control in enumerate(ipa_controls):
+                start = int(control["controlled_start"])
+                end = int(control["controlled_end"])
+                token_indices = [
+                    index for index, (token_start, token_end) in enumerate(offsets)
+                    if token_end > start and token_start < end
+                ]
+                if not token_indices:
+                    raise ValueError(f"IPA controlled span [{start}, {end}) has no VoxCPM text tokens")
+                if any(ipa_prefill_to_control[index] >= 0 for index in token_indices):
+                    raise ValueError("Overlapping IPA text controls are not supported")
+                denom = max(1, len(token_indices) - 1)
+                for order, token_index in enumerate(token_indices):
+                    ipa_prefill_to_control[token_index] = control_index
+                    ipa_prefill_progress[token_index] = order / denom
+                    ipa_prefill_gate[token_index] = 1.0
+                if bool(control.get("audio_enabled", True)):
+                    start_patch = int(control["start_patch"])
+                    gates = np.asarray(control["gates"], dtype=np.float32)
+                    end_patch = min(max_generate_length, start_patch + gates.shape[0])
+                    if start_patch < 0 or end_patch <= start_patch:
+                        raise ValueError("IPA audio control falls outside the generation budget")
+                    if np.any(ipa_audio_to_control[start_patch:end_patch] >= 0):
+                        raise ValueError("Overlapping IPA audio controls are not supported")
+                    count = end_patch - start_patch
+                    ipa_audio_to_control[start_patch:end_patch] = control_index
+                    target_patch_count = max(1, int(control["target_patch_count"]))
+                    patch_indices = np.arange(count, dtype=np.float32)
+                    ipa_audio_progress[start_patch:end_patch] = np.clip(
+                        (patch_indices + 0.5) / target_patch_count,
+                        0.0,
+                        1.0,
+                    )
+                    ipa_audio_gate[start_patch:end_patch] = gates[:count]
+                phoneme_ids.append(sparrow_phoneme_ids(str(control["target_ipa"])))
+            ipa_memories, ipa_memory_mask = self.model_runner.encode_ipa_memories(phoneme_ids)
+            cache_namespace = _ipa_cache_namespace(ipa_controls)
 
         if ref_audio_latents is not None:
             wav_latents = ref_audio_latents
@@ -158,6 +292,11 @@ class VoxCPM2Engine(LLMEngineBase):
                 + [self.ref_audio_end_token]
             )
             hash_tokens = prepend_hash_tokens + hash_tokens
+            prefix = len(prepend_hash_tokens)
+            if ipa_prefill_to_control is not None:
+                ipa_prefill_to_control = np.pad(ipa_prefill_to_control, (prefix, 0), constant_values=-1)
+                ipa_prefill_progress = np.pad(ipa_prefill_progress, (prefix, 0))
+                ipa_prefill_gate = np.pad(ipa_prefill_gate, (prefix, 0))
 
         if prompt_latents is not None:
             wav_latents = prompt_latents
@@ -200,9 +339,19 @@ class VoxCPM2Engine(LLMEngineBase):
                 generated_waveforms=[],
                 seed=seed,
                 seed_step=0,
+                ipa_memories=ipa_memories,
+                ipa_memory_mask=ipa_memory_mask,
+                ipa_prefill_to_control=ipa_prefill_to_control,
+                ipa_prefill_progress=ipa_prefill_progress,
+                ipa_prefill_gate=ipa_prefill_gate,
+                ipa_audio_to_control=ipa_audio_to_control,
+                ipa_audio_progress=ipa_audio_progress,
+                ipa_audio_gate=ipa_audio_gate,
+                min_generate_length=max(0, int(min_generate_length)),
             ),
             lora_name=lora_name,
             adapter_id=adapter_id,
+            cache_namespace=cache_namespace,
         )
         self.add_sequence(seq)
 

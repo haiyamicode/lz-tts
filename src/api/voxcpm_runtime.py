@@ -28,6 +28,8 @@ class VoxCPMRuntime:
         self.settings = dict(settings)
         self.server: Any | None = None
         self.sample_rate = 16000
+        self.output_patch_samples = 2560
+        self.ipa_fade_out_ratio = 0.2
         self._reference_latents: OrderedDict[str, bytes] = OrderedDict()
         self._reference_cache_lock = asyncio.Lock()
         self._duration_budget: Any | None = None
@@ -128,6 +130,11 @@ class VoxCPMRuntime:
             gpu_memory_utilization=float(self.settings["gpu_memory_utilization"]),
             enforce_eager=bool(self.settings["enforce_eager"]),
             lora_config=self._load_lora_runtime_config(),
+            ipa_adapter_path=(
+                str(self._resolve_path(str(self.settings["ipa_adapter_path"])))
+                if self.settings.get("ipa_adapter_path")
+                else None
+            ),
         )
         await self.server.wait_for_ready()
         for name, path in configured_loras.items():
@@ -136,6 +143,9 @@ class VoxCPMRuntime:
             self._lora_combinations[(name,)] = name
         model_info = await self.server.get_model_info()
         self.sample_rate = int(model_info["sample_rate"])
+        self.output_patch_samples = int(model_info["output_patch_samples"])
+        if model_info.get("ipa_fade_out_ratio") is not None:
+            self.ipa_fade_out_ratio = float(model_info["ipa_fade_out_ratio"])
         duration_settings = self.settings["duration_budget"]
         if duration_settings["enabled"] and duration_settings["preload"]:
             await asyncio.to_thread(self._get_duration_budget)
@@ -318,6 +328,8 @@ class VoxCPMRuntime:
         seed: int | None = None,
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
+        ipa_controls: list[dict[str, Any]] | None = None,
+        min_generate_length: int = 0,
     ) -> np.ndarray:
         if self.server is None:
             raise RuntimeError("VoxCPM runtime is not started")
@@ -328,6 +340,8 @@ class VoxCPMRuntime:
             "cfg_value": float(self.settings["cfg_value"]),
             "ref_audio_latents": ref_audio_latents,
             "lora_name": lora_name,
+            "ipa_controls": ipa_controls,
+            "min_generate_length": min_generate_length,
         }
         if seed is not None:
             generation_kwargs["seed"] = seed
@@ -338,6 +352,39 @@ class VoxCPMRuntime:
         if not chunks:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(chunks).astype(np.float32, copy=False)
+
+    async def synthesize_controlled(
+        self,
+        text: str,
+        *,
+        ipa_controls: list[dict[str, Any]],
+        min_generate_length: int,
+        max_generate_length: int,
+        seed: int,
+        reference_audio: bytes | None = None,
+        reference_format: str = "wav",
+        lora_name: str | None = None,
+    ) -> np.ndarray:
+        """Run one IPA-controlled request; nano-vLLM selects eager mode for it."""
+
+        if not self.settings.get("ipa_adapter_path"):
+            raise RuntimeError("VoxCPM IPA adapter is not configured")
+        if lora_name is not None and lora_name not in self._available_loras:
+            raise ValueError(f"VoxCPM LoRA is not registered: {lora_name}")
+        reference_latents = (
+            await self._encode_reference(reference_audio, reference_format)
+            if reference_audio is not None
+            else None
+        )
+        return await self._synthesize_one(
+            text,
+            max_generate_length=max_generate_length,
+            seed=seed,
+            ref_audio_latents=reference_latents,
+            lora_name=lora_name,
+            ipa_controls=ipa_controls,
+            min_generate_length=min_generate_length,
+        )
 
     async def synthesize_batch(
         self,

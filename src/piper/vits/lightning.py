@@ -17,12 +17,19 @@ from .models import MultiPeriodDiscriminator, SynthesizerTrn
 
 # Training-only imports (optional for inference)
 try:
-    from .dataset import Batch, LengthBucketBatchSampler, PiperDataset, UtteranceCollate
+    from .dataset import (
+        SpeakerProbabilityBatchSampler,
+        Batch,
+        LengthBucketBatchSampler,
+        PiperDataset,
+        UtteranceCollate,
+    )
     from .losses import discriminator_loss, feature_loss, generator_loss, kl_loss
 except ImportError:
     Batch = None
     PiperDataset = None
     LengthBucketBatchSampler = None
+    SpeakerProbabilityBatchSampler = None
     UtteranceCollate = None
     discriminator_loss = None
     feature_loss = None
@@ -96,6 +103,7 @@ class VitsModel(pl.LightningModule):
         speaker_id_map: Optional[dict] = None,
         use_length_buckets: bool = False,
         bucket_boundaries: Optional[List[int]] = None,
+        training_sampler_prob: Optional[dict] = None,
         # semantic / BERT options
         use_bert: bool = False,
         bert_model_name: Optional[str] = None,
@@ -284,16 +292,39 @@ class VitsModel(pl.LightningModule):
                 getattr(self.hparams, "bucket_boundaries", None)
                 or [0, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1200, 2000]
             )
-            return DataLoader(
-                self._train_dataset,
-                collate_fn=collate_fn,
-                num_workers=num_workers,
-                batch_sampler=LengthBucketBatchSampler(
+            sampler_prob = getattr(self.hparams, "training_sampler_prob", None)
+            if sampler_prob:
+                resolved_probabilities: dict[Optional[int], float] = {}
+                for speaker, probability in dict(sampler_prob).items():
+                    if speaker == "rest":
+                        speaker_id = None
+                    else:
+                        if speaker not in self.hparams.speaker_id_map:
+                            raise ValueError(
+                                f"Unknown speaker in training_sampler_prob: {speaker}"
+                            )
+                        speaker_id = int(self.hparams.speaker_id_map[speaker])
+                    resolved_probabilities[speaker_id] = float(probability)
+                batch_sampler = SpeakerProbabilityBatchSampler(
+                    self._train_dataset,
+                    batch_size=int(self.hparams.batch_size),
+                    boundaries=boundaries,
+                    speaker_probabilities=resolved_probabilities,
+                    seed=int(self.hparams.seed),
+                    shuffle=True,
+                )
+            else:
+                batch_sampler = LengthBucketBatchSampler(
                     self._train_dataset,
                     batch_size=int(self.hparams.batch_size),
                     boundaries=boundaries,
                     shuffle=True,
-                ),
+                )
+            return DataLoader(
+                self._train_dataset,
+                collate_fn=collate_fn,
+                num_workers=num_workers,
+                batch_sampler=batch_sampler,
                 pin_memory=torch.cuda.is_available(),
                 persistent_workers=num_workers > 0,
             )

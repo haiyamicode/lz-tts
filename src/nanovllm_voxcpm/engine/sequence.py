@@ -79,6 +79,7 @@ class Sequence(Generic[PlayloadType]):
         custom_payload: PlayloadType = None,
         lora_name: str | None = None,
         adapter_id: int | None = None,
+        cache_namespace: bytes | None = None,
     ):
         self.seq_id = seq_id
         self.status = SequenceStatus.WAITING
@@ -92,6 +93,7 @@ class Sequence(Generic[PlayloadType]):
         self.custom_payload = custom_payload
         self.lora_name = lora_name
         self.adapter_id = adapter_id
+        self.cache_namespace = cache_namespace
         self.stoped = False
 
     def __len__(self):

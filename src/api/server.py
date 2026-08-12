@@ -38,9 +38,15 @@ from pydantic import BaseModel, Field, ValidationError
 from ..multilingual_splitter import MultilingualSplitter
 from ..piper import PiperInference
 from ..ctc_forced_alignment import CtcAlignmentConfig, CtcForcedAligner, CtcLanguageSpan
-from ..ssml import PronunciationOperation, SSMLDocument, parse_ssml
-from ..ssml_postprocessing import insert_ssml_breaks, splice_pronunciations
+from ..aligned_pauses import ResolvedPause, insert_resolved_pauses
+from ..ssml import BreakOperation, PronunciationOperation, SSMLDocument, parse_ssml
+from ..ssml_postprocessing import (
+    insert_ssml_breaks,
+    resolve_ssml_breaks,
+    splice_pronunciations,
+)
 from ..text_norm import normalize_spoken_text
+from ..voxcpm_ipa_adapter import approximate_ipa_spelling, resolve_ipa_control_schedules
 from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
 from ..matcha_inference import MatchaBatchRequest
 from ..matcha_inference import MatchaBatcher as ProductionStarlingBatcher
@@ -256,6 +262,7 @@ class VoxCPMConfig(BaseModel):
     gpu_memory_utilization: float = Field(default=0.62, gt=0, le=1)
     num_kvcache_blocks: int = Field(default=192, ge=1)
     enforce_eager: bool = False
+    ipa_adapter_path: str | None = None
     fallback_max_generate_length: int = Field(default=4096, ge=1)
     duration_budget: VoxCPMDurationBudgetConfig = Field(default_factory=VoxCPMDurationBudgetConfig)
     temperature: float = Field(default=1.0, gt=0)
@@ -355,6 +362,10 @@ class SSMLConfig(BaseModel):
     ctc_device: str = Field(default_factory=lambda: os.environ.get("SSML_CTC_DEVICE", "cuda:0"))
     ctc_dtype: str = Field(default_factory=lambda: os.environ.get("SSML_CTC_DTYPE", "float16"))
     crossfade_seconds: float = Field(default=0.01, ge=0.0, le=0.1)
+    voxcpm_ipa_stop_cushion_patches: int = Field(default=1, ge=0)
+    voxcpm_ipa_max_length_cushion_patches: int = Field(default=12, ge=1)
+    voxcpm_ipa_alignment_tolerance_patches: int = Field(default=2, ge=0, le=10)
+    voxcpm_ipa_refinement_passes: int = Field(default=1, ge=0, le=3)
 
 
 class ServerConfig(BaseModel):
@@ -2432,6 +2443,417 @@ async def _match_ssml_replacements_to_baseline_voice(
     return decoded, output_rate
 
 
+def _request_routes_to_voxcpm(
+    request: SynthesizeRequest,
+    resolved_model: str | None,
+) -> bool:
+    if _is_voxcpm_model(resolved_model):
+        return True
+    return bool(
+        request.voice_id
+        and _configured_root_voice_for_voice_id(request.voice_id) is None
+        and not _is_seed_vc_fallback_voice(request.voice_id)
+    )
+
+
+def _ipa_marker(index: int) -> str:
+    suffix = ""
+    value = index
+    while True:
+        suffix = chr(ord("a") + value % 26) + suffix
+        value = value // 26 - 1
+        if value < 0:
+            break
+    return f"lzvoiceipaoverride{suffix}marker"
+
+
+def _prepare_voxcpm_ipa_text(
+    document: SSMLDocument,
+    forced_language: str | None,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    operations = sorted(document.pronunciations, key=lambda item: item.start)
+    cursor = 0
+    marked_parts: list[str] = []
+    replacements: list[tuple[str, PronunciationOperation]] = []
+    for index, operation in enumerate(operations):
+        if operation.start < cursor:
+            raise ValueError("Overlapping SSML pronunciation spans are not supported")
+        language = _language_at_source_position(
+            document.text, operation.start, forced_language
+        )
+        if _get_base_language(language) != "en":
+            raise ValueError(
+                "The configured VoxCPM IPA adapter currently supports English pronunciation controls only"
+            )
+        marker = _ipa_marker(index)
+        if marker in document.text.lower():
+            raise ValueError("SSML text collides with an internal pronunciation marker")
+        marked_parts.extend((document.text[cursor : operation.start], marker))
+        replacements.append((marker, operation))
+        cursor = operation.end
+    marked_parts.append(document.text[cursor:])
+
+    marked_text, detected_language = _prepare_voxcpm_input(
+        "".join(marked_parts), forced_language
+    )
+    located_replacements: list[tuple[int, str, PronunciationOperation]] = []
+    for marker, operation in replacements:
+        if marked_text.count(marker) != 1:
+            raise ValueError(
+                "Spoken-text normalization did not preserve an SSML pronunciation span"
+            )
+        located_replacements.append((marked_text.index(marker), marker, operation))
+    located_replacements.sort(key=lambda item: item[0])
+
+    controlled_parts: list[str] = []
+    controls: list[dict[str, Any]] = []
+    marked_cursor = 0
+    controlled_length = 0
+    for marker_start, marker, operation in located_replacements:
+        segment = marked_text[marked_cursor:marker_start]
+        controlled_parts.append(segment)
+        controlled_length += len(segment)
+        spelling = approximate_ipa_spelling(
+            operation.phonemes,
+            _language_at_source_position(
+                document.text, operation.start, forced_language
+            )
+        )
+        controlled_parts.append(spelling)
+        controls.append(
+            {
+                "source_start": operation.start,
+                "source_end": operation.end,
+                "controlled_start": controlled_length,
+                "controlled_end": controlled_length + len(spelling),
+                "target_ipa": operation.phonemes,
+            }
+        )
+        controlled_length += len(spelling)
+        marked_cursor = marker_start + len(marker)
+    controlled_parts.append(marked_text[marked_cursor:])
+    controlled_text = "".join(controlled_parts)
+    return controlled_text, detected_language, controls
+
+
+def _aligned_pronunciation_spans(
+    operations: tuple[PronunciationOperation, ...],
+    timestamps: list[dict[str, Any]],
+) -> list[dict[str, float]]:
+    spans: list[dict[str, float]] = []
+    for operation in operations:
+        matching = [
+            item
+            for item in timestamps
+            if int(item.get("source_start", -1)) < operation.end
+            and int(item.get("source_end", -1)) > operation.start
+        ]
+        if not matching:
+            raise ValueError(
+                "Forced alignment did not locate VoxCPM IPA source span "
+                f"[{operation.start}, {operation.end})"
+            )
+        spans.append(
+            {
+                "start_seconds": min(float(item["start_seconds"]) for item in matching),
+                "end_seconds": max(float(item["end_seconds"]) for item in matching),
+            }
+        )
+    return spans
+
+
+def _voxcpm_controlled_operations(
+    controls: list[dict[str, Any]],
+) -> tuple[PronunciationOperation, ...]:
+    return tuple(
+        PronunciationOperation(
+            start=int(control["controlled_start"]),
+            end=int(control["controlled_end"]),
+            alphabet="ipa",
+            phonemes=str(control["target_ipa"]),
+        )
+        for control in controls
+    )
+
+
+def _voxcpm_controlled_breaks(
+    document: SSMLDocument,
+    controls: list[dict[str, Any]],
+) -> tuple[BreakOperation, ...]:
+    mapped: list[BreakOperation] = []
+    ordered = sorted(controls, key=lambda control: int(control["source_start"]))
+    for operation in document.breaks:
+        shift = 0
+        for control in ordered:
+            source_start = int(control["source_start"])
+            source_end = int(control["source_end"])
+            if source_start < operation.position < source_end:
+                raise ValueError("SSML breaks inside IPA pronunciation spans are not supported")
+            if source_end <= operation.position:
+                shift += (
+                    int(control["controlled_end"])
+                    - int(control["controlled_start"])
+                    - (source_end - source_start)
+                )
+        mapped.append(BreakOperation(operation.position + shift, operation.duration_seconds))
+    return tuple(mapped)
+
+
+def _voxcpm_ipa_pass_controls(
+    controls: list[dict[str, Any]],
+    schedules: list[dict[str, object]],
+) -> list[dict[str, Any]]:
+    """Keep all text controls fixed while enabling an observed audio prefix."""
+    result = [{**control, "audio_enabled": False} for control in controls]
+    for index, schedule in enumerate(schedules):
+        result[index].update(schedule)
+        result[index]["audio_enabled"] = True
+    for index in range(len(schedules) - 1):
+        start = int(result[index]["start_patch"])
+        next_start = int(result[index + 1]["start_patch"])
+        if next_start <= start:
+            raise RuntimeError("Observed VoxCPM IPA control starts are not monotonic")
+        result[index]["gates"] = list(result[index]["gates"][: next_start - start])
+        if not result[index]["gates"]:
+            raise RuntimeError("Observed VoxCPM IPA controls have no non-overlapping frames")
+    return result
+
+
+async def _predict_ssml_ipa_durations(
+    request: SynthesizeRequest,
+    document: SSMLDocument,
+    resolved_model: str | None,
+) -> list[float]:
+    await _await_engine_ready("pipertts")
+    routes = [
+        _ssml_sparrow_route(request, document.text, operation, resolved_model)
+        for operation in document.pronunciations
+    ]
+    if len(set(routes)) != 1:
+        raise ValueError("VoxCPM IPA controls must use one Sparrow duration model")
+    speaker, model_name = routes[0]
+    inference = _get_inference(model_name)
+    internal_speaker = _resolve_internal_speaker(model_name, speaker, inference)
+    _audio, timestamps = await asyncio.to_thread(
+        inference.synthesize_with_ipa_overrides,
+        document.text,
+        [
+            (operation.start, operation.end, operation.phonemes)
+            for operation in document.pronunciations
+        ],
+        speaker=internal_speaker,
+        noise_scale=0.0,
+        length_scale=1.0,
+        noise_w=0.0,
+        sdp_ratio=0.0,
+        neural=False,
+        return_alignment=True,
+    )
+    spans = _aligned_pronunciation_spans(document.pronunciations, list(timestamps))
+    durations = [span["end_seconds"] - span["start_seconds"] for span in spans]
+    if any(duration <= 0.0 for duration in durations):
+        raise ValueError("Sparrow predicted a non-positive IPA pronunciation duration")
+    return durations
+
+
+async def _load_voxcpm_ssml_reference(
+    request: SynthesizeRequest,
+) -> tuple[bytes | None, str]:
+    if request.sample_url is not None:
+        return await _download_voxcpm_reference(
+            request.sample_url, request.reference_version
+        )
+    if request.voice_id is not None:
+        reference = _resolve_voxcpm_preset_reference(request.voice_id, request.style)
+        return await _load_voxcpm_preset_reference(reference)
+    return None, "wav"
+
+
+async def _synthesize_voxcpm_ipa_ssml(
+    request: SynthesizeRequest,
+    document: SSMLDocument,
+    baseline_audio: np.ndarray,
+    baseline_sample_rate: int,
+    resolved_model: str | None,
+) -> tuple[np.ndarray, int, list[ResolvedPause]]:
+    await _await_engine_ready("voxcpm")
+    runtime = _get_voxcpm_runtime()
+    if baseline_sample_rate != runtime.sample_rate:
+        raise ValueError(
+            "VoxCPM SSML baseline sample rate does not match the configured runtime"
+        )
+    if request.seed is None:
+        raise RuntimeError("VoxCPM IPA synthesis requires a resolved sampling seed")
+
+    controlled_text, _language, controls = _prepare_voxcpm_ipa_text(
+        document, request.language
+    )
+    controlled_operations = _voxcpm_controlled_operations(controls)
+    baseline_timestamps = await _align_ssml_audio(
+        document.text, baseline_audio, baseline_sample_rate, request.language
+    )
+    baseline_spans = _aligned_pronunciation_spans(
+        document.pronunciations, baseline_timestamps
+    )
+    target_durations = await _predict_ssml_ipa_durations(
+        request, document, resolved_model
+    )
+    patch_samples = runtime.output_patch_samples
+    baseline_patch_count, remainder = divmod(len(baseline_audio), patch_samples)
+    if baseline_patch_count <= 0 or remainder:
+        raise ValueError(
+            "VoxCPM baseline audio does not contain an integral number of output patches"
+        )
+    initial_expected_patches = baseline_patch_count
+    for span, target_duration in zip(baseline_spans, target_durations, strict=True):
+        resolved, _expected = resolve_ipa_control_schedules(
+            [span],
+            [target_duration],
+            baseline_patch_count=baseline_patch_count,
+            patch_seconds=patch_samples / runtime.sample_rate,
+            fade_out_ratio=runtime.ipa_fade_out_ratio,
+        )
+        initial_expected_patches += int(resolved[0]["duration_shift_patches"])
+    initial_expected_patches = max(2, initial_expected_patches)
+    stop_cushion = _server_config.ssml.voxcpm_ipa_stop_cushion_patches
+    max_cushion = _server_config.ssml.voxcpm_ipa_max_length_cushion_patches
+    requested_loras = _resolve_voxcpm_lora_names(request.voxcpm_loras)
+    try:
+        lora_name = await runtime.resolve_lora_combination(requested_loras)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Could not apply VoxCPM LoRAs: {exc}") from exc
+    reference_audio, reference_format = await _load_voxcpm_ssml_reference(request)
+
+    async def generate_pass(
+        schedules: list[dict[str, object]],
+        expected_patches: int,
+    ) -> np.ndarray:
+        pass_controls = _voxcpm_ipa_pass_controls(controls, schedules)
+        target_end = max(
+            (
+                int(schedule["start_patch"])
+                + int(schedule["target_patch_count"])
+                for schedule in schedules
+            ),
+            default=0,
+        )
+        gate_end = max(
+            (
+                int(control["start_patch"]) + len(control["gates"])
+                for control in pass_controls
+                if control["audio_enabled"]
+            ),
+            default=0,
+        )
+        return await runtime.synthesize_controlled(
+            controlled_text,
+            ipa_controls=pass_controls,
+            min_generate_length=max(
+                2,
+                expected_patches - stop_cushion,
+                target_end,
+            ),
+            max_generate_length=max(
+                expected_patches + max_cushion,
+                gate_end,
+            ),
+            seed=request.seed,
+            reference_audio=reference_audio,
+            reference_format=reference_format,
+            lora_name=lora_name,
+        )
+
+    async def align_controlled(
+        audio: np.ndarray,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, float]]]:
+        timestamps = await _align_ssml_audio(
+            controlled_text,
+            audio,
+            runtime.sample_rate,
+            request.language,
+        )
+        return timestamps, _aligned_pronunciation_spans(
+            controlled_operations,
+            timestamps,
+        )
+
+    # Establish one invariant text-conditioned timeline before enabling any
+    # audio gate. Each subsequent pass adds exactly one future audio control.
+    audio = await generate_pass([], initial_expected_patches)
+    timestamps, observed_spans = await align_controlled(audio)
+    schedules: list[dict[str, object]] = []
+    generation_passes = 1
+
+    async def build_schedule_suffix(start_index: int) -> None:
+        nonlocal audio, timestamps, observed_spans, generation_passes
+        del schedules[start_index:]
+        for control_index in range(start_index, len(controls)):
+            previous_patch_count, remainder = divmod(len(audio), patch_samples)
+            if previous_patch_count <= 0 or remainder:
+                raise RuntimeError(
+                    "VoxCPM IPA pass did not contain an integral number of output patches"
+                )
+            resolved, expected_patches = resolve_ipa_control_schedules(
+                [observed_spans[control_index]],
+                [target_durations[control_index]],
+                baseline_patch_count=previous_patch_count,
+                patch_seconds=patch_samples / runtime.sample_rate,
+                fade_out_ratio=runtime.ipa_fade_out_ratio,
+            )
+            schedules.append(resolved[0])
+            audio = await generate_pass(schedules, expected_patches)
+            generation_passes += 1
+            timestamps, observed_spans = await align_controlled(audio)
+
+    await build_schedule_suffix(0)
+
+    tolerance = _server_config.ssml.voxcpm_ipa_alignment_tolerance_patches
+    drifts: list[int] = []
+    for refinement in range(_server_config.ssml.voxcpm_ipa_refinement_passes + 1):
+        observed_starts = [
+            max(0, int(float(span["start_seconds"]) * runtime.sample_rate // patch_samples))
+            for span in observed_spans
+        ]
+        drifts = [
+            observed_start - int(schedule["start_patch"])
+            for observed_start, schedule in zip(observed_starts, schedules, strict=True)
+        ]
+        mismatches = [
+            index for index, drift in enumerate(drifts) if abs(drift) > tolerance
+        ]
+        if not mismatches:
+            break
+        if refinement >= _server_config.ssml.voxcpm_ipa_refinement_passes:
+            raise RuntimeError(
+                "VoxCPM IPA control timeline did not converge after observed-alignment refinement: "
+                f"drift_patches={drifts}"
+            )
+        await build_schedule_suffix(mismatches[0])
+
+    _LOGGER.info(
+        "VoxCPM IPA SSML generated controls=%d passes=%d baseline_patches=%d "
+        "actual_patches=%d schedule_starts=%s observed_drift_patches=%s eager=true",
+        len(controls),
+        generation_passes,
+        baseline_patch_count,
+        len(audio) // patch_samples,
+        [int(schedule["start_patch"]) for schedule in schedules],
+        drifts,
+    )
+    controlled_breaks = (
+        resolve_ssml_breaks(
+            controlled_text,
+            len(audio),
+            runtime.sample_rate,
+            _voxcpm_controlled_breaks(document, controls),
+            timestamps,
+        )
+        if document.breaks
+        else []
+    )
+    return audio, runtime.sample_rate, controlled_breaks
+
+
 async def _postprocess_ssml_response(
     request: SynthesizeRequest,
     document: SSMLDocument,
@@ -2440,50 +2862,69 @@ async def _postprocess_ssml_response(
 ) -> Response:
     baseline_audio, sample_rate = _decode_wav_bytes(bytes(baseline_response.body))
     audio = baseline_audio
+    resolved_breaks: list[ResolvedPause] | None = None
 
     if document.pronunciations:
-        direct_audios, direct_rates = await _render_ssml_pronunciations(
-            request,
-            document,
-            resolved_model,
-        )
-        replacement_audios, replacement_rate = await _match_ssml_replacements_to_baseline_voice(
-            direct_audios,
-            direct_rates,
-            baseline_audio,
-            sample_rate,
-        )
-        if replacement_rate != sample_rate:
-            replacement_audios = [
-                _resample_audio(item, replacement_rate, sample_rate)
+        if _request_routes_to_voxcpm(request, resolved_model):
+            audio, sample_rate, resolved_breaks = await _synthesize_voxcpm_ipa_ssml(
+                request,
+                document,
+                baseline_audio,
+                sample_rate,
+                resolved_model,
+            )
+        else:
+            direct_audios, direct_rates = await _render_ssml_pronunciations(
+                request,
+                document,
+                resolved_model,
+            )
+            replacement_audios, replacement_rate = await _match_ssml_replacements_to_baseline_voice(
+                direct_audios,
+                direct_rates,
+                baseline_audio,
+                sample_rate,
+            )
+            if replacement_rate != sample_rate:
+                replacement_audios = [
+                    _resample_audio(item, replacement_rate, sample_rate)
+                    for item in replacement_audios
+                ]
+            baseline_timestamps = await _align_ssml_audio(
+                document.text, baseline_audio, sample_rate, request.language
+            )
+            replacement_timestamps = [
+                await _align_ssml_audio(document.text, item, sample_rate, request.language)
                 for item in replacement_audios
             ]
-        baseline_timestamps = await _align_ssml_audio(
-            document.text, baseline_audio, sample_rate, request.language
-        )
-        replacement_timestamps = [
-            await _align_ssml_audio(document.text, item, sample_rate, request.language)
-            for item in replacement_audios
-        ]
-        audio, _report = splice_pronunciations(
-            baseline_audio,
-            replacement_audios,
-            sample_rate,
-            document.pronunciations,
-            baseline_timestamps,
-            replacement_timestamps,
-            crossfade_seconds=_server_config.ssml.crossfade_seconds,
-        )
+            audio, _report = splice_pronunciations(
+                baseline_audio,
+                replacement_audios,
+                sample_rate,
+                document.pronunciations,
+                baseline_timestamps,
+                replacement_timestamps,
+                crossfade_seconds=_server_config.ssml.crossfade_seconds,
+            )
 
     if document.breaks:
-        timestamps = await _align_ssml_audio(document.text, audio, sample_rate, request.language)
-        audio, _report = insert_ssml_breaks(
-            document.text,
-            audio,
-            sample_rate,
-            document.breaks,
-            timestamps,
-        )
+        if resolved_breaks is not None:
+            audio, _report = insert_resolved_pauses(
+                audio,
+                sample_rate,
+                resolved_breaks,
+            )
+        else:
+            timestamps = await _align_ssml_audio(
+                document.text, audio, sample_rate, request.language
+            )
+            audio, _report = insert_ssml_breaks(
+                document.text,
+                audio,
+                sample_rate,
+                document.breaks,
+                timestamps,
+            )
 
     if request.format == "mp3":
         return _binary_response(_audio_to_mp3_bytes(audio, sample_rate), "audio/mpeg")
@@ -3979,7 +4420,16 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             has_operations = bool(document.operations)
-            plain_request = request.model_copy(
+            effective_request = request
+            if (
+                document.pronunciations
+                and _request_routes_to_voxcpm(request, model)
+                and request.seed is None
+            ):
+                effective_request = request.model_copy(
+                    update={"seed": secrets.randbits(63)}
+                )
+            plain_request = effective_request.model_copy(
                 update={
                     "text": document.text,
                     "ssml": None,
@@ -3991,7 +4441,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 return baseline_response
             try:
                 return await _postprocess_ssml_response(
-                    request,
+                    effective_request,
                     document,
                     baseline_response,
                     model,

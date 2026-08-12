@@ -35,6 +35,8 @@ class ModelInfoResponse(TypedDict):
     channels: int
     feat_dim: int
     patch_size: int
+    output_patch_samples: int
+    ipa_fade_out_ratio: float | None
     model_path: str
 
 
@@ -67,6 +69,7 @@ class VoxCPM2ServerImpl:
         enforce_eager: bool = False,
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
+        ipa_adapter_path: str | None = None,
     ):
         model_config = VoxCPM2Config.model_validate_json(open(os.path.join(model_path, "config.json")).read())
         model_config.inference_timesteps = inference_timesteps
@@ -84,11 +87,16 @@ class VoxCPM2ServerImpl:
             model_config=model_config,
             devices=devices,
             lora_config=lora_config,
+            ipa_adapter_path=ipa_adapter_path,
         )
         self.llm = VoxCPM2Engine(engine_config)
         model_runner = cast(VoxCPM2Runner, self.llm.model_runner)
         self.encoder_sample_rate = model_runner.vae.sample_rate
         self.output_sample_rate = model_runner.vae.out_sample_rate
+        self.output_patch_samples = int(
+            self.llm.patch_size * model_runner.vae.decoder_chunk_size
+        )
+        self.ipa_fade_out_ratio = model_runner.ipa_fade_out_ratio
 
     def health(self) -> HealthResponse:
         return HealthResponse(status="ok")
@@ -101,6 +109,8 @@ class VoxCPM2ServerImpl:
             channels=1,
             feat_dim=int(self.llm.feat_dim),
             patch_size=int(self.llm.patch_size),
+            output_patch_samples=self.output_patch_samples,
+            ipa_fade_out_ratio=self.ipa_fade_out_ratio,
             model_path=str(self.model_path),
         )
 
@@ -127,6 +137,8 @@ class VoxCPM2ServerImpl:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
+        ipa_controls: list[dict[str, Any]] | None = None,
+        min_generate_length: int = 0,
     ) -> None:
 
         if prompt_latents is None:
@@ -146,6 +158,8 @@ class VoxCPM2ServerImpl:
                 cfg_value=cfg_value,
                 lora_name=lora_name,
                 seed=seed,
+                ipa_controls=ipa_controls,
+                min_generate_length=min_generate_length,
             )
             return
 
@@ -168,6 +182,8 @@ class VoxCPM2ServerImpl:
             cfg_value=cfg_value,
             lora_name=lora_name,
             seed=seed,
+            ipa_controls=ipa_controls,
+            min_generate_length=min_generate_length,
         )
 
     def register_lora(self, name: str, path: str) -> RegisterLoRAResponse:
@@ -284,6 +300,7 @@ class AsyncVoxCPM2Server:
         enforce_eager: bool = False,
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
+        ipa_adapter_path: str | None = None,
         **kwargs,
     ) -> None:
         if len(kwargs) > 0:
@@ -307,6 +324,7 @@ class AsyncVoxCPM2Server:
                     enforce_eager,
                     devices,
                     lora_config,
+                    ipa_adapter_path,
                 ),
                 {},
             ),
@@ -453,6 +471,8 @@ class AsyncVoxCPM2Server:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
+        ipa_controls: list[dict[str, Any]] | None = None,
+        min_generate_length: int = 0,
     ) -> AsyncGenerator[Waveform, None]:
         seq_id = gen_uuid()
         self.stream_table[seq_id] = asyncio.Queue()
@@ -470,6 +490,8 @@ class AsyncVoxCPM2Server:
                 ref_audio_latents,
                 lora_name,
                 seed,
+                ipa_controls,
+                min_generate_length,
             )
             while True:
                 data = await self.stream_table[seq_id].get()
@@ -496,6 +518,7 @@ class AsyncVoxCPM2ServerPool:
         enforce_eager: bool = False,
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
+        ipa_adapter_path: str | None = None,
         **kwargs,
     ):
         if len(kwargs) > 0:
@@ -512,6 +535,7 @@ class AsyncVoxCPM2ServerPool:
                 enforce_eager=enforce_eager,
                 devices=[device_idx],
                 lora_config=lora_config,
+                ipa_adapter_path=ipa_adapter_path,
             )
             for device_idx in devices
         ]
@@ -591,6 +615,8 @@ class AsyncVoxCPM2ServerPool:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
+        ipa_controls: list[dict[str, Any]] | None = None,
+        min_generate_length: int = 0,
     ):
         if prompt_id is not None:
             if prompt_id not in self._prompt_pool:
@@ -620,6 +646,8 @@ class AsyncVoxCPM2ServerPool:
                 ref_audio_latents,
                 lora_name,
                 seed,
+                ipa_controls,
+                min_generate_length,
             ):
                 yield data
         finally:
@@ -639,6 +667,7 @@ class SyncVoxCPM2ServerPool:
         enforce_eager: bool = False,
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
+        ipa_adapter_path: str | None = None,
         **kwargs,
     ):
         async def init_async_server_pool():
@@ -653,6 +682,7 @@ class SyncVoxCPM2ServerPool:
                 enforce_eager=enforce_eager,
                 devices=devices,
                 lora_config=lora_config,
+                ipa_adapter_path=ipa_adapter_path,
                 **kwargs,
             )
 
@@ -706,6 +736,8 @@ class SyncVoxCPM2ServerPool:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
+        ipa_controls: list[dict[str, Any]] | None = None,
+        min_generate_length: int = 0,
     ):
         assert self.loop is not None
         async_gen = self.server_pool.generate(
@@ -719,6 +751,8 @@ class SyncVoxCPM2ServerPool:
             ref_audio_latents,
             lora_name,
             seed,
+            ipa_controls,
+            min_generate_length,
         )
         try:
             while True:

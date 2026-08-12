@@ -24,9 +24,10 @@ For *full* blocks (exactly ``block_size`` tokens), we compute a rolling hash of
 token ids. The hash of block i includes the hash of block i-1, so the hash is a
 function of the entire prefix up to that block.
 
-The hash chain is also namespaced by the sequence's LoRA adapter. KV states
-computed by the base model or by different adapters are not interchangeable,
-even when their text and audio tokens are identical.
+The hash chain is also namespaced by the sequence's LoRA adapter and any
+model-specific cache namespace. KV states computed by the base model,
+different adapters, or different side-channel controls are not
+interchangeable, even when their text and audio tokens are identical.
 
 This is crucial because transformer KV states depend on the full causal prefix;
 two identical blocks with different prefixes must not share KV memory.
@@ -114,9 +115,19 @@ class BlockManager:
 
     @classmethod
     def _initial_prefix_hash(cls, seq: Sequence) -> int:
-        if seq.adapter_id is None:
+        identity: list[int | bytes] = []
+        if seq.adapter_id is not None:
+            identity.extend(
+                (
+                    b"lora-adapter",
+                    int(seq.adapter_id).to_bytes(8, "little", signed=False),
+                )
+            )
+        if seq.cache_namespace is not None:
+            identity.extend((b"cache-namespace", seq.cache_namespace))
+        if not identity:
             return -1
-        return cls.compute_hash([b"lora-adapter", int(seq.adapter_id).to_bytes(8, "little", signed=False)])
+        return cls.compute_hash(identity)
 
     def _allocate_block(self, block_id: int) -> Block:
         block = self.blocks[block_id]

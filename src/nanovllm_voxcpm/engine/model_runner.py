@@ -923,7 +923,7 @@ class BaseModelRunner:
         )
 
     @torch.inference_mode()
-    def run_model(self, inputs: dict, is_prefill: bool):
+    def run_model(self, inputs: dict, is_prefill: bool, *, force_eager: bool = False):
         lora_contexts = {domain: get_lora_context(domain) for domain in LORA_DOMAINS}
         has_active_lora = any(
             not context.no_lora_flag and context.token_to_slot is not None for context in lora_contexts.values()
@@ -932,6 +932,7 @@ class BaseModelRunner:
         try:
             if (
                 is_prefill
+                or force_eager
                 or self.enforce_eager
                 or inputs["positions"].size(0) > 512
                 or (has_active_lora and not has_lora_graph)

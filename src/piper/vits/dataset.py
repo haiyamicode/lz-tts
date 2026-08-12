@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import wave
 from dataclasses import dataclass
@@ -333,6 +334,155 @@ class LengthBucketBatchSampler(torch.utils.data.Sampler[List[int]]):
         return total
 
 
+class SpeakerProbabilityBatchSampler(torch.utils.data.Sampler[List[int]]):
+    """Length-bucketed epoch sampler using configured speaker-group probabilities."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        boundaries: Sequence[int],
+        speaker_probabilities: dict[Optional[int], float],
+        seed: int = 1234,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ) -> None:
+        super().__init__()
+        self.lengths = _dataset_lengths(dataset)
+        speaker_ids = _dataset_speaker_ids(dataset)
+        self.batch_size = int(batch_size)
+        self.boundaries = sorted(int(boundary) for boundary in boundaries)
+        self.speaker_probabilities = {
+            speaker_id: float(probability)
+            for speaker_id, probability in speaker_probabilities.items()
+        }
+        if not self.speaker_probabilities:
+            raise ValueError("speaker_probabilities cannot be empty")
+        if any(probability <= 0.0 for probability in self.speaker_probabilities.values()):
+            raise ValueError("All speaker sampling probabilities must be positive")
+        if abs(sum(self.speaker_probabilities.values()) - 1.0) > 1e-6:
+            raise ValueError("Speaker sampling probabilities must sum to 1")
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.epoch = 0
+
+        eligible = [
+            index
+            for index, length in enumerate(self.lengths)
+            if self._bucket_index(int(length)) >= 0
+        ]
+        explicit_ids = {
+            speaker_id for speaker_id in self.speaker_probabilities if speaker_id is not None
+        }
+        self.group_indices: dict[Optional[int], List[int]] = {
+            speaker_id: [] for speaker_id in self.speaker_probabilities
+        }
+        for index in eligible:
+            speaker_id = speaker_ids[index]
+            group = speaker_id if speaker_id in explicit_ids else None
+            if group in self.group_indices:
+                self.group_indices[group].append(index)
+        empty = [group for group, indices in self.group_indices.items() if not indices]
+        if empty:
+            raise ValueError(f"Speaker sampling groups have no rows: {empty}")
+
+        self.epoch_size = max(
+            math.ceil(len(self.group_indices[group]) / probability)
+            for group, probability in self.speaker_probabilities.items()
+        )
+        self.group_counts = self._allocate_group_counts(self.epoch_size)
+        while any(
+            self.group_counts[group] < len(indices)
+            for group, indices in self.group_indices.items()
+        ):
+            self.epoch_size += 1
+            self.group_counts = self._allocate_group_counts(self.epoch_size)
+        self._cached_epoch: Optional[int] = None
+        self._cached_batches: Optional[List[List[int]]] = None
+        _LOGGER.info(
+            "Speaker probability sampler: probabilities=%s natural_counts=%s "
+            "epoch_counts=%s",
+            self.speaker_probabilities,
+            {group: len(indices) for group, indices in self.group_indices.items()},
+            self.group_counts,
+        )
+
+    def _allocate_group_counts(self, total: int) -> dict[Optional[int], int]:
+        raw = {
+            group: total * probability
+            for group, probability in self.speaker_probabilities.items()
+        }
+        counts = {group: math.floor(value) for group, value in raw.items()}
+        remaining = total - sum(counts.values())
+        order = sorted(raw, key=lambda group: raw[group] - counts[group], reverse=True)
+        for group in order[:remaining]:
+            counts[group] += 1
+        return counts
+
+    def _bucket_index(self, length: int) -> int:
+        for index in range(len(self.boundaries) - 1):
+            if self.boundaries[index] < length <= self.boundaries[index + 1]:
+                return index
+        return -1
+
+    @staticmethod
+    def _draw_indices(
+        pool: Sequence[int], count: int, generator: torch.Generator
+    ) -> List[int]:
+        drawn: List[int] = []
+        while len(drawn) < count:
+            order = torch.randperm(len(pool), generator=generator).tolist()
+            remaining = count - len(drawn)
+            drawn.extend(pool[index] for index in order[:remaining])
+        return drawn
+
+    def _build_batches(self, epoch: int) -> List[List[int]]:
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + epoch)
+
+        sampled: List[int] = []
+        for group, pool in self.group_indices.items():
+            sampled.extend(
+                self._draw_indices(pool, self.group_counts[group], generator)
+            )
+        buckets: List[List[int]] = [[] for _ in range(len(self.boundaries) - 1)]
+        for index in sampled:
+            buckets[self._bucket_index(self.lengths[index])].append(index)
+
+        batches: List[List[int]] = []
+        for bucket in buckets:
+            if not bucket:
+                continue
+            if self.shuffle:
+                order = torch.randperm(len(bucket), generator=generator).tolist()
+                bucket = [bucket[index] for index in order]
+            for start in range(0, len(bucket), self.batch_size):
+                batch = bucket[start : start + self.batch_size]
+                if len(batch) == self.batch_size or (batch and not self.drop_last):
+                    batches.append(batch)
+        if self.shuffle and len(batches) > 1:
+            order = torch.randperm(len(batches), generator=generator).tolist()
+            batches = [batches[index] for index in order]
+        return batches
+
+    def _current_batches(self) -> List[List[int]]:
+        if self._cached_epoch != self.epoch or self._cached_batches is None:
+            self._cached_epoch = self.epoch
+            self._cached_batches = self._build_batches(self.epoch)
+        return self._cached_batches
+
+    def __iter__(self) -> Iterator[List[int]]:
+        batches = self._current_batches()
+        self.epoch += 1
+        self._cached_epoch = None
+        self._cached_batches = None
+        return iter(batches)
+
+    def __len__(self) -> int:
+        return len(self._current_batches())
+
+
 def _dataset_lengths(dataset: Dataset) -> List[int]:
     if hasattr(dataset, "lengths"):
         return [int(length) for length in getattr(dataset, "lengths")]
@@ -345,6 +495,20 @@ def _dataset_lengths(dataset: Dataset) -> List[int]:
             return [int(parent_lengths[index]) for index in indices]
 
     raise ValueError("Dataset does not expose length metadata for bucketing")
+
+
+def _dataset_speaker_ids(dataset: Dataset) -> List[Optional[int]]:
+    if hasattr(dataset, "utterances"):
+        return [utterance.speaker_id for utterance in getattr(dataset, "utterances")]
+
+    if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+        parent = getattr(dataset, "dataset")
+        indices = getattr(dataset, "indices")
+        if hasattr(parent, "utterances"):
+            utterances = getattr(parent, "utterances")
+            return [utterances[index].speaker_id for index in indices]
+
+    raise ValueError("Dataset does not expose speaker metadata for balancing")
 
 
 class UtteranceCollate:

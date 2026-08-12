@@ -44,6 +44,7 @@ _DEFAULTS: dict[str, Any] = {
     "num_workers": 1,
     "use_length_buckets": False,
     "bucket_boundaries": None,
+    "training_sampler_prob": None,
     "validation_split": 0.1,
     "num_test_examples": 5,
     "max_phoneme_ids": None,

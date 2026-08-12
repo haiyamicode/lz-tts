@@ -24,6 +24,14 @@ class PauseMarker:
     prefix_text: str
     source_start: int
     source_end: int
+    alignment_position: int | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedPause:
+    cut_sample: int
+    markers: tuple[PauseMarker, ...]
+    details: dict[str, Any]
 
 
 def parse_pause_markers(text: str, *, maximum_seconds: float = 60.0) -> tuple[str, list[PauseMarker]]:
@@ -82,6 +90,24 @@ def _is_spoken_segment(value: str) -> bool:
 
 def _alignment_boundary(marker: PauseMarker, word_timestamps: list[dict[str, Any]]) -> int:
     """Map a source-text marker to the aligner's language-dependent segments."""
+    if marker.alignment_position is not None:
+        try:
+            starts = [int(word["source_start"]) for word in word_timestamps]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "Forced alignment does not expose valid source offsets for SSML breaks"
+            ) from exc
+        if starts != sorted(starts):
+            raise ValueError("Forced-alignment source offsets are not monotonic")
+        return next(
+            (
+                index
+                for index, source_start in enumerate(starts)
+                if source_start >= marker.alignment_position
+            ),
+            len(starts),
+        )
+
     target = _normalized_alignment_text(marker.prefix_text)
     if not target:
         return 0
@@ -191,20 +217,17 @@ def _resolve_cut(
     }
 
 
-def insert_aligned_pauses(
-    audio: np.ndarray,
+def resolve_aligned_pauses(
+    audio_samples: int,
     sample_rate: int,
     markers: list[PauseMarker],
     word_timestamps: list[dict[str, Any]],
-    *,
-    fade_seconds: float = 0.005,
-) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Insert silence at forced-aligned word gaps after one continuous generation."""
-    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+) -> list[ResolvedPause]:
+    """Resolve forced-aligned pause markers to source-audio sample cuts."""
+    if audio_samples < 0:
+        raise ValueError("audio_samples must not be negative")
     if sample_rate <= 0:
         raise ValueError("sample_rate must be positive")
-    if fade_seconds < 0:
-        raise ValueError("fade_seconds must not be negative")
     if not word_timestamps:
         raise ValueError("Forced aligner returned no word timestamps")
 
@@ -212,7 +235,7 @@ def insert_aligned_pauses(
     for marker in markers:
         alignment_word_index = _alignment_boundary(marker, word_timestamps)
         cut, cut_details = _resolve_cut(
-            audio.size,
+            audio_samples,
             sample_rate,
             alignment_word_index,
             word_timestamps,
@@ -233,12 +256,42 @@ def insert_aligned_pauses(
             raise ValueError("Identical text boundaries resolved to different audio positions")
         insertion["markers"].append(marker)
 
-    insertions = sorted(insertions_by_boundary.values(), key=lambda item: item["cut"])
+    return [
+        ResolvedPause(
+            cut_sample=int(insertion["cut"]),
+            markers=tuple(insertion["markers"]),
+            details=dict(insertion["details"]),
+        )
+        for insertion in sorted(
+            insertions_by_boundary.values(), key=lambda item: item["cut"]
+        )
+    ]
+
+
+def insert_resolved_pauses(
+    audio: np.ndarray,
+    sample_rate: int,
+    insertions: list[ResolvedPause],
+    *,
+    fade_seconds: float = 0.005,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Insert silence at pre-resolved source-audio sample cuts."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    if fade_seconds < 0:
+        raise ValueError("fade_seconds must not be negative")
+    if any(not insertion.markers for insertion in insertions):
+        raise ValueError("Resolved pause insertion has no markers")
+    if any(not 0 <= insertion.cut_sample <= audio.size for insertion in insertions):
+        raise ValueError("Resolved pause cut is outside the audio")
+
+    insertions = sorted(insertions, key=lambda item: item.cut_sample)
     spliced_audio = audio.copy()
     fade_samples = round(fade_seconds * sample_rate)
     if fade_samples:
         for insertion in insertions:
-            cut = insertion["cut"]
+            cut = insertion.cut_sample
             if cut == 0 or cut == spliced_audio.size:
                 continue
             fade_out_start = max(0, cut - fade_samples)
@@ -265,9 +318,9 @@ def insert_aligned_pauses(
     cursor = 0
     inserted_samples = 0
     for insertion in insertions:
-        cut = insertion["cut"]
-        markers_at_boundary: list[PauseMarker] = insertion["markers"]
-        details = insertion["details"]
+        cut = insertion.cut_sample
+        markers_at_boundary = insertion.markers
+        details = insertion.details
         if cut < cursor:
             raise ValueError("Pause boundaries are not monotonic")
         pieces.append(spliced_audio[cursor:cut])
@@ -292,4 +345,35 @@ def insert_aligned_pauses(
     return np.concatenate(pieces), report
 
 
-__all__ = ["PauseMarker", "insert_aligned_pauses", "parse_pause_markers"]
+def insert_aligned_pauses(
+    audio: np.ndarray,
+    sample_rate: int,
+    markers: list[PauseMarker],
+    word_timestamps: list[dict[str, Any]],
+    *,
+    fade_seconds: float = 0.005,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Insert silence at forced-aligned word gaps after one continuous generation."""
+    flattened = np.asarray(audio, dtype=np.float32).reshape(-1)
+    resolved = resolve_aligned_pauses(
+        flattened.size,
+        sample_rate,
+        markers,
+        word_timestamps,
+    )
+    return insert_resolved_pauses(
+        flattened,
+        sample_rate,
+        resolved,
+        fade_seconds=fade_seconds,
+    )
+
+
+__all__ = [
+    "PauseMarker",
+    "ResolvedPause",
+    "insert_aligned_pauses",
+    "insert_resolved_pauses",
+    "parse_pause_markers",
+    "resolve_aligned_pauses",
+]
