@@ -205,6 +205,26 @@ def train_from_args(
                 sdp_ratio=float(args.utmos_sdp_ratio),
             )
         )
+    if getattr(args, "scoreq_enabled", False):
+        callbacks.append(
+            ScoreqQualityCallback(
+                every_n_epochs=int(args.scoreq_every_n_epochs),
+                num_samples=int(args.scoreq_num_samples),
+                output_dir=args.scoreq_output_dir,
+                python_bin=args.scoreq_python,
+                script_path=args.scoreq_script,
+                model_path=args.scoreq_model,
+                window_seconds=float(args.scoreq_window_seconds),
+                hop_ratio=float(args.scoreq_hop_ratio),
+                min_threshold=float(args.scoreq_min_threshold),
+                mean_threshold=float(args.scoreq_mean_threshold),
+                cpu_threads=int(args.scoreq_cpu_threads),
+                noise_scale=float(args.scoreq_noise_scale),
+                length_scale=float(args.scoreq_length_scale),
+                noise_w=float(args.scoreq_noise_w),
+                sdp_ratio=float(args.scoreq_sdp_ratio),
+            )
+        )
     if bool(getattr(args, "epoch_summary_log", True)):
         callbacks.append(EpochSummaryCallback())
 
@@ -272,6 +292,24 @@ def add_quality_monitor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--utmos-length-scale", type=float, default=1.0)
     parser.add_argument("--utmos-noise-w", type=float, default=0.8)
     parser.add_argument("--utmos-sdp-ratio", type=float, default=0.2)
+    parser.add_argument("--scoreq-enabled", action="store_true")
+    parser.add_argument("--scoreq-every-n-epochs", type=int, default=10)
+    parser.add_argument("--scoreq-num-samples", type=int, default=10)
+    parser.add_argument("--scoreq-output-dir")
+    parser.add_argument("--scoreq-python", default=".venv/bin/python")
+    parser.add_argument(
+        "--scoreq-script", default="scripts/score_dpo_scoreq_windows.py"
+    )
+    parser.add_argument("--scoreq-model")
+    parser.add_argument("--scoreq-window-seconds", type=float, default=0.75)
+    parser.add_argument("--scoreq-hop-ratio", type=float, default=0.25)
+    parser.add_argument("--scoreq-min-threshold", type=float, default=3.5)
+    parser.add_argument("--scoreq-mean-threshold", type=float, default=3.7)
+    parser.add_argument("--scoreq-cpu-threads", type=int, default=16)
+    parser.add_argument("--scoreq-noise-scale", type=float, default=0.667)
+    parser.add_argument("--scoreq-length-scale", type=float, default=1.0)
+    parser.add_argument("--scoreq-noise-w", type=float, default=0.8)
+    parser.add_argument("--scoreq-sdp-ratio", type=float, default=0.2)
 
 
 def apply_quality_preset(args: dict[str, Any], quality: str) -> None:
@@ -795,6 +833,39 @@ class LatestCheckpointCallback(Callback):
         return self.retain_every > 0 and epoch > 0 and epoch % self.retain_every == 0
 
 
+def _build_quality_bert_input(pl_module: VitsModel, utt):
+    features = getattr(utt, "bert_features", None)
+    if features is not None:
+        return {"features": features.unsqueeze(0).to(pl_module.device)}
+
+    text = getattr(utt, "text", None)
+    if not getattr(pl_module.hparams, "use_bert", False) or not text:
+        return None
+    if getattr(pl_module.hparams, "bert_features_precomputed", False):
+        raise ValueError(
+            "Quality sample is missing precomputed BERT features; regenerate "
+            "dataset.parquet with bert_path entries"
+        )
+
+    from .semantic import SemanticTokenizer, build_bert_input
+
+    if pl_module._semantic_tokenizer is None:
+        model_name = getattr(pl_module.hparams, "bert_model_name", None)
+        pl_module._semantic_tokenizer = SemanticTokenizer(model_name=model_name)
+
+    phoneme_ids = getattr(utt, "phoneme_ids", None)
+    phoneme_length = int(phoneme_ids.size(0)) if phoneme_ids is not None else None
+    bert_dict = build_bert_input(
+        [text],
+        pl_module._semantic_tokenizer,
+        phoneme_lengths=[phoneme_length] if phoneme_length is not None else None,
+        word_spans=[getattr(utt, "word_spans", None)],
+    )
+    if bert_dict is None:
+        return None
+    return {key: value.to(pl_module.device) for key, value in bert_dict.items()}
+
+
 class UtmosQualityCallback(Callback):
     def __init__(
         self,
@@ -912,38 +983,7 @@ class UtmosQualityCallback(Callback):
             writer.add_scalar("utmos/max", max_score, epoch)
 
     def _build_bert_input(self, pl_module: VitsModel, utt):
-        features = getattr(utt, "bert_features", None)
-        if features is not None:
-            return {"features": features.unsqueeze(0).to(pl_module.device)}
-
-        text = getattr(utt, "text", None)
-        if not getattr(pl_module.hparams, "use_bert", False) or not text:
-            return None
-        if getattr(pl_module.hparams, "bert_features_precomputed", False):
-            raise ValueError(
-                "UTMOS sample is missing precomputed BERT features; regenerate dataset.parquet with bert_path entries"
-            )
-
-        from .semantic import SemanticTokenizer, build_bert_input
-
-        if pl_module._semantic_tokenizer is None:
-            model_name = getattr(pl_module.hparams, "bert_model_name", None)
-            pl_module._semantic_tokenizer = SemanticTokenizer(model_name=model_name)
-
-        phoneme_ids = getattr(utt, "phoneme_ids", None)
-        phoneme_length = int(phoneme_ids.size(0)) if phoneme_ids is not None else None
-        bert_dict = build_bert_input(
-            [text],
-            pl_module._semantic_tokenizer,
-            phoneme_lengths=[phoneme_length] if phoneme_length is not None else None,
-            word_spans=[getattr(utt, "word_spans", None)],
-        )
-        if bert_dict is None:
-            return None
-        return {
-            key: value.to(pl_module.device)
-            for key, value in bert_dict.items()
-        }
+        return _build_quality_bert_input(pl_module, utt)
 
     def _score_wavs(self, wav_paths: list[Path]) -> dict[str, float]:
         python_bin = Path(self.python_bin)
@@ -1037,6 +1077,243 @@ class UtmosQualityCallback(Callback):
             writer.writerows(rows)
         with (sample_dir / "utmos_scores.json").open("w", encoding="utf-8") as f:
             json.dump(rows, f, indent=2, ensure_ascii=False)
+
+
+class ScoreqQualityCallback(Callback):
+    """Synthesize held-out samples and score overlapping windows with SCOREQ."""
+
+    _SCORE_FIELDS = (
+        "window_min",
+        "window_mean",
+        "window_median",
+        "window_p10",
+    )
+
+    def __init__(
+        self,
+        every_n_epochs: int,
+        num_samples: int,
+        output_dir: str | None,
+        python_bin: str,
+        script_path: str,
+        model_path: str | None,
+        window_seconds: float,
+        hop_ratio: float,
+        min_threshold: float,
+        mean_threshold: float,
+        cpu_threads: int,
+        noise_scale: float,
+        length_scale: float,
+        noise_w: float,
+        sdp_ratio: float,
+    ) -> None:
+        super().__init__()
+        self.every_n_epochs = max(1, every_n_epochs)
+        self.num_samples = max(1, num_samples)
+        self.output_dir = output_dir
+        self.python_bin = Path(python_bin)
+        self.script_path = Path(script_path)
+        self.model_path = Path(model_path) if model_path else None
+        self.window_seconds = window_seconds
+        self.hop_ratio = hop_ratio
+        self.min_threshold = min_threshold
+        self.mean_threshold = mean_threshold
+        self.cpu_threads = max(1, cpu_threads)
+        self.scales = [noise_scale, length_scale, noise_w, sdp_ratio]
+
+        missing = [
+            str(path)
+            for path in (self.python_bin, self.script_path, self.model_path)
+            if path is None or not path.is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"SCOREQ quality monitor dependencies are missing: {', '.join(missing)}"
+            )
+
+    def on_train_epoch_end(self, trainer: Trainer, pl_module: VitsModel) -> None:
+        epoch = int(trainer.current_epoch) + 1
+        if epoch % self.every_n_epochs != 0 and epoch != int(trainer.max_epochs):
+            return
+        if not getattr(trainer, "is_global_zero", True):
+            return
+
+        sample_dataset = getattr(pl_module, "_test_dataset", None)
+        if sample_dataset is None or len(sample_dataset) == 0:
+            _LOGGER.warning("SCOREQ monitor has no held-out samples to synthesize")
+            return
+
+        root = Path(
+            self.output_dir
+            or Path(trainer.default_root_dir) / "quality" / "scoreq_samples"
+        )
+        sample_dir = root / f"epoch_{epoch:04d}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        rows = self._synthesize(pl_module, sample_dataset, sample_dir)
+        scores = self._score(sample_dir, rows)
+
+        for row in rows:
+            result = scores.get(str(Path(row["path"]).resolve()))
+            for field in self._SCORE_FIELDS:
+                row[field] = result[field] if result is not None else ""
+        self._write_scores(sample_dir, rows)
+
+        completed = [row for row in rows if row["window_min"] != ""]
+        if not completed:
+            _LOGGER.warning("SCOREQ monitor produced no scores for epoch %s", epoch)
+            return
+
+        metrics = {
+            "window_min": float(min(row["window_min"] for row in completed)),
+            "window_min_mean": float(
+                np.mean([row["window_min"] for row in completed])
+            ),
+            "window_mean": float(np.mean([row["window_mean"] for row in completed])),
+            "window_p10_mean": float(
+                np.mean([row["window_p10"] for row in completed])
+            ),
+        }
+        _LOGGER.info(
+            "SCOREQ epoch %s: window_min=%.4f min_mean=%.4f mean=%.4f "
+            "p10_mean=%.4f n=%s",
+            epoch,
+            metrics["window_min"],
+            metrics["window_min_mean"],
+            metrics["window_mean"],
+            metrics["window_p10_mean"],
+            len(completed),
+        )
+        if trainer.logger is not None:
+            writer = trainer.logger.experiment
+            for name, value in metrics.items():
+                writer.add_scalar(f"scoreq/{name}", value, epoch)
+
+    def _synthesize(self, pl_module, sample_dataset, sample_dir):
+        was_training = pl_module.training
+        rows: list[dict[str, Any]] = []
+        pl_module.eval()
+        try:
+            with torch.inference_mode():
+                for idx in range(min(self.num_samples, len(sample_dataset))):
+                    utt = sample_dataset[idx]
+                    wav_path = sample_dir / f"{idx:03d}.wav"
+                    text = utt.phoneme_ids.unsqueeze(0).to(pl_module.device)
+                    text_lengths = torch.LongTensor([len(utt.phoneme_ids)]).to(
+                        pl_module.device
+                    )
+                    sid = (
+                        utt.speaker_id.to(pl_module.device)
+                        if utt.speaker_id is not None
+                        else None
+                    )
+                    audio = pl_module(
+                        text,
+                        text_lengths,
+                        self.scales,
+                        sid=sid,
+                        bert_input=_build_quality_bert_input(pl_module, utt),
+                    )
+                    audio_np = audio.detach().float().cpu().numpy().reshape(-1)
+                    write_wav(
+                        str(wav_path),
+                        int(pl_module.hparams.sample_rate),
+                        audio_float_to_int16(audio_np),
+                    )
+                    rows.append(
+                        {
+                            "index": idx,
+                            "path": str(wav_path),
+                            "speaker_id": int(utt.speaker_id.item())
+                            if utt.speaker_id is not None
+                            else "",
+                            "text": utt.text or "",
+                        }
+                    )
+        finally:
+            if was_training:
+                pl_module.train()
+        return rows
+
+    def _score(
+        self, sample_dir: Path, rows: list[dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        manifest_path = sample_dir / "scoreq_manifest.jsonl"
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(
+                    json.dumps(
+                        {
+                            "item_id": f"sample_{row['index']:03d}",
+                            "text": row["text"],
+                            "audio_path": str(Path(row["path"]).resolve()),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+        score_dir = sample_dir / "scoreq"
+        # A restarted epoch can regenerate these WAVs. The DPO scorer supports
+        # resuming manifests, but cached scores would then describe stale audio.
+        (score_dir / "scores.jsonl").unlink(missing_ok=True)
+        (score_dir / "summary.json").unlink(missing_ok=True)
+        command = [
+            str(self.python_bin),
+            str(self.script_path),
+            "--manifest",
+            str(manifest_path),
+            "--audio-field",
+            "audio_path",
+            "--id-field",
+            "item_id",
+            "--output-dir",
+            str(score_dir),
+            "--model",
+            str(self.model_path),
+            "--window-seconds",
+            str(self.window_seconds),
+            "--hop-ratio",
+            str(self.hop_ratio),
+            "--min-threshold",
+            str(self.min_threshold),
+            "--mean-threshold",
+            str(self.mean_threshold),
+            "--listening-count",
+            "0",
+            "--cpu-threads",
+            str(self.cpu_threads),
+        ]
+        completed = subprocess.run(
+            command, capture_output=True, text=True, check=False
+        )
+        if completed.returncode != 0:
+            _LOGGER.warning(
+                "SCOREQ scoring failed with exit code %s: %s",
+                completed.returncode,
+                completed.stderr.strip() or completed.stdout.strip(),
+            )
+            return {}
+
+        results: dict[str, dict[str, Any]] = {}
+        with (score_dir / "scores.jsonl").open(encoding="utf-8") as handle:
+            for line in handle:
+                result = json.loads(line)
+                results[result["audio_path"]] = result
+        return results
+
+    @classmethod
+    def _write_scores(cls, sample_dir: Path, rows: list[dict[str, Any]]) -> None:
+        fields = ["index", "path", "speaker_id", "text", *cls._SCORE_FIELDS]
+        with (sample_dir / "scoreq_scores.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        with (sample_dir / "scoreq_scores.json").open(
+            "w", encoding="utf-8"
+        ) as handle:
+            json.dump(rows, handle, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":

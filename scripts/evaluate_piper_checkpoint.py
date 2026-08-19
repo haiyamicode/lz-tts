@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate and score Piper checkpoint samples.
+"""Generate and score Piper checkpoint samples with windowed SCOREQ.
 
 This is the reusable script for the repeated "test latest checkpoint" workflow:
 
@@ -11,7 +11,7 @@ This is the reusable script for the repeated "test latest checkpoint" workflow:
 
 It writes:
   - prompts.json: full per-sample metadata
-  - utmos_scores.csv: score table
+  - scoreq_scores.csv: score table
   - summary.json: aggregate metrics
 """
 
@@ -21,7 +21,6 @@ import argparse
 import csv
 import json
 import math
-import os
 import re
 import subprocess
 import time
@@ -29,9 +28,18 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import yaml
 
 from src.piper import PiperInference
 from src.piper.vits.wavfile import write as write_wav
+
+
+SCOREQ_FIELDS = (
+    "window_min",
+    "window_mean",
+    "window_median",
+    "window_p10",
+)
 
 
 DEFAULT_ENGLISH_PROMPTS: list[dict[str, str]] = [
@@ -114,9 +122,15 @@ def load_prompts(path: Path | None) -> list[dict[str, str]]:
         return list(DEFAULT_ENGLISH_PROMPTS)
 
     with path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
+        payload = (
+            yaml.safe_load(f)
+            if path.suffix.lower() in {".yaml", ".yml"}
+            else json.load(f)
+        )
 
     if isinstance(payload, dict):
+        if isinstance(payload.get("evaluation"), dict):
+            payload = payload["evaluation"]
         if "prompts" in payload:
             payload = payload["prompts"]
         elif "items" in payload:
@@ -125,7 +139,7 @@ def load_prompts(path: Path | None) -> list[dict[str, str]]:
             raise ValueError(f"Unsupported prompt object keys in {path}")
 
     if not isinstance(payload, list):
-        raise ValueError(f"Prompt file must contain a JSON list: {path}")
+        raise ValueError(f"Prompt configuration must contain a prompt list: {path}")
 
     prompts: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
@@ -143,7 +157,12 @@ def load_prompts(path: Path | None) -> list[dict[str, str]]:
                 continue
             row = {
                 "language": str(item.get("language") or item.get("lang") or "en"),
-                "speaker": str(item.get("speaker") or item.get("language") or item.get("lang") or "en"),
+                "speaker": str(
+                    item.get("speaker")
+                    or item.get("language")
+                    or item.get("lang")
+                    or "en"
+                ),
                 "source": str(item.get("source") or "prompt_file"),
                 "text": text,
             }
@@ -161,60 +180,92 @@ def load_prompts(path: Path | None) -> list[dict[str, str]]:
     return prompts
 
 
-def score_utmos(
-    wav_paths: list[Path],
+def load_scoreq_config(path: Path | None) -> dict[str, Any]:
+    if path is None or path.suffix.lower() not in {".yaml", ".yml"}:
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    if not isinstance(payload, dict):
+        return {}
+    monitor = payload.get("quality_monitor")
+    return monitor if isinstance(monitor, dict) else {}
+
+
+def score_scoreq(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    *,
     python_bin: Path,
-    worker_path: Path,
-) -> dict[str, float]:
-    if not python_bin.exists():
-        raise FileNotFoundError(f"UTMOS python not found: {python_bin}")
-    if not worker_path.exists():
-        raise FileNotFoundError(f"UTMOS worker not found: {worker_path}")
+    script_path: Path,
+    model_path: Path,
+    window_seconds: float,
+    hop_ratio: float,
+    min_threshold: float,
+    mean_threshold: float,
+    cpu_threads: int,
+) -> dict[str, dict[str, Any]]:
+    for dependency in (python_bin, script_path, model_path):
+        if not dependency.is_file():
+            raise FileNotFoundError(dependency)
 
-    env = os.environ.copy()
-    proc = subprocess.Popen(
-        [str(python_bin), str(worker_path)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
-    assert proc.stdin is not None
-    assert proc.stdout is not None
-
-    scores: dict[str, float] = {}
-    try:
-        ready = proc.stdout.readline()
-        if not ready:
-            raise RuntimeError("UTMOS worker did not start")
-
-        for idx, wav_path in enumerate(wav_paths):
-            proc.stdin.write(json.dumps({"id": idx, "path": str(wav_path)}) + "\n")
-            proc.stdin.flush()
-            line = proc.stdout.readline()
-            if not line:
-                raise RuntimeError(f"UTMOS worker stopped while scoring {wav_path}")
-            response = json.loads(line)
-            if "mos_score" not in response:
-                raise RuntimeError(f"UTMOS scoring failed for {wav_path}: {response}")
-            scores[str(wav_path)] = float(response["mos_score"])
-    finally:
-        if proc.stdin:
-            proc.stdin.close()
-        stderr = proc.stderr.read() if proc.stderr else ""
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
-        if stderr.strip():
-            (Path.cwd() / "local/data/exp/utmos_worker_stderr.log").write_text(
-                stderr,
-                encoding="utf-8",
+    manifest_path = output_dir / "scoreq_manifest.jsonl"
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(
+                json.dumps(
+                    {
+                        "item_id": f"sample_{row['index']:04d}",
+                        "text": row["text"],
+                        "audio_path": str(Path(row["path"]).resolve()),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
             )
 
+    score_dir = output_dir / "scoreq"
+    # Audio generation is stochastic and may overwrite an existing run name.
+    # Never reuse scores that were computed for the previous contents.
+    (score_dir / "scores.jsonl").unlink(missing_ok=True)
+    (score_dir / "summary.json").unlink(missing_ok=True)
+    command = [
+        str(python_bin),
+        str(script_path),
+        "--manifest",
+        str(manifest_path),
+        "--audio-field",
+        "audio_path",
+        "--id-field",
+        "item_id",
+        "--output-dir",
+        str(score_dir),
+        "--model",
+        str(model_path),
+        "--window-seconds",
+        str(window_seconds),
+        "--hop-ratio",
+        str(hop_ratio),
+        "--min-threshold",
+        str(min_threshold),
+        "--mean-threshold",
+        str(mean_threshold),
+        "--listening-count",
+        "0",
+        "--cpu-threads",
+        str(cpu_threads),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "SCOREQ scoring failed: "
+            + (completed.stderr.strip() or completed.stdout.strip())
+        )
+
+    scores: dict[str, dict[str, Any]] = {}
+    with (score_dir / "scores.jsonl").open(encoding="utf-8") as handle:
+        for line in handle:
+            result = json.loads(line)
+            scores[result["audio_path"]] = result
     return scores
 
 
@@ -248,8 +299,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True, help="Piper config.json")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--run-name", help="Subdirectory/run label for this evaluation")
-    parser.add_argument("--prompts", type=Path, help="JSON prompt list; defaults to English custom set")
+    parser.add_argument(
+        "--prompts",
+        type=Path,
+        help="JSON prompt list or experiment YAML with evaluation.prompts; defaults to English custom set",
+    )
     parser.add_argument("--speaker", help="Force speaker label for every prompt")
+    parser.add_argument(
+        "--samples-per-prompt",
+        type=int,
+        default=1,
+        help="Number of independent stochastic generations for each prompt",
+    )
     parser.add_argument("--device", default="cuda", help="Torch device for synthesis")
     parser.add_argument("--noise-scale", type=float)
     parser.add_argument("--length-scale", type=float)
@@ -266,13 +327,23 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Use neural heteronym frontend; enabled by default to match production",
     )
-    parser.add_argument("--no-utmos", action="store_true", help="Skip UTMOS scoring")
-    parser.add_argument("--utmos-python", type=Path, default=Path("local/utmos_probe/.venv/bin/python"))
-    parser.add_argument("--utmos-worker", type=Path, default=Path("local/utmos_probe/utmos_stdin_worker.py"))
+    parser.add_argument(
+        "--no-scoreq", action="store_true", help="Skip windowed SCOREQ scoring"
+    )
+    parser.add_argument("--scoreq-python", type=Path)
+    parser.add_argument("--scoreq-script", type=Path)
+    parser.add_argument("--scoreq-model", type=Path)
+    parser.add_argument("--scoreq-window-seconds", type=float)
+    parser.add_argument("--scoreq-hop-ratio", type=float)
+    parser.add_argument("--scoreq-min-threshold", type=float)
+    parser.add_argument("--scoreq-mean-threshold", type=float)
+    parser.add_argument("--scoreq-cpu-threads", type=int)
     args = parser.parse_args()
 
     if args.checkpoint is None and args.experiment_root is None:
         parser.error("provide --checkpoint or --experiment-root")
+    if args.samples_per_prompt < 1:
+        parser.error("--samples-per-prompt must be at least 1")
     return args
 
 
@@ -305,45 +376,83 @@ def main() -> None:
             synth_kwargs[key] = value
 
     rows: list[dict[str, Any]] = []
-    wav_paths: list[Path] = []
-    for index, prompt in enumerate(prompts):
+    total_samples = len(prompts) * args.samples_per_prompt
+    for prompt_index, prompt in enumerate(prompts):
         text = prompt["text"]
         speaker = args.speaker if args.speaker is not None else prompt.get("speaker")
         language = prompt.get("language") or speaker or ""
-        name = f"{index:03d}_{language}_{safe_name(text)}.wav"
-        wav_path = run_dir / name
+        for sample_index in range(args.samples_per_prompt):
+            index = prompt_index * args.samples_per_prompt + sample_index
+            variant = (
+                f"_sample{sample_index + 1:02d}" if args.samples_per_prompt > 1 else ""
+            )
+            name = f"{prompt_index:03d}_{language}_{safe_name(text)}{variant}.wav"
+            wav_path = run_dir / name
 
-        start = time.perf_counter()
-        audio = inference.synthesize(text, speaker=speaker, **synth_kwargs)
-        infer_sec = time.perf_counter() - start
-        write_wav(str(wav_path), inference.sample_rate, audio)
+            start = time.perf_counter()
+            audio = inference.synthesize(text, speaker=speaker, **synth_kwargs)
+            infer_sec = time.perf_counter() - start
+            write_wav(str(wav_path), inference.sample_rate, audio)
 
-        duration_sec = float(len(audio) / inference.sample_rate)
-        rtf = float(infer_sec / duration_sec) if duration_sec > 0 else math.nan
-        row = {
-            "run": run_name,
-            "index": index,
-            "language": language,
-            "speaker": speaker,
-            "source": prompt.get("source", ""),
-            "text": text,
-            "path": str(wav_path),
-            "duration_sec": duration_sec,
-            "infer_sec": float(infer_sec),
-            "rtf": rtf,
-            "utmos": "",
-            "checkpoint": str(checkpoint),
-            "config": str(config),
-            "synth_kwargs": json.dumps(synth_kwargs, sort_keys=True),
-        }
-        rows.append(row)
-        wav_paths.append(wav_path)
-        print(f"{index + 1}/{len(prompts)} wrote {wav_path} rtf={rtf:.3f}", flush=True)
+            duration_sec = float(len(audio) / inference.sample_rate)
+            rtf = float(infer_sec / duration_sec) if duration_sec > 0 else math.nan
+            row = {
+                "run": run_name,
+                "index": index,
+                "prompt_index": prompt_index,
+                "sample_index": sample_index,
+                "language": language,
+                "speaker": speaker,
+                "source": prompt.get("source", ""),
+                "text": text,
+                "path": str(wav_path),
+                "duration_sec": duration_sec,
+                "infer_sec": float(infer_sec),
+                "rtf": rtf,
+                **{field: "" for field in SCOREQ_FIELDS},
+                "checkpoint": str(checkpoint),
+                "config": str(config),
+                "synth_kwargs": json.dumps(synth_kwargs, sort_keys=True),
+            }
+            rows.append(row)
+            print(
+                f"{index + 1}/{total_samples} wrote {wav_path} rtf={rtf:.3f}",
+                flush=True,
+            )
 
-    if not args.no_utmos:
-        scores = score_utmos(wav_paths, args.utmos_python, args.utmos_worker)
+    scoreq_config = load_scoreq_config(args.prompts)
+    if not args.no_scoreq:
+
+        def option(name: str, default: Any) -> Any:
+            cli_value = getattr(args, name)
+            return (
+                cli_value if cli_value is not None else scoreq_config.get(name, default)
+            )
+
+        scores = score_scoreq(
+            rows,
+            run_dir,
+            python_bin=Path(option("scoreq_python", ".venv/bin/python")),
+            script_path=Path(
+                option("scoreq_script", "scripts/score_dpo_scoreq_windows.py")
+            ),
+            model_path=Path(
+                option(
+                    "scoreq_model",
+                    Path.home() / ".cache/scoreq/onnx-models/adapt_nr_synthetic.onnx",
+                )
+            ),
+            window_seconds=float(option("scoreq_window_seconds", 0.75)),
+            hop_ratio=float(option("scoreq_hop_ratio", 0.25)),
+            min_threshold=float(option("scoreq_min_threshold", 3.5)),
+            mean_threshold=float(option("scoreq_mean_threshold", 3.7)),
+            cpu_threads=int(option("scoreq_cpu_threads", 16)),
+        )
         for row in rows:
-            row["utmos"] = scores.get(row["path"], "")
+            result = scores.get(str(Path(row["path"]).resolve()))
+            if result is not None:
+                for field in SCOREQ_FIELDS:
+                    row[field] = result[field]
 
     with (run_dir / "prompts.json").open("w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
@@ -351,6 +460,8 @@ def main() -> None:
     fieldnames = [
         "run",
         "index",
+        "prompt_index",
+        "sample_index",
         "language",
         "speaker",
         "source",
@@ -359,18 +470,19 @@ def main() -> None:
         "duration_sec",
         "infer_sec",
         "rtf",
-        "utmos",
+        *SCOREQ_FIELDS,
         "checkpoint",
         "config",
         "synth_kwargs",
     ]
-    with (run_dir / "utmos_scores.csv").open("w", newline="", encoding="utf-8") as f:
+    with (run_dir / "scoreq_scores.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
-    utmos_values = [float(row["utmos"]) for row in rows if row["utmos"] != ""]
-    rtf_values = [float(row["rtf"]) for row in rows if not math.isnan(float(row["rtf"]))]
+    rtf_values = [
+        float(row["rtf"]) for row in rows if not math.isnan(float(row["rtf"]))
+    ]
     summary = {
         "run": run_name,
         "checkpoint": str(checkpoint),
@@ -378,8 +490,15 @@ def main() -> None:
         "output_dir": str(run_dir),
         "sample_rate": inference.sample_rate,
         "num_prompts": len(rows),
+        "source_prompt_count": len(prompts),
+        "samples_per_prompt": args.samples_per_prompt,
         "synth_kwargs": synth_kwargs,
-        "utmos": numeric_summary(utmos_values),
+        "scoreq": {
+            field: numeric_summary(
+                [float(row[field]) for row in rows if row[field] != ""]
+            )
+            for field in SCOREQ_FIELDS
+        },
         "rtf": numeric_summary(rtf_values),
     }
     with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
