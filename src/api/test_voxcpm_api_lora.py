@@ -11,6 +11,7 @@ from .server import (
     VoxCPMConfig,
     _batch_item_pipeline,
     _batch_item_compatibility_key,
+    _effective_voxcpm_lora_names,
     _prepare_voxcpm_ipa_text,
     _shared_batch_from_items,
     _validate_batch_item,
@@ -22,6 +23,8 @@ def test_voxcpm_release_defaults_use_stabilized_model_and_three_slots() -> None:
     config = VoxCPMConfig()
 
     assert config.model_path == "data/voxcpm2-stable"
+    assert config.default_locales == []
+    assert config.locale_loras == {}
     assert config.max_concurrent_loras == 3
     assert config.max_loras_per_request == 2
 
@@ -73,6 +76,76 @@ def test_reference_voice_routing_uses_model_capabilities() -> None:
         language="bs-BA",
         model="voxcpm",
     )
+
+
+def test_locale_routing_respects_native_adapter_and_reference_accents(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        server._server_config.voxcpm,
+        "default_locales",
+        ["zh-CN", "pt-PT"],
+    )
+    monkeypatch.setattr(
+        server._server_config.voxcpm,
+        "locale_loras",
+        {"en-US": "accent-en-US", "en-GB": "accent-en-GB"},
+    )
+    request = {
+        "voice_id": "msa.en-US.AvaMultilingual",
+        "reference_url": "https://example.com/ava.mp3",
+        "model": None,
+    }
+
+    assert _voice_request_routes_to_voxcpm(
+        **request,
+        language="en-GB",
+        reference_language="en-US",
+    )
+    assert _voice_request_routes_to_voxcpm(
+        **request,
+        language="zh-CN",
+        reference_language="en-US",
+    )
+    assert not _voice_request_routes_to_voxcpm(
+        **request,
+        language="zh-HK",
+        reference_language="en-US",
+    )
+    assert _voice_request_routes_to_voxcpm(
+        **request,
+        language="pt-PT",
+        reference_language="en-US",
+    )
+    assert not _voice_request_routes_to_voxcpm(
+        **request,
+        language="pt-BR",
+        reference_language="en-US",
+    )
+    assert _voice_request_routes_to_voxcpm(
+        **request,
+        language="zh-HK",
+        reference_language="zh-HK",
+    )
+
+
+def test_locale_adapter_is_applied_from_server_config(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server._server_config.voxcpm,
+        "applicable_loras",
+        {"accent-en-US": "unused", "accent-en-GB": "unused"},
+    )
+    monkeypatch.setattr(
+        server._server_config.voxcpm,
+        "locale_loras",
+        {"en-US": "accent-en-US", "en-GB": "accent-en-GB"},
+    )
+
+    assert _effective_voxcpm_lora_names([], "en-GB") == ("accent-en-GB",)
+    assert _effective_voxcpm_lora_names(["accent-en-US"], "en-US") == (
+        "accent-en-US",
+    )
+    assert _effective_voxcpm_lora_names([], "zh-CN") == ()
 
 
 def test_root_voice_with_reference_uses_voxcpm_or_seed_vc_by_language(

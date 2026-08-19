@@ -32,7 +32,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ..multilingual_splitter import MultilingualSplitter
 from ..piper import PiperInference
@@ -273,10 +273,28 @@ class VoxCPMConfig(BaseModel):
         "id", "it", "ja", "km", "ko", "lo", "ms", "my", "nb", "nl", "pl",
         "pt", "ru", "sv", "sw", "th", "tr", "vi", "wuu", "yue", "zh",
     ])
+    default_locales: list[str] = Field(default_factory=list)
+    locale_loras: dict[str, str] = Field(default_factory=dict)
     applicable_loras: dict[str, str] = Field(default_factory=dict)
     max_concurrent_loras: int = Field(default=3, ge=1)
     max_loras_per_request: int = Field(default=2, ge=1)
     lora_composition_cache_path: str = "cache/voxcpm-lora-compositions"
+
+    @model_validator(mode="after")
+    def validate_locale_policy(self) -> "VoxCPMConfig":
+        supported = {item.lower().split("-", 1)[0] for item in self.supported_languages}
+        configured_locales = [*self.default_locales, *self.locale_loras]
+        unsupported = sorted(
+            locale
+            for locale in configured_locales
+            if locale.lower().split("-", 1)[0] not in supported
+        )
+        if unsupported:
+            raise ValueError(f"VoxCPM locale policy contains unsupported locales: {unsupported}")
+        unknown_loras = sorted(set(self.locale_loras.values()) - set(self.applicable_loras))
+        if unknown_loras:
+            raise ValueError(f"VoxCPM locale policy contains unknown LoRAs: {unknown_loras}")
+        return self
 
 
 class MatchaConfig(BaseModel):
@@ -411,6 +429,10 @@ class SynthesizeRequest(BaseModel):
         None,
         description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
     )
+    reference_language: Optional[str] = Field(
+        None,
+        description="Language/locale spoken by the reference sample",
+    )
     language: Optional[str] = Field(None, description="Force full locale for the entire input, e.g. en-GB")
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
     seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
@@ -434,6 +456,10 @@ class BatchSynthesizeInputItem(BaseModel):
     reference_url: Optional[str] = Field(
         None,
         description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
+    )
+    reference_language: Optional[str] = Field(
+        None,
+        description="Language/locale spoken by the reference sample",
     )
     language: Optional[str] = Field(None, description="Force full locale for this item, e.g. en-GB")
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
@@ -1410,6 +1436,8 @@ def _build_synthesis_capabilities() -> SynthesisCapabilitiesResponse:
         if _is_supported_sparrow_locale(locale)
     }
     locales.update(_server_config.voxcpm.supported_languages)
+    locales.update(_server_config.voxcpm.default_locales)
+    locales.update(_server_config.voxcpm.locale_loras)
     return SynthesisCapabilitiesResponse(
         locales=sorted(locales),
         rootVoiceIds=sorted(
@@ -1968,14 +1996,37 @@ def _voice_request_routes_to_voxcpm(
     reference_url: str | None,
     language: str | None,
     model: str | None,
+    reference_language: str | None = None,
 ) -> bool:
     if reference_url is None:
         return False
-    base_language = _get_base_language(language or "en")
-    return base_language in {
+    normalized_language = _normalize_locale_with_region(language or "en")
+    base_language = _get_base_language(normalized_language)
+    if base_language not in {
         _get_base_language(item)
         for item in _server_config.voxcpm.supported_languages
-    }
+    }:
+        return False
+
+    # A bare language selects VoxCPM's normal accent for that language. A full
+    # locale must be one VoxCPM can actually honor: its configured default
+    # locale, an adapter-backed locale, or the accent already in the reference.
+    if "-" not in normalized_language:
+        return True
+    if normalized_language in {
+        _normalize_locale_with_region(item)
+        for item in _server_config.voxcpm.default_locales
+    }:
+        return True
+    if normalized_language in {
+        _normalize_locale_with_region(item)
+        for item in _server_config.voxcpm.locale_loras
+    }:
+        return True
+    return bool(
+        reference_language
+        and normalized_language == _normalize_locale_with_region(reference_language)
+    )
 
 
 def _request_routes_to_voxcpm(
@@ -1987,6 +2038,7 @@ def _request_routes_to_voxcpm(
         reference_url=request.reference_url,
         language=request.language,
         model=resolved_model,
+        reference_language=request.reference_language,
     )
 
 
@@ -2396,7 +2448,10 @@ async def _synthesize_voxcpm_ipa_ssml(
     initial_expected_patches = max(2, initial_expected_patches)
     stop_cushion = _server_config.ssml.voxcpm_ipa_stop_cushion_patches
     max_cushion = _server_config.ssml.voxcpm_ipa_max_length_cushion_patches
-    requested_loras = _resolve_voxcpm_lora_names(request.voxcpm_loras)
+    requested_loras = _effective_voxcpm_lora_names(
+        request.voxcpm_loras,
+        request.language,
+    )
     try:
         lora_name = await runtime.resolve_lora_combination(requested_loras)
     except (OSError, ValueError) as exc:
@@ -3151,6 +3206,31 @@ def _resolve_voxcpm_lora_names(lora_names: list[str] | tuple[str, ...]) -> tuple
     return tuple(names)
 
 
+def _configured_voxcpm_locale_lora(language: str | None) -> str | None:
+    if language is None:
+        return None
+    locale = _normalize_locale_with_region(language)
+    return next(
+        (
+            lora
+            for configured_locale, lora in _server_config.voxcpm.locale_loras.items()
+            if _normalize_locale_with_region(configured_locale) == locale
+        ),
+        None,
+    )
+
+
+def _effective_voxcpm_lora_names(
+    lora_names: list[str] | tuple[str, ...],
+    language: str | None,
+) -> tuple[str, ...]:
+    names = list(lora_names)
+    configured_lora = _configured_voxcpm_locale_lora(language)
+    if configured_lora and configured_lora not in names:
+        names.append(configured_lora)
+    return _resolve_voxcpm_lora_names(names)
+
+
 async def _fetch_voxcpm_reference(reference_url: str) -> tuple[bytes, str]:
     parsed = urlsplit(reference_url)
     if parsed.scheme not in {"http", "https"}:
@@ -3228,7 +3308,10 @@ async def synthesize_voxcpm_batch(
 
     await _await_engine_ready("voxcpm")
     runtime = _get_voxcpm_runtime()
-    requested_loras = _resolve_voxcpm_lora_names(request.voxcpm_loras)
+    requested_loras = _effective_voxcpm_lora_names(
+        request.voxcpm_loras,
+        request.language,
+    )
     try:
         lora_name = await runtime.resolve_lora_combination(requested_loras)
     except (OSError, ValueError) as exc:
@@ -3330,6 +3413,7 @@ async def _synthesize_voxcpm_items(
         _SharedBatchSynthesizeRequest(
             texts=[text for _, _, text in records],
             seeds=[item.seed for _, item, _ in records],
+            language=first.language,
             languages=[item.language for _, item, _ in records],
             model=_server_config.voxcpm.model_id,
             voxcpm_loras=tuple(first.voxcpm_loras),
@@ -3349,6 +3433,7 @@ def _batch_item_pipeline(item: BatchSynthesizeInputItem) -> str:
         reference_url=item.reference_url,
         language=item.language,
         model=resolved_model,
+        reference_language=item.reference_language,
     ):
         return "voxcpm"
     if item.reference_url is not None:
@@ -3360,7 +3445,7 @@ def _batch_item_pipeline(item: BatchSynthesizeInputItem) -> str:
 
 _BATCH_PER_ITEM_FIELDS = frozenset({"text", "ssml", "seed"})
 _BATCH_PIPELINE_PER_ITEM_FIELDS = {
-    "voxcpm": frozenset({"reference_url", "language", "voice_id"}),
+    "voxcpm": frozenset({"reference_url", "reference_language", "language", "voice_id"}),
 }
 
 
@@ -3379,7 +3464,11 @@ def _batch_item_compatibility_key(item: BatchSynthesizeInputItem) -> _BatchCompa
     config["pipeline"] = pipeline
 
     # LoRA composition is additive, so request order does not affect inference.
-    config["voxcpm_loras"] = sorted(config["voxcpm_loras"])
+    compatibility_loras = list(item.voxcpm_loras)
+    configured_lora = _configured_voxcpm_locale_lora(item.language)
+    if pipeline == "voxcpm" and configured_lora and configured_lora not in compatibility_loras:
+        compatibility_loras.append(configured_lora)
+    config["voxcpm_loras"] = sorted(compatibility_loras)
     if config.get("language") is not None:
         config["language"] = _normalize_locale_with_region(config["language"])
     if pipeline == "voxcpm":
@@ -3416,6 +3505,7 @@ def _validate_batch_item(item: BatchSynthesizeInputItem, item_idx: int) -> str:
         reference_url=item.reference_url,
         language=item.language,
         model=resolved_model,
+        reference_language=item.reference_language,
     )
     if item.seed is not None and not routes_to_voxcpm:
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'seed' requires model='voxcpm'")
@@ -3439,7 +3529,11 @@ def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, 
         language=first.language,
         languages=[item.language for _, item, _ in records],
         model=_resolve_api_model(first.model),
-        voxcpm_loras=tuple(first.voxcpm_loras),
+        voxcpm_loras=(
+            _effective_voxcpm_lora_names(first.voxcpm_loras, first.language)
+            if _batch_item_pipeline(first) == "voxcpm"
+            else tuple(first.voxcpm_loras)
+        ),
         options=first.options,
         format=first.format,
         neural=first.neural,
