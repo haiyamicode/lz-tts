@@ -20,3 +20,8 @@ After modifying C++ code in `src/phonemizer/src/`:
 cd /mnt/data/lz-tts/src/phonemizer && uv build
 cd /mnt/data/lz-tts && uv pip install --reinstall src/phonemizer/dist/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl
 ```
+
+# NO FAKE TESTS
+
+Do not write tests full of mock code. They are fake and gay and useless, DO NOT!
+If something has real logic and is testable, ok, you can write test for that, if not, just don't.
