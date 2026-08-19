@@ -5,7 +5,9 @@ from src.nanovllm_voxcpm.models.voxcpm.engine import (
     Config,
 )
 from src.nanovllm_voxcpm.models.voxcpm.config import LoRAConfig
+from src.nanovllm_voxcpm.config import resolve_model_dtype
 import os
+import torch
 import torch.multiprocessing as mp
 from queue import Empty
 import traceback
@@ -29,6 +31,7 @@ class HealthResponse(TypedDict):
 
 
 class ModelInfoResponse(TypedDict):
+    dtype: str
     sample_rate: int
     channels: int
     feat_dim: int
@@ -64,12 +67,17 @@ class VoxCPMServerImpl:
         enforce_eager: bool = False,
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
+        dtype: str = "auto",
     ):
         model_config = VoxCPMConfig.model_validate_json(open(os.path.join(model_path, "config.json")).read())
 
         model_config.inference_timesteps = inference_timesteps
         self.lora_config = lora_config
         self.model_path = model_path
+        device_index = devices[0] if devices else 0
+        devices = devices or [device_index]
+        self.dtype = resolve_model_dtype(dtype, device_index)
+        model_config.dtype = self.dtype
 
         engine_config = Config(
             model=model_path,
@@ -81,6 +89,7 @@ class VoxCPMServerImpl:
             model_config=model_config,
             devices=devices,
             lora_config=lora_config,
+            enable_prefix_caching=torch.cuda.get_device_capability(device_index)[0] >= 8,
         )
 
         self.llm = VoxCPMEngine(engine_config)
@@ -95,6 +104,7 @@ class VoxCPMServerImpl:
     def get_model_info(self) -> ModelInfoResponse:
         # Read-only metadata for HTTP services; avoids parsing config.json in wrappers.
         return ModelInfoResponse(
+            dtype=self.dtype,
             sample_rate=int(self.sample_rate),
             channels=1,
             feat_dim=int(self.llm.feat_dim),
@@ -310,6 +320,7 @@ class AsyncVoxCPMServer:
         enforce_eager: bool = False,
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
+        dtype: str = "auto",
         **kwargs,
     ) -> None:
         if len(kwargs) > 0:
@@ -333,6 +344,7 @@ class AsyncVoxCPMServer:
                     enforce_eager,
                     devices,
                     lora_config,
+                    dtype,
                 ),
                 {},
             ),
@@ -545,6 +557,7 @@ class AsyncVoxCPMServerPool:
         enforce_eager: bool = False,
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
+        dtype: str = "auto",
         **kwargs,
     ):
         if len(kwargs) > 0:
@@ -561,6 +574,7 @@ class AsyncVoxCPMServerPool:
                 enforce_eager=enforce_eager,
                 devices=[device_idx],
                 lora_config=lora_config,
+                dtype=dtype,
             )
             for device_idx in devices
         ]
@@ -721,6 +735,7 @@ class SyncVoxCPMServerPool:
         enforce_eager: bool = False,
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
+        dtype: str = "auto",
         **kwargs,
     ):
         async def init_async_server_pool():
@@ -734,6 +749,7 @@ class SyncVoxCPMServerPool:
                 enforce_eager=enforce_eager,
                 devices=devices,
                 lora_config=lora_config,
+                dtype=dtype,
                 **kwargs,
             )
 

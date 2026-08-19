@@ -252,6 +252,9 @@ class VoxCPMConfig(BaseModel):
     model_id: Literal["voxcpm"] = "voxcpm"
     model_path: str = Field(default_factory=lambda: os.environ.get("VOXCPM_MODEL_PATH", "data/voxcpm2-stable"))
     device: int = Field(default_factory=lambda: int(os.environ.get("VOXCPM_DEVICE", "1")), ge=0)
+    dtype: Literal["auto", "bfloat16", "float16"] = Field(
+        default_factory=lambda: os.environ.get("VOXCPM_DTYPE", "auto")
+    )
     inference_timesteps: int = Field(default=10, ge=1)
     max_num_batched_tokens: int = Field(default=8192, ge=1)
     max_num_seqs: int = Field(default=12, ge=1)
@@ -3841,6 +3844,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 "model": _server_config.voxcpm.model_id,
                 "model_path": _server_config.voxcpm.model_path,
                 "device": _server_config.voxcpm.device,
+                "dtype": (
+                    _voxcpm_runtime.dtype
+                    if _voxcpm_runtime is not None
+                    else _server_config.voxcpm.dtype
+                ),
                 "num_kvcache_blocks": _server_config.voxcpm.num_kvcache_blocks,
                 "sample_rate": (
                     _voxcpm_runtime.sample_rate

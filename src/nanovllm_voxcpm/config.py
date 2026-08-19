@@ -3,7 +3,32 @@ from dataclasses import dataclass
 from pydantic import BaseModel
 from typing import Generic, TypeVar, List, Any
 
+import torch
+
 T = TypeVar("T", bound=BaseModel)
+
+
+def resolve_torch_dtype(name: str) -> torch.dtype:
+    """Resolve the model precision declared in a VoxCPM model config."""
+    try:
+        return {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }[name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported VoxCPM dtype {name!r}; expected 'bfloat16' or 'float16'"
+        ) from exc
+
+
+def resolve_model_dtype(name: str, device_index: int) -> str:
+    """Resolve automatic precision according to native CUDA dtype support."""
+    if name != "auto":
+        resolve_torch_dtype(name)
+        return name
+
+    major, _minor = torch.cuda.get_device_capability(device_index)
+    return "bfloat16" if major >= 8 else "float16"
 
 
 @dataclass
@@ -17,6 +42,7 @@ class Config(Generic[T]):
     enforce_eager: bool = False
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    enable_prefix_caching: bool = True
 
     model_config: T | None = None
     devices: List[int] | None = None

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import torch
 from multiprocessing.synchronize import Event
 
-from src.nanovllm_voxcpm.config import Config
+from src.nanovllm_voxcpm.config import Config, resolve_torch_dtype
 from src.nanovllm_voxcpm.engine.model_runner import RunnerTask, BaseModelRunner
 from src.nanovllm_voxcpm.utils.loader import load_model
 from src.nanovllm_voxcpm.utils.seed import derive_step_seed
@@ -57,22 +57,24 @@ class VoxCPMRunner(BaseModelRunner):
 
     @property
     def dtype(self) -> torch.dtype:
-        return torch.bfloat16
+        return resolve_torch_dtype(self._config.model_config.dtype)
 
     def init_model(self, model_config: VoxCPMConfig, model_path: str):
         self.model = VoxCPMModel(model_config, self.inference_timesteps, lora_config=self.lora_config)
         load_model(self.model, model_path)
 
         torch.set_default_dtype(torch.float32)
-        self.vae = (
-            AudioVAE()
-            if model_config.audio_vae_config is None
-            else AudioVAE(**model_config.audio_vae_config.model_dump(mode="dict"))
-        )
+        try:
+            self.vae = (
+                AudioVAE()
+                if model_config.audio_vae_config is None
+                else AudioVAE(**model_config.audio_vae_config.model_dump(mode="dict"))
+            )
 
-        vae_state_dict = torch.load(os.path.join(model_path, "audiovae.pth"))["state_dict"]
-        self.vae.load_state_dict(vae_state_dict)
-        torch.set_default_dtype(torch.bfloat16)
+            vae_state_dict = torch.load(os.path.join(model_path, "audiovae.pth"))["state_dict"]
+            self.vae.load_state_dict(vae_state_dict)
+        finally:
+            torch.set_default_dtype(self.dtype)
 
     def make_dummy_inputs(self, batch_size: int, length: int) -> dict[str, torch.Tensor]:
         return {

@@ -27,6 +27,7 @@ class VoxCPMRuntime:
     def __init__(self, settings: Mapping[str, Any]):
         self.settings = dict(settings)
         self.server: Any | None = None
+        self.dtype: str | None = None
         self.sample_rate = 16000
         self.output_patch_samples = 2560
         self.ipa_fade_out_ratio = 0.2
@@ -114,6 +115,7 @@ class VoxCPMRuntime:
         if num_kvcache_blocks <= 0:
             raise ValueError("voxcpm.num_kvcache_blocks must be greater than zero")
         os.environ[_KV_BLOCKS_ENV] = str(num_kvcache_blocks)
+        dtype = str(self.settings.get("dtype", "auto"))
 
         configured_loras = dict(self.settings.get("applicable_loras") or {})
         self._lora_paths = {
@@ -122,6 +124,7 @@ class VoxCPMRuntime:
         }
         self.server = VoxCPM.from_pretrained(
             model=str(self.settings["model_path"]),
+            dtype=dtype,
             devices=[int(self.settings["device"])],
             inference_timesteps=int(self.settings["inference_timesteps"]),
             max_num_batched_tokens=int(self.settings["max_num_batched_tokens"]),
@@ -142,6 +145,7 @@ class VoxCPMRuntime:
             self._available_loras.add(name)
             self._lora_combinations[(name,)] = name
         model_info = await self.server.get_model_info()
+        self.dtype = str(model_info["dtype"])
         self.sample_rate = int(model_info["sample_rate"])
         self.output_patch_samples = int(model_info["output_patch_samples"])
         if model_info.get("ipa_fade_out_ratio") is not None:
@@ -150,10 +154,11 @@ class VoxCPMRuntime:
         if duration_settings["enabled"] and duration_settings["preload"]:
             await asyncio.to_thread(self._get_duration_budget)
         _LOGGER.info(
-            "VoxCPM nano-vLLM ready model=%s device=%s sample_rate=%d "
+            "VoxCPM nano-vLLM ready model=%s device=%s dtype=%s sample_rate=%d "
             "kv_blocks=%d max_num_seqs=%d loras=%s",
             self.settings["model_path"],
             self.settings["device"],
+            self.dtype,
             self.sample_rate,
             num_kvcache_blocks,
             self.settings["max_num_seqs"],
@@ -163,6 +168,7 @@ class VoxCPMRuntime:
     async def stop(self) -> None:
         server = self.server
         self.server = None
+        self.dtype = None
         self._duration_budget = None
         self._reference_latents.clear()
         self._available_loras.clear()

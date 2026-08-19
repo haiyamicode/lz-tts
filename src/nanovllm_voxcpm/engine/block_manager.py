@@ -94,8 +94,15 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        *,
+        enable_prefix_caching: bool = True,
+    ):
         self.block_size = block_size
+        self.enable_prefix_caching = enable_prefix_caching
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
@@ -152,7 +159,11 @@ class BlockManager:
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
-            block_id = self.hash_to_block_id.get(h, -1)
+            block_id = (
+                self.hash_to_block_id.get(h, -1)
+                if self.enable_prefix_caching
+                else -1
+            )
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
             if cache_miss:

@@ -16,7 +16,7 @@ import torch.multiprocessing as mp
 from numpy.typing import NDArray
 from typing_extensions import Literal, TypedDict
 
-from src.nanovllm_voxcpm.config import Config
+from src.nanovllm_voxcpm.config import Config, resolve_model_dtype
 from src.nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig, VoxCPM2Config
 from src.nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
 from src.nanovllm_voxcpm.models.voxcpm2.runner import VoxCPM2Runner
@@ -29,6 +29,7 @@ class HealthResponse(TypedDict):
 
 
 class ModelInfoResponse(TypedDict):
+    dtype: str
     sample_rate: int
     encoder_sample_rate: int
     output_sample_rate: int
@@ -70,11 +71,16 @@ class VoxCPM2ServerImpl:
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
         ipa_adapter_path: str | None = None,
+        dtype: str = "auto",
     ):
         model_config = VoxCPM2Config.model_validate_json(open(os.path.join(model_path, "config.json")).read())
         model_config.inference_timesteps = inference_timesteps
         self.lora_config = lora_config
         self.model_path = model_path
+        device_index = devices[0] if devices else 0
+        devices = devices or [device_index]
+        self.dtype = resolve_model_dtype(dtype, device_index)
+        model_config.dtype = self.dtype
 
         engine_config = Config(
             model=model_path,
@@ -88,6 +94,7 @@ class VoxCPM2ServerImpl:
             devices=devices,
             lora_config=lora_config,
             ipa_adapter_path=ipa_adapter_path,
+            enable_prefix_caching=torch.cuda.get_device_capability(device_index)[0] >= 8,
         )
         self.llm = VoxCPM2Engine(engine_config)
         model_runner = cast(VoxCPM2Runner, self.llm.model_runner)
@@ -103,6 +110,7 @@ class VoxCPM2ServerImpl:
 
     def get_model_info(self) -> ModelInfoResponse:
         return ModelInfoResponse(
+            dtype=self.dtype,
             sample_rate=int(self.output_sample_rate),
             encoder_sample_rate=int(self.encoder_sample_rate),
             output_sample_rate=int(self.output_sample_rate),
@@ -301,6 +309,7 @@ class AsyncVoxCPM2Server:
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
         ipa_adapter_path: str | None = None,
+        dtype: str = "auto",
         **kwargs,
     ) -> None:
         if len(kwargs) > 0:
@@ -325,6 +334,7 @@ class AsyncVoxCPM2Server:
                     devices,
                     lora_config,
                     ipa_adapter_path,
+                    dtype,
                 ),
                 {},
             ),
@@ -519,6 +529,7 @@ class AsyncVoxCPM2ServerPool:
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
         ipa_adapter_path: str | None = None,
+        dtype: str = "auto",
         **kwargs,
     ):
         if len(kwargs) > 0:
@@ -536,6 +547,7 @@ class AsyncVoxCPM2ServerPool:
                 devices=[device_idx],
                 lora_config=lora_config,
                 ipa_adapter_path=ipa_adapter_path,
+                dtype=dtype,
             )
             for device_idx in devices
         ]
@@ -668,6 +680,7 @@ class SyncVoxCPM2ServerPool:
         devices: List[int] = [],
         lora_config: Optional[LoRAConfig] = None,
         ipa_adapter_path: str | None = None,
+        dtype: str = "auto",
         **kwargs,
     ):
         async def init_async_server_pool():
@@ -683,6 +696,7 @@ class SyncVoxCPM2ServerPool:
                 devices=devices,
                 lora_config=lora_config,
                 ipa_adapter_path=ipa_adapter_path,
+                dtype=dtype,
                 **kwargs,
             )
 
