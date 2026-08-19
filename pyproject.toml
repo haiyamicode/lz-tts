@@ -120,7 +120,7 @@ include = ["src*"]
 
 [project.scripts]
 lz-tts = "src.cli:main"
-lz-tts-server = "src.api.server:run"
+lz-tts-worker = "src.taskflow_worker:run"
 lz-starling-train = "src.starling.train:main"
 lz-starling-eval = "src.starling.evaluate:main"
 

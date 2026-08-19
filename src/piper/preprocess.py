@@ -255,10 +255,10 @@ _PUNCT_MAP = {
     "》": '"',
     "〈": '"',
     "〉": '"',
-    """: '"',
-    """: '"',
-    "'": "'",
-    "'": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u2018": "'",
+    "\u2019": "'",
     "…": "...",
     "‥": "..",
     "—": "-",
@@ -1661,38 +1661,49 @@ def _normalized_override_bounds(
     """Map source offsets through the same text normalization as phonemization.
 
     The normalizers can expand text before the frontend creates word mappings
-    (for example ``Dr.`` to ``doctor``).  Private-use sentinels let us carry an
-    exact source boundary through that transformation without guessing from
-    string similarity or assuming normalization preserves string length.
+    (for example ``Dr.`` to ``doctor``).  Sentinels let us carry an exact source
+    boundary through that transformation without guessing from string
+    similarity or assuming normalization preserves string length.  Most
+    normalizers preserve Unicode private-use characters; restrictive
+    normalizers such as Chinese require markers from their accepted script.
     """
-    sentinels: list[str] = []
+    private_use: list[str] = []
     for codepoint in range(0xE000, 0xF900):
         candidate = chr(codepoint)
         if candidate not in source_text:
-            sentinels.append(candidate)
-            if len(sentinels) == 2:
+            private_use.append(candidate)
+            if len(private_use) == 2:
                 break
-    if len(sentinels) != 2:
-        raise ValueError("Could not reserve text-normalization sentinels for an IPA override")
-    opening, closing = sentinels[:2]
-    marked = (
-        source_text[:source_start]
-        + opening
-        + source_text[source_start:source_end]
-        + closing
-        + source_text[source_end:]
+
+    candidates: list[Tuple[str, str]] = []
+    if len(private_use) == 2:
+        candidates.append((private_use[0], private_use[1]))
+    candidates.extend(
+        pair
+        for pair in (("龘", "龖"), ("齉", "爨"))
+        if pair[0] not in source_text and pair[1] not in source_text
     )
-    normalized_marked = _normalize_text_for_mapping(marked, voice)
-    if normalized_marked.count(opening) != 1 or normalized_marked.count(closing) != 1:
-        raise ValueError("Text normalization did not preserve IPA override boundaries")
-    normalized_start = normalized_marked.index(opening)
-    normalized_end_with_marker = normalized_marked.index(closing)
-    if normalized_start >= normalized_end_with_marker:
-        raise ValueError("Text normalization produced an empty IPA override")
-    unmarked = normalized_marked.replace(opening, "").replace(closing, "")
-    if unmarked != normalized_text:
-        raise ValueError("Could not map IPA override through text normalization exactly")
-    return normalized_start, normalized_end_with_marker - 1
+
+    for opening, closing in candidates:
+        marked = (
+            source_text[:source_start]
+            + opening
+            + source_text[source_start:source_end]
+            + closing
+            + source_text[source_end:]
+        )
+        normalized_marked = _normalize_text_for_mapping(marked, voice)
+        if normalized_marked.count(opening) != 1 or normalized_marked.count(closing) != 1:
+            continue
+        normalized_start = normalized_marked.index(opening)
+        normalized_end_with_marker = normalized_marked.index(closing)
+        if normalized_start >= normalized_end_with_marker:
+            continue
+        unmarked = normalized_marked.replace(opening, "").replace(closing, "")
+        if unmarked == normalized_text:
+            return normalized_start, normalized_end_with_marker - 1
+
+    raise ValueError("Text normalization did not preserve IPA override boundaries")
 
 
 def _phoneme_edit_distance(left: List[str], right: List[str]) -> int:

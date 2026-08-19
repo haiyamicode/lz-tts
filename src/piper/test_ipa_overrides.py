@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from .preprocess import apply_ipa_overrides
+from .preprocess import (
+    _normalize_text_for_mapping,
+    _normalized_override_bounds,
+    apply_ipa_overrides,
+)
 
 
 def test_apply_ipa_overrides_rewrites_exact_mapping_and_shifts_following_spans() -> None:
@@ -118,3 +122,16 @@ def test_apply_ipa_overrides_maps_boundaries_through_text_normalization() -> Non
         [8, 13, 4, 8],
         [14, 18, 9, 12],
     ]
+
+
+def test_ipa_override_boundaries_survive_chinese_normalization() -> None:
+    text = "今天我们用新鲜的番茄做一道简单的菜。"
+    normalized = _normalize_text_for_mapping(text, "cmn-latn-pinyin")
+
+    assert _normalized_override_bounds(
+        text,
+        text.index("番茄"),
+        text.index("番茄") + len("番茄"),
+        "cmn-latn-pinyin",
+        normalized,
+    ) == (8, 10)

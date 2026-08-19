@@ -7,8 +7,6 @@ currently implement: timed breaks and IPA pronunciation overrides.
 
 from __future__ import annotations
 
-import unicodedata
-from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import TypeAlias
@@ -102,15 +100,53 @@ def _parse_break_time(value: str) -> float:
     return float(seconds)
 
 
-def _break_separates_spoken_text(text: str, position: int) -> bool:
-    """Return whether removing a break would join two spoken-text runs."""
-    if not 0 < position < len(text) or not text[position].isalnum():
-        return False
+def _collapse_text_whitespace(text: str) -> tuple[str, list[int], list[int]]:
+    """Collapse decoded SSML whitespace and retain biased boundary mappings.
 
-    previous = position - 1
-    while previous >= 0 and unicodedata.category(text[previous]).startswith("M"):
-        previous -= 1
-    return previous >= 0 and text[previous].isalnum()
+    A raw boundary inside a whitespace run can mean either side of the one
+    collapsed space. ``before`` maps to its left edge and ``after`` to its
+    right edge. This lets breaks remain before the separator while phoneme
+    spans exclude surrounding whitespace.
+    """
+    before: list[int | None] = [None] * (len(text) + 1)
+    after: list[int | None] = [None] * (len(text) + 1)
+    output: list[str] = []
+
+    def record(position: int, left: int, right: int | None = None) -> None:
+        right = left if right is None else right
+        current_before = before[position]
+        current_after = after[position]
+        before[position] = left if current_before is None else min(current_before, left)
+        after[position] = right if current_after is None else max(current_after, right)
+
+    cursor = 0
+    while cursor < len(text):
+        if not text[cursor].isspace():
+            output_position = len(output)
+            record(cursor, output_position)
+            output.append(text[cursor])
+            record(cursor + 1, output_position + 1)
+            cursor += 1
+            continue
+
+        run_start = cursor
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        run_end = cursor
+        left = len(output)
+        if output and run_end < len(text):
+            output.append(" ")
+        right = len(output)
+        for position in range(run_start, run_end + 1):
+            record(position, left, right)
+
+    record(0, 0)
+    record(len(text), len(output))
+    return (
+        "".join(output),
+        [int(position) for position in before],
+        [int(position) for position in after],
+    )
 
 
 class _DocumentBuilder:
@@ -150,6 +186,10 @@ class _DocumentBuilder:
                     duration_seconds=_parse_break_time(element.attrib.get("time", "1s")),
                 )
             )
+            # A break is a boundary in the decoded text stream. Treating it as
+            # whitespace lets the one normalization pass handle punctuation,
+            # adjacent breaks, indentation, and languages without spaces alike.
+            self.append_text(" ")
             return
 
         if name == "phoneme":
@@ -184,56 +224,28 @@ class _DocumentBuilder:
 
     def finish(self) -> SSMLDocument:
         raw_text = "".join(self._text_parts)
-        break_positions = {
-            operation.position
-            for operation in self.operations
-            if isinstance(operation, BreakOperation)
-        }
-        separator_positions = sorted(
-            position
-            for position in break_positions
-            if _break_separates_spoken_text(raw_text, position)
-        )
-        if separator_positions:
-            parts: list[str] = []
-            cursor = 0
-            for position in separator_positions:
-                parts.extend((raw_text[cursor:position], " "))
-                cursor = position
-            parts.append(raw_text[cursor:])
-            rendered_text = "".join(parts)
-        else:
-            rendered_text = raw_text
-
-        def shift_before(position: int) -> int:
-            return position + bisect_left(separator_positions, position)
-
-        def shift_through(position: int) -> int:
-            return position + bisect_right(separator_positions, position)
-
-        leading = len(rendered_text) - len(rendered_text.lstrip())
-        trailing_end = len(rendered_text.rstrip())
-        text = rendered_text[leading:trailing_end]
+        text, before, after = _collapse_text_whitespace(raw_text)
         if not text:
             raise ValueError("SSML contains no text to synthesize")
 
         adjusted: list[SSMLOperation] = []
         for operation in self.operations:
             if isinstance(operation, BreakOperation):
-                position = shift_before(operation.position)
-                position = min(max(position, leading), trailing_end) - leading
                 adjusted.append(
-                    BreakOperation(position=position, duration_seconds=operation.duration_seconds)
+                    BreakOperation(
+                        position=before[operation.position],
+                        duration_seconds=operation.duration_seconds,
+                    )
                 )
             else:
-                start = shift_through(operation.start)
-                end = shift_before(operation.end)
-                if start < leading or end > trailing_end:
+                start = after[operation.start]
+                end = before[operation.end]
+                if start >= end:
                     raise ValueError("SSML <phoneme> display text cannot be only outer whitespace")
                 adjusted.append(
                     PronunciationOperation(
-                        start=start - leading,
-                        end=end - leading,
+                        start=start,
+                        end=end,
                         alphabet=operation.alphabet,
                         phonemes=operation.phonemes,
                     )

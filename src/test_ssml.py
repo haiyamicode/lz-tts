@@ -58,13 +58,54 @@ def test_break_defaults_to_lazybird_one_second() -> None:
     assert document.breaks == (BreakOperation(5, 1.0),)
 
 
-def test_break_only_adds_a_boundary_when_words_would_be_joined() -> None:
+def test_break_is_collapsible_whitespace_regardless_of_punctuation() -> None:
     document = parse_ssml(
         "<speak>Hello,<break time='200ms'/>world and hello<break time='300ms'/>.</speak>"
     )
 
-    assert document.text == "Hello,world and hello."
-    assert document.breaks == (BreakOperation(6, 0.2), BreakOperation(21, 0.3))
+    assert document.text == "Hello, world and hello ."
+    assert document.breaks == (BreakOperation(6, 0.2), BreakOperation(22, 0.3))
+
+
+@pytest.mark.parametrize(
+    "ssml",
+    [
+        '<speak>Hello<break time="250ms"/>world</speak>',
+        '<speak>Hello <break time="250ms"/> world</speak>',
+        '<speak>Hello\n\t <break time="250ms"/>   world</speak>',
+    ],
+)
+def test_break_and_surrounding_whitespace_collapse_to_one_space(ssml: str) -> None:
+    document = parse_ssml(ssml)
+
+    assert document.text == "Hello world"
+    assert document.breaks == (BreakOperation(5, 0.25),)
+
+
+def test_whitespace_collapses_across_text_and_phoneme_nodes() -> None:
+    document = parse_ssml(
+        '<speak>  Say\n\t<phoneme alphabet="ipa" ph="njuː jɔːk"> '
+        'New   York </phoneme>   <break time="300ms"/> now.  </speak>'
+    )
+
+    assert document.text == "Say New York now."
+    assert document.pronunciations == (
+        PronunciationOperation(4, 12, "ipa", "njuː jɔːk"),
+    )
+    assert document.breaks == (BreakOperation(12, 0.3),)
+
+
+def test_break_after_punctuation_stays_between_sentences() -> None:
+    document = parse_ssml(
+        '<speak>Use a <phoneme alphabet="ipa" ph="təˈmɑːtəʊ">tomato</phoneme>.'
+        '<break time="1.2s"/>Then continue.</speak>'
+    )
+
+    assert document.text == "Use a tomato. Then continue."
+    assert document.pronunciations == (
+        PronunciationOperation(6, 12, "ipa", "təˈmɑːtəʊ"),
+    )
+    assert document.breaks == (BreakOperation(13, 1.2),)
 
 
 @pytest.mark.parametrize(

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from .ssml import BreakOperation, PronunciationOperation
+from .ssml import BreakOperation
 from .ssml import parse_ssml
-from .ssml_postprocessing import aligned_text_interval, insert_ssml_breaks, splice_pronunciations
+from .ssml_postprocessing import insert_ssml_breaks
 
 
 TIMESTAMPS = [
@@ -12,40 +12,6 @@ TIMESTAMPS = [
     {"text": "Saoirse ", "start_seconds": 0.6, "end_seconds": 1.0, "source_start": 6, "source_end": 14},
     {"text": "left", "start_seconds": 1.2, "end_seconds": 1.5, "source_start": 14, "source_end": 18},
 ]
-
-
-def test_aligned_text_interval_uses_neighbor_midpoints() -> None:
-    interval = aligned_text_interval(
-        PronunciationOperation(6, 13, "ipa", "sˈɜːɹʃə"),
-        TIMESTAMPS,
-        audio_samples=1600,
-        sample_rate=1000,
-    )
-    assert (interval.start_sample, interval.end_sample) == (500, 1100)
-    assert interval.alignment_indices == (1,)
-
-
-def test_splice_pronunciation_uses_separately_aligned_context_render() -> None:
-    baseline = np.zeros(1600, dtype=np.float32)
-    replacement = np.ones(1800, dtype=np.float32)
-    replacement_timestamps = [
-        {**TIMESTAMPS[0], "end_seconds": 0.5},
-        {**TIMESTAMPS[1], "start_seconds": 0.7, "end_seconds": 1.2},
-        {**TIMESTAMPS[2], "start_seconds": 1.4, "end_seconds": 1.7},
-    ]
-    output, report = splice_pronunciations(
-        baseline,
-        [replacement],
-        1000,
-        [PronunciationOperation(6, 13, "ipa", "sˈɜːɹʃə")],
-        TIMESTAMPS,
-        [replacement_timestamps],
-        crossfade_seconds=0,
-    )
-    assert output.size == 1700
-    assert np.all(output[500:1200] == 1)
-    assert report[0]["baseline_start_seconds"] == 0.5
-    assert report[0]["replacement_start_seconds"] == 0.6
 
 
 def test_ssml_breaks_use_source_prefix_and_support_bos_eos() -> None:
