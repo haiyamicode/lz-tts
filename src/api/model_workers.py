@@ -14,15 +14,13 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 import torch
-from fastapi import HTTPException
-
 from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
 from ..matcha_inference import MatchaBatchRequest
 from ..piper import PiperInference
+from .locale_utils import normalize_locale
 from .seed_vc_backend import (
     SeedVCBackend,
     SeedVCBatchRequest,
-    SeedVCEnhanceRequest,
     SeedVCFindVoiceRequest,
     SeedVCRequest,
 )
@@ -66,13 +64,6 @@ def _settings_data_to_config(settings_data: dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(**sections)
 
 
-def _normalize_locale(lang: str) -> str:
-    parts = lang.lower().split("-")
-    if len(parts) == 2:
-        return f"{parts[0]}-{parts[1].upper()}"
-    return parts[0]
-
-
 def _pipertts_enabled() -> bool:
     if _server_config is None:
         return False
@@ -107,25 +98,15 @@ def _append_unique(items: list[str], value: str | None) -> None:
         items.append(value)
 
 
-def _required_piper_models() -> list[str]:
+def _preloaded_piper_models() -> list[str]:
     if _server_config is None or not _pipertts_enabled():
         return []
 
-    config = _server_config.pipertts
     models: list[str] = []
-    for model in getattr(config, "preload_models", []) or []:
+    for model in getattr(_server_config.pipertts, "preload_models", []) or []:
+        if not _is_model_allowed(model):
+            raise ValueError(f"Preloaded model is not configured for this server: {model}")
         _append_unique(models, model)
-    for model in getattr(config, "model_priority", []) or []:
-        _append_unique(models, model)
-    for model in getattr(config, "models", []) or []:
-        _append_unique(models, model)
-    _append_unique(models, getattr(config, "default_model", DEFAULT_MODEL))
-
-    if not models:
-        models = _allowed_models()
-    else:
-        for model in _allowed_models():
-            _append_unique(models, model)
     return models
 
 
@@ -150,13 +131,14 @@ def _get_model_speakers(model: str) -> dict[str, int]:
     return {str(label): int(sid) for label, sid in (data.get("speaker_id_map") or {}).items()}
 
 
-def _enforce_cache_limit() -> None:
+def _make_cache_room() -> None:
     if _server_config is None:
         return
-    limit = max(int(getattr(_server_config.pipertts, "max_models_in_cache", 1)), len(_required_piper_models()))
-    while len(_inference_cache) > limit:
-        evicted, _ = _inference_cache.popitem(last=False)
+    limit = max(1, int(getattr(_server_config.pipertts, "max_models_in_cache", 1)))
+    while len(_inference_cache) >= limit:
+        evicted, inference = _inference_cache.popitem(last=False)
         _LOGGER.info("Evicted model from cache: %s", evicted)
+        del inference
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -177,6 +159,9 @@ def _load_model(model: str) -> PiperInference:
     if checkpoint_path is None:
         raise ValueError(f"No checkpoint found for model: {model}")
 
+    # Evict before constructing the replacement. Loading first briefly keeps two
+    # complete VITS + semantic encoder stacks resident and can OOM a 16 GB GPU.
+    _make_cache_room()
     _LOGGER.info("Loading Sparrow model model=%s checkpoint=%s config=%s", model, checkpoint_path, config_path)
     started = time.perf_counter()
     try:
@@ -185,13 +170,20 @@ def _load_model(model: str) -> PiperInference:
         _LOGGER.exception("Failed loading Sparrow model model=%s elapsed=%.2fs", model, time.perf_counter() - started)
         raise
     _inference_cache[model] = inference
-    _enforce_cache_limit()
     _LOGGER.info(
         "Loaded Sparrow model model=%s speakers=%d elapsed=%.2fs",
         model,
         len(getattr(inference, "speakers", {}) or {}),
         time.perf_counter() - started,
     )
+    return inference
+
+
+def _get_or_load_model(model: str) -> PiperInference:
+    inference = _inference_cache.pop(model, None)
+    if inference is None:
+        return _load_model(model)
+    _inference_cache[model] = inference
     return inference
 
 
@@ -222,10 +214,7 @@ def _preload_piper_text_models() -> None:
             inference.warmup_semantic()
             semantic_count += 1
 
-    device = None
-    if _inference_cache:
-        first_inference = next(iter(_inference_cache.values()))
-        device = str(first_inference.device)
+    device = str(getattr(_server_config.pipertts, "text_preprocessor_device", "cpu"))
 
     from ..piper.heteronym import get_resolver
 
@@ -243,7 +232,7 @@ def _preload_piper_text_models() -> None:
     except Exception:
         _LOGGER.debug("Context replacer not available", exc_info=True)
 
-    _LOGGER.info("Loaded Sparrow text models semantic_models=%d heteronym_device=%s", semantic_count, device or "auto")
+    _LOGGER.info("Loaded Sparrow text models semantic_models=%d heteronym_device=%s", semantic_count, device)
 
 
 def _model_override_speakers(model_name: str) -> dict[str, int | None]:
@@ -294,12 +283,12 @@ def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
     _speaker_routes.clear()
     _lang_speaker_map.clear()
     for locale, speaker in getattr(_server_config.pipertts, "lang_speaker_map", {}).items():
-        _lang_speaker_map[_normalize_locale(locale)] = speaker
+        _lang_speaker_map[normalize_locale(locale)] = speaker
 
-    required_models = _required_piper_models()
-    if not required_models:
+    allowed_models = _allowed_models()
+    if not allowed_models:
         raise RuntimeError("PiperTTS is enabled but no Sparrow models are configured or available")
-    _preload_models(required_models, strict=True)
+    _preload_models(_preloaded_piper_models(), strict=True)
     _preload_piper_text_models()
 
     route_models = list(getattr(_server_config.pipertts, "model_priority", []) or []) or _allowed_models()
@@ -323,9 +312,7 @@ def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
             raise ValueError("worker payload must be an object")
         if action == "synthesize_batch":
             model_name = str(payload["model"])
-            inference = _inference_cache.get(model_name)
-            if inference is None:
-                raise HTTPException(status_code=503, detail=f"Model was not loaded in Sparrow worker: {model_name}")
+            inference = _get_or_load_model(model_name)
             audios = inference.synthesize_batch(
                 list(payload.get("texts") or []),
                 speaker=payload.get("speaker"),
@@ -336,9 +323,7 @@ def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
             return {"ok": True, "data": {"audios": audios, "sample_rate": inference.sample_rate}}
         if action == "synthesize_span":
             model_name = str(payload["model"])
-            inference = _inference_cache.get(model_name)
-            if inference is None:
-                raise HTTPException(status_code=503, detail=f"Model was not loaded in Sparrow worker: {model_name}")
+            inference = _get_or_load_model(model_name)
             audio = inference.synthesize_span(
                 str(payload.get("text") or ""),
                 speaker=payload.get("speaker"),
@@ -348,9 +333,7 @@ def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
             return {"ok": True, "data": {"audio": audio, "sample_rate": inference.sample_rate}}
         if action == "synthesize_with_ipa_overrides":
             model_name = str(payload["model"])
-            inference = _inference_cache.get(model_name)
-            if inference is None:
-                raise HTTPException(status_code=503, detail=f"Model was not loaded in Sparrow worker: {model_name}")
+            inference = _get_or_load_model(model_name)
             audio = inference.synthesize_with_ipa_overrides(
                 str(payload.get("text") or ""),
                 [tuple(item) for item in (payload.get("overrides") or [])],
@@ -486,10 +469,6 @@ def seed_vc_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
             request = SeedVCFindVoiceRequest(**payload["request"])
             result = backend.find_voice(request, Path(payload["reference_path"]))
             return {"ok": True, "data": {"voice_id": result}}
-        if action == "enhance":
-            request = SeedVCEnhanceRequest(**payload["request"])
-            data = backend.enhance(request, Path(payload["raw_path"]))
-            return {"ok": True, "data": {"audio": data}}
         raise ValueError(f"unknown worker action: {action}")
 
     run_worker_loop("Seed-VC", _with_gpu_cleanup(handler), request_queue, response_queue)

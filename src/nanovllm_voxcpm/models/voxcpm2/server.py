@@ -294,6 +294,13 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 if seq.is_finished:
                     queue_out.put({"type": "stream", "id": seq.seq_id, "data": None})
 
+        # IPA-controlled generations use eager execution even when normal
+        # decoding uses CUDA graphs. Release their cached temporary buffers
+        # once the engine is idle so varied SSML requests cannot grow the
+        # worker until the other resident TTS engines are starved of VRAM.
+        if not states["is_stoped"]:
+            torch.cuda.empty_cache()
+
 
 class AsyncVoxCPM2Server:
     def __init__(

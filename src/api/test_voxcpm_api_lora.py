@@ -84,7 +84,7 @@ def test_locale_routing_respects_native_adapter_and_reference_accents(
     monkeypatch.setattr(
         server._server_config.voxcpm,
         "default_locales",
-        ["zh-CN", "pt-PT"],
+        ["zh-CN", "zh-HK", "yue-CN", "pt-PT"],
     )
     monkeypatch.setattr(
         server._server_config.voxcpm,
@@ -107,9 +107,14 @@ def test_locale_routing_respects_native_adapter_and_reference_accents(
         language="zh-CN",
         reference_language="en-US",
     )
-    assert not _voice_request_routes_to_voxcpm(
+    assert _voice_request_routes_to_voxcpm(
         **request,
         language="zh-HK",
+        reference_language="en-US",
+    )
+    assert _voice_request_routes_to_voxcpm(
+        **request,
+        language="yue-CN",
         reference_language="en-US",
     )
     assert _voice_request_routes_to_voxcpm(

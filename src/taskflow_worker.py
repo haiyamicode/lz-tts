@@ -7,22 +7,17 @@ import contextlib
 import logging
 import os
 import socket
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
 
-from .api.server import create_app
+from .api.server import InferenceOperationError, LzTtsInferenceSession
 
 _LOGGER = logging.getLogger(__name__)
-TASK_TYPE = "tts-synthesis"
-OPERATION_PATHS = {
-    "synthesize": "/synthesize",
-    "voice-convert": "/vc",
-    "enhance": "/enhance",
-    "find-voice": "/find-voice",
-}
+TASK_TYPES = ("tts-synthesis", "voice-enhance")
 
 
 class ProtocolError(RuntimeError):
@@ -86,7 +81,7 @@ class TaskflowWorker:
                 "workerId": self.worker_id,
                 "ephemeral": False,
                 "metadata": metadata,
-                "capabilities": {"taskTypes": [TASK_TYPE], "concurrency": self.concurrency},
+                "capabilities": {"taskTypes": list(TASK_TYPES), "concurrency": self.concurrency},
             },
         )
         body = response.json()
@@ -135,7 +130,7 @@ class TaskflowWorker:
                 f"/workers/{self.worker_id}/pull",
                 token=self.session_token,
                 headers=self._session_headers(),
-                json={"maxTasks": self.concurrency, "waitMs": 1000, "taskTypes": [TASK_TYPE]},
+                json={"maxTasks": self.concurrency, "waitMs": 1000, "taskTypes": list(TASK_TYPES)},
             )
         except ProtocolError as error:
             # A server restart can leave the previous long-poll marker alive briefly in Redis.
@@ -184,37 +179,52 @@ class TaskflowWorker:
 
 async def _process_lease(
     taskflow: TaskflowWorker,
-    inference: httpx.AsyncClient,
+    inference: LzTtsInferenceSession,
     lease: dict[str, Any],
 ) -> None:
     lease_id = lease["id"]
+    run_id = lease.get("runId")
+    started_at = time.monotonic()
     taskflow.active_lease_ids.add(lease_id)
     current_task = asyncio.current_task()
     if current_task is not None:
         taskflow.active_lease_tasks[lease_id] = current_task
+    operation = "unknown"
+    task_type = lease.get("type", "unknown")
     try:
         payload = lease["payload"]
-        operation = payload["operation"]
-        path = OPERATION_PATHS.get(operation)
-        if path is None:
-            raise ValueError(f"Unsupported TTS operation: {operation}")
-        response = await inference.post(path, json=payload["request"])
-        if response.is_error:
-            raise httpx.HTTPStatusError(
-                f"LZ-TTS synthesis failed ({response.status_code}): {response.text[:1000]}",
-                request=response.request,
-                response=response,
+        operation = "voice-enhance" if task_type == "voice-enhance" else payload["operation"]
+        request = payload["request"]
+        _LOGGER.info(
+            "LZ-TTS task started type=%s lease=%s run=%s operation=%s artifact=%s "
+            "model=%s voice=%s locale=%s",
+            task_type,
+            lease_id,
+            run_id,
+            operation,
+            payload.get("artifactId"),
+            request.get("model"),
+            request.get("voice_id") or request.get("id"),
+            request.get("language") or request.get("locale"),
+        )
+        result = await inference.execute(operation, request)
+        if result.kind == "json":
+            await taskflow.complete(lease, {"kind": "json", "data": result.data})
+            _LOGGER.info(
+                "LZ-TTS task completed type=%s lease=%s run=%s operation=%s kind=json "
+                "wall_seconds=%.3f",
+                task_type,
+                lease_id,
+                run_id,
+                operation,
+                time.monotonic() - started_at,
             )
-
-        content_type = response.headers.get("content-type", "application/octet-stream").split(";", 1)[0]
-        if content_type == "application/json":
-            await taskflow.complete(lease, {"kind": "json", "data": response.json()})
             return
 
         artifact_id = payload.get("artifactId")
         if not artifact_id:
             raise ValueError(f"TTS operation {operation} returned audio without an artifactId")
-        audio = response.content
+        audio = result.audio or b""
         if not audio:
             raise RuntimeError("LZ-TTS returned an empty audio artifact")
         await taskflow.upload(lease, artifact_id, audio)
@@ -224,37 +234,76 @@ async def _process_lease(
                 "kind": "artifact",
                 "artifactId": artifact_id,
                 "bytes": len(audio),
-                "contentType": content_type,
+                "contentType": result.content_type or "application/octet-stream",
             },
         )
+        _LOGGER.info(
+            "LZ-TTS task completed type=%s lease=%s run=%s operation=%s kind=artifact bytes=%d "
+            "wall_seconds=%.3f",
+            task_type,
+            lease_id,
+            run_id,
+            operation,
+            len(audio),
+            time.monotonic() - started_at,
+        )
     except asyncio.CancelledError:
-        _LOGGER.info("Cancelled superseded TTS task lease=%s run=%s", lease_id, lease.get("runId"))
-    except httpx.HTTPStatusError as error:
-        retry = error.response.status_code >= 500 or error.response.status_code in {408, 429}
-        await taskflow.fail(lease, error, retry=retry)
+        _LOGGER.warning(
+            "LZ-TTS task cancelled type=%s lease=%s run=%s operation=%s",
+            task_type,
+            lease_id,
+            run_id,
+            operation,
+        )
+    except InferenceOperationError as error:
+        retry = error.status_code >= 500 or error.status_code in {408, 429}
+        _LOGGER.error(
+            "LZ-TTS task rejected type=%s lease=%s run=%s operation=%s status=%d retry=%s "
+            "detail=%s",
+            task_type,
+            lease_id,
+            run_id,
+            operation,
+            error.status_code,
+            retry,
+            str(error.detail)[:1000],
+        )
+        try:
+            await taskflow.fail(lease, error, retry=retry)
+        except Exception:
+            _LOGGER.exception(
+                "Failed to report rejected LZ-TTS task to Taskflow type=%s lease=%s run=%s",
+                task_type,
+                lease_id,
+                run_id,
+            )
+            raise
     except Exception as error:
-        _LOGGER.exception("TTS task failed lease=%s run=%s", lease_id, lease.get("runId"))
-        with contextlib.suppress(Exception):
+        _LOGGER.exception(
+            "LZ-TTS task failed type=%s lease=%s run=%s operation=%s",
+            task_type,
+            lease_id,
+            run_id,
+            operation,
+        )
+        try:
             await taskflow.fail(lease, error, retry=True)
+        except Exception:
+            _LOGGER.exception(
+                "Failed to report failed LZ-TTS task to Taskflow type=%s lease=%s run=%s",
+                task_type,
+                lease_id,
+                run_id,
+            )
+            raise
     finally:
         taskflow.active_lease_ids.discard(lease_id)
         taskflow.active_lease_tasks.pop(lease_id, None)
 
 
-async def _load_synthesis_capabilities(inference: httpx.AsyncClient) -> dict[str, Any]:
-    while True:
-        try:
-            response = await inference.get("/synthesize/capabilities")
-            response.raise_for_status()
-            return response.json()
-        except Exception:
-            _LOGGER.exception("LZ-TTS is not ready; retrying synthesis capabilities")
-            await asyncio.sleep(5)
-
-
 async def _serve_taskflow(
     taskflow: TaskflowWorker,
-    inference: httpx.AsyncClient,
+    inference: LzTtsInferenceSession,
     synthesis_capabilities: dict[str, Any],
 ) -> None:
     while True:
@@ -300,22 +349,14 @@ async def run_worker() -> None:
         worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lz-tts-{socket.gethostname()}"),
         concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "1"))),
     )
-    app = create_app()
-    await app.router.startup()
-    transport = httpx.ASGITransport(app=app)
-    inference = httpx.AsyncClient(
-        transport=transport,
-        base_url="http://lz-tts.internal",
-        headers={"X-Api-Key": api_key},
-        timeout=None,
-    )
+    inference = LzTtsInferenceSession()
+    await inference.start()
     try:
-        synthesis_capabilities = await _load_synthesis_capabilities(inference)
+        synthesis_capabilities = inference.synthesis_capabilities()
         await _serve_taskflow(taskflow, inference, synthesis_capabilities)
     finally:
-        await inference.aclose()
         await taskflow.close()
-        await app.router.shutdown()
+        await inference.close()
 
 
 def run() -> None:

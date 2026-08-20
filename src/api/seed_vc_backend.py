@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import logging
 import shutil
-import subprocess
 import sys
 import threading
 import uuid
@@ -44,6 +43,9 @@ class SeedVCRequest(BaseModel):
     intensity: Optional[float] = 1.0
     preset: Optional[str] = None
     remove_glitches: Optional[bool] = False
+    speed: float = Field(1.0, ge=0.5, le=1.5, description="Playback speed ratio")
+    pitch: float = Field(1.0, ge=0.5, le=1.5, description="Pitch ratio without changing duration")
+    volume: float = Field(1.0, ge=0.0, le=1.0, description="Output volume multiplier")
 
 
 class SeedVCBatchRequest(BaseModel):
@@ -58,11 +60,6 @@ class SeedVCBatchRequest(BaseModel):
 
 
 class SeedVCFindVoiceRequest(BaseModel):
-    reference_url: str
-    id: str
-
-
-class SeedVCEnhanceRequest(BaseModel):
     reference_url: str
     id: str
 
@@ -834,27 +831,3 @@ class SeedVCBackend:
             raise RuntimeError("Seed-VC find_voice support is unavailable")
         with self.lock, _temporary_cwd(self.root):
             return str(self.find_base_voice(str(reference_path)))
-
-    def enhance(self, request: SeedVCEnhanceRequest, raw_path: Path) -> bytes:
-        import subprocess
-        enhance_dir = raw_path.parent
-        sample_dir = enhance_dir / "sample"
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        wav_path = enhance_dir / "sample_raw.wav"
-
-        subprocess.run(["ffmpeg", "-i", str(raw_path), "-t", "120", str(wav_path), "-y"],
-                       capture_output=True, check=True)
-        subprocess.run(["uv", "tool", "run", "ffmpeg-normalize", str(wav_path), "-o", str(sample_dir / "sample.wav"), "-f"],
-                       capture_output=True, check=True)
-        sample_wav = sample_dir / "sample.wav"
-        enhanced_dir = enhance_dir / "enhanced"
-        enhanced_dir.mkdir(exist_ok=True)
-        enhanced_wav = enhanced_dir / "sample.wav"
-        enhanced_wav.write_bytes(sample_wav.read_bytes())
-        mp3_path = enhance_dir / "final_sample.mp3"
-        subprocess.run(
-            ["ffmpeg", "-i", str(enhanced_wav), "-f", "mp3", "-q:a", "0", "-b:a", "320k", str(mp3_path), "-y"],
-            capture_output=True,
-            check=True,
-        )
-        return mp3_path.read_bytes()

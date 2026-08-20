@@ -26,10 +26,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 import numpy as np
 import torch
 import soundfile as sf
-from asgi_compression import BrotliAlgorithm, CompressionMiddleware, GzipAlgorithm, ZstdAlgorithm
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -47,16 +45,17 @@ from ..text_norm import normalize_spoken_text
 from ..voxcpm_ipa_adapter import approximate_ipa_spelling, resolve_ipa_control_schedules
 from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
 from ..matcha_inference import MatchaBatcher as ProductionStarlingBatcher
-from .request_decompression import RequestDecompressionMiddleware
 from .audio_utils import _audio_to_mp3_bytes, _audio_to_wav_bytes, _resample_audio
+from .audio_adjustments import adjust_audio
+from .locale_utils import normalize_locale as _normalize_locale_with_region
 from .model_workers import seed_vc_worker_main, sparrow_worker_main, starling_worker_main
 from .seed_vc_backend import (
     SeedVCBackend as _SeedVCBackend,
     SeedVCBatchRequest,
-    SeedVCEnhanceRequest,
     SeedVCFindVoiceRequest,
     SeedVCRequest,
 )
+from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
 from .voxcpm_runtime import VoxCPMRuntime
 from .worker_common import WorkerProcessClient
 
@@ -94,7 +93,6 @@ def _binary_response(content: bytes, media_type: str, headers: dict[str, str] | 
 # Default paths
 DATA_DIR = Path("data")
 CONFIG_PATH = Path(os.environ.get("LZ_TTS_SERVER_CONFIG", "local/server.json"))
-LLMS_TEMPLATE_PATH = Path(__file__).with_name("llms.txt")
 DEFAULT_MODEL = "lzspeech-sparrow"
 PUBLIC_SPARROW_MODEL = "sparrow"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -162,12 +160,6 @@ def _request_api_key(request: Request) -> str:
     return (request.headers.get("X-Api-Key") or request.query_params.get("api_key") or "").strip()
 
 
-def _render_llms_txt(request: Request) -> str:
-    template = LLMS_TEMPLATE_PATH.read_text(encoding="utf-8")
-    base_url = str(request.base_url).rstrip("/")
-    return template.replace("{{BASE_URL}}", base_url)
-
-
 def _scrub_api_key_query_param(request: Request) -> None:
     query_string = request.scope.get("query_string", b"")
     if b"api_key=" not in query_string:
@@ -216,6 +208,7 @@ class PiperTTSConfig(BaseModel):
     models: list[str] = Field(default_factory=list)
     max_models_in_cache: int = Field(1, ge=1)
     preload_models: list[str] = Field(default_factory=list)
+    text_preprocessor_device: str = "cpu"
     model_priority: list[str] = Field(default_factory=list)
     lang_speaker_map: dict[str, str] = Field(default_factory=dict)
     root_voices: dict[str, RootVoiceConfig] = Field(default_factory=dict)
@@ -443,6 +436,9 @@ class SynthesizeRequest(BaseModel):
     options: Optional[SparrowSynthesizeOptions] = Field(None, description="Sparrow/VITS-specific synthesis options")
     format: Literal["wav", "mp3"] = Field("wav", description="Output audio format (wav or mp3)")
     neural: bool = Field(True, description="Use neural heteronym disambiguation for more accurate pronunciation of ambiguous words")
+    speed: float = Field(1.0, ge=0.5, le=1.5, description="Playback speed ratio")
+    pitch: float = Field(1.0, ge=0.5, le=1.5, description="Pitch ratio without changing duration")
+    volume: float = Field(1.0, ge=0.0, le=1.0, description="Output volume multiplier")
 
 
 class BatchSynthesizeInputItem(BaseModel):
@@ -657,22 +653,6 @@ def _maybe_cleanup_gpu() -> None:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-
-def _normalize_locale(lang: str) -> str:
-    """Normalize locale code to canonical BCP 47 format (e.g., en-us -> en-US)."""
-    parts = lang.lower().split("-")
-    if len(parts) == 2:
-        return f"{parts[0]}-{parts[1].upper()}"
-    return parts[0]
-
-
-def _normalize_locale_with_region(lang: str) -> str:
-    """Normalize locale code and keep only the primary language and region."""
-    parts = lang.lower().split("-")
-    if len(parts) >= 2:
-        return f"{parts[0]}-{parts[1].upper()}"
-    return parts[0]
 
 
 def _extract_locale_from_voice_id(voice_id: str) -> str | None:
@@ -1005,25 +985,16 @@ def _append_unique(items: list[str], value: str | None) -> None:
         items.append(value)
 
 
-def _required_piper_models() -> list[str]:
-    """All Sparrow/VITS models that must be resident after startup."""
+def _preloaded_piper_models() -> list[str]:
+    """Configured Sparrow/VITS models to make resident at startup."""
     if not _engine_enabled("pipertts"):
         return []
 
     models: list[str] = []
     for model in _server_config.pipertts.preload_models:
+        if not _is_model_allowed(model):
+            raise ValueError(f"Preloaded model is not configured for this server: {model}")
         _append_unique(models, model)
-    for model in _server_config.pipertts.model_priority:
-        _append_unique(models, model)
-    for model in _server_config.pipertts.models:
-        _append_unique(models, model)
-    _append_unique(models, _server_config.pipertts.default_model)
-
-    if not models:
-        models = _allowed_models()
-    else:
-        for model in _allowed_models():
-            _append_unique(models, model)
     return models
 
 
@@ -1039,15 +1010,13 @@ def _get_model_speakers(model: str) -> dict[str, int]:
     return {str(label): int(sid) for label, sid in (data.get("speaker_id_map") or {}).items()}
 
 
-def _enforce_cache_limit() -> None:
-    """Evict least-recently-used models until the cache is within its limit."""
-    # Startup loads every configured Sparrow model. The historical cache limit is
-    # kept as a lower bound for compatibility, not as permission to evict models
-    # that the process is expected to serve without lazy reloads.
-    limit = max(_server_config.pipertts.max_models_in_cache, len(_required_piper_models()))
-    while len(_inference_cache) > limit:
-        evicted, _ = _inference_cache.popitem(last=False)
+def _make_cache_room() -> None:
+    """Evict LRU models before loading another complete model stack."""
+    limit = _server_config.pipertts.max_models_in_cache
+    while len(_inference_cache) >= limit:
+        evicted, inference = _inference_cache.popitem(last=False)
         _LOGGER.info("Evicted model from cache: %s", evicted)
+        del inference
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1069,6 +1038,7 @@ def _load_model(model: str) -> PiperInference:
     if checkpoint_path is None:
         raise ValueError(f"No checkpoint found for model: {model}")
 
+    _make_cache_room()
     _LOGGER.info(
         "Loading Sparrow model model=%s checkpoint=%s config=%s",
         model,
@@ -1085,7 +1055,6 @@ def _load_model(model: str) -> PiperInference:
         _LOGGER.exception("Failed loading Sparrow model model=%s elapsed=%.2fs", model, time.perf_counter() - started)
         raise
     _inference_cache[model] = inference
-    _enforce_cache_limit()
     _LOGGER.info(
         "Loaded Sparrow model model=%s speakers=%d elapsed=%.2fs",
         model,
@@ -1176,7 +1145,7 @@ class _SparrowInferenceProxy:
 
 
 def _get_inference(model: str) -> PiperInference:
-    """Get an already loaded inference instance for a model."""
+    """Get a Sparrow model, loading it on demand when necessary."""
     if not _engine_enabled("pipertts"):
         raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
     _wait_for_engine_ready("pipertts")
@@ -1184,14 +1153,25 @@ def _get_inference(model: str) -> PiperInference:
         if model in _sparrow_model_info:
             return _SparrowInferenceProxy(model, _sparrow_model_info[model])
         if _is_model_allowed(model):
-            raise HTTPException(status_code=503, detail=f"Model was not loaded at startup: {model}")
+            config_path = DATA_DIR / model / "config.json"
+            if not config_path.exists():
+                raise HTTPException(status_code=503, detail=f"Model config not found: {model}")
+            with config_path.open("r", encoding="utf-8") as handle:
+                model_config = json.load(handle)
+            return _SparrowInferenceProxy(
+                model,
+                {
+                    "sample_rate": (model_config.get("audio") or {}).get("sample_rate", 22050),
+                    "speakers": model_config.get("speaker_id_map") or {},
+                },
+            )
         raise HTTPException(status_code=404, detail=f"Model is not configured for this server: {model}")
     if model in _inference_cache:
         inference = _inference_cache.pop(model)
         _inference_cache[model] = inference
         return inference
     if _is_model_allowed(model):
-        raise HTTPException(status_code=503, detail=f"Model was not loaded at startup: {model}")
+        return _load_model(model)
     raise HTTPException(status_code=404, detail=f"Model is not configured for this server: {model}")
 
 
@@ -1224,10 +1204,7 @@ def _preload_piper_text_models() -> None:
             inference.warmup_semantic()
             semantic_count += 1
 
-    device = None
-    if _inference_cache:
-        first_inference = next(iter(_inference_cache.values()))
-        device = str(first_inference.device)
+    device = _server_config.pipertts.text_preprocessor_device
 
     from ..piper.heteronym import get_resolver
 
@@ -1247,7 +1224,7 @@ def _preload_piper_text_models() -> None:
     _LOGGER.info(
         "Loaded Sparrow text models semantic_models=%d heteronym_device=%s",
         semantic_count,
-        device or "auto",
+        device,
     )
 
 
@@ -1318,6 +1295,22 @@ def _resolve_speaker_and_model(input_speaker: str | None, *, explicit: bool = Fa
 
     # Fallback to default model
     return speaker, _server_config.pipertts.default_model
+
+
+def _validate_language_speaker_routes() -> None:
+    """Fail startup when a configured locale points at no loaded Sparrow speaker."""
+    unresolved = sorted(
+        {
+            speaker
+            for speaker in _lang_speaker_map.values()
+            if speaker not in _speaker_routes
+        }
+    )
+    if unresolved:
+        raise RuntimeError(
+            "PiperTTS lang_speaker_map contains unresolved speakers: "
+            + ", ".join(unresolved)
+        )
 
 
 def _synthesize_multilingual(
@@ -2818,14 +2811,6 @@ class _SeedVCBackendProxy:
         )
         return str((response.get("data") or {})["voice_id"])
 
-    def enhance(self, request: SeedVCEnhanceRequest, raw_path: Path) -> bytes:
-        response = _ensure_seed_vc_worker().call(
-            "enhance",
-            {"request": request.model_dump(mode="json"), "raw_path": str(raw_path)},
-        )
-        return (response.get("data") or {})["audio"]
-
-
 def _get_seed_vc_backend() -> _SeedVCBackend:
     if not _engine_enabled("seed_vc"):
         raise HTTPException(status_code=503, detail="Seed-VC backend is disabled")
@@ -3668,841 +3653,590 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
     )
 
 
-def create_app(config: ServerConfig | None = None) -> FastAPI:
-    """Create the FastAPI application."""
-    global _server_config, _speaker_routes, _ssml_aligner
+@dataclass(frozen=True)
+class InferenceResult:
+    """Transport-independent result returned by the preloaded inference session."""
 
-    if config is None:
-        config = _load_config()
+    kind: Literal["audio", "json"]
+    content_type: str | None = None
+    audio: bytes | None = None
+    data: dict[str, Any] | None = None
+
+
+async def _apply_audio_adjustments(
+    result: InferenceResult,
+    *,
+    speed: float,
+    pitch: float,
+    volume: float,
+) -> InferenceResult:
+    if result.kind != "audio" or (speed == 1.0 and pitch == 1.0 and volume == 1.0):
+        return result
+    if not result.audio:
+        raise RuntimeError("cannot adjust an empty inference result")
+
+    audio_format: Literal["mp3", "wav"] = (
+        "mp3" if result.content_type == "audio/mpeg" else "wav"
+    )
+    audio = await asyncio.to_thread(
+        adjust_audio,
+        result.audio,
+        input_format=audio_format,
+        output_format=audio_format,
+        speed=speed,
+        pitch=pitch,
+        volume=volume,
+    )
+    return InferenceResult(
+        kind="audio",
+        content_type=result.content_type,
+        audio=audio,
+    )
+
+
+class InferenceOperationError(RuntimeError):
+    """An inference failure with retry semantics independent of HTTP."""
+
+    def __init__(self, status_code: int, detail: Any):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(str(detail))
+
+
+async def _start_inference_runtime(config: ServerConfig) -> None:
+    """Initialize the process-wide model runtime without constructing an API app."""
+    global _server_config, _speaker_routes, _ssml_aligner
+    global _lang_speaker_map, _splitter, _splitter_languages
+    global _starling_backend, _starling_batcher, _seed_vc_backend
+    global _voxcpm_runtime
+    global _sparrow_model_info, _starling_info, _seed_vc_info
+    global _startup_loader_task
+
     _server_config = config
     _ssml_aligner = None
+    startup_started = time.perf_counter()
+    _LOGGER.info("Scheduling inference runtime startup config=%s", CONFIG_PATH)
+    with _logged_startup_step("reset_runtime_state"):
+        if _startup_loader_task is not None and not _startup_loader_task.done():
+            _startup_loader_task.cancel()
+        if _voxcpm_runtime is not None:
+            await _voxcpm_runtime.stop()
+            _voxcpm_runtime = None
+        _stop_model_workers()
+        _inference_cache.clear()
+        _lang_speaker_map.clear()
+        _speaker_routes.clear()
+        _splitter = None
+        _splitter_languages = None
+        _starling_backend = None
+        _starling_batcher = None
+        _seed_vc_backend = None
+        _sparrow_model_info = {}
+        _starling_info = {}
+        _seed_vc_info = {}
+        for engine in _engine_load_states:
+            if _engine_enabled("starling" if engine == "starling" else engine):  # type: ignore[arg-type]
+                _mark_engine_loading(engine)
+            else:
+                _mark_engine_disabled(engine)
+
+    async def run_loader(engine: str, loader: Callable[[], Awaitable[None]]) -> None:
+        try:
+            await loader()
+            _mark_engine_ready(engine)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOGGER.exception("Failed loading %s backend", engine)
+            _mark_engine_failed(engine, exc)
+
+    async def load_models_background() -> None:
+        load_started = time.perf_counter()
+        startup_tasks: list[asyncio.Task] = []
+
+        if _engine_enabled("pipertts"):
+            allowed_models = _allowed_models()
+            preload_models = _preloaded_piper_models()
+            if not allowed_models:
+                _mark_engine_failed(
+                    "pipertts",
+                    RuntimeError("PiperTTS is enabled but no Sparrow models are configured or available"),
+                )
+            else:
+                async def start_sparrow() -> None:
+                    global _sparrow_model_info
+                    with _logged_startup_step("sparrow_worker", preload_models=preload_models):
+                        worker = _ensure_sparrow_worker()
+                        worker.start()
+                        response = await asyncio.to_thread(worker.call, "health")
+                        data = response.get("data") or {}
+                        _sparrow_model_info = dict(data.get("models") or {})
+                        _LOGGER.info("Sparrow worker loaded models=%s", list(_sparrow_model_info.keys()))
+
+                startup_tasks.append(asyncio.create_task(run_loader("pipertts", start_sparrow)))
+        else:
+            _LOGGER.info("PiperTTS backend disabled")
+
+        if _engine_enabled("voxcpm"):
+            async def start_voxcpm() -> None:
+                global _voxcpm_runtime
+                with _logged_startup_step(
+                    "voxcpm_nanovllm",
+                    model=_server_config.voxcpm.model_path,
+                    model_id=_server_config.voxcpm.model_id,
+                    device=_server_config.voxcpm.device,
+                    kv_blocks=_server_config.voxcpm.num_kvcache_blocks,
+                ):
+                    runtime = VoxCPMRuntime(_server_config.voxcpm.model_dump(mode="python"))
+                    await runtime.start()
+                    _voxcpm_runtime = runtime
+
+            startup_tasks.append(asyncio.create_task(run_loader("voxcpm", start_voxcpm)))
+        else:
+            _LOGGER.info("VoxCPM backend disabled")
+
+        if _engine_enabled("starling"):
+            async def start_starling() -> None:
+                global _starling_info
+                with _logged_startup_step(
+                    "starling_worker",
+                    device=_server_config.starling.device,
+                    checkpoint=_server_config.starling.checkpoint,
+                    vocoder=_server_config.starling.vocoder,
+                ):
+                    worker = _ensure_starling_worker()
+                    worker.start()
+                    response = await asyncio.to_thread(worker.call, "health")
+                    _starling_info = dict(response.get("data") or {})
+
+            startup_tasks.append(asyncio.create_task(run_loader("starling", start_starling)))
+        else:
+            _LOGGER.info("Starling backend disabled")
+
+        if _engine_enabled("seed_vc"):
+            async def start_seed_vc() -> None:
+                global _seed_vc_info
+                with _logged_startup_step(
+                    "seed_vc_worker",
+                    device=_server_config.seed_vc.device,
+                    root=_server_config.seed_vc.root,
+                ):
+                    worker = _ensure_seed_vc_worker()
+                    worker.start()
+                    response = await asyncio.to_thread(worker.call, "health")
+                    _seed_vc_info = dict(response.get("data") or {})
+
+            startup_tasks.append(asyncio.create_task(run_loader("seed_vc", start_seed_vc)))
+        else:
+            _LOGGER.info("Seed-VC backend disabled")
+
+        if startup_tasks:
+            await asyncio.gather(*startup_tasks)
+        _LOGGER.info("Loaded inference runtime models elapsed=%.2fs", time.perf_counter() - load_started)
+
+    if _engine_enabled("pipertts"):
+        for locale, speaker in _server_config.pipertts.lang_speaker_map.items():
+            _lang_speaker_map[_normalize_locale_with_region(locale)] = speaker
+        route_models = _server_config.pipertts.model_priority or _allowed_models()
+        if route_models:
+            _LOGGER.info("Loading PiperTTS speaker routes models=%s", route_models)
+            _speaker_routes = _build_speaker_routes(route_models)
+            _validate_language_speaker_routes()
+            _LOGGER.info(
+                "Loaded PiperTTS speaker routes speakers=%d locales=%d",
+                len(_speaker_routes),
+                len(_lang_speaker_map),
+            )
+    else:
+        _LOGGER.info("PiperTTS backend disabled")
+
+    _startup_loader_task = asyncio.create_task(load_models_background())
+    _LOGGER.info("Inference runtime startup scheduled elapsed=%.2fs", time.perf_counter() - startup_started)
+
+
+async def _stop_inference_runtime() -> None:
+    global _startup_loader_task, _voxcpm_runtime
+    if _startup_loader_task is not None and not _startup_loader_task.done():
+        _startup_loader_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _startup_loader_task
+    _startup_loader_task = None
+    if _voxcpm_runtime is not None:
+        await _voxcpm_runtime.stop()
+        _voxcpm_runtime = None
+    _stop_model_workers()
+
+
+async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> Response:
+    """Run one synthesis directly against the preloaded runtime."""
+    if request.text and request.ssml:
+        raise HTTPException(status_code=400, detail="Provide either 'text' or 'ssml', not both")
+    if not request.text and not request.ssml:
+        raise HTTPException(status_code=400, detail="Must provide either 'text' or 'ssml'")
+    if request.ssml is not None:
+        try:
+            document = parse_ssml(request.ssml)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if document.pronunciations and not _request_routes_to_voxcpm(request, model):
+            try:
+                audio, sample_rate = await _synthesize_sparrow_ipa_ssml(
+                    request,
+                    document,
+                    model,
+                )
+                if document.breaks:
+                    timestamps = await _align_ssml_audio(
+                        document.text,
+                        audio,
+                        sample_rate,
+                        request.language,
+                    )
+                    audio, _report = insert_ssml_breaks(
+                        document.text,
+                        audio,
+                        sample_rate,
+                        document.breaks,
+                        timestamps,
+                    )
+            except HTTPException:
+                raise
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if request.format == "mp3":
+                return _binary_response(_audio_to_mp3_bytes(audio, sample_rate), "audio/mpeg")
+            return _binary_response(_audio_to_wav_bytes(audio, sample_rate), "audio/wav")
+        has_operations = bool(document.operations)
+        effective_request = request
+        if (
+            document.pronunciations
+            and _request_routes_to_voxcpm(request, model)
+            and request.seed is None
+        ):
+            effective_request = request.model_copy(update={"seed": secrets.randbits(63)})
+        plain_request = effective_request.model_copy(
+            update={
+                "text": document.text,
+                "ssml": None,
+                "format": "wav" if has_operations else request.format,
+            }
+        )
+        baseline_response = await _synthesize(plain_request, model=model)
+        if not has_operations:
+            return baseline_response
+        try:
+            return await _postprocess_ssml_response(
+                effective_request,
+                document,
+                baseline_response,
+                model,
+            )
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if request.reference_url is not None and request.voice_id is None:
+        raise HTTPException(status_code=400, detail="'reference_url' requires 'voice_id'")
+    if request.voice_id is not None and request.reference_url is None:
+        raise HTTPException(status_code=400, detail="Voices require 'reference_url'")
+    if _is_voxcpm_model(model) and request.reference_url is None:
+        raise HTTPException(status_code=400, detail="model='voxcpm' requires 'reference_url'")
+
+    routes_to_voxcpm = _request_routes_to_voxcpm(request, model)
+    _LOGGER.info(
+        "Synthesis route voice=%s language=%s requested_model=%s backend=%s "
+        "reference_language=%s text_chars=%d",
+        request.voice_id,
+        request.language,
+        model,
+        "voxcpm" if routes_to_voxcpm else "sparrow",
+        request.reference_language,
+        len(request.text or ""),
+    )
+    if request.seed is not None and not routes_to_voxcpm:
+        raise HTTPException(status_code=400, detail="'seed' requires model='voxcpm'")
+    if request.voxcpm_loras and not routes_to_voxcpm:
+        raise HTTPException(status_code=400, detail="'voxcpm_loras' requires model='voxcpm'")
+    if request.voxcpm_loras:
+        _resolve_voxcpm_lora_names(request.voxcpm_loras)
+
+    if routes_to_voxcpm:
+        result = await synthesize_voxcpm_batch(
+            _SharedBatchSynthesizeRequest(
+                texts=[request.text or ""],
+                seeds=[request.seed],
+                voice_id=request.voice_id,
+                reference_url=request.reference_url,
+                language=request.language,
+                model=_server_config.voxcpm.model_id,
+                voxcpm_loras=tuple(request.voxcpm_loras),
+                options=request.options,
+                format=request.format,
+                neural=request.neural,
+            )
+        )
+        audio_bytes = base64.b64decode(result.items[0].audio_base64)
+        media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
+        return _binary_response(audio_bytes, media_type)
+
+    if not _engine_enabled("pipertts"):
+        raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
+    await _await_engine_ready("pipertts")
+    synth_kwargs = _synth_kwargs_from_request(request)
+
+    if model is None or model == PUBLIC_SPARROW_MODEL:
+        audio, sample_rate = _synthesize_multilingual(
+            request.text,
+            language=request.language,
+            neural=request.neural,
+            **synth_kwargs,
+        )
+    else:
+        inference = _get_inference(model)
+        batch_audios = await asyncio.to_thread(
+            inference.synthesize_batch,
+            [request.text],
+            speaker=None,
+            batch_size=1,
+            neural=request.neural,
+            **synth_kwargs,
+        )
+        audio = batch_audios[0]
+        sample_rate = inference.sample_rate
+
+    if request.reference_url is not None:
+        converted, _ = await _convert_generated_audio_to_sample_batch(
+            source_audios=[audio],
+            source_sample_rates=[sample_rate],
+            reference_url=request.reference_url,
+            output_format=request.format,
+        )
+        audio_bytes, _ = converted[0]
+        media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
+        _maybe_cleanup_gpu()
+        return _binary_response(audio_bytes, media_type)
+
+    if request.format == "mp3":
+        audio_bytes = _audio_to_mp3_bytes(audio, sample_rate)
+        media_type = "audio/mpeg"
+    else:
+        audio_bytes = _audio_to_wav_bytes(audio, sample_rate)
+        media_type = "audio/wav"
+    _maybe_cleanup_gpu()
+    return _binary_response(audio_bytes, media_type)
+
+
+class LzTtsInferenceSession:
+    """One preloaded runtime with direct task-operation dispatch."""
+
+    def __init__(self, config: ServerConfig | None = None):
+        self.config = config or _load_config()
+        self.voice_enhancer = VoiceEnhancer(
+            os.environ.get("VOICE_ENHANCE_TMP_DIR", "data/voice-enhance/tmp")
+        )
+        self._started = False
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        await _start_inference_runtime(self.config)
+        self._started = True
+
+    async def close(self) -> None:
+        if not self._started:
+            return
+        await _stop_inference_runtime()
+        self._started = False
+
+    def synthesis_capabilities(self) -> dict[str, Any]:
+        return _build_synthesis_capabilities().model_dump(mode="json")
+
+    async def execute(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
+        if not self._started:
+            raise RuntimeError("Inference session has not been started")
+        started = time.perf_counter()
+        context = {
+            "operation": operation,
+            "model": request_data.get("model"),
+            "voice": request_data.get("voice_id") or request_data.get("id"),
+            "language": request_data.get("language") or request_data.get("locale"),
+            "text_chars": len(request_data.get("text") or ""),
+            "ssml_chars": len(request_data.get("ssml") or ""),
+            "has_reference": bool(request_data.get("reference_url")),
+            "speed": request_data.get("speed", 1.0),
+            "pitch": request_data.get("pitch", 1.0),
+            "volume": request_data.get("volume", 1.0),
+        }
+        _LOGGER.info("Inference operation started: %s", json.dumps(context, default=str))
+        try:
+            if operation == "synthesize":
+                request = SynthesizeRequest.model_validate(request_data)
+                response = await _synthesize(request, model=_resolve_api_model(request.model))
+                result = InferenceResult(
+                    kind="audio",
+                    content_type=response.media_type,
+                    audio=bytes(response.body),
+                )
+                result = await _apply_audio_adjustments(
+                    result,
+                    speed=request.speed,
+                    pitch=request.pitch,
+                    volume=request.volume,
+                )
+            elif operation == "voice-convert":
+                request = SeedVCRequest.model_validate(request_data)
+                result = await self._voice_convert(request)
+                result = await _apply_audio_adjustments(
+                    result,
+                    speed=request.speed,
+                    pitch=request.pitch,
+                    volume=request.volume,
+                )
+            elif operation == "voice-enhance":
+                result = await self._enhance(VoiceEnhanceRequest.model_validate(request_data))
+            elif operation == "find-voice":
+                result = await self._find_voice(SeedVCFindVoiceRequest.model_validate(request_data))
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported TTS operation: {operation}")
+        except ValidationError as exc:
+            _LOGGER.warning("Inference input rejected context=%s errors=%s", context, exc.errors())
+            raise InferenceOperationError(400, jsonable_encoder(exc.errors())) from exc
+        except HTTPException as exc:
+            _LOGGER.warning(
+                "Inference operation rejected context=%s status=%s detail=%s",
+                context,
+                exc.status_code,
+                exc.detail,
+            )
+            raise InferenceOperationError(exc.status_code, exc.detail) from exc
+        except Exception:
+            _LOGGER.exception("Inference operation failed context=%s", context)
+            raise
+
+        _LOGGER.info(
+            "Inference operation completed context=%s kind=%s bytes=%s wall_seconds=%.3f",
+            context,
+            result.kind,
+            len(result.audio or b"") if result.kind == "audio" else None,
+            time.perf_counter() - started,
+        )
+        return result
+
+    async def _voice_convert(self, request: SeedVCRequest) -> InferenceResult:
+        if not request.audio:
+            raise HTTPException(status_code=400, detail="audio is required")
+        await _await_engine_ready("seed_vc")
+        backend = _get_seed_vc_backend()
+        emb_key, emb = backend._resolve_cached_embeddings(request)
+        reference_path = None if emb is not None else await backend._fetch_sample(request)
+        audio = await asyncio.to_thread(
+            backend._convert_with_reference,
+            request,
+            reference_path,
+            emb_key if emb is not None else None,
+            emb,
+        )
+        _maybe_cleanup_gpu()
+        return InferenceResult(kind="audio", content_type="audio/mpeg", audio=audio)
+
+    async def _find_voice(self, request: SeedVCFindVoiceRequest) -> InferenceResult:
+        await _await_engine_ready("seed_vc")
+        backend = _get_seed_vc_backend()
+        sample_request = SeedVCRequest(audio="", reference_url=request.reference_url, id=request.id)
+        reference_path = await backend._fetch_sample(sample_request)
+        voice_id = await asyncio.to_thread(backend.find_voice, request, reference_path)
+        return InferenceResult(kind="json", data={"voice_id": voice_id})
+
+    async def _enhance(self, request: VoiceEnhanceRequest) -> InferenceResult:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.get(request.reference_url)
+            response.raise_for_status()
+        audio = await asyncio.to_thread(self.voice_enhancer.enhance, response.content)
+        return InferenceResult(kind="audio", content_type="audio/mpeg", audio=audio)
+
+
+class SyncTaskInput(BaseModel):
+    """Generic development task accepted by /task/sync."""
+
+    model_config = {"extra": "forbid"}
+
+    operation: Literal["synthesize", "voice-convert", "voice-enhance", "find-voice"]
+    request: dict[str, Any]
+
+
+class SyncTaskRequest(BaseModel):
+    """Runpod-style synchronous task envelope."""
+
+    model_config = {"extra": "forbid"}
+
+    input: SyncTaskInput
+
+
+def create_app(config: ServerConfig | None = None) -> FastAPI:
+    """Create the development-only synchronous task adapter."""
+    global _server_config
+    session = LzTtsInferenceSession(config)
+    _server_config = session.config
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        await session.start()
+        try:
+            yield
+        finally:
+            await session.close()
 
     app = FastAPI(
-        title="LZ-TTS API",
-        description="Piper TTS inference API",
+        title="LZ-TTS synchronous task adapter",
         version="0.1.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
     )
-    app.add_middleware(
-        CompressionMiddleware,
-        algorithms=[
-            ZstdAlgorithm(level=3),
-            BrotliAlgorithm(quality=4),
-            GzipAlgorithm(compresslevel=5),
-        ],
-        minimum_size=1024,
-    )
-    app.add_middleware(RequestDecompressionMiddleware)
 
     @app.middleware("http")
     async def api_key_auth_middleware(request: Request, call_next):
         provided_api_key = _request_api_key(request)
         _scrub_api_key_query_param(request)
-
         expected_api_key = _configured_api_key()
         if not expected_api_key:
-            return JSONResponse(
-                status_code=503,
-                content={"detail": "API_KEY is not configured"},
-            )
+            return JSONResponse(status_code=503, content={"error": "API_KEY is not configured"})
         if not provided_api_key or not secrets.compare_digest(provided_api_key, expected_api_key):
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Invalid or missing API key"},
-            )
+            return JSONResponse(status_code=401, content={"error": "Invalid or missing API key"})
         return await call_next(request)
 
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request: Request, exc: RequestValidationError):
-        if request.url.path in {"/synthesize", "/synthesize/batch"}:
-            try:
-                input_data = dict(request.query_params) if request.method == "GET" else await request.json()
-            except Exception:
-                input_data = {}
-            _log_synthesize_request(
-                route=request.url.path,
-                method=request.method,
-                status="http_400",
-                started=time.perf_counter(),
-                count=0,
-                text_chars=0,
-                input_data=input_data,
-                error=str(exc.errors()),
-            )
-        return JSONResponse(status_code=400, content={"detail": jsonable_encoder(exc.errors())})
-
-    @app.on_event("startup")
-    async def startup_event():
-        """Schedule enabled model engines to load in background worker processes."""
-        global _speaker_routes, _lang_speaker_map, _splitter, _splitter_languages
-        global _starling_backend, _starling_batcher, _seed_vc_backend
-        global _voxcpm_runtime
-        global _sparrow_model_info, _starling_info, _seed_vc_info
-        global _startup_loader_task
-
-        startup_started = time.perf_counter()
-        _LOGGER.info("Scheduling server startup mode=early-online-parallel-workers config=%s", CONFIG_PATH)
-        with _logged_startup_step("reset_runtime_state"):
-            if _startup_loader_task is not None and not _startup_loader_task.done():
-                _startup_loader_task.cancel()
-            if _voxcpm_runtime is not None:
-                await _voxcpm_runtime.stop()
-                _voxcpm_runtime = None
-            _stop_model_workers()
-            _inference_cache.clear()
-            _lang_speaker_map.clear()
-            _speaker_routes.clear()
-            _splitter = None
-            _splitter_languages = None
-            _starling_backend = None
-            _starling_batcher = None
-            _seed_vc_backend = None
-            _sparrow_model_info = {}
-            _starling_info = {}
-            _seed_vc_info = {}
-            for engine in _engine_load_states:
-                if _engine_enabled("starling" if engine == "starling" else engine):  # type: ignore[arg-type]
-                    _mark_engine_loading(engine)
-                else:
-                    _mark_engine_disabled(engine)
-
-        async def run_loader(engine: str, loader: Callable[[], Awaitable[None]]) -> None:
-            try:
-                await loader()
-                _mark_engine_ready(engine)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                _LOGGER.exception("Failed loading %s backend", engine)
-                _mark_engine_failed(engine, exc)
-
-        async def load_models_background() -> None:
-            load_started = time.perf_counter()
-            startup_tasks: list[asyncio.Task] = []
-
-            if _engine_enabled("pipertts"):
-                required_models = _required_piper_models()
-                if not required_models:
-                    _mark_engine_failed("pipertts", RuntimeError("PiperTTS is enabled but no Sparrow models are configured or available"))
-                else:
-                    async def start_sparrow() -> None:
-                        global _sparrow_model_info
-                        with _logged_startup_step("sparrow_worker", models=required_models):
-                            worker = _ensure_sparrow_worker()
-                            worker.start()
-                            response = await asyncio.to_thread(worker.call, "health")
-                            data = response.get("data") or {}
-                            _sparrow_model_info = dict(data.get("models") or {})
-                            _LOGGER.info("Sparrow worker loaded models=%s", list(_sparrow_model_info.keys()))
-
-                    startup_tasks.append(asyncio.create_task(run_loader("pipertts", start_sparrow)))
-            else:
-                _LOGGER.info("PiperTTS backend disabled")
-
-            if _engine_enabled("voxcpm"):
-                async def start_voxcpm() -> None:
-                    global _voxcpm_runtime
-                    with _logged_startup_step(
-                        "voxcpm_nanovllm",
-                        model=_server_config.voxcpm.model_path,
-                        model_id=_server_config.voxcpm.model_id,
-                        device=_server_config.voxcpm.device,
-                        kv_blocks=_server_config.voxcpm.num_kvcache_blocks,
-                    ):
-                        runtime = VoxCPMRuntime(_server_config.voxcpm.model_dump(mode="python"))
-                        await runtime.start()
-                        _voxcpm_runtime = runtime
-
-                startup_tasks.append(asyncio.create_task(run_loader("voxcpm", start_voxcpm)))
-            else:
-                _LOGGER.info("VoxCPM backend disabled")
-
-            if _engine_enabled("starling"):
-                async def start_starling() -> None:
-                    global _starling_info
-                    with _logged_startup_step(
-                        "starling_worker",
-                        device=_server_config.starling.device,
-                        checkpoint=_server_config.starling.checkpoint,
-                        vocoder=_server_config.starling.vocoder,
-                    ):
-                        worker = _ensure_starling_worker()
-                        worker.start()
-                        response = await asyncio.to_thread(worker.call, "health")
-                        _starling_info = dict(response.get("data") or {})
-
-                startup_tasks.append(asyncio.create_task(run_loader("starling", start_starling)))
-            else:
-                _LOGGER.info("Starling backend disabled")
-
-            if _engine_enabled("seed_vc"):
-                async def start_seed_vc() -> None:
-                    global _seed_vc_info
-                    with _logged_startup_step(
-                        "seed_vc_worker",
-                        device=_server_config.seed_vc.device,
-                        root=_server_config.seed_vc.root,
-                    ):
-                        worker = _ensure_seed_vc_worker()
-                        worker.start()
-                        response = await asyncio.to_thread(worker.call, "health")
-                        _seed_vc_info = dict(response.get("data") or {})
-
-                startup_tasks.append(asyncio.create_task(run_loader("seed_vc", start_seed_vc)))
-            else:
-                _LOGGER.info("Seed-VC backend disabled")
-
-            if startup_tasks:
-                await asyncio.gather(*startup_tasks)
-            _LOGGER.info("Loaded server background models elapsed=%.2fs", time.perf_counter() - load_started)
-
-        if _engine_enabled("pipertts"):
-            for locale, speaker in _server_config.pipertts.lang_speaker_map.items():
-                canonical = _normalize_locale(locale)
-                _lang_speaker_map[canonical] = speaker
-            route_models = _server_config.pipertts.model_priority or _allowed_models()
-            if route_models:
-                _LOGGER.info("Loading PiperTTS speaker routes models=%s", route_models)
-                _speaker_routes = _build_speaker_routes(route_models)
-                _LOGGER.info("Loaded PiperTTS speaker routes speakers=%d locales=%d", len(_speaker_routes), len(_lang_speaker_map))
-        else:
-            _LOGGER.info("PiperTTS backend disabled")
-
-        _startup_loader_task = asyncio.create_task(load_models_background())
-        _LOGGER.info("Server startup scheduled background loading elapsed=%.2fs", time.perf_counter() - startup_started)
-
-    @app.on_event("shutdown")
-    async def shutdown_event():
-        global _startup_loader_task, _voxcpm_runtime
-        if _startup_loader_task is not None and not _startup_loader_task.done():
-            _startup_loader_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await _startup_loader_task
-        _startup_loader_task = None
-        if _voxcpm_runtime is not None:
-            await _voxcpm_runtime.stop()
-            _voxcpm_runtime = None
-        _stop_model_workers()
-
-    @app.get("/")
-    async def health():
-        """Health check and server info."""
-        # Build speaker list with locale mappings
-        speakers = []
-        seen_locales: set[str] = set()
-
-        for locale, speaker in _lang_speaker_map.items():
-            if speaker in _speaker_routes:
-                model, sid = _speaker_routes[speaker]
-                speakers.append({
-                    "locale": locale,
-                    "speaker": speaker,
-                    "model": _public_model_name(model),
-                    "speaker_id": sid,
-                })
-                seen_locales.add(locale)
-
-        for speaker, (model, sid) in _speaker_routes.items():
-            if speaker not in seen_locales:
-                speakers.append({
-                    "locale": speaker,
-                    "speaker": speaker,
-                    "model": _public_model_name(model),
-                    "speaker_id": sid,
-                })
-
-        speakers.sort(key=lambda x: x["locale"])
-
-        return {
-            "status": "ok",
-            "version": "0.1.0",
-            "engines": {
-                "pipertts": _engine_enabled("pipertts"),
-                "voxcpm": _engine_enabled("voxcpm"),
-                "starling": _engine_enabled("starling"),
-                "seed_vc": _engine_enabled("seed_vc"),
-            },
-            "pipertts": {
-                "enabled": _engine_enabled("pipertts"),
-                **_engine_status("pipertts"),
-                "models_loaded": _public_model_names(
-                    list(_sparrow_model_info.keys()) if _sparrow_worker is not None else list(_inference_cache.keys())
-                ),
-                "models_enabled": _public_model_names(_allowed_models()),
-                "max_models_in_cache": _server_config.pipertts.max_models_in_cache,
-                "default_model": PUBLIC_SPARROW_MODEL,
-            },
-            "voxcpm": {
-                "enabled": _engine_enabled("voxcpm"),
-                **_engine_status("voxcpm"),
-                "loaded": _voxcpm_runtime is not None,
-                "model": _server_config.voxcpm.model_id,
-                "model_path": _server_config.voxcpm.model_path,
-                "device": _server_config.voxcpm.device,
-                "dtype": (
-                    _voxcpm_runtime.dtype
-                    if _voxcpm_runtime is not None
-                    else _server_config.voxcpm.dtype
-                ),
-                "num_kvcache_blocks": _server_config.voxcpm.num_kvcache_blocks,
-                "sample_rate": (
-                    _voxcpm_runtime.sample_rate
-                    if _voxcpm_runtime is not None
-                    else None
-                ),
-            },
-            "starling": {
-                "enabled": _engine_enabled("starling"),
-                **_engine_status("starling"),
-                "loaded": (_starling_worker is not None and bool(_starling_info)) or _starling_backend is not None,
-                "device": _server_config.starling.device,
-                "checkpoint": _server_config.starling.checkpoint,
-                "vocoder": _server_config.starling.vocoder,
-                "sample_rate": _starling_info.get("sample_rate") or getattr(_starling_backend, "sample_rate", _server_config.starling.sample_rate),
-                "n_mels": _server_config.starling.n_mels,
-                "max_batch_size": _server_config.starling.max_batch_size,
-                "batch_wait_ms": _server_config.starling.batch_wait_ms,
-            },
-            "seed_vc": {
-                "enabled": _engine_enabled("seed_vc"),
-                **_engine_status("seed_vc"),
-                "loaded": (_seed_vc_worker is not None and bool(_seed_vc_info)) or _seed_vc_backend is not None,
-                "device": _server_config.seed_vc.device,
-                "root": _server_config.seed_vc.root,
-                "runtime_root": _server_config.seed_vc.runtime_root,
-                "presets": sorted(_SeedVCBackend.model_presets),
-            },
-            "speakers": speakers,
-        }
-
-    @app.get("/llms.txt", response_class=Response)
-    async def llms_txt(request: Request):
-        """LLM-readable API documentation."""
-        return Response(content=_render_llms_txt(request), media_type="text/plain")
-
-    @app.get("/synthesize/capabilities", response_model=SynthesisCapabilitiesResponse)
-    async def synthesis_capabilities():
-        """Return model capabilities without product voice metadata."""
-        return _build_synthesis_capabilities()
-
-    @app.get("/starling/status")
-    @app.get("/matcha/status")
-    async def starling_status():
-        """Starling backend status."""
-        return {
-            "enabled": _engine_enabled("starling"),
-            **_engine_status("starling"),
-            "loaded": (_starling_worker is not None and bool(_starling_info)) or _starling_backend is not None,
-            "device": _server_config.starling.device,
-            "checkpoint": _server_config.starling.checkpoint,
-            "vocoder": _server_config.starling.vocoder,
-            "sample_rate": _starling_info.get("sample_rate") or getattr(_starling_backend, "sample_rate", _server_config.starling.sample_rate),
-            "n_mels": _server_config.starling.n_mels,
-            "n_timesteps": _server_config.starling.n_timesteps,
-            "semantic": "always",
-            "max_batch_size": _server_config.starling.max_batch_size,
-            "batch_wait_ms": _server_config.starling.batch_wait_ms,
-        }
-
-    @app.get("/seed-vc/status")
-    async def seed_vc_status():
-        """Embedded Seed-VC backend status."""
-        return {
-            "enabled": _engine_enabled("seed_vc"),
-            **_engine_status("seed_vc"),
-            "loaded": (_seed_vc_worker is not None and bool(_seed_vc_info)) or _seed_vc_backend is not None,
-            "device": _server_config.seed_vc.device,
-            "root": _server_config.seed_vc.root,
-            "runtime_root": _server_config.seed_vc.runtime_root,
-            "presets": sorted(_SeedVCBackend.model_presets),
-        }
-
-    @app.post("/vc")
-    async def seed_vc_convert(request: SeedVCRequest):
-        """Seed-VC voice conversion endpoint compatible with the standalone API."""
-        if not request.audio:
-            raise HTTPException(status_code=400, detail="audio is required")
-        try:
-            await _await_engine_ready("seed_vc")
-            backend = _get_seed_vc_backend()
-            # Resolve cached embedding check async; download reference in background
-            emb_key, emb = backend._resolve_cached_embeddings(request)
-            reference_path = None if emb is not None else await backend._fetch_sample(request)
-            mp3_bytes = await asyncio.to_thread(
-                backend._convert_with_reference, request, reference_path, emb_key if emb is not None else None, emb
-            )
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _LOGGER.exception("Seed-VC conversion failed")
-            raise HTTPException(status_code=500, detail=f"Seed-VC conversion failed: {exc}") from exc
-        _maybe_cleanup_gpu()
-        return _binary_response(mp3_bytes, "audio/mpeg")
-
-    @app.post("/vc-batch")
-    async def seed_vc_convert_batch(request: SeedVCBatchRequest):
-        """Batched Seed-VC conversion endpoint for shared target voice settings."""
-        if not request.items:
-            raise HTTPException(status_code=400, detail="items is required")
-        if any(not item.audio for item in request.items):
-            raise HTTPException(status_code=400, detail="all items require audio")
-        try:
-            await _await_engine_ready("seed_vc")
-            started = time.perf_counter()
-            backend = _get_seed_vc_backend()
-            first = request.items[0]
-            emb_key, emb = backend._resolve_cached_embeddings(first)
-            reference_path = None if emb is not None else await backend._fetch_sample(first)
-            result = await asyncio.to_thread(
-                backend.convert_batch_request, request, reference_path,
-                emb_key if emb is not None else None, emb,
-            )
-            result["wall_time_sec"] = time.perf_counter() - started
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _LOGGER.exception("Seed-VC batch conversion failed")
-            raise HTTPException(status_code=500, detail=f"Seed-VC batch conversion failed: {exc}") from exc
-        _maybe_cleanup_gpu()
-        return result
-
-    @app.post("/find-voice")
-    async def seed_vc_find_voice(request: SeedVCFindVoiceRequest):
-        """Seed-VC compatible voice lookup endpoint."""
-        try:
-            await _await_engine_ready("seed_vc")
-            backend = _get_seed_vc_backend()
-            sample_request = SeedVCRequest(audio="", reference_url=request.reference_url, id=request.id)
-            reference_path = await backend._fetch_sample(sample_request)
-            voice_id = await asyncio.to_thread(backend.find_voice, request, reference_path)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _LOGGER.exception("Seed-VC find-voice failed")
-            raise HTTPException(status_code=500, detail=f"Seed-VC find-voice failed: {exc}") from exc
-        return {"voice_id": voice_id}
-
-    @app.post("/enhance")
-    async def seed_vc_enhance(request: SeedVCEnhanceRequest):
-        """Seed-VC compatible audio enhancement endpoint."""
-        try:
-            await _await_engine_ready("seed_vc")
-            backend = _get_seed_vc_backend()
-            raw_path = backend.tmp_dir / request.id / "sample_raw.mp3"
-            raw_path.parent.mkdir(parents=True, exist_ok=True)
-            async with httpx.AsyncClient(follow_redirects=True) as client:
-                resp = await client.get(request.reference_url)
-                resp.raise_for_status()
-                raw_path.write_bytes(resp.content)
-            mp3_bytes = await asyncio.to_thread(backend.enhance, request, raw_path)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _LOGGER.exception("Seed-VC enhance failed")
-            raise HTTPException(status_code=500, detail=f"Seed-VC enhance failed: {exc}") from exc
-        _maybe_cleanup_gpu()
-        return _binary_response(mp3_bytes, "audio/mpeg")
-
-    async def _handle_synthesize(
-        request: SynthesizeRequest,
-        model: str | None = None,
-    ) -> Response:
-        # Validate exactly one of text or ssml is provided
-        if request.text and request.ssml:
-            raise HTTPException(status_code=400, detail="Provide either 'text' or 'ssml', not both")
-        if not request.text and not request.ssml:
-            raise HTTPException(status_code=400, detail="Must provide either 'text' or 'ssml'")
-        if request.ssml is not None:
-            try:
-                document = parse_ssml(request.ssml)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            if document.pronunciations and not _request_routes_to_voxcpm(request, model):
-                try:
-                    audio, sample_rate = await _synthesize_sparrow_ipa_ssml(
-                        request,
-                        document,
-                        model,
-                    )
-                    if document.breaks:
-                        timestamps = await _align_ssml_audio(
-                            document.text,
-                            audio,
-                            sample_rate,
-                            request.language,
-                        )
-                        audio, _report = insert_ssml_breaks(
-                            document.text,
-                            audio,
-                            sample_rate,
-                            document.breaks,
-                            timestamps,
-                        )
-                except HTTPException:
-                    raise
-                except ValueError as exc:
-                    raise HTTPException(status_code=400, detail=str(exc)) from exc
-                if request.format == "mp3":
-                    return _binary_response(
-                        _audio_to_mp3_bytes(audio, sample_rate),
-                        "audio/mpeg",
-                    )
-                return _binary_response(
-                    _audio_to_wav_bytes(audio, sample_rate),
-                    "audio/wav",
-                )
-            has_operations = bool(document.operations)
-            effective_request = request
-            if (
-                document.pronunciations
-                and _request_routes_to_voxcpm(request, model)
-                and request.seed is None
-            ):
-                effective_request = request.model_copy(
-                    update={"seed": secrets.randbits(63)}
-                )
-            plain_request = effective_request.model_copy(
-                update={
-                    "text": document.text,
-                    "ssml": None,
-                    "format": "wav" if has_operations else request.format,
-                }
-            )
-            baseline_response = await _handle_synthesize(plain_request, model=model)
-            if not has_operations:
-                return baseline_response
-            try:
-                return await _postprocess_ssml_response(
-                    effective_request,
-                    document,
-                    baseline_response,
-                    model,
-                )
-            except HTTPException:
-                raise
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if request.reference_url is not None and request.voice_id is None:
-            raise HTTPException(status_code=400, detail="'reference_url' requires 'voice_id'")
-        if request.voice_id is not None and request.reference_url is None:
-            raise HTTPException(status_code=400, detail="Voices require 'reference_url'")
-        if _is_voxcpm_model(model) and request.reference_url is None:
-            raise HTTPException(status_code=400, detail="model='voxcpm' requires 'reference_url'")
-
-        routes_to_voxcpm = _request_routes_to_voxcpm(request, model)
-        if request.seed is not None and not routes_to_voxcpm:
-            raise HTTPException(status_code=400, detail="'seed' requires model='voxcpm'")
-        if request.voxcpm_loras and not routes_to_voxcpm:
-            raise HTTPException(status_code=400, detail="'voxcpm_loras' requires model='voxcpm'")
-        if request.voxcpm_loras:
-            _resolve_voxcpm_lora_names(request.voxcpm_loras)
-
-        if routes_to_voxcpm:
-            result = await synthesize_voxcpm_batch(
-                _SharedBatchSynthesizeRequest(
-                    texts=[request.text or ""],
-                    seeds=[request.seed],
-                    voice_id=request.voice_id,
-                    reference_url=request.reference_url,
-                    language=request.language,
-                    model=_server_config.voxcpm.model_id,
-                    voxcpm_loras=tuple(request.voxcpm_loras),
-                    options=request.options,
-                    format=request.format,
-                    neural=request.neural,
-                )
-            )
-            audio_bytes = base64.b64decode(result.items[0].audio_base64)
-            media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
-            return _binary_response(audio_bytes, media_type)
-
-        if not _engine_enabled("pipertts"):
-            raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
-        await _await_engine_ready("pipertts")
-        synth_kwargs = _synth_kwargs_from_request(request)
-
-        if model is None or model == PUBLIC_SPARROW_MODEL:
-            audio, sample_rate = _synthesize_multilingual(
-                request.text,
-                language=request.language,
-                neural=request.neural,
-                **synth_kwargs,
-            )
-        else:
-            inference = _get_inference(model)
-            internal_speaker = None
-            batch_audios = await asyncio.to_thread(
-                inference.synthesize_batch,
-                [request.text],
-                speaker=internal_speaker,
-                batch_size=1,
-                neural=request.neural,
-                **synth_kwargs,
-            )
-            audio = batch_audios[0]
-            sample_rate = inference.sample_rate
-
-        if request.reference_url is not None:
-            converted, _ = await _convert_generated_audio_to_sample_batch(
-                source_audios=[audio],
-                source_sample_rates=[sample_rate],
-                reference_url=request.reference_url,
-                output_format=request.format,
-            )
-            audio_bytes, _ = converted[0]
-            media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
-            _maybe_cleanup_gpu()
-            return _binary_response(audio_bytes, media_type)
-
-        # Convert to requested format
-        if request.format == "mp3":
-            audio_bytes = _audio_to_mp3_bytes(audio, sample_rate)
-            media_type = "audio/mpeg"
-        else:
-            audio_bytes = _audio_to_wav_bytes(audio, sample_rate)
-            media_type = "audio/wav"
-
-        _maybe_cleanup_gpu()
-        return _binary_response(audio_bytes, media_type)
-
-    @app.post("/synthesize")
-    async def synthesize(
-        request: SynthesizeRequest,
-        fastapi_request: Request,
-    ):
-        """Synthesize text or SSML to speech.
-
-        Provide either `text` (plain text) or `ssml` (SSML with <speak> wrapper), not both.
-
-        By default, text is split by language and routed automatically.
-        Use `language` to force one supported locale for the entire text.
-        """
+    @app.post("/task/sync")
+    async def sync_task(task: SyncTaskRequest):
         started = time.perf_counter()
-        model = _resolve_api_model(request.model)
-        _log_synthesize_request(
-            route=fastapi_request.url.path,
-            method=fastapi_request.method,
-            status="received",
-            started=started,
-            count=1,
-            text_chars=_text_length(request.text),
-            ssml_chars=_text_length(request.ssml),
-            input_data=_request_model_input(request, model=model),
-        )
         try:
-            response = await _handle_synthesize(request, model=model)
-        except HTTPException as exc:
-            _log_synthesize_request(
-                route=fastapi_request.url.path,
-                method=fastapi_request.method,
-                status=f"http_{exc.status_code}",
-                started=started,
-                count=1,
-                text_chars=_text_length(request.text),
-                ssml_chars=_text_length(request.ssml),
-                input_data=_request_model_input(request, model=model),
-                error=str(exc.detail),
+            result = await session.execute(task.input.operation, task.input.request)
+        except InferenceOperationError as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"status": "FAILED", "error": jsonable_encoder(exc.detail)},
             )
-            raise
         except Exception as exc:
-            _log_synthesize_request(
-                route=fastapi_request.url.path,
-                method=fastapi_request.method,
-                status="error",
-                started=started,
-                count=1,
-                text_chars=_text_length(request.text),
-                ssml_chars=_text_length(request.ssml),
-                input_data=_request_model_input(request, model=model),
-                error=type(exc).__name__,
+            _LOGGER.exception("Synchronous inference task failed operation=%s", task.input.operation)
+            return JSONResponse(
+                status_code=500,
+                content={"status": "FAILED", "error": str(exc)},
             )
-            raise
-        _log_synthesize_request(
-            route=fastapi_request.url.path,
-            method=fastapi_request.method,
-            status="ok",
-            started=started,
-            count=1,
-            text_chars=_text_length(request.text),
-            ssml_chars=_text_length(request.ssml),
-            input_data=_request_model_input(request, model=model),
-        )
-        return response
 
-    @app.post("/synthesize/batch", response_model=BatchSynthesizeResponse)
-    async def synthesize_batch(request: BatchSynthesizeRequest, fastapi_request: Request):
-        """Batched synthesis with independent /synthesize-shaped inputs."""
-        started = time.perf_counter()
-        _log_synthesize_request(
-            route=fastapi_request.url.path,
-            method=fastapi_request.method,
-            status="received",
-            started=started,
-            count=len(request.items),
-            text_chars=sum(_text_length(item.text) for item in request.items),
-            ssml_chars=sum(_text_length(item.ssml) for item in request.items),
-            input_data=_request_model_input(request),
-        )
-        try:
-            result = await synthesize_mixed_batch(request)
-        except HTTPException as exc:
-            _log_synthesize_request(
-                route=fastapi_request.url.path,
-                method=fastapi_request.method,
-                status=f"http_{exc.status_code}",
-                started=started,
-                count=len(request.items),
-                text_chars=sum(_text_length(item.text) for item in request.items),
-                ssml_chars=sum(_text_length(item.ssml) for item in request.items),
-                input_data=_request_model_input(request),
-                error=str(exc.detail),
-            )
-            raise
-        except Exception as exc:
-            _log_synthesize_request(
-                route=fastapi_request.url.path,
-                method=fastapi_request.method,
-                status="error",
-                started=started,
-                count=len(request.items),
-                text_chars=sum(_text_length(item.text) for item in request.items),
-                ssml_chars=sum(_text_length(item.ssml) for item in request.items),
-                input_data=_request_model_input(request),
-                error=type(exc).__name__,
-            )
-            raise
-        _log_synthesize_request(
-            route=fastapi_request.url.path,
-            method=fastapi_request.method,
-            status="ok",
-            started=started,
-            count=len(request.items),
-            text_chars=sum(_text_length(item.text) for item in request.items),
-            ssml_chars=sum(_text_length(item.ssml) for item in request.items),
-            input_data=_request_model_input(request),
-        )
-        _maybe_cleanup_gpu()
-        return result
-
-    @app.get("/synthesize")
-    async def synthesize_get(
-        fastapi_request: Request,
-        text: Optional[str] = Query(None, description="Plain text to synthesize (mutually exclusive with ssml)"),
-        ssml: Optional[str] = Query(None, description="SSML to synthesize, must be wrapped in <speak> tags (mutually exclusive with text)"),
-        model: str = Query(None, description="Public model family, e.g. sparrow or voxcpm"),
-        voice_id: Optional[str] = Query(None, description="Opaque product voice id"),
-        reference_url: Optional[str] = Query(
-            None,
-            description="Reference sample URL; used natively by VoxCPM or for Seed-VC conversion with Sparrow",
-        ),
-        language: Optional[str] = Query(None, description="Force full locale for the entire text, e.g. en-GB"),
-        voxcpm_loras: Optional[list[str]] = Query(
-            None,
-            description="Configured VoxCPM LoRA name; repeat the query parameter to provide a list",
-        ),
-        options: Optional[str] = Query(
-            None,
-            description='Sparrow options as JSON, e.g. {"length_scale":1.2,"duration_sdp_ratio":0.2}',
-        ),
-        format: Literal["wav", "mp3"] = Query("wav", description="Output audio format (wav or mp3)"),
-        neural: bool = Query(True, description="Use neural heteronym disambiguation"),
-    ):
-        """Synthesize text or SSML to speech (GET endpoint for easy testing).
-
-        Provide either `text` (plain text) or `ssml` (SSML with <speak> wrapper), not both.
-
-        By default, text is split by language and routed automatically.
-        """
-        started = time.perf_counter()
-        resolved_model = _resolved_synthesize_model(None, model)
-        get_input = {
-            "text": text,
-            "ssml": ssml,
-            "model": model,
-            "voice_id": voice_id,
-            "reference_url": reference_url,
-            "language": language,
-            "voxcpm_loras": voxcpm_loras or [],
-            "options": options,
-            "format": format,
-            "neural": neural,
+        if result.kind == "json":
+            output: dict[str, Any] = {"kind": "json", "data": result.data}
+        else:
+            output = {
+                "kind": "audio",
+                "contentType": result.content_type,
+                "audioBase64": base64.b64encode(result.audio or b"").decode("ascii"),
+            }
+        return {
+            "status": "COMPLETED",
+            "executionTime": time.perf_counter() - started,
+            "output": output,
         }
-        _log_synthesize_request(
-            route=fastapi_request.url.path,
-            method=fastapi_request.method,
-            status="received",
-            started=started,
-            count=1,
-            text_chars=_text_length(text),
-            ssml_chars=_text_length(ssml),
-            input_data=get_input,
-        )
-        try:
-            parsed_options = SparrowSynthesizeOptions.model_validate_json(options) if options else None
-        except ValidationError as exc:
-            detail = jsonable_encoder(exc.errors())
-            _log_synthesize_request(
-                route=fastapi_request.url.path,
-                method=fastapi_request.method,
-                status="http_400",
-                started=started,
-                count=1,
-                text_chars=_text_length(text),
-                ssml_chars=_text_length(ssml),
-                input_data=get_input,
-                error=str(detail),
-            )
-            raise HTTPException(status_code=400, detail=detail) from exc
-
-        synth_request = SynthesizeRequest(
-            text=text,
-            ssml=ssml,
-            voice_id=voice_id,
-            reference_url=reference_url,
-            language=language,
-            voxcpm_loras=voxcpm_loras or [],
-            options=parsed_options,
-            format=format,
-            neural=neural,
-        )
-        try:
-            response = await _handle_synthesize(synth_request, model=resolved_model)
-        except HTTPException as exc:
-            _log_synthesize_request(
-                route=fastapi_request.url.path,
-                method=fastapi_request.method,
-                status=f"http_{exc.status_code}",
-                started=started,
-                count=1,
-                text_chars=_text_length(synth_request.text),
-                ssml_chars=_text_length(synth_request.ssml),
-                input_data=get_input,
-                error=str(exc.detail),
-            )
-            raise
-        except Exception as exc:
-            _log_synthesize_request(
-                route=fastapi_request.url.path,
-                method=fastapi_request.method,
-                status="error",
-                started=started,
-                count=1,
-                text_chars=_text_length(synth_request.text),
-                ssml_chars=_text_length(synth_request.ssml),
-                input_data=get_input,
-                error=type(exc).__name__,
-            )
-            raise
-        _log_synthesize_request(
-            route=fastapi_request.url.path,
-            method=fastapi_request.method,
-            status="ok",
-            started=started,
-            count=1,
-            text_chars=_text_length(synth_request.text),
-            ssml_chars=_text_length(synth_request.ssml),
-            input_data=get_input,
-        )
-        return response
 
     return app
 
