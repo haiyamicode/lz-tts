@@ -29,7 +29,7 @@ class ProtocolError(RuntimeError):
 @dataclass
 class TaskflowWorker:
     base_url: str
-    join_token: str
+    worker_token: str
     worker_id: str
     concurrency: int = 1
     session_id: str | None = None
@@ -76,7 +76,7 @@ class TaskflowWorker:
         response = await self._request(
             "POST",
             "/workers/join",
-            token=self.join_token,
+            token=self.worker_token,
             json={
                 "workerId": self.worker_id,
                 "ephemeral": False,
@@ -339,13 +339,13 @@ async def _serve_taskflow(
 
 async def run_worker() -> None:
     load_dotenv()
-    api_key = os.environ.get("API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("API_KEY is required to join Lazybird Taskflow")
+    worker_token = os.environ.get("TASKFLOW_WORKER_TOKEN", "").strip()
+    if not worker_token:
+        raise RuntimeError("TASKFLOW_WORKER_TOKEN is required to authenticate with Lazybird Taskflow")
     lazybird_url = os.environ.get("LZB_API", "http://localhost:4001").rstrip("/")
     taskflow = TaskflowWorker(
         base_url=f"{lazybird_url}/internal/taskflow/v1",
-        join_token=api_key,
+        worker_token=worker_token,
         worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lz-tts-{socket.gethostname()}"),
         concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "1"))),
     )
