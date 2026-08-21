@@ -4084,15 +4084,6 @@ class LzTtsInferenceSession:
                     pitch=request.pitch,
                     volume=request.volume,
                 )
-            elif operation == "voice-convert":
-                request = SeedVCRequest.model_validate(request_data)
-                result = await self._voice_convert(request)
-                result = await _apply_audio_adjustments(
-                    result,
-                    speed=request.speed,
-                    pitch=request.pitch,
-                    volume=request.volume,
-                )
             elif operation == "voice-enhance":
                 result = await self._enhance(VoiceEnhanceRequest.model_validate(request_data))
             elif operation == "find-voice":
@@ -4123,23 +4114,6 @@ class LzTtsInferenceSession:
         )
         return result
 
-    async def _voice_convert(self, request: SeedVCRequest) -> InferenceResult:
-        if not request.audio:
-            raise HTTPException(status_code=400, detail="audio is required")
-        await _await_engine_ready("seed_vc")
-        backend = _get_seed_vc_backend()
-        emb_key, emb = backend._resolve_cached_embeddings(request)
-        reference_path = None if emb is not None else await backend._fetch_sample(request)
-        audio = await asyncio.to_thread(
-            backend._convert_with_reference,
-            request,
-            reference_path,
-            emb_key if emb is not None else None,
-            emb,
-        )
-        _maybe_cleanup_gpu()
-        return InferenceResult(kind="audio", content_type="audio/mpeg", audio=audio)
-
     async def _find_voice(self, request: SeedVCFindVoiceRequest) -> InferenceResult:
         await _await_engine_ready("seed_vc")
         backend = _get_seed_vc_backend()
@@ -4161,7 +4135,7 @@ class SyncTaskInput(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    operation: Literal["synthesize", "voice-convert", "voice-enhance", "find-voice"]
+    operation: Literal["synthesize", "voice-enhance", "find-voice"]
     request: dict[str, Any]
 
 
