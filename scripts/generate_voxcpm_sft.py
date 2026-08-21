@@ -331,11 +331,8 @@ def _build_validator(cfg: DictConfig) -> Any:
             checkpoint=_absolute(cfg.validation.mas.checkpoint),
             device=str(cfg.validation.device),
             language="multilingual",
-            noise_scale=float(cfg.validation.mas.noise_scale),
             length_scale=float(cfg.validation.mas.length_scale),
             token_rate=12.0,
-            samples=int(cfg.validation.mas.duration_samples),
-            upper_quantile=0.90,
             min_margin=1.0,
             max_margin=1.35,
             min_extra_tokens=0,
@@ -648,7 +645,7 @@ def _validate_batch(
             expected_seconds = None
         else:
             budget = budgets[index]
-            expected_seconds = float(budget["p50_seconds"])
+            expected_seconds = float(budget["seconds"])
             validation = validator.validate_alignment(
                 text=task["text"],
                 wav_data=audio,

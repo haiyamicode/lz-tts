@@ -208,7 +208,7 @@ class PiperTTSConfig(BaseModel):
     models: list[str] = Field(default_factory=list)
     max_models_in_cache: int = Field(1, ge=1)
     preload_models: list[str] = Field(default_factory=list)
-    text_preprocessor_device: str = "cpu"
+    text_preprocessor_device: str = "cuda:0"
     model_priority: list[str] = Field(default_factory=list)
     lang_speaker_map: dict[str, str] = Field(default_factory=dict)
     root_voices: dict[str, RootVoiceConfig] = Field(default_factory=dict)
@@ -216,20 +216,17 @@ class PiperTTSConfig(BaseModel):
 
 
 class VoxCPMDurationBudgetConfig(BaseModel):
-    """Sparrow DP settings used to derive a VoxCPM generation limit per text."""
+    """Sparrow deterministic-DP settings for VoxCPM generation limits."""
 
     enabled: bool = True
     preload: bool = True
     use_bert: bool = False
     checkpoint: str = "data/lzspeech-sparrow/model.ckpt"
     config_path: Optional[str] = None
-    device: str = "cuda:0"
+    device: str = "auto"
     language: str = "multilingual"
-    noise_scale: float = Field(default=0.8, ge=0)
     length_scale: float = Field(default=1.0, gt=0)
     token_rate: float = Field(default=6.25, gt=0)
-    samples: int = Field(default=32, ge=1)
-    upper_quantile: float = Field(default=0.90, ge=0, le=1)
     min_margin: float = Field(default=1.0, gt=0)
     max_margin: float = Field(default=1.35, gt=0)
     min_extra_tokens: int = Field(default=0, ge=0)

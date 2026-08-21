@@ -134,11 +134,8 @@ class DpBudgetConfig:
     config_path: Optional[Path] = None
     device: str = "cpu"
     language: str = "multilingual"
-    noise_scale: float = 0.8
     length_scale: float = 1.0
     token_rate: float = 12.0
-    samples: int = 32
-    upper_quantile: float = 0.90
     min_margin: float = 1.0
     max_margin: float = 1.25
     min_extra_tokens: int = 0
@@ -275,6 +272,8 @@ class DurationAlignmentValidator:
             if not self.config.enable_alignment_validation:
                 model_g.enc_q = None
                 model_g.flow = None
+            if model_g.use_duration_blend:
+                model_g.sdp = None
             gc.collect()
 
             self._sync_config_from_checkpoint(model)
@@ -500,13 +499,14 @@ class DurationAlignmentValidator:
             phoneme_length=batch_phoneme_lengths,
             word_spans=batch_word_spans,
         )
-        frame_samples = []
-        for _ in range(max(1, self.config.samples)):
-            frame_samples.append(self._predict_frames(x, x_lengths, sid, bert_input))
-        frame_tensor = torch.stack(frame_samples, dim=0).to(dtype=torch.float32)
+        frame_tensor = self._predict_frames(
+            x,
+            x_lengths,
+            sid,
+            bert_input,
+        ).to(dtype=torch.float32)
         seconds_tensor = frame_tensor * (256.0 / 22050.0)
         token_tensor = seconds_tensor * self.config.token_rate
-        quantile = self.config.upper_quantile
 
         for batch_idx, (input_index, language, phoneme_ids, _payload) in enumerate(batch_entries):
             profile_language, profile = self._budget_profile(language)
@@ -515,11 +515,9 @@ class DurationAlignmentValidator:
             min_extra_tokens = self._profile_int(profile, "min_extra_tokens", self.config.min_extra_tokens)
             max_extra_tokens = self._profile_int(profile, "max_extra_tokens", self.config.max_extra_tokens)
 
-            sample_frames = frame_tensor[:, batch_idx]
-            sample_seconds = seconds_tensor[:, batch_idx]
-            mel_frames = int(torch.quantile(sample_frames, quantile).ceil().item())
-            seconds = float(torch.quantile(sample_seconds, quantile).item())
-            estimated_tokens = max(1, round(float(torch.quantile(token_tensor[:, batch_idx], quantile).item())))
+            mel_frames = int(frame_tensor[batch_idx].ceil().item())
+            seconds = float(seconds_tensor[batch_idx].item())
+            estimated_tokens = max(1, round(float(token_tensor[batch_idx].item())))
             min_tokens = max(1, round(estimated_tokens * min_margin) + min_extra_tokens)
             max_tokens = max(min_tokens, round(estimated_tokens * max_margin) + max_extra_tokens)
 
@@ -530,8 +528,6 @@ class DurationAlignmentValidator:
                 "min_tokens": min_tokens,
                 "max_tokens": max_tokens,
                 "token_rate": self.config.token_rate,
-                "samples": self.config.samples,
-                "upper_quantile": self.config.upper_quantile,
                 "budget_language": profile_language,
                 "budget_profile": profile,
                 "min_margin": min_margin,
@@ -541,13 +537,7 @@ class DurationAlignmentValidator:
                 "phoneme_count": len(phoneme_ids),
                 "phoneme_language": self._phoneme_config(language)["language"]["code"],
                 "speaker_id": int(self._speaker_id_for_language(language)),
-                "sample_frames": [int(v) for v in sample_frames.tolist()],
-                "sample_seconds": [round(float(s), 3) for s in sample_seconds.tolist()],
-                "mean_seconds": float(torch.mean(sample_seconds).item()),
-                "p50_seconds": float(torch.quantile(sample_seconds, 0.50).item()),
-                "p90_seconds": float(torch.quantile(sample_seconds, 0.90).item()),
                 "length_scale": self.config.length_scale,
-                "noise_scale": self.config.noise_scale,
             }
 
         return budgets
@@ -854,31 +844,31 @@ class DurationAlignmentValidator:
         assert self._model is not None
         model = self._model
         with torch.device(self.device):
-            if bert_input is not None:
-                x_encoded, _m_p, _logs_p, x_mask = model.enc_p(
-                    x,
-                    x_lengths,
-                    bert_input=bert_input,
-                )
-            else:
-                x_encoded, _m_p, _logs_p, x_mask = model.enc_p(x, x_lengths)
-
             if model.n_speakers > 1:
                 g = model.emb_g(sid).unsqueeze(-1)
             else:
                 g = None
 
-            if model.use_sdp:
-                dp = model.sdp if model.use_duration_blend else model.dp
-                logw = dp(
-                    x_encoded,
-                    x_mask,
+            if bert_input is not None:
+                x_encoded, _m_p, _logs_p, x_mask = model.enc_p(
+                    x,
+                    x_lengths,
+                    bert_input=bert_input,
                     g=g,
-                    reverse=True,
-                    noise_scale=self.config.noise_scale,
                 )
             else:
-                logw = model.dp(x_encoded, x_mask, g=g)
+                x_encoded, _m_p, _logs_p, x_mask = model.enc_p(
+                    x,
+                    x_lengths,
+                    g=g,
+                )
+
+            if model.use_sdp and not model.use_duration_blend:
+                raise RuntimeError(
+                    "Duration budgeting requires a checkpoint with a deterministic "
+                    "duration predictor"
+                )
+            logw = model.dp(x_encoded, x_mask, g=g)
             w = torch.exp(logw) * x_mask * self.config.length_scale
             w_ceil = torch.ceil(w)
             return torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1)
@@ -896,8 +886,6 @@ class DurationAlignmentValidator:
             "min_tokens": 1,
             "max_tokens": 1,
             "token_rate": self.config.token_rate,
-            "samples": 0,
-            "upper_quantile": self.config.upper_quantile,
             "budget_language": profile_language,
             "budget_profile": profile,
             "min_margin": min_margin,
@@ -907,11 +895,5 @@ class DurationAlignmentValidator:
             "phoneme_count": 0,
             "phoneme_language": self.config.language,
             "speaker_id": self._speaker_id_for_language(language),
-            "sample_frames": [],
-            "sample_seconds": [],
-            "mean_seconds": 0.0,
-            "p50_seconds": 0.0,
-            "p90_seconds": 0.0,
             "length_scale": self.config.length_scale,
-            "noise_scale": self.config.noise_scale,
         }

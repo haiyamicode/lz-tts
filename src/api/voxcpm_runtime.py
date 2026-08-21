@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -238,17 +239,20 @@ class VoxCPMRuntime:
 
             settings = self.settings["duration_budget"]
             config_path = settings.get("config_path")
+            configured_device = str(settings["device"])
+            duration_device = (
+                f"cuda:{int(self.settings['device'])}"
+                if configured_device.strip().lower() == "auto"
+                else configured_device
+            )
             validator = DurationAlignmentValidator(
                 DpBudgetConfig(
                     checkpoint=Path(settings["checkpoint"]),
                     config_path=Path(config_path) if config_path else None,
-                    device=str(settings["device"]),
+                    device=duration_device,
                     language=str(settings["language"]),
-                    noise_scale=float(settings["noise_scale"]),
                     length_scale=float(settings["length_scale"]),
                     token_rate=float(settings["token_rate"]),
-                    samples=int(settings["samples"]),
-                    upper_quantile=float(settings["upper_quantile"]),
                     min_margin=float(settings["min_margin"]),
                     max_margin=float(settings["max_margin"]),
                     min_extra_tokens=int(settings["min_extra_tokens"]),
@@ -264,7 +268,7 @@ class VoxCPMRuntime:
                 "VoxCPM DP budget ready checkpoint=%s device=%s token_rate=%.2f "
                 "max_margin=%.2f max_extra_tokens=%d",
                 settings["checkpoint"],
-                settings["device"],
+                duration_device,
                 settings["token_rate"],
                 settings["max_margin"],
                 settings["max_extra_tokens"],
@@ -435,9 +439,11 @@ class VoxCPMRuntime:
         if len(reference_formats) != len(texts):
             raise ValueError("reference_formats length must match texts length")
 
+        duration_started = time.perf_counter()
         generation_limits, _budgets = await self._predict_generation_limits(
             texts, languages
         )
+        duration_wall_seconds = time.perf_counter() - duration_started
 
         unique_references: dict[tuple[str, str], tuple[bytes, str]] = {}
         reference_keys: list[tuple[str, str] | None] = []
@@ -449,6 +455,7 @@ class VoxCPMRuntime:
             unique_references.setdefault(key, (audio, audio_format))
             reference_keys.append(key)
 
+        reference_started = time.perf_counter()
         encoded_references = await asyncio.gather(
             *(
                 self._encode_reference(audio, audio_format)
@@ -460,7 +467,10 @@ class VoxCPMRuntime:
             reference_latents_by_key[key] if key is not None else None
             for key in reference_keys
         ]
-        return list(
+        reference_wall_seconds = time.perf_counter() - reference_started
+
+        inference_started = time.perf_counter()
+        outputs = list(
             await asyncio.gather(
                 *(
                     self._synthesize_one(
@@ -480,6 +490,16 @@ class VoxCPMRuntime:
                 )
             )
         )
+        inference_wall_seconds = time.perf_counter() - inference_started
+        _LOGGER.info(
+            "VoxCPM runtime batch timing item_count=%d duration_budget_wall_seconds=%.4f "
+            "reference_encode_wall_seconds=%.4f inference_wall_seconds=%.4f",
+            len(texts),
+            duration_wall_seconds,
+            reference_wall_seconds,
+            inference_wall_seconds,
+        )
+        return outputs
 
 
 __all__ = ["VoxCPMRuntime"]
