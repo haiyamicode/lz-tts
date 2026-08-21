@@ -89,7 +89,7 @@ from src.nanovllm_voxcpm.engine.lora_manager import (
     build_lora_context_from_slot_list,
 )
 from src.nanovllm_voxcpm.layers.attention import Attention
-from src.nanovllm_voxcpm.layers.lora import iter_lora_modules
+from src.nanovllm_voxcpm.layers.lora import force_lora_kernel_execution, iter_lora_modules
 from src.nanovllm_voxcpm.lora import is_available as is_lora_available
 from src.nanovllm_voxcpm.utils.context import (
     DIT_LORA_DOMAIN,
@@ -899,10 +899,15 @@ class BaseModelRunner:
                     block_tables=block_tables[:bs],
                 )
                 self._set_graph_lora_contexts({"lora_domains": lora_domains}, dummy_contexts)
-                if isinstance(outputs, torch.Tensor):
-                    outputs[:bs] = self.model(**cut_inputs(inputs, bs))
-                else:
-                    assign_outputs(self.model(**cut_inputs(inputs, bs)), outputs, bs)
+                # No adapters are registered until after runner startup. Force
+                # this eager pass through the zero-initialized LoRA kernels so
+                # Triton compiles and loads them before CUDA capture begins.
+                with force_lora_kernel_execution(self.model):
+                    if isinstance(outputs, torch.Tensor):
+                        outputs[:bs] = self.model(**cut_inputs(inputs, bs))
+                    else:
+                        assign_outputs(self.model(**cut_inputs(inputs, bs)), outputs, bs)
+                torch.cuda.synchronize()
                 with torch.cuda.graph(lora_graph, self.graph_pool):
                     if isinstance(outputs, torch.Tensor):
                         outputs[:bs] = self.model(**cut_inputs(inputs, bs))

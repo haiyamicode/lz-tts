@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
@@ -68,6 +69,7 @@ class _LoRALayerBase(nn.Module):
         self._lora_scaling_values = [0.0 for _ in range(max_loras)]
         self._lora_base_scaling_values = [0.0 for _ in range(max_loras)]
         self._effective_lora_rank_values = [0 for _ in range(max_loras)]
+        self._force_lora_kernel_execution = False
 
     def _active_rank(self, slot_id: int) -> int:
         return self._effective_lora_rank_values[slot_id]
@@ -104,7 +106,11 @@ class _LoRALayerBase(nn.Module):
             # request; skipping the LoRA kernels at capture time would bake
             # "no LoRA here" into the graph, and later adapters that DO touch
             # this module would silently produce incorrect output.
-            if not _is_cuda_graph_capture() and self._batch_has_no_effective_rank(context):
+            if (
+                not _is_cuda_graph_capture()
+                and not self._force_lora_kernel_execution
+                and self._batch_has_no_effective_rank(context)
+            ):
                 return None
             # Pass int32 straight through — the Triton shrink/expand kernels
             # consume int32 metadata, and casting to int64 here was a tiny but
@@ -911,6 +917,25 @@ def iter_lora_modules(model: nn.Module):
         ):
             if module.lora_enabled:
                 yield module
+
+
+@contextmanager
+def force_lora_kernel_execution(model: nn.Module):
+    """Run configured LoRA kernels even while every adapter slot is empty.
+
+    CUDA graph warmup uses this to compile and load Triton kernels before
+    capture. Adapter registration happens after runner startup, so the normal
+    empty-rank optimization would otherwise skip the warmup kernels entirely.
+    """
+    modules = list(iter_lora_modules(model))
+    previous_values = [module._force_lora_kernel_execution for module in modules]
+    try:
+        for module in modules:
+            module._force_lora_kernel_execution = True
+        yield
+    finally:
+        for module, previous_value in zip(modules, previous_values):
+            module._force_lora_kernel_execution = previous_value
 
 
 def get_lora_state_dict(model: nn.Module) -> dict:
