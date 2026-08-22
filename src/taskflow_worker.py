@@ -18,6 +18,7 @@ from .api.server import InferenceOperationError, LzTtsInferenceSession
 
 _LOGGER = logging.getLogger(__name__)
 TASK_TYPES = ("tts-synthesis", "voice-enhance")
+_REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
 
 
 class ProtocolError(RuntimeError):
@@ -40,7 +41,7 @@ class TaskflowWorker:
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=65.0))
+        self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
 
     async def close(self) -> None:
         try:
@@ -162,6 +163,13 @@ class TaskflowWorker:
 
     async def upload(self, lease: dict[str, Any], artifact_id: str, audio: bytes) -> None:
         artifact_base_url = self.base_url.removesuffix("/taskflow/v1") + "/tts-artifacts/v1"
+        started_at = time.monotonic()
+        _LOGGER.info(
+            "Artifact upload started lease=%s artifact=%s bytes=%d",
+            lease["id"],
+            artifact_id,
+            len(audio),
+        )
         response = await self._client.put(
             f"{artifact_base_url}/leases/{lease['id']}/{artifact_id}",
             content=audio,
@@ -175,6 +183,13 @@ class TaskflowWorker:
                 f"Artifact upload failed ({response.status_code}): {response.text[:500]}",
                 response.status_code,
             )
+        _LOGGER.info(
+            "Artifact upload completed lease=%s artifact=%s bytes=%d wall_seconds=%.3f",
+            lease["id"],
+            artifact_id,
+            len(audio),
+            time.monotonic() - started_at,
+        )
 
 
 async def _process_lease(
