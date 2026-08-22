@@ -231,7 +231,18 @@ class VoxCPMDurationBudgetConfig(BaseModel):
     max_margin: float = Field(default=1.35, gt=0)
     min_extra_tokens: int = Field(default=0, ge=0)
     max_extra_tokens: int = Field(default=38, ge=0)
+    soft_text_token_limit: int = Field(default=250, ge=1)
+    hard_text_token_limit: int = Field(default=300, ge=1)
     language_profiles: dict[str, dict[str, float | int]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_text_token_limits(self) -> "VoxCPMDurationBudgetConfig":
+        if self.hard_text_token_limit < self.soft_text_token_limit:
+            raise ValueError(
+                "hard_text_token_limit must be greater than or equal to "
+                "soft_text_token_limit"
+            )
+        return self
 
 
 class VoxCPMConfig(BaseModel):
@@ -3829,6 +3840,27 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
 
         if startup_tasks:
             await asyncio.gather(*startup_tasks)
+
+        failed_engines = {
+            name: state.error
+            for name, state in _engine_load_states.items()
+            if state.status == "error"
+        }
+        if failed_engines:
+            details = "; ".join(
+                f"{name}: {error}"
+                for name, error in failed_engines.items()
+            )
+            raise RuntimeError(f"Configured inference engines failed to load: {details}")
+
+        if _server_config.ssml.enabled:
+            with _logged_startup_step(
+                "ssml_ctc_aligner",
+                model=_server_config.ssml.ctc_model,
+                device=_server_config.ssml.ctc_device,
+                dtype=_server_config.ssml.ctc_dtype,
+            ):
+                await asyncio.to_thread(_get_ssml_aligner().load)
         _LOGGER.info("Loaded inference runtime models elapsed=%.2fs", time.perf_counter() - load_started)
 
     if _engine_enabled("pipertts"):
@@ -3848,7 +3880,8 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
         _LOGGER.info("PiperTTS backend disabled")
 
     _startup_loader_task = asyncio.create_task(load_models_background())
-    _LOGGER.info("Inference runtime startup scheduled elapsed=%.2fs", time.perf_counter() - startup_started)
+    await _startup_loader_task
+    _LOGGER.info("Inference runtime startup complete elapsed=%.2fs", time.perf_counter() - startup_started)
 
 
 async def _stop_inference_runtime() -> None:

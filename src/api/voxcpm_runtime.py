@@ -257,6 +257,8 @@ class VoxCPMRuntime:
                     max_margin=float(settings["max_margin"]),
                     min_extra_tokens=int(settings["min_extra_tokens"]),
                     max_extra_tokens=int(settings["max_extra_tokens"]),
+                    soft_text_token_limit=int(settings["soft_text_token_limit"]),
+                    hard_text_token_limit=int(settings["hard_text_token_limit"]),
                     language_profiles=dict(settings["language_profiles"]),
                     use_bert=bool(settings["use_bert"]),
                     enable_alignment_validation=False,

@@ -140,9 +140,20 @@ class DpBudgetConfig:
     max_margin: float = 1.25
     min_extra_tokens: int = 0
     max_extra_tokens: int = 36
+    soft_text_token_limit: int = 250
+    hard_text_token_limit: int = 300
     language_profiles: dict[str, dict[str, float | int]] = field(default_factory=dict)
     use_bert: bool = False
     enable_alignment_validation: bool = False
+
+    def __post_init__(self) -> None:
+        if self.soft_text_token_limit < 1:
+            raise ValueError("soft_text_token_limit must be positive")
+        if self.hard_text_token_limit < self.soft_text_token_limit:
+            raise ValueError(
+                "hard_text_token_limit must be greater than or equal to "
+                "soft_text_token_limit"
+            )
 
 
 LANGUAGE_ALIASES = {
@@ -439,85 +450,78 @@ class DurationAlignmentValidator:
         if len(texts) != len(languages):
             raise ValueError("languages length must match texts length")
 
-        from src.piper.preprocess import phonemize_text_for_infer
-
-        phoneme_results: list[dict[str, Any]] = []
-        for text, language in zip(texts, languages):
-            phoneme_result = phonemize_text_for_infer(
-                text,
-                self._phoneme_config(language),
-                neural=False,
-            )
-            phoneme_results.append(phoneme_result)
-
         budgets = [self._empty_budget(language) for language in languages]
         batch_entries: list[tuple[int, str | None, list[int], dict[str, Any]]] = []
-        for index, (text, language, phoneme_result) in enumerate(zip(texts, languages, phoneme_results)):
-            phoneme_ids = phoneme_result["phoneme_ids"]
-            if not phoneme_ids:
-                continue
-            phoneme_text = phoneme_result.get("text") or text
-            batch_entries.append(
-                (
-                    index,
-                    language,
-                    phoneme_ids,
-                    {
-                        "phoneme_text": phoneme_text,
-                        "phoneme_length": len(phoneme_ids),
-                        "word_spans": phoneme_result.get("word_spans"),
-                    },
+        for index, (text, language) in enumerate(zip(texts, languages)):
+            chunk_results = self._phonemize_budget_chunks(text, language)
+            for chunk_index, phoneme_result in enumerate(chunk_results):
+                phoneme_ids = phoneme_result["phoneme_ids"]
+                if not phoneme_ids:
+                    continue
+                batch_entries.append(
+                    (
+                        index,
+                        language,
+                        phoneme_ids,
+                        {
+                            "phoneme_text": phoneme_result.get("text") or text,
+                            "phoneme_length": len(phoneme_ids),
+                            "word_spans": phoneme_result.get("word_spans"),
+                            "keep_bos": chunk_index == 0,
+                            "keep_eos": chunk_index == len(chunk_results) - 1,
+                        },
+                    )
                 )
-            )
 
         if not batch_entries:
             return budgets
 
-        batch_size = len(batch_entries)
-        max_len = max(len(phoneme_ids) for _, _, phoneme_ids, _ in batch_entries)
-        x = torch.zeros((batch_size, max_len), dtype=torch.long, device=self.device)
-        x_lengths = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-        sid_values = []
-        batch_texts = []
-        batch_phoneme_lengths = []
-        batch_word_spans = []
-        for batch_idx, (input_index, language, phoneme_ids, payload) in enumerate(batch_entries):
-            x[batch_idx, : len(phoneme_ids)] = torch.tensor(
-                phoneme_ids,
+        frame_tensor = torch.zeros(len(texts), dtype=torch.float32, device=self.device)
+        phoneme_counts = [0] * len(texts)
+        chunk_counts = [0] * len(texts)
+        for input_index, language, phoneme_ids, payload in batch_entries:
+            x = torch.tensor([phoneme_ids], dtype=torch.long, device=self.device)
+            x_lengths = torch.tensor(
+                [len(phoneme_ids)], dtype=torch.long, device=self.device
+            )
+            sid = torch.tensor(
+                [self._speaker_id_for_language(language)],
                 dtype=torch.long,
                 device=self.device,
             )
-            x_lengths[batch_idx] = len(phoneme_ids)
-            sid_values.append(self._speaker_id_for_language(language))
-            batch_texts.append(payload["phoneme_text"])
-            batch_phoneme_lengths.append(payload["phoneme_length"])
-            batch_word_spans.append(payload["word_spans"])
+            bert_input = self._bert_input(
+                [payload["phoneme_text"]],
+                phoneme_length=[payload["phoneme_length"]],
+                word_spans=[payload["word_spans"]],
+            )
+            token_frames = self._predict_token_frames(x, x_lengths, sid, bert_input)
+            token_start = 0 if payload["keep_bos"] else 2
+            token_end = (
+                len(phoneme_ids)
+                if payload["keep_eos"]
+                else len(phoneme_ids) - 1
+            )
+            frame_tensor[input_index] += token_frames[
+                0, 0, token_start:token_end
+            ].sum(dtype=torch.float32)
+            phoneme_counts[input_index] += token_end - token_start
+            chunk_counts[input_index] += 1
 
-        sid = torch.tensor(sid_values, dtype=torch.long, device=self.device)
-        bert_input = self._bert_input(
-            batch_texts,
-            phoneme_length=batch_phoneme_lengths,
-            word_spans=batch_word_spans,
-        )
-        frame_tensor = self._predict_frames(
-            x,
-            x_lengths,
-            sid,
-            bert_input,
-        ).to(dtype=torch.float32)
         seconds_tensor = frame_tensor * (256.0 / 22050.0)
         token_tensor = seconds_tensor * self.config.token_rate
 
-        for batch_idx, (input_index, language, phoneme_ids, _payload) in enumerate(batch_entries):
+        for input_index, language in enumerate(languages):
+            if chunk_counts[input_index] == 0:
+                continue
             profile_language, profile = self._budget_profile(language)
             min_margin = self._profile_float(profile, "min_margin", self.config.min_margin)
             max_margin = self._profile_float(profile, "max_margin", self.config.max_margin)
             min_extra_tokens = self._profile_int(profile, "min_extra_tokens", self.config.min_extra_tokens)
             max_extra_tokens = self._profile_int(profile, "max_extra_tokens", self.config.max_extra_tokens)
 
-            mel_frames = int(frame_tensor[batch_idx].ceil().item())
-            seconds = float(seconds_tensor[batch_idx].item())
-            estimated_tokens = max(1, round(float(token_tensor[batch_idx].item())))
+            mel_frames = int(frame_tensor[input_index].ceil().item())
+            seconds = float(seconds_tensor[input_index].item())
+            estimated_tokens = max(1, round(float(token_tensor[input_index].item())))
             min_tokens = max(1, round(estimated_tokens * min_margin) + min_extra_tokens)
             max_tokens = max(min_tokens, round(estimated_tokens * max_margin) + max_extra_tokens)
 
@@ -534,13 +538,39 @@ class DurationAlignmentValidator:
                 "max_margin": max_margin,
                 "min_extra_tokens": min_extra_tokens,
                 "max_extra_tokens": max_extra_tokens,
-                "phoneme_count": len(phoneme_ids),
+                "phoneme_count": phoneme_counts[input_index],
+                "duration_chunks": chunk_counts[input_index],
                 "phoneme_language": self._phoneme_config(language)["language"]["code"],
                 "speaker_id": int(self._speaker_id_for_language(language)),
                 "length_scale": self.config.length_scale,
             }
 
         return budgets
+
+    def _phonemize_budget_chunks(
+        self,
+        text: str,
+        language: str | None,
+    ) -> list[dict[str, Any]]:
+        """Split source text naturally using Lazybird's token limits."""
+        from src.piper.preprocess import phonemize_text_for_infer
+        from src.text_splitter import count_cl100k_tokens, split_text
+
+        phoneme_config = self._phoneme_config(language)
+        chunks = split_text(
+            text,
+            self.config.hard_text_token_limit,
+            soft_max_length=self.config.soft_text_token_limit,
+            length_function=count_cl100k_tokens,
+            measure_merged_length=True,
+        )
+        results: list[dict[str, Any]] = []
+        for chunk in chunks:
+            result = phonemize_text_for_infer(chunk, phoneme_config, neural=False)
+            if len(result["phoneme_ids"]) <= 3:
+                continue
+            results.append(result)
+        return results
 
     @torch.no_grad()
     def validate_alignment(
@@ -841,6 +871,16 @@ class DurationAlignmentValidator:
         sid: torch.Tensor,
         bert_input: dict[str, torch.Tensor] | None,
     ) -> torch.Tensor:
+        token_frames = self._predict_token_frames(x, x_lengths, sid, bert_input)
+        return torch.clamp_min(torch.sum(token_frames, [1, 2]), 1)
+
+    def _predict_token_frames(
+        self,
+        x: torch.Tensor,
+        x_lengths: torch.Tensor,
+        sid: torch.Tensor,
+        bert_input: dict[str, torch.Tensor] | None,
+    ) -> torch.Tensor:
         assert self._model is not None
         model = self._model
         with torch.device(self.device):
@@ -870,8 +910,14 @@ class DurationAlignmentValidator:
                 )
             logw = model.dp(x_encoded, x_mask, g=g)
             w = torch.exp(logw) * x_mask * self.config.length_scale
-            w_ceil = torch.ceil(w)
-            return torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1)
+            token_frames = torch.ceil(w)
+
+            # VITS stores every attention matrix on its module for training-time
+            # inspection. The duration-budget runtime never consumes those tensors.
+            for module in model.enc_p.modules():
+                if hasattr(module, "attn"):
+                    module.attn = None
+            return token_frames
 
     def _empty_budget(self, language: str | None = None) -> dict[str, Any]:
         profile_language, profile = self._budget_profile(language)
