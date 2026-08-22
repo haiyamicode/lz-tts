@@ -872,13 +872,23 @@ def _phonemize_espeak_for_voice_with_spans(
     voice: str,
     casing_fn,
     espeak_data,
+    *,
+    include_word_spans: bool = True,
 ) -> Tuple[list, Optional[List[List[int]]], str]:
     frontend_result = _phonemize_registered_frontend(text, voice, casing_fn)
     if frontend_result is not None:
+        if not include_word_spans:
+            return frontend_result[0], None, frontend_result[2]
         return frontend_result
 
     norm_text = _normalize_text_for_mapping(text, voice)
     processed_text = casing_fn(norm_text)
+    if not include_word_spans:
+        phonemes = _flatten_sentences(
+            _phonemize_espeak_with_reset(processed_text, voice, espeak_data)
+        )
+        return phonemes, None, processed_text
+
     sent_ph, sent_word_mapping = _phonemize_espeak_with_mapping(
         processed_text, voice, espeak_data
     )
@@ -1075,6 +1085,7 @@ def _phonemize_multilingual_with_spans(
     espeak_data: Optional[str] = None,
     primary_voice: str = "en-us",
     neural: bool = False,
+    include_word_spans: bool = True,
 ) -> Tuple[list, Optional[List[List[int]]], str]:
     """Phonemize mixed-language text and preserve word-to-phoneme spans."""
     splitter = MultilingualSplitter()
@@ -1110,24 +1121,28 @@ def _phonemize_multilingual_with_spans(
                 espeak_data,
                 voice,
             )
+            if not include_word_spans:
+                span_word_spans = None
         else:
             span_phonemes, span_word_spans, semantic_text = _phonemize_espeak_for_voice_with_spans(
                 span_text,
                 voice,
                 casing_fn,
                 espeak_data,
+                include_word_spans=include_word_spans,
             )
 
         _LOGGER.debug("span[%s] phonemes=%s", idx, _short_list(span_phonemes, 32))
 
         if not span_phonemes:
             continue
-        _validate_word_spans(
-            span_phonemes,
-            span_word_spans,
-            semantic_text,
-            f"multilingual span={idx} voice={voice}",
-        )
+        if include_word_spans:
+            _validate_word_spans(
+                span_phonemes,
+                span_word_spans,
+                semantic_text,
+                f"multilingual span={idx} voice={voice}",
+            )
 
         if phonemes and span_phonemes:
             phonemes.append(" ")
@@ -1151,12 +1166,13 @@ def _phonemize_multilingual_with_spans(
         phonemes.extend(span_phonemes)
 
     semantic_text = "".join(semantic_parts) if semantic_parts else text
-    _validate_word_spans(
-        phonemes,
-        word_spans,
-        semantic_text,
-        "multilingual",
-    )
+    if include_word_spans:
+        _validate_word_spans(
+            phonemes,
+            word_spans,
+            semantic_text,
+            "multilingual",
+        )
     return phonemes, word_spans or None, semantic_text
 
 
@@ -1345,6 +1361,7 @@ def phonemize_text_for_infer(
     config_path: "Path | str",
     espeak_data: Optional[str] = None,
     neural: bool = False,
+    include_word_spans: bool = True,
 ) -> Dict[str, List[str]]:
     """Phonemize text for inference.
 
@@ -1353,6 +1370,8 @@ def phonemize_text_for_infer(
         config_path: Path to model config JSON.
         espeak_data: Optional path to espeak-ng data.
         neural: If True, use neural heteronym disambiguation.
+        include_word_spans: Build source-word to phoneme mappings. Disable this
+            for callers that only consume phoneme IDs.
 
     Returns a dict with 'phonemes' and 'phoneme_ids'.
     """
@@ -1375,6 +1394,8 @@ def phonemize_text_for_infer(
         phonemes, word_spans, semantic_text = _phonemize_neural_with_spans(
             text, casing, espeak_data, voice
         )
+        if not include_word_spans:
+            word_spans = None
     elif is_multi:
         phonemes, word_spans, semantic_text = _phonemize_multilingual_with_spans(
             text,
@@ -1382,12 +1403,17 @@ def phonemize_text_for_infer(
             espeak_data,
             primary,
             neural=neural,
+            include_word_spans=include_word_spans,
         )
     else:
         voice = es_voice or lang_code or primary
         voice = _map_cld2_to_espeak(voice, primary)
         phonemes, word_spans, semantic_text = _phonemize_espeak_for_voice_with_spans(
-            text, voice, casing, espeak_data
+            text,
+            voice,
+            casing,
+            espeak_data,
+            include_word_spans=include_word_spans,
         )
         _LOGGER.debug("infer: voice=%s text='%s'", voice, _short_text(semantic_text, 120))
 

@@ -2,7 +2,13 @@ import numpy as np
 import pytest
 import torch
 
-from src.duration_alignment import alignment_word_timestamps, trim_boundary_silence
+from src.duration_alignment import (
+    DpBudgetConfig,
+    DurationAlignmentValidator,
+    alignment_word_timestamps,
+    trim_boundary_silence,
+)
+from src.piper.preprocess import phonemize_text_for_infer
 
 
 def _tone(sample_rate: int, seconds: float, amplitude: float = 0.2) -> np.ndarray:
@@ -71,3 +77,25 @@ def test_trim_boundary_silence_returns_empty_for_silence() -> None:
     assert trimmed.size == 0
     assert start == 0
     assert end == 0
+
+
+def test_duration_budget_can_skip_unused_word_span_alignment() -> None:
+    text = "清晨的小雨已经停了，工作人员正在准备今天的图书馆活动。"
+    config = {
+        "language": {"code": "zh-CN"},
+        "espeak": {"voice": "zh-CN", "primary": "en-us"},
+    }
+
+    mapped = phonemize_text_for_infer(text, config, include_word_spans=True)
+    unmapped = phonemize_text_for_infer(text, config, include_word_spans=False)
+
+    assert mapped["word_spans"]
+    assert unmapped["word_spans"] is None
+    assert unmapped["text"] == mapped["text"]
+    assert unmapped["phonemes"] == mapped["phonemes"]
+    assert unmapped["phoneme_ids"] == mapped["phoneme_ids"]
+
+    validator = DurationAlignmentValidator(DpBudgetConfig(include_word_spans=False))
+    chunks = validator._phonemize_budget_chunks(text, "zh-CN")
+    assert chunks
+    assert all(chunk["word_spans"] is None for chunk in chunks)

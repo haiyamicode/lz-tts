@@ -233,6 +233,7 @@ class VoxCPMDurationBudgetConfig(BaseModel):
     max_extra_tokens: int = Field(default=38, ge=0)
     soft_text_token_limit: int = Field(default=250, ge=1)
     hard_text_token_limit: int = Field(default=300, ge=1)
+    include_word_spans: bool = True
     language_profiles: dict[str, dict[str, float | int]] = Field(default_factory=dict)
 
     @model_validator(mode="after")

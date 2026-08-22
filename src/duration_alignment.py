@@ -142,6 +142,7 @@ class DpBudgetConfig:
     max_extra_tokens: int = 36
     soft_text_token_limit: int = 250
     hard_text_token_limit: int = 300
+    include_word_spans: bool = True
     language_profiles: dict[str, dict[str, float | int]] = field(default_factory=dict)
     use_bert: bool = False
     enable_alignment_validation: bool = False
@@ -566,7 +567,12 @@ class DurationAlignmentValidator:
         )
         results: list[dict[str, Any]] = []
         for chunk in chunks:
-            result = phonemize_text_for_infer(chunk, phoneme_config, neural=False)
+            result = phonemize_text_for_infer(
+                chunk,
+                phoneme_config,
+                neural=False,
+                include_word_spans=self.config.include_word_spans,
+            )
             if len(result["phoneme_ids"]) <= 3:
                 continue
             results.append(result)

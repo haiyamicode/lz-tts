@@ -259,6 +259,7 @@ class VoxCPMRuntime:
                     max_extra_tokens=int(settings["max_extra_tokens"]),
                     soft_text_token_limit=int(settings["soft_text_token_limit"]),
                     hard_text_token_limit=int(settings["hard_text_token_limit"]),
+                    include_word_spans=bool(settings.get("include_word_spans", True)),
                     language_profiles=dict(settings["language_profiles"]),
                     use_bert=bool(settings["use_bert"]),
                     enable_alignment_validation=False,
