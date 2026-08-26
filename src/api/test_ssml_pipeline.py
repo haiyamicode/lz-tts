@@ -50,3 +50,31 @@ def test_root_voice_pronunciation_uses_language_speaker_when_not_fixed(monkeypat
     )
 
     assert route == ("zh", "sparrow-root")
+
+
+def test_native_root_voice_ssml_does_not_route_through_seed_vc(monkeypatch) -> None:
+    root_voice = server.RootVoiceConfig(
+        voice_id="msa.bs-BA.Vesna",
+        model="lzspeech-sparrow-lfl",
+        speaker="bs-BA",
+        languages=["bs-BA"],
+    )
+    monkeypatch.setattr(
+        server,
+        "_configured_root_voice_for_voice_id",
+        lambda voice_id: root_voice if voice_id == root_voice.voice_id else None,
+    )
+    monkeypatch.setattr(server, "_request_routes_to_voxcpm", lambda *_args: False)
+
+    request = SynthesizeRequest(
+        ssml='<speak>Ovo je <phoneme alphabet="ipa" ph="tɛst">test</phoneme>.</speak>',
+        voice_id=root_voice.voice_id,
+        reference_url="https://example.com/vesna.mp3",
+        language="bs-BA",
+    )
+
+    assert not server._request_routes_to_seed_vc(request, None)
+    assert server._request_routes_to_seed_vc(
+        request.model_copy(update={"language": "as-IN"}),
+        None,
+    )

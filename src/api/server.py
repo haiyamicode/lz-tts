@@ -231,8 +231,8 @@ class VoxCPMDurationBudgetConfig(BaseModel):
     max_margin: float = Field(default=1.35, gt=0)
     min_extra_tokens: int = Field(default=0, ge=0)
     max_extra_tokens: int = Field(default=38, ge=0)
-    soft_text_token_limit: int = Field(default=250, ge=1)
-    hard_text_token_limit: int = Field(default=300, ge=1)
+    soft_text_token_limit: int = Field(default=64, ge=1)
+    hard_text_token_limit: int = Field(default=80, ge=1)
     include_word_spans: bool = True
     language_profiles: dict[str, dict[str, float | int]] = Field(default_factory=dict)
 
@@ -1403,6 +1403,16 @@ def _configured_root_voice_for_voice_id(voice_id: str | None) -> RootVoiceConfig
     return None
 
 
+def _configured_voice_language(voice_id: str | None, language: str | None) -> str | None:
+    """Resolve the configured default locale of a locale-specific root voice."""
+    if language is not None:
+        return language
+    root_voice = _configured_root_voice_for_voice_id(voice_id)
+    if root_voice and root_voice.languages and len(root_voice.languages) == 1:
+        return root_voice.languages[0]
+    return None
+
+
 def _default_root_voice() -> RootVoiceConfig | None:
     for config in _server_config.pipertts.root_voices.values():
         if config.languages is None:
@@ -1640,16 +1650,11 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
             validate_primary_speaker=False,
         )
         if root_voice is not None:
-            fallback_root_voice = _default_root_voice()
             for segment in segments:
                 if _root_voice_can_synthesize_language(root_voice, segment["lang"]):
                     if root_voice.speaker is not None:
                         segment["speaker"] = root_voice.speaker
                     segment["model"] = root_voice.model
-                elif fallback_root_voice is not None:
-                    if fallback_root_voice.speaker is not None:
-                        segment["speaker"] = fallback_root_voice.speaker
-                    segment["model"] = fallback_root_voice.model
         item_segments.append(segments)
         for segment_idx, segment in enumerate(segments):
             record = {**segment, "item_idx": item_idx, "segment_idx": segment_idx}
@@ -1973,17 +1978,13 @@ def _ssml_sparrow_route(
     operation: PronunciationOperation,
     resolved_model: str | None,
 ) -> tuple[str | None, str]:
-    language = _language_at_source_position(text, operation.start, request.language)
+    requested_language = _configured_voice_language(request.voice_id, request.language)
+    language = _language_at_source_position(text, operation.start, requested_language)
     _locale, speaker, model_name = _resolve_forced_language(language)
     root_voice = _configured_root_voice_for_voice_id(request.voice_id)
     if root_voice is not None:
-        selected_root = (
-            root_voice
-            if _root_voice_can_synthesize_language(root_voice, language)
-            else _default_root_voice()
-        )
-        if selected_root is not None:
-            return selected_root.speaker or speaker, selected_root.model
+        if _root_voice_can_synthesize_language(root_voice, language):
+            return root_voice.speaker or speaker, root_voice.model
     if resolved_model and resolved_model not in {
         PUBLIC_SPARROW_MODEL,
         _server_config.voxcpm.model_id,
@@ -2002,7 +2003,9 @@ def _voice_request_routes_to_voxcpm(
 ) -> bool:
     if reference_url is None:
         return False
-    normalized_language = _normalize_locale_with_region(language or "en")
+
+    effective_language = _configured_voice_language(voice_id, language)
+    normalized_language = _normalize_locale_with_region(effective_language or "en")
     base_language = _get_base_language(normalized_language)
     if base_language not in {
         _get_base_language(item)
@@ -2048,10 +2051,32 @@ def _request_routes_to_seed_vc(
     request: SynthesizeRequest,
     resolved_model: str | None,
 ) -> bool:
-    return (
-        request.reference_url is not None
-        and not _request_routes_to_voxcpm(request, resolved_model)
+    if request.reference_url is None or _request_routes_to_voxcpm(request, resolved_model):
+        return False
+
+    return _voice_reference_requires_seed_vc(
+        voice_id=request.voice_id,
+        reference_url=request.reference_url,
+        language=request.language,
     )
+
+
+def _voice_reference_requires_seed_vc(
+    *,
+    voice_id: str | None,
+    reference_url: str | None,
+    language: str | None,
+) -> bool:
+    """Return whether Sparrow output must be converted to the requested voice."""
+    if reference_url is None:
+        return False
+
+    root_voice = _configured_root_voice_for_voice_id(voice_id)
+    if root_voice is None:
+        return True
+
+    effective_language = _configured_voice_language(voice_id, language)
+    return not _root_voice_can_synthesize_language(root_voice, effective_language)
 
 
 async def _synthesize_sparrow_ipa_ssml(
@@ -2097,16 +2122,11 @@ async def _synthesize_sparrow_ipa_ssml(
         )
 
     if root_voice is not None:
-        fallback_root_voice = _default_root_voice()
         for segment in segments:
             if _root_voice_can_synthesize_language(root_voice, str(segment["lang"])):
                 if root_voice.speaker is not None:
                     segment["speaker"] = root_voice.speaker
                 segment["model"] = root_voice.model
-            elif fallback_root_voice is not None:
-                if fallback_root_voice.speaker is not None:
-                    segment["speaker"] = fallback_root_voice.speaker
-                segment["model"] = fallback_root_voice.model
 
     assigned_operations: set[int] = set()
     for segment in segments:
@@ -3403,12 +3423,16 @@ async def _synthesize_voxcpm_items(
         for key in reference_keys
     ]
     first = records[0][1]
+    languages = [
+        _configured_voice_language(item.voice_id, item.language)
+        for _, item, _ in records
+    ]
     return await synthesize_voxcpm_batch(
         _SharedBatchSynthesizeRequest(
             texts=[text for _, _, text in records],
             seeds=[item.seed for _, item, _ in records],
-            language=first.language,
-            languages=[item.language for _, item, _ in records],
+            language=languages[0],
+            languages=languages,
             model=_server_config.voxcpm.model_id,
             voxcpm_loras=tuple(first.voxcpm_loras),
             options=first.options,
@@ -3430,7 +3454,11 @@ def _batch_item_pipeline(item: BatchSynthesizeInputItem) -> str:
         reference_language=item.reference_language,
     ):
         return "voxcpm"
-    if item.reference_url is not None:
+    if _voice_reference_requires_seed_vc(
+        voice_id=item.voice_id,
+        reference_url=item.reference_url,
+        language=item.language,
+    ):
         return "sparrow_reference"
     if item.language is not None:
         return "sparrow_forced_language"
@@ -3515,17 +3543,28 @@ def _validate_batch_item(item: BatchSynthesizeInputItem, item_idx: int) -> str:
 
 def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, str]]) -> _SharedBatchSynthesizeRequest:
     first = records[0][1]
+    pipeline = _batch_item_pipeline(first)
+    languages = [
+        _configured_voice_language(item.voice_id, item.language)
+        for _, item, _ in records
+    ]
     return _SharedBatchSynthesizeRequest(
         texts=[text for _, _, text in records],
         seeds=[item.seed for _, item, _ in records],
         voice_id=None,
-        reference_url=first.reference_url,
-        language=first.language,
-        languages=[item.language for _, item, _ in records],
+        # Once routing selected native Sparrow, its registry reference is
+        # metadata only. Passing it into the Sparrow backend means Seed-VC.
+        reference_url=(
+            first.reference_url
+            if pipeline in {"voxcpm", "sparrow_reference"}
+            else None
+        ),
+        language=languages[0],
+        languages=languages,
         model=_resolve_api_model(first.model),
         voxcpm_loras=(
             _effective_voxcpm_lora_names(first.voxcpm_loras, first.language)
-            if _batch_item_pipeline(first) == "voxcpm"
+            if pipeline == "voxcpm"
             else tuple(first.voxcpm_loras)
         ),
         options=first.options,
@@ -3904,6 +3943,9 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
         raise HTTPException(status_code=400, detail="Provide either 'text' or 'ssml', not both")
     if not request.text and not request.ssml:
         raise HTTPException(status_code=400, detail="Must provide either 'text' or 'ssml'")
+    effective_language = _configured_voice_language(request.voice_id, request.language)
+    if effective_language != request.language:
+        request = request.model_copy(update={"language": effective_language})
     if request.ssml is not None:
         try:
             document = parse_ssml(request.ssml)
@@ -4036,7 +4078,8 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
         audio = batch_audios[0]
         sample_rate = inference.sample_rate
 
-    if request.reference_url is not None:
+    if _request_routes_to_seed_vc(request, model):
+        assert request.reference_url is not None
         converted, _ = await _convert_generated_audio_to_sample_batch(
             source_audios=[audio],
             source_sample_rates=[sample_rate],

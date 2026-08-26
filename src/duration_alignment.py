@@ -140,8 +140,8 @@ class DpBudgetConfig:
     max_margin: float = 1.25
     min_extra_tokens: int = 0
     max_extra_tokens: int = 36
-    soft_text_token_limit: int = 250
-    hard_text_token_limit: int = 300
+    soft_text_token_limit: int = 64
+    hard_text_token_limit: int = 80
     include_word_spans: bool = True
     language_profiles: dict[str, dict[str, float | int]] = field(default_factory=dict)
     use_bert: bool = False

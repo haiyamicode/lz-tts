@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .hf_cache import resolve_hf_model_path
+from .hf_cache import get_shared_hf_encoder, resolve_hf_model_path
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -194,10 +194,9 @@ class HeteronymResolver:
         self._model.eval()
 
         # Load frozen context encoder
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoTokenizer
 
         tokenizer_path = resolve_hf_model_path(self._context_model_name)
-        model_path = resolve_hf_model_path(self._context_model_name, require_weights=True)
         local_files_only = any(
             os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
             for name in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE")
@@ -207,11 +206,12 @@ class HeteronymResolver:
             local_files_only=local_files_only,
             use_fast=True,
         )
-        self._bert = AutoModel.from_pretrained(
-            model_path,
+        self._bert = get_shared_hf_encoder(
+            self._context_model_name,
+            device=self.device,
+            dtype=torch.float32,
             local_files_only=local_files_only,
-        ).to(self.device)
-        self._bert.eval()
+        )
 
         self._loaded = True
         _LOGGER.info("Heteronym model loaded successfully")

@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
+import weakref
 from pathlib import Path
 
+import torch
+from torch import nn
+
+
+_LOGGER = logging.getLogger(__name__)
 
 _HF_MODEL_ALIASES = {
     "distilbert-base-multilingual-cased": "distilbert/distilbert-base-multilingual-cased",
@@ -19,6 +27,11 @@ _MODEL_WEIGHT_FILES = {
     "model.ckpt.index",
     "flax_model.msgpack",
 }
+
+_ENCODER_CACHE: weakref.WeakValueDictionary[tuple[str, str, torch.dtype], nn.Module] = (
+    weakref.WeakValueDictionary()
+)
+_ENCODER_CACHE_LOCK = threading.Lock()
 
 
 def _has_model_weights(snapshot_dir: Path) -> bool:
@@ -63,3 +76,53 @@ def resolve_hf_model_path(model_name: str, *, require_weights: bool = False) -> 
                 return str(max(snapshots, key=lambda item: item.stat().st_mtime))
 
     return model_name
+
+
+def _canonical_device(device: str | torch.device) -> torch.device:
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
+def get_shared_hf_encoder(
+    model_name: str,
+    *,
+    device: str | torch.device,
+    dtype: torch.dtype,
+    local_files_only: bool,
+) -> nn.Module:
+    """Load or reuse one frozen Hugging Face encoder per model/device/dtype."""
+    from transformers import AutoModel
+
+    model_path = resolve_hf_model_path(model_name, require_weights=True)
+    path = Path(model_path)
+    cache_model_id = str(path.resolve()) if path.exists() else model_path
+    resolved_device = _canonical_device(device)
+    key = (cache_model_id, str(resolved_device), dtype)
+
+    with _ENCODER_CACHE_LOCK:
+        cached = _ENCODER_CACHE.get(key)
+        if cached is not None:
+            _LOGGER.info(
+                "Reusing shared Hugging Face encoder model=%s device=%s dtype=%s",
+                model_name,
+                resolved_device,
+                dtype,
+            )
+            return cached
+
+        _LOGGER.info(
+            "Loading shared Hugging Face encoder model=%s device=%s dtype=%s",
+            model_name,
+            resolved_device,
+            dtype,
+        )
+        model = AutoModel.from_pretrained(
+            model_path,
+            local_files_only=local_files_only,
+        ).eval()
+        model.to(device=resolved_device, dtype=dtype)
+        model.requires_grad_(False)
+        _ENCODER_CACHE[key] = model
+        return model

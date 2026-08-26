@@ -153,10 +153,15 @@ def test_locale_adapter_is_applied_from_server_config(monkeypatch) -> None:
     assert _effective_voxcpm_lora_names([], "zh-CN") == ()
 
 
-def test_root_voice_with_reference_uses_voxcpm_or_seed_vc_by_language(
+def test_root_voice_with_reference_skips_seed_vc_for_its_native_language(
     monkeypatch,
 ) -> None:
-    root = RootVoiceConfig(voice_id="root", model="sparrow-root")
+    root = RootVoiceConfig(
+        voice_id="root",
+        model="sparrow-root",
+        speaker="bs-BA",
+        languages=["bs-BA"],
+    )
     monkeypatch.setattr(
         server,
         "_configured_root_voice_for_voice_id",
@@ -168,13 +173,23 @@ def test_root_voice_with_reference_uses_voxcpm_or_seed_vc_by_language(
         reference_url="https://example.com/root.mp3",
         language="en-US",
     )
-    unsupported = supported.model_copy(update={"language": "bs-BA"})
+    native = supported.model_copy(update={"language": "bs-BA"})
+    unsupported = supported.model_copy(update={"language": "as-IN"})
 
     assert _batch_item_pipeline(supported) == "voxcpm"
+    assert _batch_item_pipeline(native) == "sparrow_forced_language"
     assert _batch_item_pipeline(unsupported) == "sparrow_reference"
+    native_shared = _shared_batch_from_items([(0, native, native.text or "")])
+    assert native_shared.reference_url is None
     shared = _shared_batch_from_items([(0, unsupported, unsupported.text or "")])
     assert shared.voice_id is None
     assert shared.reference_url == unsupported.reference_url
+
+    native_without_language = native.model_copy(update={"language": None})
+    assert _batch_item_pipeline(native_without_language) == "sparrow"
+    assert _shared_batch_from_items(
+        [(0, native_without_language, native_without_language.text or "")]
+    ).reference_url is None
 
 
 def test_explicit_voxcpm_requires_a_reference() -> None:

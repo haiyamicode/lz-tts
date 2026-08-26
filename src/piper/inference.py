@@ -178,23 +178,18 @@ class PiperInference:
         if self.semantic_model is not None:
             return self.semantic_model
 
-        from transformers import AutoModel
+        from .hf_cache import get_shared_hf_encoder
 
-        from .hf_cache import resolve_hf_model_path
-
-        model_path = resolve_hf_model_path(self.bert_model_name, require_weights=True)
         local_files_only = any(
             os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
             for name in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE")
         )
-        _LOGGER.info("Loading BERT feature model: %s", self.bert_model_name or model_path)
-        model = AutoModel.from_pretrained(
-            model_path,
+        model = get_shared_hf_encoder(
+            self.bert_model_name,
+            device=self.device,
+            dtype=torch.float16 if self.fp16 else torch.float32,
             local_files_only=local_files_only,
-        ).eval()
-        model.to(self.device)
-        if self.fp16:
-            model.half()
+        )
         self.semantic_model = model
         return model
 
