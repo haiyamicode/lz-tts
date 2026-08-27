@@ -706,6 +706,72 @@ class TestReconstructionComprehensive(unittest.TestCase):
                     )
 
 
+class TestMainLanguageHint(unittest.TestCase):
+    LATIN_CASES = {
+        "bs": "Jučer sam razgovarao s prijateljem koji radi u velikoj kompaniji.",
+        "sr": "Juče sam razgovarao sa prijateljem koji radi u velikoj kompaniji.",
+        "nb": "Dette er en tydelig norsk setning som skal leses naturlig.",
+        "fil": "Ito ay isang malinaw na pangungusap para sa pagsubok ng pagsasalita.",
+        "jv": "Iki ukara basa Jawa sing cetha kanggo nyoba sintesis swara.",
+        "su": "Ieu kalimah basa Sunda anu jelas pikeun nguji sintésis sora.",
+        "so": "Kani waa jumlad Soomaali ah oo cad oo lagu tijaabinayo hadalka.",
+        "zu": "Lona umusho ocacile wesiZulu wokuhlola ukuhlanganiswa kwezwi.",
+        "fr": "Ceci est une phrase française claire pour tester la synthèse.",
+        "vi": "Đây là một câu tiếng Việt rõ ràng để kiểm tra tổng hợp giọng nói.",
+    }
+
+    def assert_spans(self, result, expected):
+        position = 0
+        self.assertEqual(len(result.segments), len(expected))
+        for segment, (language, segment_text) in zip(result.segments, expected):
+            with self.subTest(language=language, segment_text=segment_text):
+                self.assertEqual(segment.language, language)
+                self.assertEqual(segment.text, segment_text)
+                self.assertEqual(segment.start, position)
+                position += len(segment_text)
+                self.assertEqual(segment.end, position)
+                self.assertEqual(result.original_text[segment.start:segment.end], segment.text)
+        self.assertEqual(position, len(result.original_text))
+
+    def test_hint_stabilizes_supported_latin_languages(self):
+        splitter = MultilingualSplitter()
+        for language, text in self.LATIN_CASES.items():
+            with self.subTest(language=language):
+                result = splitter.split(text, main_lang=language)
+                self.assertEqual(result.main_language, language)
+                self.assert_spans(result, [(language, text)])
+
+    def test_latin_hint_preserves_cross_script_switch(self):
+        chinese = "今天我们去图书馆。"
+        for language, native_text in self.LATIN_CASES.items():
+            with self.subTest(language=language):
+                text = f"{native_text} {chinese} {native_text}"
+                result = MultilingualSplitter().split(text, main_lang=language)
+                self.assert_spans(
+                    result,
+                    [
+                        (language, f"{native_text} "),
+                        ("zh", chinese),
+                        (language, f" {native_text}"),
+                    ],
+                )
+
+    def test_latin_hint_allows_clear_same_script_switch(self):
+        english = "This is a clearly English sentence with enough context."
+        for language, native_text in self.LATIN_CASES.items():
+            with self.subTest(language=language):
+                text = f"{native_text} {english} {native_text}"
+                result = MultilingualSplitter().split(text, main_lang=language)
+                self.assert_spans(
+                    result,
+                    [
+                        (language, native_text),
+                        ("en", f" {english}"),
+                        (language, f" {native_text}"),
+                    ],
+                )
+
+
 class TestNoUndInFinalOutput(unittest.TestCase):
     """Test that no segments have 'und' language in final output (except edge cases)."""
 
@@ -713,25 +779,36 @@ class TestNoUndInFinalOutput(unittest.TestCase):
     def setUpClass(cls):
         cls.splitter = MultilingualSplitter()
 
-    def test_no_und_in_normal_text(self):
-        """Normal text should not have 'und' segments."""
+    def test_exact_spans_for_normal_text(self):
+        """Normal and mixed-script text has exact, positioned language spans."""
         normal_texts = [
-            "Hello world",
-            "你好世界",
-            "こんにちは",
-            "안녕하세요",
-            "Привет мир",
-            "Hello 世界 test",
-            "100块钱买咖啡",
+            ("Hello world", "en", [("en", 0, 11, "Hello world")]),
+            ("你好世界", "zh", [("zh", 0, 4, "你好世界")]),
+            ("こんにちは", "ja", [("ja", 0, 5, "こんにちは")]),
+            ("안녕하세요", "ko", [("ko", 0, 5, "안녕하세요")]),
+            ("Привет мир", "ru", [("ru", 0, 10, "Привет мир")]),
+            (
+                "Hello 世界 test",
+                "en",
+                [
+                    ("en", 0, 6, "Hello "),
+                    ("zh", 6, 8, "世界"),
+                    ("en", 8, 13, " test"),
+                ],
+            ),
+            ("100块钱买咖啡", "zh", [("zh", 0, 8, "100块钱买咖啡")]),
         ]
-        for text in normal_texts:
+        for text, main_language, expected_spans in normal_texts:
             with self.subTest(text=text):
                 result = self.splitter.split(text)
-                for seg in result.segments:
-                    self.assertNotEqual(
-                        seg.language, "und",
-                        f"Found 'und' segment in normal text: {seg.text!r}"
-                    )
+                self.assertEqual(result.main_language, main_language)
+                self.assertEqual(
+                    [
+                        (segment.language, segment.start, segment.end, segment.text)
+                        for segment in result.segments
+                    ],
+                    expected_spans,
+                )
 
 
 # =============================================================================

@@ -131,6 +131,7 @@ def test_batch_planner_orders_backends_and_splits_incompatible_loras() -> None:
         text="Sparrow",
         model="sparrow",
         language="bs-BA",
+        language_override=True,
     )
 
     plans = _plan_synthesis_batches([voxcpm, different_lora, sparrow])
@@ -326,10 +327,18 @@ def test_root_voice_with_reference_skips_seed_vc_for_its_native_language(
     unsupported = supported.model_copy(update={"language": "as-IN"})
 
     assert _batch_item_pipeline(supported) == "voxcpm"
-    assert _batch_item_pipeline(native) == "sparrow_forced_language"
+    assert _batch_item_pipeline(native) == "sparrow"
     assert _batch_item_pipeline(unsupported) == "sparrow_reference"
     native_shared = _shared_batch_from_items([(0, native, native.text or "")])
     assert native_shared.reference_url is None
+    assert native_shared.language == "bs-BA"
+    assert native_shared.languages == [None]
+
+    native_override = native.model_copy(update={"language_override": True})
+    assert _batch_item_pipeline(native_override) == "sparrow_forced_language"
+    assert _shared_batch_from_items(
+        [(0, native_override, native_override.text or "")]
+    ).language == "bs-BA"
     shared = _shared_batch_from_items([(0, unsupported, unsupported.text or "")])
     assert shared.voice_id is None
     assert shared.reference_url == unsupported.reference_url
@@ -364,7 +373,9 @@ def test_non_english_voxcpm_ipa_keeps_native_visible_text_as_guide(
     document = parse_ssml(ssml)
 
     controlled_text, detected_language, controls = _prepare_voxcpm_ipa_text(
-        document, language
+        document,
+        language,
+        language,
     )
 
     assert visible_text in controlled_text

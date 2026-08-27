@@ -109,6 +109,22 @@ CONFUSABLE_LANGUAGE_PAIRS: dict[frozenset[str], DetectionThreshold] = {
     ),
 }
 
+# Equivalent detector/application codes. CLD2 reports the legacy or umbrella
+# code while the voice registry uses the modern/specific code.
+EQUIVALENT_LANGUAGE_CODES = (
+    frozenset({"no", "nb", "nn"}),
+    frozenset({"tl", "fil"}),
+    frozenset({"jw", "jv"}),
+)
+
+# The application uses current locale language codes while CLD2 still expects
+# older/umbrella codes for these languages.
+CLD2_LANGUAGE_CODES = {
+    "nb": "no",
+    "fil": "tl",
+    "jv": "jw",
+}
+
 # Script-specific configurations for language groups that share scripts
 # and are commonly confused by language detectors
 SCRIPT_DETECTION_CONFIG: dict[str, ScriptConfig] = {
@@ -160,10 +176,10 @@ SCRIPT_DETECTION_CONFIG: dict[str, ScriptConfig] = {
     "Latin": ScriptConfig(
         languages=frozenset({
             "en", "de", "fr", "es", "it", "pt", "nl", "pl", "cs", "sk",
-            "hu", "ro", "hr", "sl", "fi", "sv", "no", "da", "is", "et",
+            "hu", "ro", "bs", "hr", "sr", "sl", "fi", "sv", "no", "nb", "da", "is", "et",
             "lv", "lt", "mt", "sq", "tr", "az", "uz", "vi", "id", "ms",
-            "tl", "sw", "af", "eu", "ca", "gl", "cy", "ga", "gd", "br",
-            "eo", "la",
+            "tl", "fil", "jv", "su", "sw", "so", "zu", "af", "eu", "ca", "gl",
+            "cy", "ga", "gd", "br", "eo", "la",
         }),
         threshold=DetectionThreshold(
             min_detected_confidence=0.7,
@@ -320,10 +336,11 @@ class MultilingualSplitter:
             return [("und", 1.0)], False
 
         try:
+            cld2_hint = CLD2_LANGUAGE_CODES.get(hint_language, hint_language)
             is_reliable, _, details = cld2.detect(
                 clean_text,
                 bestEffort=best_effort,
-                hintLanguage=hint_language,
+                hintLanguage=cld2_hint,
             )
         except Exception:
             # CLD2 can fail on certain inputs
@@ -336,6 +353,16 @@ class MultilingualSplitter:
             # Normalize some CLD2 codes (zh-Hant -> zh, etc.)
             if code.startswith("zh"):
                 code = "zh"
+            for application_code, detector_code in CLD2_LANGUAGE_CODES.items():
+                if code != detector_code:
+                    continue
+                if hint_language == application_code or (
+                    self.languages is not None
+                    and application_code in self.languages
+                    and detector_code not in self.languages
+                ):
+                    code = application_code
+                break
             # Filter to allowed languages if specified
             if self.languages is None or code in self.languages:
                 results.append((code, percent / 100.0))
@@ -452,7 +479,6 @@ class MultilingualSplitter:
         "sn",   # Shona
         "st",   # Sotho
         "xh",   # Xhosa
-        "zu",   # Zulu
         "ny",   # Chichewa
         "ig",   # Igbo
         "yo",   # Yoruba
@@ -483,8 +509,6 @@ class MultilingualSplitter:
         "hmn",  # Hmong
         "kha",  # Khasi
         "za",   # Zhuang
-        "su",   # Sundanese
-        "jw",   # Javanese (has own script)
         # Caribbean/Creole languages
         "ht",   # Haitian Creole
         "mfe",  # Mauritian Creole
@@ -506,7 +530,6 @@ class MultilingualSplitter:
         "fy",   # Frisian
         "lb",   # Luxembourgish
         # Other
-        "so",   # Somali
         "mg",   # Malagasy
         "ceb",  # Cebuano
         "war",  # Waray
@@ -523,18 +546,7 @@ class MultilingualSplitter:
         obscure Latin-script languages like Wolof. This set contains only
         the commonly used Latin-script languages that CLD2 reliably detects.
         """
-        # Common Latin-script languages that CLD2 reliably detects
-        common_latin_languages = {
-            # Major European languages
-            "en", "de", "fr", "es", "pt", "it", "nl", "pl", "cs", "sk",
-            "hu", "ro", "hr", "sl", "sv", "no", "da", "fi", "et", "lv",
-            "lt", "is", "ga", "cy", "eu", "ca", "gl", "sq", "mt",
-            # Major non-European Latin-script languages
-            "id", "ms", "tl", "vi", "tr", "sw", "af",
-            # Constructed languages
-            "eo", "la",
-        }
-        return lang in common_latin_languages
+        return lang in SHARED_SCRIPTS["Latin"]
 
     def detect_main_language(self, text: str) -> str:
         """
@@ -700,6 +712,12 @@ class MultilingualSplitter:
 
         # If detection matches main language, keep it
         if top_lang == main_lang:
+            return main_lang
+
+        if any(
+            main_lang in equivalents and top_lang in equivalents
+            for equivalents in EQUIVALENT_LANGUAGE_CODES
+        ):
             return main_lang
 
         # CLD2 detected a different language despite the hint.
@@ -885,6 +903,96 @@ class MultilingualSplitter:
 
         return self._merge_adjacent_segments(adjusted)
 
+    def _stabilize_main_language_sentences(
+        self,
+        text: str,
+        segments: list[Segment],
+        main_lang: str,
+    ) -> list[Segment]:
+        """Use sentence context to reject isolated same-script misdetections.
+
+        CLD2 is useful on a sentence but unreliable on individual words. The
+        script splitter necessarily exposes individual words around whitespace,
+        so classify the compatible-script content of each sentence once and
+        keep it in the known main language when that contextual classification
+        agrees. Segments in an incompatible script remain independent, which
+        preserves Chinese/Japanese/etc. code switches.
+        """
+        if not segments:
+            return segments
+
+        sentence_pattern = regex.compile(r"[^.!?。！？\n]+(?:[.!?。！？]+|\n+|$)")
+        assignments: list[tuple[int, int, str]] = []
+        for sentence_match in sentence_pattern.finditer(text):
+            sentence_start, sentence_end = sentence_match.span()
+            compatible = [
+                segment
+                for segment in segments
+                if segment.end > sentence_start
+                and segment.start < sentence_end
+                and self._is_script_valid_for_language(segment.script, main_lang)
+            ]
+            scripts = [
+                segment.script
+                for segment in compatible
+                if segment.script not in {"Common", "Inherited", "Unknown"}
+            ]
+            if not scripts:
+                continue
+
+            contextual_text = "".join(
+                text[
+                    max(segment.start, sentence_start) : min(segment.end, sentence_end)
+                ]
+                for segment in compatible
+            ).strip()
+            if not contextual_text:
+                continue
+            contextual_language = self._detect_with_bias(
+                contextual_text,
+                main_lang,
+                scripts[0],
+            )
+            if not self._is_script_valid_for_language(
+                scripts[0],
+                contextual_language,
+            ):
+                continue
+
+            assignments.append((sentence_start, sentence_end, contextual_language))
+
+        if not assignments:
+            return segments
+
+        adjusted: list[Segment] = []
+        for segment in segments:
+            boundaries = {segment.start, segment.end}
+            for sentence_start, sentence_end, _ in assignments:
+                if segment.start < sentence_start < segment.end:
+                    boundaries.add(sentence_start)
+                if segment.start < sentence_end < segment.end:
+                    boundaries.add(sentence_end)
+
+            ordered_boundaries = sorted(boundaries)
+            for start, end in zip(ordered_boundaries, ordered_boundaries[1:]):
+                language = segment.language
+                if self._is_script_valid_for_language(segment.script, main_lang):
+                    for sentence_start, sentence_end, sentence_language in assignments:
+                        if sentence_start <= start and end <= sentence_end:
+                            language = sentence_language
+                            break
+                adjusted.append(
+                    Segment(
+                        text=text[start:end],
+                        start=start,
+                        end=end,
+                        script=segment.script,
+                        language=language,
+                    )
+                )
+
+        return adjusted
+
     def split(self, text: str, main_lang: Optional[str] = None) -> SplitResult:
         """
         Split text into language-tagged segments.
@@ -1030,6 +1138,12 @@ class MultilingualSplitter:
                             language=main_lang,
                         )
                     )
+
+        segments = self._stabilize_main_language_sentences(
+            text,
+            segments,
+            main_lang,
+        )
 
         # Final merge of adjacent same-language segments
         merged_segments = self._merge_adjacent_segments(segments)

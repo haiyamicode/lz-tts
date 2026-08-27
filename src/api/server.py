@@ -32,7 +32,7 @@ from fastapi.responses import JSONResponse, Response
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
-from ..multilingual_splitter import MultilingualSplitter
+from ..multilingual_splitter import MultilingualSplitter, SplitResult
 from ..piper import PiperInference
 from ..ctc_forced_alignment import CtcAlignmentConfig, CtcForcedAligner, CtcLanguageSpan
 from ..aligned_pauses import ResolvedPause, insert_resolved_pauses
@@ -435,7 +435,10 @@ class SynthesizeRequest(BaseModel):
         None,
         description="Language/locale spoken by the reference sample",
     )
-    language: Optional[str] = Field(None, description="Force full locale for the entire input, e.g. en-GB")
+    language: Optional[str] = Field(
+        None,
+        description="Language/locale routing hint; forced for the entire input only when language_override is true",
+    )
     language_override: bool = Field(
         False,
         description="Whether language was explicitly selected rather than detected",
@@ -470,7 +473,10 @@ class BatchSynthesizeInputItem(BaseModel):
         None,
         description="Language/locale spoken by the reference sample",
     )
-    language: Optional[str] = Field(None, description="Force full locale for this item, e.g. en-GB")
+    language: Optional[str] = Field(
+        None,
+        description="Language/locale routing hint; forced for this item only when language_override is true",
+    )
     language_override: bool = Field(
         False,
         description="Whether language was explicitly selected rather than detected",
@@ -741,6 +747,18 @@ def _get_multilingual_splitter() -> MultilingualSplitter:
         _splitter = MultilingualSplitter(languages=list(languages) if languages else None)
         _splitter_languages = languages
     return _splitter
+
+
+def _split_multilingual_text(text: str, language_hint: str | None = None) -> SplitResult:
+    """Split text while using a routable locale only as the primary-language hint."""
+    hinted_main_language = (
+        _get_base_language(_normalize_locale_with_region(language_hint))
+        if language_hint
+        else None
+    )
+    if hinted_main_language not in _supported_sparrow_language_codes():
+        hinted_main_language = None
+    return _get_multilingual_splitter().split(text, main_lang=hinted_main_language)
 
 
 def _routable_detected_language(language: str, main_lang: str) -> str:
@@ -1344,7 +1362,8 @@ def _validate_language_speaker_routes() -> None:
 def _synthesize_multilingual(
     text: str,
     primary_speaker: Optional[str] = None,
-    language: Optional[str] = None,
+    language_hint: Optional[str] = None,
+    forced_language: Optional[str] = None,
     noise_scale: Optional[float] = None,
     length_scale: Optional[float] = None,
     noise_w: Optional[float] = None,
@@ -1357,12 +1376,13 @@ def _synthesize_multilingual(
         text: Text to synthesize.
         primary_speaker: If set, use this speaker for segments matching its base language
                         (e.g., "en-GB" applies to "en" segments only).
-        language: If set, force the whole text to this locale.
+        language_hint: Preferred locale for ambiguous same-script text.
+        forced_language: If set, force the whole text to this locale.
 
     Returns (audio, sample_rate).
     """
-    if language is not None:
-        _resolve_forced_language(language)
+    if forced_language is not None:
+        _resolve_forced_language(forced_language)
 
     synth_kwargs = {}
     if noise_scale is not None:
@@ -1378,7 +1398,8 @@ def _synthesize_multilingual(
     routing_plan, _ = _plan_text_segments(
         text,
         primary_speaker,
-        forced_language=language,
+        language_hint=language_hint,
+        forced_language=forced_language,
         validate_primary_speaker=primary_speaker is not None,
     )
 
@@ -1430,6 +1451,11 @@ def _configured_voice_language(voice_id: str | None, language: str | None) -> st
     if root_voice and root_voice.languages and len(root_voice.languages) == 1:
         return root_voice.languages[0]
     return None
+
+
+def _explicit_language(language: str | None, language_override: bool) -> str | None:
+    """Return the locale only when the caller explicitly requested it."""
+    return language if language_override else None
 
 
 def _default_root_voice() -> RootVoiceConfig | None:
@@ -1563,30 +1589,18 @@ def _resolve_internal_speaker(model_name: str, speaker: str | None, inference: P
 def _plan_text_segments(
     text: str,
     primary_speaker: str | None,
+    language_hint: str | None = None,
     forced_language: str | None = None,
     *,
     validate_primary_speaker: bool = False,
 ) -> tuple[list[dict[str, Any]], set[str]]:
-    splitter = _get_multilingual_splitter()
-
     if forced_language is not None:
         forced_locale, forced_speaker, forced_model = _resolve_forced_language(forced_language)
-
-    result = splitter.split(text)
-    main_lang = result.main_language or "en"
-    primary_lang = _get_base_language(primary_speaker) if primary_speaker else None
-    if primary_speaker is not None and validate_primary_speaker:
-        _resolve_speaker_and_model(primary_speaker, explicit=True)
-
-    segments: list[dict[str, Any]] = []
-    languages: set[str] = set()
-
-    if forced_language is not None:
         source_start = len(text) - len(text.lstrip())
         source_end = len(text.rstrip())
         segment_text = text[source_start:source_end]
+        segments: list[dict[str, Any]] = []
         if segment_text:
-            languages.add(forced_locale)
             segments.append({
                 "lang": forced_locale,
                 "speaker": forced_speaker,
@@ -1595,7 +1609,16 @@ def _plan_text_segments(
                 "source_start": source_start,
                 "source_end": source_end,
             })
-        return segments, languages or {forced_locale}
+        return segments, {forced_locale}
+
+    result = _split_multilingual_text(text, language_hint)
+    main_lang = result.main_language or "en"
+    primary_lang = _get_base_language(primary_speaker) if primary_speaker else None
+    if primary_speaker is not None and validate_primary_speaker:
+        _resolve_speaker_and_model(primary_speaker, explicit=True)
+
+    segments = []
+    languages: set[str] = set()
 
     for segment in result.segments:
         source_start = int(segment.start)
@@ -1649,7 +1672,9 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         raise HTTPException(status_code=400, detail="all texts must be non-empty")
 
     await _await_engine_ready("pipertts")
-    forced_language = _configured_voice_forced_language(root_voice, request.language)
+    forced_language = _resolve_sparrow_forced_language(
+        _explicit_language(request.language, request.language_override)
+    )
 
     primary_speaker: str | None = (
         forced_language
@@ -1665,6 +1690,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         segments, _ = _plan_text_segments(
             text,
             primary_speaker,
+            language_hint=request.language,
             forced_language=forced_language,
             validate_primary_speaker=False,
         )
@@ -1909,12 +1935,16 @@ def _get_ssml_aligner() -> CtcForcedAligner:
     return _ssml_aligner
 
 
-def _ssml_language_plan(text: str, forced_language: str | None) -> tuple[str, list[CtcLanguageSpan]]:
+def _ssml_language_plan(
+    text: str,
+    language_hint: str | None,
+    forced_language: str | None,
+) -> tuple[str, list[CtcLanguageSpan]]:
     if forced_language:
         language = _normalize_locale_with_region(forced_language)
         return language, [CtcLanguageSpan(0, len(text), language)]
 
-    result = _get_multilingual_splitter().split(text)
+    result = _split_multilingual_text(text, language_hint)
     main_language = result.main_language or "en"
     spans: list[CtcLanguageSpan] = []
     cursor = 0
@@ -1946,9 +1976,14 @@ async def _align_ssml_audio(
     text: str,
     audio: np.ndarray,
     sample_rate: int,
+    language_hint: str | None,
     forced_language: str | None,
 ) -> list[dict[str, Any]]:
-    language, language_spans = _ssml_language_plan(text, forced_language)
+    language, language_spans = _ssml_language_plan(
+        text,
+        language_hint,
+        forced_language,
+    )
     result = await asyncio.to_thread(
         _get_ssml_aligner().align_words,
         text,
@@ -1962,10 +1997,15 @@ async def _align_ssml_audio(
     return list(result["word_timestamps"])
 
 
-def _language_at_source_position(text: str, position: int, forced_language: str | None) -> str:
+def _language_at_source_position(
+    text: str,
+    position: int,
+    language_hint: str | None,
+    forced_language: str | None,
+) -> str:
     if forced_language:
         return _normalize_locale_with_region(forced_language)
-    result = _get_multilingual_splitter().split(text)
+    result = _split_multilingual_text(text, language_hint)
     main_language = result.main_language or "en"
     for segment in result.segments:
         if segment.start <= position < segment.end:
@@ -1974,13 +2014,7 @@ def _language_at_source_position(text: str, position: int, forced_language: str 
     return main_language
 
 
-def _configured_voice_forced_language(
-    root_voice: RootVoiceConfig,
-    requested_language: str | None,
-) -> str | None:
-    language = requested_language
-    if language is None and root_voice.languages and len(root_voice.languages) == 1:
-        language = root_voice.languages[0]
+def _resolve_sparrow_forced_language(language: str | None) -> str | None:
     if language is None:
         return None
 
@@ -1999,8 +2033,16 @@ def _ssml_sparrow_route(
     operation: PronunciationOperation,
     resolved_model: str | None,
 ) -> tuple[str | None, str]:
-    requested_language = _configured_voice_language(request.voice_id, request.language)
-    language = _language_at_source_position(text, operation.start, requested_language)
+    forced_language = _explicit_language(
+        request.language,
+        request.language_override,
+    )
+    language = _language_at_source_position(
+        text,
+        operation.start,
+        request.language,
+        forced_language,
+    )
     _locale, speaker, model_name = _resolve_forced_language(language)
     root_voice = _configured_root_voice_for_voice_id(request.voice_id)
     if root_voice is not None:
@@ -2108,10 +2150,8 @@ async def _synthesize_sparrow_ipa_ssml(
     """Synthesize Sparrow IPA overrides natively in one pass per language span."""
     await _await_engine_ready("pipertts")
     root_voice = _configured_root_voice_for_voice_id(request.voice_id)
-    forced_language = (
-        _configured_voice_forced_language(root_voice, request.language)
-        if root_voice is not None
-        else request.language
+    forced_language = _resolve_sparrow_forced_language(
+        _explicit_language(request.language, request.language_override)
     )
     primary_speaker = (
         forced_language
@@ -2138,6 +2178,7 @@ async def _synthesize_sparrow_ipa_ssml(
         segments, _ = _plan_text_segments(
             document.text,
             primary_speaker,
+            language_hint=request.language,
             forced_language=forced_language,
             validate_primary_speaker=False,
         )
@@ -2241,11 +2282,15 @@ def _ipa_marker(index: int) -> str:
 def _voxcpm_ipa_guide_text(
     document: SSMLDocument,
     operation: PronunciationOperation,
+    language_hint: str | None,
     forced_language: str | None,
 ) -> str:
     """Return the visible LM guide; the adapter receives exact IPA separately."""
     language = _language_at_source_position(
-        document.text, operation.start, forced_language
+        document.text,
+        operation.start,
+        language_hint,
+        forced_language,
     )
     if _get_base_language(language) == "en":
         return approximate_ipa_spelling(operation.phonemes, language)
@@ -2258,6 +2303,7 @@ def _voxcpm_ipa_guide_text(
 
 def _prepare_voxcpm_ipa_text(
     document: SSMLDocument,
+    language_hint: str | None,
     forced_language: str | None,
 ) -> tuple[str, str, list[dict[str, Any]]]:
     operations = sorted(document.pronunciations, key=lambda item: item.start)
@@ -2296,7 +2342,10 @@ def _prepare_voxcpm_ipa_text(
         controlled_parts.append(segment)
         controlled_length += len(segment)
         spelling = _voxcpm_ipa_guide_text(
-            document, operation, forced_language
+            document,
+            operation,
+            language_hint,
+            forced_language,
         )
         controlled_parts.append(spelling)
         controls.append(
@@ -2459,12 +2508,22 @@ async def _synthesize_voxcpm_ipa_ssml(
     if request.seed is None:
         raise RuntimeError("VoxCPM IPA synthesis requires a resolved sampling seed")
 
+    forced_language = _explicit_language(
+        request.language,
+        request.language_override,
+    )
     controlled_text, _language, controls = _prepare_voxcpm_ipa_text(
-        document, request.language
+        document,
+        request.language,
+        forced_language,
     )
     controlled_operations = _voxcpm_controlled_operations(controls)
     baseline_timestamps = await _align_ssml_audio(
-        document.text, baseline_audio, baseline_sample_rate, request.language
+        document.text,
+        baseline_audio,
+        baseline_sample_rate,
+        request.language,
+        forced_language,
     )
     baseline_spans = _aligned_pronunciation_spans(
         document.pronunciations, baseline_timestamps
@@ -2549,6 +2608,7 @@ async def _synthesize_voxcpm_ipa_ssml(
             audio,
             runtime.sample_rate,
             request.language,
+            forced_language,
         )
         return timestamps, _aligned_pronunciation_spans(
             controlled_operations,
@@ -2662,7 +2722,11 @@ async def _postprocess_ssml_response(
             )
         else:
             timestamps = await _align_ssml_audio(
-                document.text, audio, sample_rate, request.language
+                document.text,
+                audio,
+                sample_rate,
+                request.language,
+                _explicit_language(request.language, request.language_override),
             )
             audio, _report = insert_ssml_breaks(
                 document.text,
@@ -3032,7 +3096,11 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
     segment_groups: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
 
     for item_idx, text in enumerate(texts):
-        segments, _ = _plan_text_segments(text, primary_speaker=None, forced_language=None)
+        segments, _ = _plan_text_segments(
+            text,
+            primary_speaker=None,
+            language_hint=request.language,
+        )
         item_segments.append(segments)
         for segment_idx, segment in enumerate(segments):
             record = {**segment, "item_idx": item_idx, "segment_idx": segment_idx}
@@ -3341,7 +3409,9 @@ async def synthesize_voxcpm_batch(
     texts = [text.strip() for text in request.texts]
     if any(not text for text in texts):
         raise HTTPException(status_code=400, detail="all texts must be non-empty")
-    languages = request.languages or [request.language] * len(texts)
+    languages = request.languages or [
+        _explicit_language(request.language, request.language_override)
+    ] * len(texts)
     if len(languages) != len(texts):
         raise HTTPException(status_code=400, detail="VoxCPM languages length must match texts length")
 
@@ -3450,18 +3520,22 @@ async def _synthesize_voxcpm_items(
         for key in reference_keys
     ]
     first = records[0][1]
-    languages = [
+    routing_languages = [
         _configured_voice_language(item.voice_id, item.language)
         for _, item, _ in records
+    ]
+    forced_languages = [
+        _explicit_language(language, item.language_override)
+        for language, (_, item, _) in zip(routing_languages, records, strict=True)
     ]
     return await synthesize_voxcpm_batch(
         _SharedBatchSynthesizeRequest(
             texts=[text for _, _, text in records],
             seeds=[item.seed for _, item, _ in records],
             reference_language=first.reference_language,
-            language=languages[0],
+            language=routing_languages[0],
             language_override=first.language_override,
-            languages=languages,
+            languages=forced_languages,
             model=_server_config.voxcpm.model_id,
             voxcpm_loras=tuple(first.voxcpm_loras),
             options=first.options,
@@ -3489,7 +3563,7 @@ def _batch_item_pipeline(item: BatchSynthesizeInputItem) -> str:
         language=item.language,
     ):
         return "sparrow_reference"
-    if item.language is not None:
+    if _explicit_language(item.language, item.language_override) is not None:
         return "sparrow_forced_language"
     return "sparrow"
 
@@ -3578,8 +3652,11 @@ def _validate_batch_item(item: BatchSynthesizeInputItem, item_idx: int) -> str:
 def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, str]]) -> _SharedBatchSynthesizeRequest:
     first = records[0][1]
     pipeline = _batch_item_pipeline(first)
-    languages = [
-        _configured_voice_language(item.voice_id, item.language)
+    forced_languages = [
+        _explicit_language(
+            _configured_voice_language(item.voice_id, item.language),
+            item.language_override,
+        )
         for _, item, _ in records
     ]
     return _SharedBatchSynthesizeRequest(
@@ -3594,9 +3671,9 @@ def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, 
             else None
         ),
         reference_language=first.reference_language,
-        language=languages[0],
+        language=_configured_voice_language(first.voice_id, first.language),
         language_override=first.language_override,
-        languages=languages,
+        languages=forced_languages,
         model=_resolve_api_model(first.model),
         voxcpm_loras=tuple(first.voxcpm_loras),
         options=first.options,
@@ -3650,9 +3727,10 @@ async def _execute_synthesis_batch_plan(
     shared_request = _shared_batch_from_items(records)
     if plan.pipeline == "voxcpm":
         return await _synthesize_voxcpm_items(records)
-    if shared_request.language is not None:
+    forced_language = (shared_request.languages or [None])[0]
+    if forced_language is not None:
         await _await_engine_ready("pipertts")
-        _, forced_speaker, forced_model = _resolve_forced_language(shared_request.language)
+        _, forced_speaker, forced_model = _resolve_forced_language(forced_language)
         return await synthesize_sparrow_batch(
             _SharedBatchSynthesizeRequest(
                 texts=shared_request.texts,
@@ -4014,6 +4092,10 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
     effective_language = _configured_voice_language(request.voice_id, request.language)
     if effective_language != request.language:
         request = request.model_copy(update={"language": effective_language})
+    forced_language = _explicit_language(
+        request.language,
+        request.language_override,
+    )
     if request.ssml is not None:
         try:
             document = parse_ssml(request.ssml)
@@ -4032,6 +4114,7 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
                         audio,
                         sample_rate,
                         request.language,
+                        forced_language,
                     )
                     audio, _report = insert_ssml_breaks(
                         document.text,
@@ -4112,6 +4195,7 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
                 reference_language=request.reference_language,
                 language=request.language,
                 language_override=request.language_override,
+                languages=[forced_language],
                 model=_server_config.voxcpm.model_id,
                 voxcpm_loras=tuple(request.voxcpm_loras),
                 options=request.options,
@@ -4131,7 +4215,8 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
     if model is None or model == PUBLIC_SPARROW_MODEL:
         audio, sample_rate = _synthesize_multilingual(
             request.text,
-            language=request.language,
+            language_hint=request.language,
+            forced_language=forced_language,
             neural=request.neural,
             **synth_kwargs,
         )
