@@ -13,10 +13,38 @@ from .server import (
     _batch_item_compatibility_key,
     _effective_voxcpm_lora_names,
     _prepare_voxcpm_ipa_text,
+    _plan_synthesis_batches,
+    _prepare_batchable_synthesis_request,
     _shared_batch_from_items,
     _validate_batch_item,
     _voice_request_routes_to_voxcpm,
 )
+
+
+def test_plain_speak_wrapper_is_prepared_for_batching() -> None:
+    request = _prepare_batchable_synthesis_request(
+        {
+            "ssml": "<speak>Hello &amp; welcome.</speak>",
+            "voice_id": "voice",
+            "reference_url": "https://example.com/reference.wav",
+        }
+    )
+
+    assert request is not None
+    assert request.text == "Hello & welcome."
+    assert request.ssml is None
+
+
+def test_ssml_with_postprocessing_is_not_prepared_for_batching() -> None:
+    request = _prepare_batchable_synthesis_request(
+        {
+            "ssml": '<speak>Hello<break time="1s"/>world.</speak>',
+            "voice_id": "voice",
+            "reference_url": "https://example.com/reference.wav",
+        }
+    )
+
+    assert request is None
 
 
 def test_voxcpm_release_defaults_use_stabilized_model_and_three_slots() -> None:
@@ -29,7 +57,16 @@ def test_voxcpm_release_defaults_use_stabilized_model_and_three_slots() -> None:
     assert config.max_loras_per_request == 2
 
 
-def test_voxcpm_batch_grouping_is_adapter_order_independent() -> None:
+def test_voxcpm_batch_grouping_is_adapter_order_independent(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server._server_config.voxcpm,
+        "applicable_loras",
+        {
+            "accent-en-US": "unused",
+            "accent-en-GB": "unused",
+            "ipa": "unused",
+        },
+    )
     first = BatchSynthesizeInputItem(
         text="first",
         model="voxcpm",
@@ -56,6 +93,53 @@ def test_voxcpm_batch_grouping_is_adapter_order_independent() -> None:
     assert _batch_item_compatibility_key(first) != _batch_item_compatibility_key(
         different_adapter
     )
+
+
+def test_batch_planner_combines_eight_voxcpm_voices() -> None:
+    items = [
+        BatchSynthesizeInputItem(
+            text=f"Distinct synthesis request number {index}.",
+            model="voxcpm",
+            voice_id=f"voice.{index}",
+            reference_url=f"https://example.com/reference-{index}.wav",
+            language="zh-CN",
+        )
+        for index in range(8)
+    ]
+
+    plans = _plan_synthesis_batches(items)
+
+    assert [(plan.pipeline, len(plan.records)) for plan in plans] == [("voxcpm", 8)]
+
+
+def test_batch_planner_orders_backends_and_splits_incompatible_loras() -> None:
+    voxcpm = BatchSynthesizeInputItem(
+        text="VoxCPM",
+        model="voxcpm",
+        voice_id="voice.voxcpm",
+        reference_url="https://example.com/voxcpm.wav",
+        language="zh-CN",
+    )
+    different_lora = voxcpm.model_copy(
+        update={
+            "text": "Different adapter",
+            "voxcpm_loras": ["accent-en-US"],
+            "language": "en-US",
+        }
+    )
+    sparrow = BatchSynthesizeInputItem(
+        text="Sparrow",
+        model="sparrow",
+        language="bs-BA",
+    )
+
+    plans = _plan_synthesis_batches([voxcpm, different_lora, sparrow])
+
+    assert [plan.pipeline for plan in plans] == [
+        "sparrow_forced_language",
+        "voxcpm",
+        "voxcpm",
+    ]
 
 
 def test_reference_voice_routing_uses_model_capabilities() -> None:
@@ -134,7 +218,7 @@ def test_locale_routing_respects_native_adapter_and_reference_accents(
     )
 
 
-def test_locale_adapter_is_applied_from_server_config(monkeypatch) -> None:
+def test_locale_adapter_is_only_applied_for_a_locale_override(monkeypatch) -> None:
     monkeypatch.setattr(
         server._server_config.voxcpm,
         "applicable_loras",
@@ -146,11 +230,76 @@ def test_locale_adapter_is_applied_from_server_config(monkeypatch) -> None:
         {"en-US": "accent-en-US", "en-GB": "accent-en-GB"},
     )
 
-    assert _effective_voxcpm_lora_names([], "en-GB") == ("accent-en-GB",)
+    assert _effective_voxcpm_lora_names([], "en-US") == ()
+    assert _effective_voxcpm_lora_names([], "en-GB", True) == (
+        "accent-en-GB",
+    )
+    assert _effective_voxcpm_lora_names([], "en-US", True) == (
+        "accent-en-US",
+    )
     assert _effective_voxcpm_lora_names(["accent-en-US"], "en-US") == (
         "accent-en-US",
     )
-    assert _effective_voxcpm_lora_names([], "zh-CN") == ()
+    assert _effective_voxcpm_lora_names([], "en-GB") == ()
+    assert _effective_voxcpm_lora_names([], "zh-CN", True) == ()
+
+
+def test_batch_grouping_separates_native_and_overridden_accents(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server._server_config.voxcpm,
+        "applicable_loras",
+        {"accent-en-US": "unused", "accent-en-GB": "unused"},
+    )
+    monkeypatch.setattr(
+        server._server_config.voxcpm,
+        "locale_loras",
+        {"en-US": "accent-en-US", "en-GB": "accent-en-GB"},
+    )
+    native = BatchSynthesizeInputItem(
+        text="Native American English.",
+        model="voxcpm",
+        voice_id="msa.en-US.AvaMultilingual",
+        reference_url="https://example.com/ava.wav",
+        reference_language="en-US",
+        language="en-US",
+    )
+    overridden = native.model_copy(
+        update={
+            "text": "British accent override.",
+            "language": "en-GB",
+            "language_override": True,
+        }
+    )
+
+    plans = _plan_synthesis_batches([native, overridden])
+
+    assert [len(plan.records) for plan in plans] == [1, 1]
+
+
+def test_native_british_voice_does_not_infer_an_accent_override(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server._server_config.voxcpm,
+        "applicable_loras",
+        {"accent-en-US": "unused", "accent-en-GB": "unused"},
+    )
+    monkeypatch.setattr(
+        server._server_config.voxcpm,
+        "locale_loras",
+        {"en-US": "accent-en-US", "en-GB": "accent-en-GB"},
+    )
+    native = BatchSynthesizeInputItem(
+        text="Native British English.",
+        model="voxcpm",
+        voice_id="msa.en-GB.AdaMultilingual",
+        reference_url="https://example.com/ada.wav",
+        reference_language="en-GB",
+        language="en-GB",
+    )
+
+    assert _batch_item_compatibility_key(native) == _batch_item_compatibility_key(
+        native.model_copy(update={"text": "Another native request."})
+    )
+    assert _effective_voxcpm_lora_names([], native.language, native.language_override) == ()
 
 
 def test_root_voice_with_reference_skips_seed_vc_for_its_native_language(

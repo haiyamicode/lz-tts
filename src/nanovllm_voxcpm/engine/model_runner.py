@@ -839,7 +839,7 @@ class BaseModelRunner:
         }
         outputs = self.make_dummy_outputs(max_bs)
 
-        graph_bs_candidates = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16)) + [max_bs]
+        graph_bs_candidates = [1, 2, 4, 8]
         self.graph_bs = sorted({bs for bs in graph_bs_candidates if 1 <= bs <= max_bs})
         self.graphs = {"base": {}, "lora": {}}
         self.graph_pool = None
@@ -940,6 +940,7 @@ class BaseModelRunner:
                 or force_eager
                 or self.enforce_eager
                 or inputs["positions"].size(0) > 512
+                or inputs["positions"].size(0) > self.graph_bs[-1]
                 or (has_active_lora and not has_lora_graph)
             ):
                 return self.model(**inputs)

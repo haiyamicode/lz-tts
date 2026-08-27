@@ -32,12 +32,11 @@ class TaskflowWorker:
     base_url: str
     worker_token: str
     worker_id: str
-    concurrency: int = 1
+    concurrency: int = 8
     session_id: str | None = None
     session_token: str | None = None
     heartbeat_interval: float = 15.0
     active_lease_ids: set[str] = field(default_factory=set)
-    active_lease_tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
@@ -108,9 +107,6 @@ class TaskflowWorker:
         body = response.json()
         for lease_id in (*body.get("cancelledLeaseIds", []), *body.get("lostLeaseIds", [])):
             self.active_lease_ids.discard(lease_id)
-            task = self.active_lease_tasks.get(lease_id)
-            if task and not task.done():
-                task.cancel()
 
     async def heartbeat_loop(self, connection_lost: asyncio.Event) -> None:
         while True:
@@ -122,7 +118,12 @@ class TaskflowWorker:
                 connection_lost.set()
                 return
 
-    async def pull(self) -> list[dict[str, Any]]:
+    async def pull(
+        self,
+        *,
+        max_tasks: int | None = None,
+        wait_ms: int = 1000,
+    ) -> list[dict[str, Any]]:
         if not self.session_token:
             raise ProtocolError("Worker has not joined Taskflow")
         try:
@@ -131,7 +132,11 @@ class TaskflowWorker:
                 f"/workers/{self.worker_id}/pull",
                 token=self.session_token,
                 headers=self._session_headers(),
-                json={"maxTasks": self.concurrency, "waitMs": 1000, "taskTypes": list(TASK_TYPES)},
+                json={
+                    "maxTasks": max_tasks or self.concurrency,
+                    "waitMs": wait_ms,
+                    "taskTypes": list(TASK_TYPES),
+                },
             )
         except ProtocolError as error:
             # A server restart can leave the previous long-poll marker alive briefly in Redis.
@@ -192,53 +197,81 @@ class TaskflowWorker:
         )
 
 
-async def _process_lease(
-    taskflow: TaskflowWorker,
-    inference: LzTtsInferenceSession,
-    lease: dict[str, Any],
-) -> None:
+@dataclass(frozen=True)
+class _LeaseWork:
+    lease: dict[str, Any]
+    operation: str
+    request: dict[str, Any]
+    task_type: str
+    started_at: float
+
+
+def _prepare_lease(taskflow: TaskflowWorker, lease: dict[str, Any]) -> _LeaseWork:
     lease_id = lease["id"]
     run_id = lease.get("runId")
-    started_at = time.monotonic()
-    taskflow.active_lease_ids.add(lease_id)
-    current_task = asyncio.current_task()
-    if current_task is not None:
-        taskflow.active_lease_tasks[lease_id] = current_task
-    operation = "unknown"
     task_type = lease.get("type", "unknown")
+    payload = lease["payload"]
+    operation = "voice-enhance" if task_type == "voice-enhance" else payload["operation"]
+    request = payload["request"]
+    taskflow.active_lease_ids.add(lease_id)
+    _LOGGER.info(
+        "LZ-TTS task started type=%s lease=%s run=%s operation=%s artifact=%s "
+        "model=%s voice=%s locale=%s",
+        task_type,
+        lease_id,
+        run_id,
+        operation,
+        payload.get("artifactId"),
+        request.get("model"),
+        request.get("voice_id") or request.get("id"),
+        request.get("language") or request.get("locale"),
+    )
+    return _LeaseWork(
+        lease=lease,
+        operation=operation,
+        request=request,
+        task_type=task_type,
+        started_at=time.monotonic(),
+    )
+
+
+async def _finish_lease(
+    taskflow: TaskflowWorker,
+    work: _LeaseWork,
+    outcome: Any,
+) -> None:
+    lease = work.lease
+    lease_id = lease["id"]
+    run_id = lease.get("runId")
     try:
-        payload = lease["payload"]
-        operation = "voice-enhance" if task_type == "voice-enhance" else payload["operation"]
-        request = payload["request"]
-        _LOGGER.info(
-            "LZ-TTS task started type=%s lease=%s run=%s operation=%s artifact=%s "
-            "model=%s voice=%s locale=%s",
-            task_type,
-            lease_id,
-            run_id,
-            operation,
-            payload.get("artifactId"),
-            request.get("model"),
-            request.get("voice_id") or request.get("id"),
-            request.get("language") or request.get("locale"),
-        )
-        result = await inference.execute(operation, request)
+        if lease_id not in taskflow.active_lease_ids:
+            _LOGGER.warning(
+                "Discarding completed inference for inactive lease=%s run=%s",
+                lease_id,
+                run_id,
+            )
+            return
+        if isinstance(outcome, BaseException):
+            raise outcome
+        result = outcome
         if result.kind == "json":
             await taskflow.complete(lease, {"kind": "json", "data": result.data})
             _LOGGER.info(
                 "LZ-TTS task completed type=%s lease=%s run=%s operation=%s kind=json "
                 "wall_seconds=%.3f",
-                task_type,
+                work.task_type,
                 lease_id,
                 run_id,
-                operation,
-                time.monotonic() - started_at,
+                work.operation,
+                time.monotonic() - work.started_at,
             )
             return
 
-        artifact_id = payload.get("artifactId")
+        artifact_id = lease["payload"].get("artifactId")
         if not artifact_id:
-            raise ValueError(f"TTS operation {operation} returned audio without an artifactId")
+            raise ValueError(
+                f"TTS operation {work.operation} returned audio without an artifactId"
+            )
         audio = result.audio or b""
         if not audio:
             raise RuntimeError("LZ-TTS returned an empty audio artifact")
@@ -255,30 +288,22 @@ async def _process_lease(
         _LOGGER.info(
             "LZ-TTS task completed type=%s lease=%s run=%s operation=%s kind=artifact bytes=%d "
             "wall_seconds=%.3f",
-            task_type,
+            work.task_type,
             lease_id,
             run_id,
-            operation,
+            work.operation,
             len(audio),
-            time.monotonic() - started_at,
-        )
-    except asyncio.CancelledError:
-        _LOGGER.warning(
-            "LZ-TTS task cancelled type=%s lease=%s run=%s operation=%s",
-            task_type,
-            lease_id,
-            run_id,
-            operation,
+            time.monotonic() - work.started_at,
         )
     except InferenceOperationError as error:
         retry = error.status_code >= 500 or error.status_code in {408, 429}
         _LOGGER.error(
             "LZ-TTS task rejected type=%s lease=%s run=%s operation=%s status=%d retry=%s "
             "detail=%s",
-            task_type,
+            work.task_type,
             lease_id,
             run_id,
-            operation,
+            work.operation,
             error.status_code,
             retry,
             str(error.detail)[:1000],
@@ -288,7 +313,7 @@ async def _process_lease(
         except Exception:
             _LOGGER.exception(
                 "Failed to report rejected LZ-TTS task to Taskflow type=%s lease=%s run=%s",
-                task_type,
+                work.task_type,
                 lease_id,
                 run_id,
             )
@@ -296,24 +321,103 @@ async def _process_lease(
     except Exception as error:
         _LOGGER.exception(
             "LZ-TTS task failed type=%s lease=%s run=%s operation=%s",
-            task_type,
+            work.task_type,
             lease_id,
             run_id,
-            operation,
+            work.operation,
         )
         try:
             await taskflow.fail(lease, error, retry=True)
         except Exception:
             _LOGGER.exception(
                 "Failed to report failed LZ-TTS task to Taskflow type=%s lease=%s run=%s",
-                task_type,
+                work.task_type,
                 lease_id,
                 run_id,
             )
             raise
     finally:
         taskflow.active_lease_ids.discard(lease_id)
-        taskflow.active_lease_tasks.pop(lease_id, None)
+
+
+async def _process_leases(
+    taskflow: TaskflowWorker,
+    inference: LzTtsInferenceSession,
+    leases: list[dict[str, Any]],
+) -> None:
+    works: list[_LeaseWork] = []
+    for lease in leases:
+        try:
+            works.append(_prepare_lease(taskflow, lease))
+        except Exception as error:
+            _LOGGER.exception(
+                "Invalid LZ-TTS lease payload lease=%s run=%s",
+                lease.get("id"),
+                lease.get("runId"),
+            )
+            try:
+                await taskflow.fail(lease, error, retry=False)
+            except Exception:
+                _LOGGER.exception(
+                    "Failed to reject invalid LZ-TTS lease lease=%s run=%s",
+                    lease.get("id"),
+                    lease.get("runId"),
+                )
+
+    if not works:
+        return
+    try:
+        outcomes = await inference.execute_many(
+            [(work.operation, work.request) for work in works]
+        )
+        if len(outcomes) != len(works):
+            raise RuntimeError(
+                "Inference batch returned a different number of outcomes"
+            )
+    except Exception as error:
+        _LOGGER.exception("LZ-TTS task batch planning or execution failed")
+        outcomes = [error] * len(works)
+    await asyncio.gather(
+        *(
+            _finish_lease(taskflow, work, outcome)
+            for work, outcome in zip(works, outcomes, strict=True)
+        )
+    )
+
+
+async def _process_lease(
+    taskflow: TaskflowWorker,
+    inference: LzTtsInferenceSession,
+    lease: dict[str, Any],
+) -> None:
+    await _process_leases(taskflow, inference, [lease])
+
+
+async def _pull_task_batch(taskflow: TaskflowWorker) -> list[dict[str, Any]]:
+    leases = await taskflow.pull()
+    if not leases or len(leases) >= taskflow.concurrency:
+        return leases
+
+    # Keep isolated request latency low. Once a burst is visible, give its
+    # remaining submissions time to reach Taskflow and fill the model batch.
+    burst = len(leases) > 1
+    deadline = time.monotonic() + (1.0 if burst else 0.1)
+    while len(leases) < taskflow.concurrency:
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            break
+        more = await taskflow.pull(
+            max_tasks=taskflow.concurrency - len(leases),
+            wait_ms=max(1, min(100, round(remaining_seconds * 1000))),
+        )
+        if more:
+            leases.extend(more)
+            if not burst:
+                burst = True
+                deadline = time.monotonic() + 1.0
+        elif not burst:
+            break
+    return leases
 
 
 async def _serve_taskflow(
@@ -332,11 +436,9 @@ async def _serve_taskflow(
             heartbeat_task = asyncio.create_task(taskflow.heartbeat_loop(connection_lost))
             _LOGGER.info("LZ-TTS Taskflow worker ready id=%s", taskflow.worker_id)
             while not connection_lost.is_set():
-                leases = await taskflow.pull()
+                leases = await _pull_task_batch(taskflow)
                 if leases:
-                    await asyncio.gather(
-                        *(_process_lease(taskflow, inference, lease) for lease in leases)
-                    )
+                    await _process_leases(taskflow, inference, leases)
         except ProtocolError as error:
             if error.status_code in {401, 403, 404}:
                 taskflow.session_id = None
@@ -362,7 +464,7 @@ async def run_worker() -> None:
         base_url=f"{lazybird_url}/internal/taskflow/v1",
         worker_token=worker_token,
         worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lz-tts-{socket.gethostname()}"),
-        concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "1"))),
+        concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "8"))),
     )
     inference = LzTtsInferenceSession()
     await inference.start()

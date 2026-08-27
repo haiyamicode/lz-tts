@@ -259,7 +259,7 @@ class VoxCPMConfig(BaseModel):
     )
     inference_timesteps: int = Field(default=10, ge=1)
     max_num_batched_tokens: int = Field(default=8192, ge=1)
-    max_num_seqs: int = Field(default=12, ge=1)
+    max_num_seqs: int = Field(default=8, ge=1)
     max_model_len: int = Field(default=4096, ge=1)
     gpu_memory_utilization: float = Field(default=0.62, gt=0, le=1)
     num_kvcache_blocks: int = Field(default=192, ge=1)
@@ -436,6 +436,10 @@ class SynthesizeRequest(BaseModel):
         description="Language/locale spoken by the reference sample",
     )
     language: Optional[str] = Field(None, description="Force full locale for the entire input, e.g. en-GB")
+    language_override: bool = Field(
+        False,
+        description="Whether language was explicitly selected rather than detected",
+    )
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
     seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
     voxcpm_loras: list[str] = Field(
@@ -467,6 +471,10 @@ class BatchSynthesizeInputItem(BaseModel):
         description="Language/locale spoken by the reference sample",
     )
     language: Optional[str] = Field(None, description="Force full locale for this item, e.g. en-GB")
+    language_override: bool = Field(
+        False,
+        description="Whether language was explicitly selected rather than detected",
+    )
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
     seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
     voxcpm_loras: list[str] = Field(
@@ -492,7 +500,9 @@ class _SharedBatchSynthesizeRequest:
     seeds: list[int | None] | None = None
     voice_id: str | None = None
     reference_url: str | None = None
+    reference_language: str | None = None
     language: str | None = None
+    language_override: bool = False
     languages: list[str | None] | None = None
     model: str | None = None
     voxcpm_loras: tuple[str, ...] = ()
@@ -519,6 +529,15 @@ class _BatchCompatibilityKey:
         )
         digest = hashlib.sha256(canonical_config.encode("utf-8")).hexdigest()
         return cls(digest=digest, canonical_config=canonical_config)
+
+
+@dataclass(frozen=True)
+class _SynthesisBatchPlan:
+    """One ordered group that can share a backend inference call."""
+
+    compatibility_key: _BatchCompatibilityKey
+    pipeline: str
+    records: list[tuple[int, BatchSynthesizeInputItem, str]]
 
 
 class BatchSynthesizeItem(BaseModel):
@@ -1851,7 +1870,9 @@ async def _synthesize_configured_voice(request: SynthesizeRequest) -> Response:
             texts=[request.text],
             seeds=[request.seed],
             voice_id=request.voice_id,
+            reference_language=request.reference_language,
             language=request.language,
+            language_override=request.language_override,
             voxcpm_loras=tuple(request.voxcpm_loras),
             options=request.options,
             format=request.format,
@@ -2473,6 +2494,7 @@ async def _synthesize_voxcpm_ipa_ssml(
     requested_loras = _effective_voxcpm_lora_names(
         request.voxcpm_loras,
         request.language,
+        request.language_override,
     )
     try:
         lora_name = await runtime.resolve_lora_combination(requested_loras)
@@ -3237,9 +3259,12 @@ def _configured_voxcpm_locale_lora(language: str | None) -> str | None:
 def _effective_voxcpm_lora_names(
     lora_names: list[str] | tuple[str, ...],
     language: str | None,
+    language_override: bool = False,
 ) -> tuple[str, ...]:
     names = list(lora_names)
-    configured_lora = _configured_voxcpm_locale_lora(language)
+    configured_lora = (
+        _configured_voxcpm_locale_lora(language) if language_override else None
+    )
     if configured_lora and configured_lora not in names:
         names.append(configured_lora)
     return _resolve_voxcpm_lora_names(names)
@@ -3325,6 +3350,7 @@ async def synthesize_voxcpm_batch(
     requested_loras = _effective_voxcpm_lora_names(
         request.voxcpm_loras,
         request.language,
+        request.language_override,
     )
     try:
         lora_name = await runtime.resolve_lora_combination(requested_loras)
@@ -3382,6 +3408,7 @@ async def synthesize_voxcpm_batch(
     _log_synthesize_batch_stage(
         "voxcpm_batch_done",
         model=_server_config.voxcpm.model_id,
+        loras=list(requested_loras),
         item_count=len(items),
         sample_rate=sample_rate,
         generation_wall_seconds=round(generation_wall_seconds, 6),
@@ -3431,7 +3458,9 @@ async def _synthesize_voxcpm_items(
         _SharedBatchSynthesizeRequest(
             texts=[text for _, _, text in records],
             seeds=[item.seed for _, item, _ in records],
+            reference_language=first.reference_language,
             language=languages[0],
+            language_override=first.language_override,
             languages=languages,
             model=_server_config.voxcpm.model_id,
             voxcpm_loras=tuple(first.voxcpm_loras),
@@ -3465,7 +3494,7 @@ def _batch_item_pipeline(item: BatchSynthesizeInputItem) -> str:
     return "sparrow"
 
 
-_BATCH_PER_ITEM_FIELDS = frozenset({"text", "ssml", "seed"})
+_BATCH_PER_ITEM_FIELDS = frozenset({"text", "ssml", "seed", "language_override"})
 _BATCH_PIPELINE_PER_ITEM_FIELDS = {
     "voxcpm": frozenset({"reference_url", "reference_language", "language", "voice_id"}),
 }
@@ -3487,9 +3516,14 @@ def _batch_item_compatibility_key(item: BatchSynthesizeInputItem) -> _BatchCompa
 
     # LoRA composition is additive, so request order does not affect inference.
     compatibility_loras = list(item.voxcpm_loras)
-    configured_lora = _configured_voxcpm_locale_lora(item.language)
-    if pipeline == "voxcpm" and configured_lora and configured_lora not in compatibility_loras:
-        compatibility_loras.append(configured_lora)
+    if pipeline == "voxcpm":
+        compatibility_loras = list(
+            _effective_voxcpm_lora_names(
+                compatibility_loras,
+                item.language,
+                item.language_override,
+            )
+        )
     config["voxcpm_loras"] = sorted(compatibility_loras)
     if config.get("language") is not None:
         config["language"] = _normalize_locale_with_region(config["language"])
@@ -3559,59 +3593,117 @@ def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, 
             if pipeline in {"voxcpm", "sparrow_reference"}
             else None
         ),
+        reference_language=first.reference_language,
         language=languages[0],
+        language_override=first.language_override,
         languages=languages,
         model=_resolve_api_model(first.model),
-        voxcpm_loras=(
-            _effective_voxcpm_lora_names(first.voxcpm_loras, first.language)
-            if pipeline == "voxcpm"
-            else tuple(first.voxcpm_loras)
-        ),
+        voxcpm_loras=tuple(first.voxcpm_loras),
         options=first.options,
         format=first.format,
         neural=first.neural,
     )
 
 
+_BATCH_PIPELINE_PRIORITY = {
+    "sparrow": 0,
+    "sparrow_forced_language": 0,
+    "sparrow_reference": 1,
+    "voxcpm": 2,
+}
+
+
+def _plan_synthesis_batches(
+    items: list[BatchSynthesizeInputItem],
+) -> list[_SynthesisBatchPlan]:
+    """Resolve routes once, then partition requests by actual backend compatibility."""
+    groups: OrderedDict[
+        _BatchCompatibilityKey,
+        tuple[str, list[tuple[int, BatchSynthesizeInputItem, str]]],
+    ] = OrderedDict()
+    for item_idx, item in enumerate(items):
+        text = _validate_batch_item(item, item_idx)
+        pipeline = _batch_item_pipeline(item)
+        key = _batch_item_compatibility_key(item)
+        if key not in groups:
+            groups[key] = (pipeline, [])
+        groups[key][1].append((item_idx, item, text))
+
+    plans = [
+        _SynthesisBatchPlan(
+            compatibility_key=key,
+            pipeline=pipeline,
+            records=records,
+        )
+        for key, (pipeline, records) in groups.items()
+    ]
+    return sorted(
+        plans,
+        key=lambda plan: _BATCH_PIPELINE_PRIORITY.get(plan.pipeline, 99),
+    )
+
+
+async def _execute_synthesis_batch_plan(
+    plan: _SynthesisBatchPlan,
+) -> BatchSynthesizeResponse:
+    records = plan.records
+    shared_request = _shared_batch_from_items(records)
+    if plan.pipeline == "voxcpm":
+        return await _synthesize_voxcpm_items(records)
+    if shared_request.language is not None:
+        await _await_engine_ready("pipertts")
+        _, forced_speaker, forced_model = _resolve_forced_language(shared_request.language)
+        return await synthesize_sparrow_batch(
+            _SharedBatchSynthesizeRequest(
+                texts=shared_request.texts,
+                reference_url=shared_request.reference_url,
+                model=forced_model,
+                options=shared_request.options,
+                format=shared_request.format,
+                neural=shared_request.neural,
+            ),
+            speaker=forced_speaker,
+        )
+    await _await_engine_ready("pipertts")
+    if shared_request.model in {None, PUBLIC_SPARROW_MODEL}:
+        return await synthesize_multilingual_sparrow_batch(shared_request)
+    return await synthesize_sparrow_batch(shared_request)
+
+
 async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthesizeResponse:
     """Group independent /synthesize-shaped inputs and run compatible real batches."""
     started = time.perf_counter()
-    groups: OrderedDict[
-        _BatchCompatibilityKey,
-        list[tuple[int, BatchSynthesizeInputItem, str]],
-    ] = OrderedDict()
-    for item_idx, item in enumerate(request.items):
-        text = _validate_batch_item(item, item_idx)
-        key = _batch_item_compatibility_key(item)
-        groups.setdefault(key, []).append((item_idx, item, text))
+    plans = _plan_synthesis_batches(request.items)
 
     _log_synthesize_batch_stage(
         "request_grouping",
         item_count=len(request.items),
-        group_count=len(groups),
+        group_count=len(plans),
         groups=[
             {
                 "group_index": group_idx,
-                "config_hash": key.digest,
-                "item_indices": [item_idx for item_idx, _, _ in records],
-                "count": len(records),
-                "voice_ids": [item.voice_id for _, item, _ in records],
-                "reference_url": bool(records[0][1].reference_url),
-                "languages": [item.language for _, item, _ in records],
-                "model": records[0][1].model,
-                "format": records[0][1].format,
-                "neural": records[0][1].neural,
+                "config_hash": plan.compatibility_key.digest,
+                "pipeline": plan.pipeline,
+                "item_indices": [item_idx for item_idx, _, _ in plan.records],
+                "count": len(plan.records),
+                "voice_ids": [item.voice_id for _, item, _ in plan.records],
+                "reference_url": bool(plan.records[0][1].reference_url),
+                "languages": [item.language for _, item, _ in plan.records],
+                "model": plan.records[0][1].model,
+                "format": plan.records[0][1].format,
+                "neural": plan.records[0][1].neural,
             }
-            for group_idx, (key, records) in enumerate(groups.items())
+            for group_idx, plan in enumerate(plans)
         ],
     )
 
     output_items: list[BatchSynthesizeItem | None] = [None for _ in request.items]
     group_results: list[BatchSynthesizeResponse] = []
 
-    for group_idx, (compatibility_key, records) in enumerate(groups.items()):
+    for group_idx, plan in enumerate(plans):
+        compatibility_key = plan.compatibility_key
+        records = plan.records
         shared_request = _shared_batch_from_items(records)
-        pipeline = _batch_item_pipeline(records[0][1])
         group_started = time.perf_counter()
         _log_synthesize_batch_stage(
             "group_start",
@@ -3625,31 +3717,7 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
             model=shared_request.model,
             format=shared_request.format,
         )
-        if pipeline == "voxcpm":
-            group_result = await _synthesize_voxcpm_items(records)
-        elif shared_request.language is not None:
-            await _await_engine_ready("pipertts")
-            _, forced_speaker, forced_model = _resolve_forced_language(shared_request.language)
-            group_result = await synthesize_sparrow_batch(
-                _SharedBatchSynthesizeRequest(
-                    texts=shared_request.texts,
-                    reference_url=shared_request.reference_url,
-                    model=forced_model,
-                    options=shared_request.options,
-                    format=shared_request.format,
-                    neural=shared_request.neural,
-                ),
-                speaker=forced_speaker,
-            )
-        elif shared_request.model == PUBLIC_SPARROW_MODEL:
-            await _await_engine_ready("pipertts")
-            group_result = await synthesize_multilingual_sparrow_batch(shared_request)
-        elif shared_request.model is not None:
-            await _await_engine_ready("pipertts")
-            group_result = await synthesize_sparrow_batch(shared_request)
-        else:
-            await _await_engine_ready("pipertts")
-            group_result = await synthesize_multilingual_sparrow_batch(shared_request)
+        group_result = await _execute_synthesis_batch_plan(plan)
 
         _log_synthesize_batch_stage(
             "group_done",
@@ -4041,7 +4109,9 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
                 seeds=[request.seed],
                 voice_id=request.voice_id,
                 reference_url=request.reference_url,
+                reference_language=request.reference_language,
                 language=request.language,
+                language_override=request.language_override,
                 model=_server_config.voxcpm.model_id,
                 voxcpm_loras=tuple(request.voxcpm_loras),
                 options=request.options,
@@ -4101,6 +4171,27 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
     return _binary_response(audio_bytes, media_type)
 
 
+def _prepare_batchable_synthesis_request(
+    request_data: dict[str, Any],
+) -> SynthesizeRequest | None:
+    """Return plain synthesis input, or None when SSML needs postprocessing."""
+    request = SynthesizeRequest.model_validate(request_data)
+    if request.ssml is None:
+        return request
+    if request.text is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'text' or 'ssml', not both",
+        )
+    try:
+        document = parse_ssml(request.ssml)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if document.operations:
+        return None
+    return request.model_copy(update={"text": document.text, "ssml": None})
+
+
 class LzTtsInferenceSession:
     """One preloaded runtime with direct task-operation dispatch."""
 
@@ -4125,6 +4216,124 @@ class LzTtsInferenceSession:
 
     def synthesis_capabilities(self) -> dict[str, Any]:
         return _build_synthesis_capabilities().model_dump(mode="json")
+
+    async def execute_many(
+        self,
+        operations: list[tuple[str, dict[str, Any]]],
+    ) -> list[InferenceResult | BaseException]:
+        """Plan compatible synthesis operations into real backend batches."""
+        if not self._started:
+            raise RuntimeError("Inference session has not been started")
+
+        outcomes: list[InferenceResult | BaseException | None] = [None] * len(operations)
+        batch_items: list[BatchSynthesizeInputItem] = []
+        batch_requests: list[SynthesizeRequest] = []
+        batch_operation_indices: list[int] = []
+        singleton_indices: list[int] = []
+
+        for operation_index, (operation, request_data) in enumerate(operations):
+            if operation != "synthesize":
+                singleton_indices.append(operation_index)
+                continue
+            try:
+                request = _prepare_batchable_synthesis_request(request_data)
+                if request is None:
+                    singleton_indices.append(operation_index)
+                    continue
+                item = BatchSynthesizeInputItem.model_validate(
+                    request.model_dump(
+                        mode="python",
+                        exclude={"speed", "pitch", "volume"},
+                    )
+                )
+                _validate_batch_item(item, operation_index)
+            except ValidationError as error:
+                outcomes[operation_index] = InferenceOperationError(
+                    400, jsonable_encoder(error.errors())
+                )
+            except HTTPException as error:
+                outcomes[operation_index] = InferenceOperationError(
+                    error.status_code, error.detail
+                )
+            else:
+                batch_items.append(item)
+                batch_requests.append(request)
+                batch_operation_indices.append(operation_index)
+
+        plans = _plan_synthesis_batches(batch_items) if batch_items else []
+        _LOGGER.info(
+            "Inference task batch planned: %s",
+            json.dumps(
+                {
+                    "operation_count": len(operations),
+                    "batchable_synthesis_count": len(batch_items),
+                    "singleton_count": len(singleton_indices),
+                    "groups": [
+                        {
+                            "pipeline": plan.pipeline,
+                            "count": len(plan.records),
+                            "operation_indices": [
+                                batch_operation_indices[item_index]
+                                for item_index, _, _ in plan.records
+                            ],
+                        }
+                        for plan in plans
+                    ],
+                }
+            ),
+        )
+
+        for plan in plans:
+            try:
+                response = await _execute_synthesis_batch_plan(plan)
+                if len(response.items) != len(plan.records):
+                    raise RuntimeError(
+                        "backend batch returned a different number of results"
+                    )
+                for (batch_item_index, item, _), response_item in zip(
+                    plan.records, response.items, strict=True
+                ):
+                    request = batch_requests[batch_item_index]
+                    result = InferenceResult(
+                        kind="audio",
+                        content_type=(
+                            "audio/mpeg" if item.format == "mp3" else "audio/wav"
+                        ),
+                        audio=base64.b64decode(response_item.audio_base64),
+                    )
+                    outcomes[batch_operation_indices[batch_item_index]] = (
+                        await _apply_audio_adjustments(
+                            result,
+                            speed=request.speed,
+                            pitch=request.pitch,
+                            volume=request.volume,
+                        )
+                    )
+            except HTTPException as error:
+                outcome: BaseException = InferenceOperationError(
+                    error.status_code, error.detail
+                )
+                for batch_item_index, _, _ in plan.records:
+                    outcomes[batch_operation_indices[batch_item_index]] = outcome
+            except Exception as error:
+                _LOGGER.exception(
+                    "Inference task batch failed pipeline=%s count=%d",
+                    plan.pipeline,
+                    len(plan.records),
+                )
+                for batch_item_index, _, _ in plan.records:
+                    outcomes[batch_operation_indices[batch_item_index]] = error
+
+        for operation_index in singleton_indices:
+            operation, request_data = operations[operation_index]
+            try:
+                outcomes[operation_index] = await self.execute(operation, request_data)
+            except Exception as error:
+                outcomes[operation_index] = error
+
+        if any(outcome is None for outcome in outcomes):
+            raise RuntimeError("internal inference batch result ordering error")
+        return [outcome for outcome in outcomes if outcome is not None]
 
     async def execute(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
         if not self._started:
