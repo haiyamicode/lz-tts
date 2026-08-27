@@ -349,7 +349,7 @@ class SpeakerProbabilityBatchSampler(torch.utils.data.Sampler[List[int]]):
     ) -> None:
         super().__init__()
         self.lengths = _dataset_lengths(dataset)
-        speaker_ids = _dataset_speaker_ids(dataset)
+        speaker_ids = dataset_speaker_ids(dataset)
         self.batch_size = int(batch_size)
         self.boundaries = sorted(int(boundary) for boundary in boundaries)
         self.speaker_probabilities = {
@@ -497,7 +497,7 @@ def _dataset_lengths(dataset: Dataset) -> List[int]:
     raise ValueError("Dataset does not expose length metadata for bucketing")
 
 
-def _dataset_speaker_ids(dataset: Dataset) -> List[Optional[int]]:
+def dataset_speaker_ids(dataset: Dataset) -> List[Optional[int]]:
     if hasattr(dataset, "utterances"):
         return [utterance.speaker_id for utterance in getattr(dataset, "utterances")]
 

@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter, defaultdict
 import logging
 import os
 import time
@@ -23,6 +24,7 @@ try:
         LengthBucketBatchSampler,
         PiperDataset,
         UtteranceCollate,
+        dataset_speaker_ids,
     )
     from .losses import discriminator_loss, feature_loss, generator_loss, kl_loss
 except ImportError:
@@ -31,6 +33,7 @@ except ImportError:
     LengthBucketBatchSampler = None
     SpeakerProbabilityBatchSampler = None
     UtteranceCollate = None
+    dataset_speaker_ids = None
     discriminator_loss = None
     feature_loss = None
     generator_loss = None
@@ -38,6 +41,71 @@ except ImportError:
 
 _LOGGER = logging.getLogger("vits.lightning")
 _DEBUG_SEMANTIC = bool(int(os.environ.get("PIPER_SEMANTIC_DEBUG", "0")))
+
+
+def _speaker_stratified_split_indices(
+    dataset: Dataset,
+    validation_split: float,
+    num_test_examples: int,
+    seed: int,
+) -> tuple[list[int], list[int], list[int]]:
+    if not 0.0 <= validation_split < 1.0:
+        raise ValueError("validation_split must be between 0 and 1")
+    if not hasattr(dataset, "utterances"):
+        raise ValueError("Dataset does not expose utterances for speaker-stratified splitting")
+
+    grouped_indices: dict[Optional[int], list[int]] = defaultdict(list)
+    for index, utterance in enumerate(getattr(dataset, "utterances")):
+        grouped_indices[utterance.speaker_id].append(index)
+
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    shuffled_groups: dict[Optional[int], list[int]] = {}
+    val_indices: list[int] = []
+    group_order = sorted(
+        grouped_indices,
+        key=lambda speaker_id: (
+            speaker_id is None,
+            speaker_id if speaker_id is not None else -1,
+        ),
+    )
+    for speaker_id in group_order:
+        indices = grouped_indices[speaker_id]
+        order = torch.randperm(len(indices), generator=generator).tolist()
+        shuffled = [indices[position] for position in order]
+        val_count = int(len(shuffled) * validation_split)
+        if validation_split > 0.0:
+            val_count = max(1, val_count)
+        val_count = min(val_count, max(0, len(shuffled) - 1))
+        val_indices.extend(shuffled[:val_count])
+        shuffled_groups[speaker_id] = shuffled[val_count:]
+
+    test_indices: list[int] = []
+    while len(test_indices) < num_test_examples:
+        added = False
+        for speaker_id in group_order:
+            group = shuffled_groups[speaker_id]
+            if len(group) <= 1:
+                continue
+            test_indices.append(group.pop())
+            added = True
+            if len(test_indices) >= num_test_examples:
+                break
+        if not added:
+            break
+
+    if len(test_indices) != num_test_examples:
+        raise ValueError(
+            f"Unable to reserve {num_test_examples} test examples while keeping "
+            "at least one training example per speaker"
+        )
+
+    train_indices = [
+        index
+        for speaker_id in group_order
+        for index in shuffled_groups[speaker_id]
+    ]
+    return sorted(train_indices), sorted(test_indices), sorted(val_indices)
 
 
 class VitsModel(pl.LightningModule):
@@ -104,6 +172,8 @@ class VitsModel(pl.LightningModule):
         use_length_buckets: bool = False,
         bucket_boundaries: Optional[List[int]] = None,
         training_sampler_prob: Optional[dict] = None,
+        training_sampler_alpha: Optional[float] = None,
+        validation_split_mode: str = "contiguous",
         # semantic / BERT options
         use_bert: bool = False,
         bert_model_name: Optional[str] = None,
@@ -181,7 +251,13 @@ class VitsModel(pl.LightningModule):
         self._val_dataset: Optional[Dataset] = None
         self._test_dataset: Optional[Dataset] = None
         if not inference_only:
-            self._load_datasets(validation_split, num_test_examples, max_phoneme_ids)
+            self._load_datasets(
+                validation_split,
+                num_test_examples,
+                max_phoneme_ids,
+                validation_split_mode=validation_split_mode,
+                seed=seed,
+            )
 
         # State kept between training optimizers
         self._y = None
@@ -209,6 +285,8 @@ class VitsModel(pl.LightningModule):
         validation_split: float,
         num_test_examples: int,
         max_phoneme_ids: Optional[int] = None,
+        validation_split_mode: str = "contiguous",
+        seed: int = 1234,
     ):
         if self.hparams.dataset is None:
             _LOGGER.debug("No dataset to load")
@@ -224,6 +302,31 @@ class VitsModel(pl.LightningModule):
             raise ValueError("No utterances available after dataset filtering")
 
         num_test_examples = max(0, min(int(num_test_examples), max(0, dataset_size - 1)))
+
+        if validation_split_mode == "speaker_stratified":
+            train_indices, test_indices, val_indices = _speaker_stratified_split_indices(
+                full_dataset,
+                validation_split=validation_split,
+                num_test_examples=num_test_examples,
+                seed=seed,
+            )
+            _LOGGER.info(
+                "Dataset split: train=%s test=%s val=%s "
+                "(deterministic speaker-stratified, speakers=%s)",
+                len(train_indices),
+                len(test_indices),
+                len(val_indices),
+                len({full_dataset.utterances[index].speaker_id for index in range(dataset_size)}),
+            )
+            self._train_dataset = Subset(full_dataset, train_indices)
+            self._test_dataset = Subset(full_dataset, test_indices)
+            self._val_dataset = Subset(full_dataset, val_indices)
+            return
+        if validation_split_mode != "contiguous":
+            raise ValueError(
+                "validation_split_mode must be 'contiguous' or 'speaker_stratified', "
+                f"got {validation_split_mode!r}"
+            )
 
         valid_set_size = int(dataset_size * validation_split)
         if validation_split > 0 and valid_set_size == 0:
@@ -293,7 +396,34 @@ class VitsModel(pl.LightningModule):
                 or [0, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1200, 2000]
             )
             sampler_prob = getattr(self.hparams, "training_sampler_prob", None)
-            if sampler_prob:
+            sampler_alpha = getattr(self.hparams, "training_sampler_alpha", None)
+            if sampler_prob and sampler_alpha is not None:
+                raise ValueError(
+                    "training_sampler_prob and training_sampler_alpha cannot both be set"
+                )
+            if sampler_alpha is not None:
+                sampler_alpha = float(sampler_alpha)
+                if not 0.0 <= sampler_alpha <= 1.0:
+                    raise ValueError("training_sampler_alpha must be between 0 and 1")
+                speaker_counts = Counter(dataset_speaker_ids(self._train_dataset))
+                weights = {
+                    speaker_id: count**sampler_alpha
+                    for speaker_id, count in speaker_counts.items()
+                }
+                total_weight = sum(weights.values())
+                resolved_probabilities = {
+                    speaker_id: weight / total_weight
+                    for speaker_id, weight in weights.items()
+                }
+                batch_sampler = SpeakerProbabilityBatchSampler(
+                    self._train_dataset,
+                    batch_size=int(self.hparams.batch_size),
+                    boundaries=boundaries,
+                    speaker_probabilities=resolved_probabilities,
+                    seed=int(self.hparams.seed),
+                    shuffle=True,
+                )
+            elif sampler_prob:
                 resolved_probabilities: dict[Optional[int], float] = {}
                 for speaker, probability in dict(sampler_prob).items():
                     if speaker == "rest":
