@@ -55,7 +55,7 @@ def test_root_voice_pronunciation_uses_language_speaker_when_not_fixed(monkeypat
 def test_native_root_voice_ssml_does_not_route_through_seed_vc(monkeypatch) -> None:
     root_voice = server.RootVoiceConfig(
         voice_id="msa.bs-BA.Vesna",
-        model="lzspeech-sparrow-lfl",
+        model="lzspeech-sparrow",
         speaker="bs-BA",
         languages=["bs-BA"],
     )
