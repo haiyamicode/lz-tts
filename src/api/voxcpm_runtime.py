@@ -321,7 +321,11 @@ class VoxCPMRuntime:
                 self._reference_latents.move_to_end(cache_key)
                 return cached
 
-        latents = await self.server.encode_latents(audio, audio_format)
+        latents = await self.server.encode_latents(
+            audio,
+            audio_format,
+            float(self.settings.get("max_reference_seconds", 25.0)),
+        )
         async with self._reference_cache_lock:
             cached = self._reference_latents.get(cache_key)
             if cached is not None:

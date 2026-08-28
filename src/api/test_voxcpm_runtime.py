@@ -18,7 +18,13 @@ class _FakeServer:
         self.seeds: list[int | None] = []
         self.lora_names: list[str | None] = []
 
-    async def encode_latents(self, audio: bytes, audio_format: str) -> bytes:
+    async def encode_latents(
+        self,
+        audio: bytes,
+        audio_format: str,
+        max_reference_seconds: float,
+    ) -> bytes:
+        assert max_reference_seconds == 25.0
         self.encoded.append((audio, audio_format))
         return b"latents:" + audio
 
@@ -56,6 +62,7 @@ def _settings() -> dict:
         "temperature": 1.0,
         "cfg_value": 2.0,
         "reference_cache_size": 8,
+        "max_reference_seconds": 25.0,
     }
 
 

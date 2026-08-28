@@ -122,8 +122,17 @@ class VoxCPM2ServerImpl:
             model_path=str(self.model_path),
         )
 
-    def encode_latents(self, wav: bytes, wav_format: str) -> bytes:
+    def encode_latents(
+        self,
+        wav: bytes,
+        wav_format: str,
+        max_reference_seconds: float = 25.0,
+    ) -> bytes:
         wav_np, _ = librosa.load(io.BytesIO(wav), sr=self.encoder_sample_rate, mono=False)
+        max_reference_samples = max(
+            1, int(self.encoder_sample_rate * max_reference_seconds)
+        )
+        wav_np = wav_np[..., :max_reference_samples]
         wav_tensor = torch.from_numpy(wav_np)
         if wav_tensor.ndim == 1:
             wav_tensor = wav_tensor.unsqueeze(0)
@@ -433,8 +442,15 @@ class AsyncVoxCPM2Server:
             await asyncio.sleep(0.05)
         await self._init_fut
 
-    async def encode_latents(self, wav: bytes, wav_format: str) -> bytes:
-        return await self.submit("encode_latents", wav, wav_format)
+    async def encode_latents(
+        self,
+        wav: bytes,
+        wav_format: str,
+        max_reference_seconds: float = 25.0,
+    ) -> bytes:
+        return await self.submit(
+            "encode_latents", wav, wav_format, max_reference_seconds
+        )
 
     async def stop(self) -> None:
         graceful_stop = False
@@ -569,9 +585,16 @@ class AsyncVoxCPM2ServerPool:
     async def stop(self):
         await asyncio.gather(*[server.stop() for server in self.servers])
 
-    async def encode_latents(self, wav: bytes, wav_format: str):
+    async def encode_latents(
+        self,
+        wav: bytes,
+        wav_format: str,
+        max_reference_seconds: float = 25.0,
+    ):
         min_load_server_idx = np.argmin(self.servers_load)
-        return await self.servers[min_load_server_idx].encode_latents(wav, wav_format)
+        return await self.servers[min_load_server_idx].encode_latents(
+            wav, wav_format, max_reference_seconds
+        )
 
     async def get_model_info(self) -> ModelInfoResponse:
         if len(self.servers) == 0:
@@ -717,9 +740,18 @@ class SyncVoxCPM2ServerPool:
         self.loop.close()
         self.loop = None
 
-    def encode_latents(self, wav: bytes, wav_format: str):
+    def encode_latents(
+        self,
+        wav: bytes,
+        wav_format: str,
+        max_reference_seconds: float = 25.0,
+    ):
         assert self.loop is not None
-        return self.loop.run_until_complete(self.server_pool.encode_latents(wav, wav_format))
+        return self.loop.run_until_complete(
+            self.server_pool.encode_latents(
+                wav, wav_format, max_reference_seconds
+            )
+        )
 
     def get_model_info(self) -> ModelInfoResponse:
         assert self.loop is not None

@@ -112,10 +112,19 @@ class VoxCPMServerImpl:
             model_path=str(self.model_path),
         )
 
-    def encode_latents(self, wav: bytes, wav_format: str) -> bytes:
+    def encode_latents(
+        self,
+        wav: bytes,
+        wav_format: str,
+        max_reference_seconds: float = 25.0,
+    ) -> bytes:
         wav_tensor, sr = torchaudio.load(io.BytesIO(wav), format=wav_format)
         if sr != self.sample_rate:
             wav_tensor = torchaudio.functional.resample(wav_tensor, sr, self.sample_rate)
+        max_reference_samples = max(
+            1, int(self.sample_rate * max_reference_seconds)
+        )
+        wav_tensor = wav_tensor[..., :max_reference_samples]
 
         if wav_tensor.size(0) > 1:
             wav_tensor = wav_tensor.mean(dim=0, keepdim=True)
@@ -447,8 +456,15 @@ class AsyncVoxCPMServer:
             await asyncio.sleep(0.05)
         await self._init_fut
 
-    async def encode_latents(self, wav: bytes, wav_format: str) -> bytes:
-        return await self.submit("encode_latents", wav, wav_format)
+    async def encode_latents(
+        self,
+        wav: bytes,
+        wav_format: str,
+        max_reference_seconds: float = 25.0,
+    ) -> bytes:
+        return await self.submit(
+            "encode_latents", wav, wav_format, max_reference_seconds
+        )
 
     async def stop(self) -> None:
         # Best-effort graceful shutdown. If init failed or the child process
@@ -591,10 +607,17 @@ class AsyncVoxCPMServerPool:
     async def stop(self):
         await asyncio.gather(*[server.stop() for server in self.servers])
 
-    async def encode_latents(self, wav: bytes, wav_format: str):
+    async def encode_latents(
+        self,
+        wav: bytes,
+        wav_format: str,
+        max_reference_seconds: float = 25.0,
+    ):
         # send to one
         min_load_server_idx = np.argmin(self.servers_load)
-        return await self.servers[min_load_server_idx].encode_latents(wav, wav_format)
+        return await self.servers[min_load_server_idx].encode_latents(
+            wav, wav_format, max_reference_seconds
+        )
 
     async def get_model_info(self) -> ModelInfoResponse:
         # Assume homogeneous servers inside a pool.
@@ -763,9 +786,18 @@ class SyncVoxCPMServerPool:
         self.loop.close()
         self.loop = None
 
-    def encode_latents(self, wav: bytes, wav_format: str):
+    def encode_latents(
+        self,
+        wav: bytes,
+        wav_format: str,
+        max_reference_seconds: float = 25.0,
+    ):
         assert self.loop is not None
-        return self.loop.run_until_complete(self.server_pool.encode_latents(wav, wav_format))
+        return self.loop.run_until_complete(
+            self.server_pool.encode_latents(
+                wav, wav_format, max_reference_seconds
+            )
+        )
 
     def get_model_info(self) -> ModelInfoResponse:
         assert self.loop is not None

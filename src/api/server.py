@@ -270,6 +270,7 @@ class VoxCPMConfig(BaseModel):
     temperature: float = Field(default=1.0, gt=0)
     cfg_value: float = Field(default=2.0, ge=0)
     reference_cache_size: int = Field(default=128, ge=1)
+    max_reference_seconds: float = Field(default=25.0, gt=0)
     supported_languages: list[str] = Field(default_factory=lambda: [
         "ar", "da", "de", "el", "en", "es", "fi", "fil", "fr", "he", "hi",
         "id", "it", "ja", "km", "ko", "lo", "ms", "my", "nb", "nl", "pl",
