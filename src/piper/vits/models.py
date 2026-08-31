@@ -9,7 +9,12 @@ from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 
 from . import attentions, commons, modules, monotonic_align
-from .voice_adapter import install_conditioning_lora, unwrap_lora_base
+from .voice_adapter import (
+    install_conditioning_lora,
+    remove_conditioning_lora,
+    set_conditioning_lora_enabled,
+    unwrap_lora_base,
+)
 from .commons import get_padding, init_weights
 
 _DEBUG_SEMANTIC = bool(int(os.environ.get("PIPER_SEMANTIC_DEBUG", "0")))
@@ -976,6 +981,7 @@ class SynthesizerTrn(nn.Module):
         self.voice_adapter_embedding: typing.Optional[nn.Parameter] = None
         self.voice_adapter_speaker_id: typing.Optional[int] = None
         self.voice_adapter_target_modules: typing.Tuple[str, ...] = ()
+        self.voice_adapter_active = False
 
     def configure_voice_adapter(
         self,
@@ -1004,6 +1010,28 @@ class SynthesizerTrn(nn.Module):
         )
         initial_embedding = self.emb_g.weight[self.voice_adapter_speaker_id].detach().clone()
         self.voice_adapter_embedding = nn.Parameter(initial_embedding)
+        self.voice_adapter_active = True
+
+    def set_voice_adapter_enabled(self, enabled: bool) -> None:
+        if self.voice_adapter_embedding is None:
+            if enabled:
+                raise RuntimeError("No voice adapter is installed")
+            return
+        set_conditioning_lora_enabled(
+            self,
+            self.voice_adapter_target_modules,
+            enabled,
+        )
+        self.voice_adapter_active = bool(enabled)
+
+    def remove_voice_adapter(self) -> None:
+        if self.voice_adapter_embedding is None:
+            return
+        remove_conditioning_lora(self, self.voice_adapter_target_modules)
+        self.voice_adapter_embedding = None
+        self.voice_adapter_speaker_id = None
+        self.voice_adapter_target_modules = ()
+        self.voice_adapter_active = False
 
     def reset_voice_adapter_embedding(self) -> None:
         if self.voice_adapter_embedding is None:
@@ -1015,7 +1043,7 @@ class SynthesizerTrn(nn.Module):
             )
 
     def _speaker_conditioning(self, sid: torch.Tensor) -> torch.Tensor:
-        if self.voice_adapter_embedding is None:
+        if self.voice_adapter_embedding is None or not self.voice_adapter_active:
             return self.emb_g(sid).unsqueeze(-1)
 
         assert self.voice_adapter_speaker_id is not None

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import math
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import torch
 from torch import nn
@@ -59,6 +59,7 @@ class LoRAConv1d(nn.Module):
             padding_mode=base.padding_mode,
         )
         self.lora_b = nn.Conv1d(self.rank, base.out_channels, 1, bias=False)
+        self.enabled = True
 
         nn.init.kaiming_uniform_(self.lora_a.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_b.weight)
@@ -66,8 +67,11 @@ class LoRAConv1d(nn.Module):
             parameter.requires_grad_(False)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        base_output = self.base(inputs)
+        if not self.enabled:
+            return base_output
         residual = self.lora_b(self.lora_a(self.dropout(inputs)))
-        return self.base(inputs) + residual * self.scale
+        return base_output + residual * self.scale
 
 
 class LoRAConvTranspose1d(nn.Module):
@@ -108,6 +112,7 @@ class LoRAConvTranspose1d(nn.Module):
             padding_mode=base.padding_mode,
         )
         self.lora_b = nn.Conv1d(self.rank, base.out_channels, 1, bias=False)
+        self.enabled = True
 
         nn.init.kaiming_uniform_(self.lora_a.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_b.weight)
@@ -120,6 +125,8 @@ class LoRAConvTranspose1d(nn.Module):
         output_size: list[int] | None = None,
     ) -> torch.Tensor:
         base_output = self.base(inputs, output_size=output_size)
+        if not self.enabled:
+            return base_output
         dropped = self.dropout(inputs)
         if output_size is None:
             projected = self.lora_a(dropped)
@@ -213,9 +220,46 @@ def install_conditioning_lora(
             if isinstance(base, nn.ConvTranspose1d)
             else LoRAConv1d
         )
-        setattr(parent, child_name, wrapper_type(base, rank, alpha, dropout))
+        wrapper = wrapper_type(base, rank, alpha, dropout)
+        reference_parameter = next(base.parameters())
+        wrapper.to(
+            device=reference_parameter.device,
+            dtype=reference_parameter.dtype,
+        )
+        setattr(parent, child_name, wrapper)
 
     return installed
+
+
+def set_conditioning_lora_enabled(
+    model: nn.Module,
+    target_modules: Sequence[str],
+    enabled: bool,
+) -> None:
+    """Enable or bypass every installed LoRA residual."""
+
+    for target in target_modules:
+        module = model.get_submodule(target)
+        if not isinstance(module, _LORA_CONVOLUTIONS):
+            raise TypeError(f"Voice adapter target is not wrapped: {target}")
+        module.enabled = bool(enabled)
+
+
+def remove_conditioning_lora(
+    model: nn.Module,
+    target_modules: Sequence[str],
+) -> None:
+    """Restore the frozen base convolutions under installed LoRA wrappers."""
+
+    for target in target_modules:
+        parent_path, separator, child_name = target.rpartition(".")
+        if not separator:
+            raise ValueError(f"Voice adapter target must be a dotted path: {target}")
+        parent = model.get_submodule(parent_path)
+        wrapper = getattr(parent, child_name)
+        if not isinstance(wrapper, _LORA_CONVOLUTIONS):
+            raise TypeError(f"Voice adapter target is not wrapped: {target}")
+        setattr(parent, child_name, wrapper.base)
 
 
 def adapter_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -236,6 +280,40 @@ def adapter_parameter_names(model: nn.Module) -> tuple[str, ...]:
         for name, parameter in model.named_parameters()
         if parameter.requires_grad
     )
+
+
+def load_adapter_state_dict(
+    model: nn.Module,
+    saved_state: Mapping[str, torch.Tensor],
+) -> None:
+    """Load an adapter-only state dict without touching frozen base weights."""
+
+    model_state = model.state_dict()
+    expected = {
+        name
+        for name in model_state
+        if name == "voice_adapter_embedding"
+        or any(marker in name for marker in (".lora_a.", ".lora_b."))
+    }
+    observed = set(saved_state)
+    missing = sorted(expected - observed)
+    unexpected = sorted(observed - expected)
+    if missing or unexpected:
+        raise ValueError(
+            "Voice adapter state mismatch: "
+            f"missing={missing} unexpected={unexpected}"
+        )
+
+    with torch.no_grad():
+        for name in sorted(expected):
+            source = saved_state[name]
+            target = model_state[name]
+            if tuple(source.shape) != tuple(target.shape):
+                raise ValueError(
+                    f"Voice adapter tensor shape mismatch for {name}: "
+                    f"source={tuple(source.shape)} target={tuple(target.shape)}"
+                )
+            target.copy_(source.to(device=target.device, dtype=target.dtype))
 
 
 def source_key_for_wrapped_target(

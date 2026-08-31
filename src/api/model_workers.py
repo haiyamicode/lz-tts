@@ -143,6 +143,31 @@ def _make_cache_room() -> None:
             torch.cuda.empty_cache()
 
 
+def _config_value(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _configure_model_voice_adapters(model: str, inference: PiperInference) -> None:
+    if _server_config is None:
+        return
+    configured = getattr(_server_config.pipertts, "voice_adapters", {}) or {}
+    adapters: dict[str, Path] = {}
+    for name, config in configured.items():
+        if str(_config_value(config, "model", "")) != model:
+            continue
+        path = Path(str(_config_value(config, "path")))
+        adapters[str(name)] = path if path.is_absolute() else PROJECT_ROOT / path
+    if adapters:
+        inference.configure_voice_adapters(
+            adapters,
+            cache_size=int(
+                getattr(_server_config.pipertts, "voice_adapter_cache_size", 1)
+            ),
+        )
+
+
 def _load_model(model: str) -> PiperInference:
     if not _pipertts_enabled():
         raise ValueError("PiperTTS backend is disabled")
@@ -165,6 +190,7 @@ def _load_model(model: str) -> PiperInference:
     started = time.perf_counter()
     try:
         inference = PiperInference(checkpoint_path=checkpoint_path, config_path=config_path)
+        _configure_model_voice_adapters(model, inference)
     except Exception:
         _LOGGER.exception("Failed loading Sparrow model model=%s elapsed=%.2fs", model, time.perf_counter() - started)
         raise
@@ -300,6 +326,7 @@ def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
                 "sample_rate": inference.sample_rate,
                 "speakers": dict(getattr(inference, "speakers", {}) or {}),
                 "use_bert": bool(getattr(inference, "use_bert", False)),
+                "voice_adapters": inference.voice_adapter_status,
             }
             for name, inference in _inference_cache.items()
         }
@@ -317,6 +344,7 @@ def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
                 speaker=payload.get("speaker"),
                 batch_size=int(payload.get("batch_size") or len(payload.get("texts") or []) or 1),
                 neural=bool(payload.get("neural", True)),
+                voice_adapter=payload.get("voice_adapter"),
                 **dict(payload.get("synth_kwargs") or {}),
             )
             return {"ok": True, "data": {"audios": audios, "sample_rate": inference.sample_rate}}
@@ -327,6 +355,7 @@ def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
                 str(payload.get("text") or ""),
                 speaker=payload.get("speaker"),
                 neural=bool(payload.get("neural", True)),
+                voice_adapter=payload.get("voice_adapter"),
                 **dict(payload.get("synth_kwargs") or {}),
             )
             return {"ok": True, "data": {"audio": audio, "sample_rate": inference.sample_rate}}
@@ -338,6 +367,7 @@ def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
                 [tuple(item) for item in (payload.get("overrides") or [])],
                 speaker=payload.get("speaker"),
                 neural=bool(payload.get("neural", True)),
+                voice_adapter=payload.get("voice_adapter"),
                 **dict(payload.get("synth_kwargs") or {}),
             )
             return {"ok": True, "data": {"audio": audio, "sample_rate": inference.sample_rate}}

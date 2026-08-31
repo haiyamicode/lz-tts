@@ -5,14 +5,18 @@ Provides a minimal interface for running TTS inference using a Piper/VITS model 
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import threading
+import time
 import warnings
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 import numpy as np
 import torch
@@ -34,6 +38,13 @@ class InferenceConfig:
     noise_w: float = 0.8
     sdp_ratio: float = 0.2
     sample_rate: int = 22050
+
+
+@dataclass
+class _CachedVoiceAdapter:
+    path: Path
+    metadata: dict[str, Any]
+    tensors: dict[str, torch.Tensor]
 
 
 class PiperInference:
@@ -58,6 +69,14 @@ class PiperInference:
         """
         self.checkpoint_path = Path(checkpoint_path)
         self.config_path = Path(config_path)
+        self._voice_adapter_specs: dict[str, Path] = {}
+        self._voice_adapter_cache: OrderedDict[str, _CachedVoiceAdapter] = OrderedDict()
+        self._voice_adapter_cache_size = 1
+        self._voice_adapter_runtime_enabled = False
+        self._resident_voice_adapter: str | None = None
+        self._active_voice_adapter: str | None = None
+        self._checkpoint_sha256: str | None = None
+        self._voice_adapter_lock = threading.RLock()
 
         # Load config
         with open(self.config_path) as f:
@@ -136,6 +155,161 @@ class PiperInference:
             len(self.speakers),
             self.use_bert,
         )
+
+    def configure_voice_adapters(
+        self,
+        adapters: Mapping[str, str | Path],
+        *,
+        cache_size: int = 1,
+    ) -> None:
+        """Configure lazily loaded adapters for this persistent base model."""
+
+        if cache_size < 1:
+            raise ValueError("Voice adapter cache size must be at least 1")
+        if self.model.model_g.voice_adapter_embedding is not None:
+            raise RuntimeError(
+                "Managed voice adapters require an unmodified base checkpoint"
+            )
+
+        specs: dict[str, Path] = {}
+        for raw_name, raw_path in adapters.items():
+            name = str(raw_name).strip()
+            if not name:
+                raise ValueError("Voice adapter names must be non-empty")
+            path = Path(raw_path).resolve()
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            metadata_path = path.with_suffix(".json")
+            if not metadata_path.is_file():
+                raise FileNotFoundError(metadata_path)
+            specs[name] = path
+
+        self._voice_adapter_specs = specs
+        self._voice_adapter_cache_size = int(cache_size)
+        self._voice_adapter_runtime_enabled = True
+        _LOGGER.info(
+            "Configured Sparrow voice adapters names=%s cache_size=%d",
+            sorted(specs),
+            self._voice_adapter_cache_size,
+        )
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _load_cached_voice_adapter(self, name: str) -> _CachedVoiceAdapter:
+        cached = self._voice_adapter_cache.pop(name, None)
+        if cached is not None:
+            self._voice_adapter_cache[name] = cached
+            return cached
+
+        path = self._voice_adapter_specs.get(name)
+        if path is None:
+            raise ValueError(f"Unknown Sparrow voice adapter: {name}")
+        metadata = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+        if metadata.get("format") != "sparrow_voice_adapter":
+            raise ValueError(f"Unsupported Sparrow voice adapter format: {path}")
+        if int(metadata.get("format_version", 0)) != 1:
+            raise ValueError(
+                f"Unsupported Sparrow voice adapter version: {metadata.get('format_version')}"
+            )
+
+        base_hash = str(metadata.get("base_checkpoint_sha256") or "")
+        if not base_hash:
+            raise ValueError(f"Voice adapter metadata has no base checkpoint hash: {path}")
+        if self._checkpoint_sha256 is None:
+            self._checkpoint_sha256 = self._sha256_file(self.checkpoint_path)
+        if base_hash != self._checkpoint_sha256:
+            raise ValueError(
+                "Voice adapter base checkpoint mismatch: "
+                f"adapter={base_hash} loaded={self._checkpoint_sha256}"
+            )
+
+        speaker = str(metadata.get("speaker") or "")
+        speaker_id = int(metadata.get("speaker_id", -1))
+        if self.speakers.get(speaker) != speaker_id:
+            raise ValueError(
+                "Voice adapter speaker does not match the loaded model: "
+                f"speaker={speaker!r} id={speaker_id}"
+            )
+
+        from safetensors.torch import load_file
+
+        started = time.perf_counter()
+        cached = _CachedVoiceAdapter(
+            path=path,
+            metadata=metadata,
+            tensors=load_file(str(path), device="cpu"),
+        )
+        self._voice_adapter_cache[name] = cached
+        while len(self._voice_adapter_cache) > self._voice_adapter_cache_size:
+            evicted_name, _ = self._voice_adapter_cache.popitem(last=False)
+            _LOGGER.info("Evicted Sparrow voice adapter from LRU cache: %s", evicted_name)
+        _LOGGER.info(
+            "Loaded Sparrow voice adapter name=%s path=%s elapsed=%.3fs cached=%s",
+            name,
+            path,
+            time.perf_counter() - started,
+            list(self._voice_adapter_cache),
+        )
+        return cached
+
+    def _select_voice_adapter(self, name: str | None) -> None:
+        if not self._voice_adapter_runtime_enabled:
+            if name is not None:
+                raise RuntimeError("No managed Sparrow voice adapters are configured")
+            return
+
+        model_g = self.model.model_g
+        if name is None:
+            model_g.set_voice_adapter_enabled(False)
+            self._active_voice_adapter = None
+            return
+
+        cached = self._load_cached_voice_adapter(name)
+        if self._resident_voice_adapter == name:
+            model_g.set_voice_adapter_enabled(True)
+            self._active_voice_adapter = name
+            return
+
+        from .vits.voice_adapter import load_adapter_state_dict
+
+        model_g.remove_voice_adapter()
+        self._resident_voice_adapter = None
+        self._active_voice_adapter = None
+        metadata = cached.metadata
+        model_g.configure_voice_adapter(
+            speaker_id=int(metadata["speaker_id"]),
+            target_modules=tuple(metadata["target_modules"]),
+            rank=int(metadata["rank"]),
+            alpha=float(metadata["alpha"]),
+            dropout=float(metadata["dropout"]),
+        )
+        load_adapter_state_dict(model_g, cached.tensors)
+        model_g.eval()
+        model_g.set_voice_adapter_enabled(True)
+        self._resident_voice_adapter = name
+        self._active_voice_adapter = name
+        _LOGGER.info(
+            "Activated Sparrow voice adapter name=%s speaker=%s targets=%d",
+            name,
+            metadata["speaker"],
+            len(metadata["target_modules"]),
+        )
+
+    @property
+    def voice_adapter_status(self) -> dict[str, Any]:
+        return {
+            "configured": sorted(self._voice_adapter_specs),
+            "cached": list(self._voice_adapter_cache),
+            "resident": self._resident_voice_adapter,
+            "active": self._active_voice_adapter,
+            "cache_size": self._voice_adapter_cache_size,
+        }
 
     def _sync_config_from_checkpoint(self) -> None:
         speaker_map = getattr(self.model.hparams, "speaker_id_map", None)
@@ -414,6 +588,7 @@ class PiperInference:
         noise_w: Optional[float] = None,
         sdp_ratio: Optional[float] = None,
         neural: bool = True,
+        voice_adapter: str | None = None,
     ) -> np.ndarray:
         """Synthesize a single text span with a specific speaker.
 
@@ -440,6 +615,7 @@ class PiperInference:
             noise_w=noise_w,
             sdp_ratio=sdp_ratio,
             neural=neural,
+            voice_adapter=voice_adapter,
         )[0]
 
     def synthesize_with_ipa_overrides(
@@ -453,18 +629,46 @@ class PiperInference:
         sdp_ratio: Optional[float] = None,
         neural: bool = True,
         return_alignment: bool = False,
+        voice_adapter: str | None = None,
     ) -> np.ndarray | tuple[np.ndarray, list[dict]]:
         """Synthesize full-context speech with exact IPA source-span overrides."""
-        if not overrides:
-            audio = self.synthesize_span(
+        with self._voice_adapter_lock:
+            self._select_voice_adapter(voice_adapter)
+            return self._synthesize_with_ipa_overrides_unlocked(
                 text,
+                overrides,
                 speaker=speaker,
                 noise_scale=noise_scale,
                 length_scale=length_scale,
                 noise_w=noise_w,
                 sdp_ratio=sdp_ratio,
                 neural=neural,
+                return_alignment=return_alignment,
             )
+
+    def _synthesize_with_ipa_overrides_unlocked(
+        self,
+        text: str,
+        overrides: Sequence[tuple[int, int, str]],
+        speaker: Optional[str] = None,
+        noise_scale: Optional[float] = None,
+        length_scale: Optional[float] = None,
+        noise_w: Optional[float] = None,
+        sdp_ratio: Optional[float] = None,
+        neural: bool = True,
+        return_alignment: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, list[dict]]:
+        if not overrides:
+            audio = self._synthesize_batch_unlocked(
+                [text],
+                speaker=speaker,
+                batch_size=1,
+                noise_scale=noise_scale,
+                length_scale=length_scale,
+                noise_w=noise_w,
+                sdp_ratio=sdp_ratio,
+                neural=neural,
+            )[0]
             return (audio, []) if return_alignment else audio
 
         from .preprocess import apply_ipa_overrides
@@ -555,6 +759,7 @@ class PiperInference:
         noise_w: Optional[float] = None,
         sdp_ratio: Optional[float] = None,
         neural: bool = False,
+        voice_adapter: str | None = None,
     ) -> list[np.ndarray]:
         """Synthesize multiple texts with real batched model inference.
 
@@ -562,6 +767,30 @@ class PiperInference:
         VITS inference are batched. Mixed-speaker or auto-routed calls keep the
         existing per-text routing behavior before the model batch is formed.
         """
+        with self._voice_adapter_lock:
+            self._select_voice_adapter(voice_adapter)
+            return self._synthesize_batch_unlocked(
+                texts,
+                speaker=speaker,
+                batch_size=batch_size,
+                noise_scale=noise_scale,
+                length_scale=length_scale,
+                noise_w=noise_w,
+                sdp_ratio=sdp_ratio,
+                neural=neural,
+            )
+
+    def _synthesize_batch_unlocked(
+        self,
+        texts: Sequence[str],
+        speaker: Optional[str] | Sequence[Optional[str]] = None,
+        batch_size: Optional[int] = None,
+        noise_scale: Optional[float] = None,
+        length_scale: Optional[float] = None,
+        noise_w: Optional[float] = None,
+        sdp_ratio: Optional[float] = None,
+        neural: bool = False,
+    ) -> list[np.ndarray]:
         text_items = list(texts)
         if not text_items:
             return []
@@ -628,6 +857,7 @@ class PiperInference:
         noise_w: Optional[float] = None,
         sdp_ratio: Optional[float] = None,
         neural: bool = False,
+        voice_adapter: str | None = None,
     ) -> np.ndarray:
         """Synthesize speech from text.
 
@@ -651,6 +881,7 @@ class PiperInference:
             noise_w=noise_w,
             sdp_ratio=sdp_ratio,
             neural=neural,
+            voice_adapter=voice_adapter,
         )[0]
 
     def synthesize_to_file(

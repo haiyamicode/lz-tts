@@ -7,7 +7,9 @@ from ..ssml import parse_ssml
 from . import server
 from .server import (
     BatchSynthesizeInputItem,
+    PiperTTSConfig,
     RootVoiceConfig,
+    SparrowVoiceAdapterConfig,
     VoxCPMConfig,
     _batch_item_pipeline,
     _batch_item_compatibility_key,
@@ -342,6 +344,7 @@ def test_root_voice_with_reference_skips_seed_vc_for_its_native_language(
     assert _batch_item_pipeline(native) == "sparrow"
     assert _batch_item_pipeline(unsupported) == "sparrow_reference"
     native_shared = _shared_batch_from_items([(0, native, native.text or "")])
+    assert native_shared.voice_id == "root"
     assert native_shared.reference_url is None
     assert native_shared.language == "bs-BA"
     assert native_shared.languages == [None]
@@ -359,7 +362,36 @@ def test_root_voice_with_reference_skips_seed_vc_for_its_native_language(
     assert _batch_item_pipeline(native_without_language) == "sparrow"
     assert _shared_batch_from_items(
         [(0, native_without_language, native_without_language.text or "")]
-    ).reference_url is None
+    ).voice_id == "root"
+
+
+def test_sparrow_root_voice_adapter_must_match_its_base_model() -> None:
+    adapter = SparrowVoiceAdapterConfig(path="adapter.safetensors", model="sparrow-a")
+
+    config = PiperTTSConfig(
+        voice_adapters={"goran": adapter},
+        root_voices={
+            "goran": RootVoiceConfig(
+                voice_id="msa.bs-BA.Goran",
+                model="sparrow-a",
+                speaker="bs-BA",
+                adapter="goran",
+            )
+        },
+    )
+    assert config.root_voices["goran"].adapter == "goran"
+
+    with pytest.raises(ValueError, match="does not match adapter"):
+        PiperTTSConfig(
+            voice_adapters={"goran": adapter},
+            root_voices={
+                "goran": RootVoiceConfig(
+                    voice_id="msa.bs-BA.Goran",
+                    model="sparrow-b",
+                    adapter="goran",
+                )
+            },
+        )
 
 
 def test_explicit_voxcpm_requires_a_reference() -> None:

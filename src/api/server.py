@@ -180,6 +180,13 @@ class ModelConfig(BaseModel):
     phoneme_voice: Optional[str] = None
 
 
+class SparrowVoiceAdapterConfig(BaseModel):
+    """An adapter artifact bound to one persistent Sparrow base model."""
+
+    path: str
+    model: str
+
+
 class RootVoiceConfig(BaseModel):
     """A configured public voice id backed directly by a Sparrow model."""
 
@@ -187,6 +194,7 @@ class RootVoiceConfig(BaseModel):
     model: str
     speaker: Optional[str] = None
     languages: Optional[list[str]] = None
+    adapter: Optional[str] = None
 
 
 class EngineEnableConfig(BaseModel):
@@ -211,7 +219,27 @@ class PiperTTSConfig(BaseModel):
     model_priority: list[str] = Field(default_factory=list)
     lang_speaker_map: dict[str, str] = Field(default_factory=dict)
     root_voices: dict[str, RootVoiceConfig] = Field(default_factory=dict)
+    voice_adapter_cache_size: int = Field(1, ge=1)
+    voice_adapters: dict[str, SparrowVoiceAdapterConfig] = Field(default_factory=dict)
     model_config_overrides: dict[str, ModelConfig] = Field(default_factory=dict, alias="model_config")
+
+    @model_validator(mode="after")
+    def validate_voice_adapters(self) -> "PiperTTSConfig":
+        for root_name, root_voice in self.root_voices.items():
+            if root_voice.adapter is None:
+                continue
+            adapter = self.voice_adapters.get(root_voice.adapter)
+            if adapter is None:
+                raise ValueError(
+                    f"Root voice {root_name!r} uses unknown Sparrow adapter "
+                    f"{root_voice.adapter!r}"
+                )
+            if adapter.model != root_voice.model:
+                raise ValueError(
+                    f"Root voice {root_name!r} model {root_voice.model!r} does not "
+                    f"match adapter {root_voice.adapter!r} model {adapter.model!r}"
+                )
+        return self
 
 
 class VoxCPMDurationBudgetConfig(BaseModel):
@@ -1068,6 +1096,19 @@ def _make_cache_room() -> None:
             torch.cuda.empty_cache()
 
 
+def _configure_model_voice_adapters(model: str, inference: PiperInference) -> None:
+    adapters = {
+        name: _resolve_project_path(config.path)
+        for name, config in _server_config.pipertts.voice_adapters.items()
+        if config.model == model
+    }
+    if adapters:
+        inference.configure_voice_adapters(
+            adapters,
+            cache_size=_server_config.pipertts.voice_adapter_cache_size,
+        )
+
+
 def _load_model(model: str) -> PiperInference:
     """Load a model (used internally, raises ValueError instead of HTTPException)."""
     if not _engine_enabled("pipertts"):
@@ -1097,6 +1138,7 @@ def _load_model(model: str) -> PiperInference:
             checkpoint_path=checkpoint_path,
             config_path=config_path,
         )
+        _configure_model_voice_adapters(model, inference)
     except Exception:
         _LOGGER.exception("Failed loading Sparrow model model=%s elapsed=%.2fs", model, time.perf_counter() - started)
         raise
@@ -1126,6 +1168,7 @@ class _SparrowInferenceProxy:
         speaker: Any = None,
         batch_size: int = 1,
         neural: bool = True,
+        voice_adapter: str | None = None,
         **synth_kwargs: Any,
     ) -> list[np.ndarray]:
         response = _ensure_sparrow_worker().call(
@@ -1136,6 +1179,7 @@ class _SparrowInferenceProxy:
                 "speaker": speaker,
                 "batch_size": batch_size,
                 "neural": neural,
+                "voice_adapter": voice_adapter,
                 "synth_kwargs": synth_kwargs,
             },
         )
@@ -1149,6 +1193,7 @@ class _SparrowInferenceProxy:
         *,
         speaker: Any = None,
         neural: bool = True,
+        voice_adapter: str | None = None,
         **synth_kwargs: Any,
     ) -> np.ndarray:
         response = _ensure_sparrow_worker().call(
@@ -1158,6 +1203,7 @@ class _SparrowInferenceProxy:
                 "text": text,
                 "speaker": speaker,
                 "neural": neural,
+                "voice_adapter": voice_adapter,
                 "synth_kwargs": synth_kwargs,
             },
         )
@@ -1172,6 +1218,7 @@ class _SparrowInferenceProxy:
         *,
         speaker: Any = None,
         neural: bool = True,
+        voice_adapter: str | None = None,
         **synth_kwargs: Any,
     ) -> np.ndarray:
         response = _ensure_sparrow_worker().call(
@@ -1182,6 +1229,7 @@ class _SparrowInferenceProxy:
                 "overrides": list(overrides),
                 "speaker": speaker,
                 "neural": neural,
+                "voice_adapter": voice_adapter,
                 "synth_kwargs": synth_kwargs,
             },
         )
@@ -1684,7 +1732,9 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
     started = time.perf_counter()
     synth_kwargs = _synth_kwargs_from_request(request)
     item_segments: list[list[dict[str, Any]]] = []
-    segment_groups: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+    segment_groups: OrderedDict[
+        tuple[str, str | None], list[dict[str, Any]]
+    ] = OrderedDict()
 
     for item_idx, text in enumerate(texts):
         segments, _ = _plan_text_segments(
@@ -1694,16 +1744,20 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
             forced_language=forced_language,
             validate_primary_speaker=False,
         )
+        for segment in segments:
+            segment["voice_adapter"] = None
         if root_voice is not None:
             for segment in segments:
                 if _root_voice_can_synthesize_language(root_voice, segment["lang"]):
                     if root_voice.speaker is not None:
                         segment["speaker"] = root_voice.speaker
                     segment["model"] = root_voice.model
+                    segment["voice_adapter"] = root_voice.adapter
         item_segments.append(segments)
         for segment_idx, segment in enumerate(segments):
             record = {**segment, "item_idx": item_idx, "segment_idx": segment_idx}
-            segment_groups.setdefault(segment["model"], []).append(record)
+            group_key = (segment["model"], segment["voice_adapter"])
+            segment_groups.setdefault(group_key, []).append(record)
 
     _log_synthesize_batch_stage(
         "configured_voice_routing",
@@ -1721,12 +1775,13 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         model_groups=[
             {
                 "model": model_name,
+                "voice_adapter": voice_adapter,
                 "segment_count": len(records),
                 "item_indices": sorted({int(record["item_idx"]) for record in records}),
                 "speakers": sorted({str(record["speaker"]) for record in records}),
                 "languages": sorted({str(record["lang"]) for record in records}),
             }
-            for model_name, records in segment_groups.items()
+            for (model_name, voice_adapter), records in segment_groups.items()
         ],
     )
 
@@ -1735,7 +1790,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         for segments in item_segments
     ]
 
-    for model_name, records in segment_groups.items():
+    for (model_name, voice_adapter), records in segment_groups.items():
         if _is_starling_model(model_name):
             await _await_engine_ready("starling")
             starling_batcher = _get_starling_batcher()
@@ -1746,6 +1801,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
                 pipeline="configured_voice",
                 voice_id=request.voice_id,
                 model=model_name,
+                voice_adapter=voice_adapter,
                 item_count=len(texts),
                 segment_count=len(records),
                 batch_size=len(records),
@@ -1796,6 +1852,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
             pipeline="configured_voice",
             voice_id=request.voice_id,
             model=model_name,
+            voice_adapter=voice_adapter,
             item_count=len(texts),
             segment_count=len(batch_texts),
             batch_size=len(batch_texts),
@@ -1809,6 +1866,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
             speaker=batch_speakers,
             batch_size=len(batch_texts),
             neural=request.neural,
+            voice_adapter=voice_adapter,
             **synth_kwargs,
         )
         audio_seconds = sum(float(len(audio)) / model_sample_rate for audio in batch_audios) if model_sample_rate else 0.0
@@ -1818,6 +1876,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
             pipeline="configured_voice",
             voice_id=request.voice_id,
             model=model_name,
+            voice_adapter=voice_adapter,
             output_count=len(batch_audios),
             audio_seconds=round(audio_seconds, 6),
             wall_seconds=round(elapsed, 6),
@@ -2188,12 +2247,16 @@ async def _synthesize_sparrow_ipa_ssml(
             validate_primary_speaker=False,
         )
 
+    for segment in segments:
+        segment["voice_adapter"] = None
+
     if root_voice is not None:
         for segment in segments:
             if _root_voice_can_synthesize_language(root_voice, str(segment["lang"])):
                 if root_voice.speaker is not None:
                     segment["speaker"] = root_voice.speaker
                 segment["model"] = root_voice.model
+                segment["voice_adapter"] = root_voice.adapter
 
     assigned_operations: set[int] = set()
     for segment in segments:
@@ -2236,6 +2299,7 @@ async def _synthesize_sparrow_ipa_ssml(
                 overrides,
                 speaker=internal_speaker,
                 neural=request.neural,
+                voice_adapter=segment["voice_adapter"],
                 **synth_kwargs,
             )
         else:
@@ -2246,6 +2310,7 @@ async def _synthesize_sparrow_ipa_ssml(
                     speaker=internal_speaker,
                     batch_size=1,
                     neural=request.neural,
+                    voice_adapter=segment["voice_adapter"],
                     **synth_kwargs,
                 )
             )[0]
@@ -3650,6 +3715,11 @@ def _validate_batch_item(item: BatchSynthesizeInputItem, item_idx: int) -> str:
 def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, str]]) -> _SharedBatchSynthesizeRequest:
     first = records[0][1]
     pipeline = _batch_item_pipeline(first)
+    root_voice = _configured_root_voice_for_voice_id(first.voice_id)
+    native_root_voice = root_voice is not None and pipeline in {
+        "sparrow",
+        "sparrow_forced_language",
+    }
     forced_languages = [
         _explicit_language(
             _configured_voice_language(item.voice_id, item.language),
@@ -3660,7 +3730,7 @@ def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, 
     return _SharedBatchSynthesizeRequest(
         texts=[text for _, _, text in records],
         seeds=[item.seed for _, item, _ in records],
-        voice_id=None,
+        voice_id=first.voice_id if native_root_voice else None,
         # Once routing selected native Sparrow, its registry reference is
         # metadata only. Passing it into the Sparrow backend means Seed-VC.
         reference_url=(
@@ -3725,6 +3795,8 @@ async def _execute_synthesis_batch_plan(
     shared_request = _shared_batch_from_items(records)
     if plan.pipeline == "voxcpm":
         return await _synthesize_voxcpm_items(records)
+    if _configured_root_voice_for_voice_id(shared_request.voice_id) is not None:
+        return await synthesize_configured_voice_batch(shared_request)
     forced_language = (shared_request.languages or [None])[0]
     if forced_language is not None:
         await _await_engine_ready("pipertts")
@@ -4204,6 +4276,14 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
         audio_bytes = base64.b64decode(result.items[0].audio_base64)
         media_type = "audio/mpeg" if request.format == "mp3" else "audio/wav"
         return _binary_response(audio_bytes, media_type)
+
+    root_voice = _configured_root_voice_for_voice_id(request.voice_id)
+    if (
+        root_voice is not None
+        and model in {None, PUBLIC_SPARROW_MODEL}
+        and not _request_routes_to_seed_vc(request, model)
+    ):
+        return await _synthesize_configured_voice(request)
 
     if not _engine_enabled("pipertts"):
         raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")

@@ -29,6 +29,8 @@ SERVING_FILES = {
     "lzspeech-sparrow/config.json",
     "lzspeech-sparrow/manifest.json",
     "lzspeech-sparrow/model.ckpt",
+    "lzspeech-sparrow/voice-adapters/goran-epoch20.json",
+    "lzspeech-sparrow/voice-adapters/goran-epoch20.safetensors",
     "lzspeech-starling/model.ckpt",
     "voice-presets.json",
     "seed-vc/manifest.json",
