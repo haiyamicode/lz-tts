@@ -9,6 +9,7 @@ from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 
 from . import attentions, commons, modules, monotonic_align
+from .voice_adapter import install_conditioning_lora, unwrap_lora_base
 from .commons import get_padding, init_weights
 
 _DEBUG_SEMANTIC = bool(int(os.environ.get("PIPER_SEMANTIC_DEBUG", "0")))
@@ -679,7 +680,7 @@ class Generator(torch.nn.Module):
     def remove_weight_norm(self):
         print("Removing weight norm...")
         for l in self.ups:
-            remove_weight_norm(l)
+            remove_weight_norm(unwrap_lora_base(l))
         for l in self.resblocks:
             l.remove_weight_norm()
 
@@ -972,6 +973,62 @@ class SynthesizerTrn(nn.Module):
         if n_speakers > 1:
             self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
+        self.voice_adapter_embedding: typing.Optional[nn.Parameter] = None
+        self.voice_adapter_speaker_id: typing.Optional[int] = None
+        self.voice_adapter_target_modules: typing.Tuple[str, ...] = ()
+
+    def configure_voice_adapter(
+        self,
+        speaker_id: int,
+        target_modules: typing.Sequence[str],
+        rank: int,
+        alpha: float,
+        dropout: float,
+    ) -> None:
+        if self.n_speakers <= 1 or not hasattr(self, "emb_g"):
+            raise ValueError("Voice adapters require a multi-speaker Sparrow model")
+        if not 0 <= int(speaker_id) < self.n_speakers:
+            raise ValueError(
+                f"Voice adapter speaker id {speaker_id} is outside [0, {self.n_speakers})"
+            )
+        if self.voice_adapter_embedding is not None:
+            raise ValueError("A voice adapter is already configured")
+
+        self.voice_adapter_speaker_id = int(speaker_id)
+        self.voice_adapter_target_modules = install_conditioning_lora(
+            self,
+            target_modules=target_modules,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+        initial_embedding = self.emb_g.weight[self.voice_adapter_speaker_id].detach().clone()
+        self.voice_adapter_embedding = nn.Parameter(initial_embedding)
+
+    def reset_voice_adapter_embedding(self) -> None:
+        if self.voice_adapter_embedding is None:
+            return
+        assert self.voice_adapter_speaker_id is not None
+        with torch.no_grad():
+            self.voice_adapter_embedding.copy_(
+                self.emb_g.weight[self.voice_adapter_speaker_id]
+            )
+
+    def _speaker_conditioning(self, sid: torch.Tensor) -> torch.Tensor:
+        if self.voice_adapter_embedding is None:
+            return self.emb_g(sid).unsqueeze(-1)
+
+        assert self.voice_adapter_speaker_id is not None
+        if bool((sid != self.voice_adapter_speaker_id).any()):
+            observed = sorted(set(int(value) for value in sid.detach().cpu().view(-1)))
+            raise ValueError(
+                "Voice adapter batches may only contain speaker id "
+                f"{self.voice_adapter_speaker_id}; observed {observed}"
+            )
+        return self.voice_adapter_embedding.view(1, -1, 1).expand(
+            sid.size(0), -1, -1
+        )
+
     def forward(
         self,
         x,
@@ -983,7 +1040,7 @@ class SynthesizerTrn(nn.Module):
     ):
 
         if self.n_speakers > 1:
-            g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
+            g = self._speaker_conditioning(sid)  # [b, h, 1]
         else:
             g = None
 
@@ -1079,7 +1136,7 @@ class SynthesizerTrn(nn.Module):
     ):
         if self.n_speakers > 1:
             assert sid is not None, "Missing speaker id"
-            g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
+            g = self._speaker_conditioning(sid)  # [b, h, 1]
         else:
             g = None
 

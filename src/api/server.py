@@ -52,7 +52,6 @@ from .model_workers import seed_vc_worker_main, sparrow_worker_main, starling_wo
 from .seed_vc_backend import (
     SeedVCBackend as _SeedVCBackend,
     SeedVCBatchRequest,
-    SeedVCFindVoiceRequest,
     SeedVCRequest,
 )
 from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
@@ -2068,6 +2067,11 @@ def _voice_request_routes_to_voxcpm(
     if reference_url is None:
         return False
 
+    # An explicit public model selects the backend. Capability-based routing is
+    # only used when the client leaves model unset.
+    if model is not None:
+        return _is_voxcpm_model(model)
+
     effective_language = _configured_voice_language(voice_id, language)
     normalized_language = _normalize_locale_with_region(effective_language or "en")
     base_language = _get_base_language(normalized_language)
@@ -2919,13 +2923,6 @@ class _SeedVCBackendProxy:
         data = response.get("data") or {}
         self.sample_rate = int(data.get("sample_rate") or self.sample_rate)
         return list(data.get("items") or [])
-
-    def find_voice(self, request: SeedVCFindVoiceRequest, reference_path: Path) -> str:
-        response = _ensure_seed_vc_worker().call(
-            "find_voice",
-            {"request": request.model_dump(mode="json"), "reference_path": str(reference_path)},
-        )
-        return str((response.get("data") or {})["voice_id"])
 
 def _get_seed_vc_backend() -> _SeedVCBackend:
     if not _engine_enabled("seed_vc"):
@@ -4455,8 +4452,6 @@ class LzTtsInferenceSession:
                 )
             elif operation == "voice-enhance":
                 result = await self._enhance(VoiceEnhanceRequest.model_validate(request_data))
-            elif operation == "find-voice":
-                result = await self._find_voice(SeedVCFindVoiceRequest.model_validate(request_data))
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported TTS operation: {operation}")
         except ValidationError as exc:
@@ -4483,14 +4478,6 @@ class LzTtsInferenceSession:
         )
         return result
 
-    async def _find_voice(self, request: SeedVCFindVoiceRequest) -> InferenceResult:
-        await _await_engine_ready("seed_vc")
-        backend = _get_seed_vc_backend()
-        sample_request = SeedVCRequest(audio="", reference_url=request.reference_url, id=request.id)
-        reference_path = await backend._fetch_sample(sample_request)
-        voice_id = await asyncio.to_thread(backend.find_voice, request, reference_path)
-        return InferenceResult(kind="json", data={"voice_id": voice_id})
-
     async def _enhance(self, request: VoiceEnhanceRequest) -> InferenceResult:
         async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.get(request.reference_url)
@@ -4504,7 +4491,7 @@ class SyncTaskInput(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    operation: Literal["synthesize", "voice-enhance", "find-voice"]
+    operation: Literal["synthesize", "voice-enhance"]
     request: dict[str, Any]
 
 

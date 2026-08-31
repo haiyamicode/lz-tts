@@ -1,5 +1,6 @@
 import argparse
 from collections import Counter, defaultdict
+import json
 import logging
 import os
 import time
@@ -15,6 +16,12 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from .commons import slice_segments
 from .mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from .models import MultiPeriodDiscriminator, SynthesizerTrn
+from .voice_adapter import (
+    DEFAULT_VOICE_ADAPTER_TARGETS,
+    adapter_parameter_names,
+    adapter_state_dict,
+    source_key_for_wrapped_target,
+)
 
 # Training-only imports (optional for inference)
 try:
@@ -184,6 +191,15 @@ class VitsModel(pl.LightningModule):
         semantic_fusion_mode: Optional[str] = None,
         use_spk_conditioned_encoder: bool = False,
         speaker_condition_layer: int = 2,
+        # speaker-conditioning voice adapter
+        voice_adapter_enabled: bool = False,
+        voice_adapter_speaker: Optional[str] = None,
+        voice_adapter_rank: int = 8,
+        voice_adapter_alpha: float = 8.0,
+        voice_adapter_dropout: float = 0.0,
+        voice_adapter_target_modules: Optional[List[str]] = None,
+        voice_adapter_speaker_learning_rate: Optional[float] = None,
+        voice_adapter_weight_decay: float = 0.0,
         # inference-only (no discriminator, no datasets)
         inference_only: bool = False,
         **kwargs,
@@ -279,6 +295,168 @@ class VitsModel(pl.LightningModule):
                 self.hparams.gin_channels,
                 speaker_condition_layer,
             )
+        if voice_adapter_enabled:
+            self._configure_voice_adapter()
+
+    def _configure_voice_adapter(self) -> None:
+        speaker = getattr(self.hparams, "voice_adapter_speaker", None)
+        if not speaker:
+            raise ValueError("voice_adapter.speaker is required when the adapter is enabled")
+        if speaker not in self.hparams.speaker_id_map:
+            raise ValueError(
+                f"Voice adapter speaker {speaker!r} is not in the dataset speaker map"
+            )
+        speaker_id = int(self.hparams.speaker_id_map[speaker])
+        target_modules = tuple(
+            getattr(self.hparams, "voice_adapter_target_modules", None)
+            or DEFAULT_VOICE_ADAPTER_TARGETS
+        )
+
+        for parameter in self.model_g.parameters():
+            parameter.requires_grad_(False)
+        if self.model_d is not None:
+            for parameter in self.model_d.parameters():
+                parameter.requires_grad_(True)
+
+        self.model_g.configure_voice_adapter(
+            speaker_id=speaker_id,
+            target_modules=target_modules,
+            rank=int(self.hparams.voice_adapter_rank),
+            alpha=float(self.hparams.voice_adapter_alpha),
+            dropout=float(self.hparams.voice_adapter_dropout),
+        )
+        self.hparams.voice_adapter_target_modules = list(
+            self.model_g.voice_adapter_target_modules
+        )
+        self.hparams.voice_adapter_speaker_id = speaker_id
+
+        observed_speaker_ids: set[Optional[int]] = set()
+        for dataset in (self._train_dataset, self._val_dataset, self._test_dataset):
+            if dataset is not None:
+                observed_speaker_ids.update(dataset_speaker_ids(dataset))
+        if observed_speaker_ids and observed_speaker_ids != {speaker_id}:
+            raise ValueError(
+                "Voice adapter training data must contain exactly the configured "
+                f"speaker id {speaker_id}; observed {sorted(observed_speaker_ids)}"
+            )
+
+        names = adapter_parameter_names(self.model_g)
+        unexpected = [
+            name
+            for name in names
+            if name != "voice_adapter_embedding" and ".lora_" not in name
+        ]
+        if unexpected:
+            raise RuntimeError(
+                f"Unexpected trainable parameters in voice adapter mode: {unexpected}"
+            )
+        if not names:
+            raise RuntimeError("Voice adapter mode produced no trainable parameters")
+
+        trainable = sum(
+            parameter.numel()
+            for parameter in self.model_g.parameters()
+            if parameter.requires_grad
+        )
+        total = sum(parameter.numel() for parameter in self.model_g.parameters())
+        _LOGGER.info(
+            "Voice adapter enabled: speaker=%s id=%s rank=%s alpha=%s "
+            "targets=%s trainable=%s/%s (%.4f%%)",
+            speaker,
+            speaker_id,
+            self.hparams.voice_adapter_rank,
+            self.hparams.voice_adapter_alpha,
+            len(self.model_g.voice_adapter_target_modules),
+            trainable,
+            total,
+            100.0 * trainable / total,
+        )
+
+    def load_voice_adapter_base_state_dict(
+        self, saved_state_dict: dict[str, torch.Tensor]
+    ) -> None:
+        """Load an unwrapped base generator under installed LoRA wrappers."""
+
+        if not bool(getattr(self.hparams, "voice_adapter_enabled", False)):
+            raise RuntimeError("No voice adapter is configured")
+
+        target_modules = tuple(self.model_g.voice_adapter_target_modules)
+        target_state = self.model_g.state_dict()
+        loaded_state: dict[str, torch.Tensor] = {}
+        consumed_source_keys: set[str] = set()
+        missing: list[str] = []
+
+        for target_key, target_value in target_state.items():
+            if target_key == "voice_adapter_embedding" or any(
+                marker in target_key for marker in (".lora_a.", ".lora_b.")
+            ):
+                loaded_state[target_key] = target_value
+                continue
+
+            source_key = source_key_for_wrapped_target(target_key, target_modules)
+            source_value = saved_state_dict.get(source_key)
+            if source_value is None:
+                missing.append(source_key)
+                continue
+            if tuple(source_value.shape) != tuple(target_value.shape):
+                raise ValueError(
+                    f"Base checkpoint shape mismatch for {source_key}: "
+                    f"source={tuple(source_value.shape)} target={tuple(target_value.shape)}"
+                )
+            loaded_state[target_key] = source_value
+            consumed_source_keys.add(source_key)
+
+        if missing:
+            raise ValueError(
+                f"Base checkpoint is missing {len(missing)} generator keys: {missing}"
+            )
+        extra = set(saved_state_dict) - consumed_source_keys
+        if extra:
+            raise ValueError(
+                f"Base checkpoint has {len(extra)} unexpected generator keys: {sorted(extra)}"
+            )
+
+        self.model_g.load_state_dict(loaded_state, strict=True)
+        self.model_g.reset_voice_adapter_embedding()
+
+    def export_voice_adapter(
+        self,
+        output_path: Union[str, Path],
+        extra_metadata: Optional[dict] = None,
+    ) -> Path:
+        if not bool(getattr(self.hparams, "voice_adapter_enabled", False)):
+            raise RuntimeError("No voice adapter is configured")
+
+        from safetensors.torch import save_file
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        tensors = adapter_state_dict(self.model_g)
+        if not tensors:
+            raise RuntimeError("No voice adapter tensors are available to export")
+
+        metadata = {
+            "format": "sparrow_voice_adapter",
+            "format_version": 1,
+            "speaker": str(self.hparams.voice_adapter_speaker),
+            "speaker_id": int(self.hparams.voice_adapter_speaker_id),
+            "rank": int(self.hparams.voice_adapter_rank),
+            "alpha": float(self.hparams.voice_adapter_alpha),
+            "dropout": float(self.hparams.voice_adapter_dropout),
+            "target_modules": list(self.model_g.voice_adapter_target_modules),
+            "tensor_count": len(tensors),
+            "parameter_count": sum(value.numel() for value in tensors.values()),
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
+
+        save_file(tensors, str(output_path))
+        metadata_path = output_path.with_suffix(".json")
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return output_path
 
     def _load_datasets(
         self,
@@ -881,22 +1059,90 @@ class VitsModel(pl.LightningModule):
         return val_loss
 
     def configure_optimizers(self):
-        g_opt = torch.optim.AdamW(
-            self.model_g.parameters(),
-            lr=self.hparams.learning_rate,
-            betas=self.hparams.betas,
-            eps=self.hparams.eps,
-        )
+        if bool(getattr(self.hparams, "voice_adapter_enabled", False)):
+            lora_parameters = []
+            speaker_parameters = []
+            unexpected = []
+            for name, parameter in self.model_g.named_parameters():
+                if not parameter.requires_grad:
+                    continue
+                if name == "voice_adapter_embedding":
+                    speaker_parameters.append(parameter)
+                elif ".lora_" in name:
+                    lora_parameters.append(parameter)
+                else:
+                    unexpected.append(name)
+            if unexpected:
+                raise RuntimeError(
+                    f"Unexpected trainable parameters in voice adapter optimizer: {unexpected}"
+                )
+            if not lora_parameters or not speaker_parameters:
+                raise RuntimeError(
+                    "Voice adapter optimizer requires both LoRA and speaker parameters"
+                )
+
+            speaker_lr = getattr(
+                self.hparams, "voice_adapter_speaker_learning_rate", None
+            )
+            if speaker_lr is None:
+                speaker_lr = self.hparams.learning_rate
+            g_opt = torch.optim.AdamW(
+                [
+                    {"params": lora_parameters, "lr": self.hparams.learning_rate},
+                    {"params": speaker_parameters, "lr": float(speaker_lr)},
+                ],
+                lr=self.hparams.learning_rate,
+                betas=self.hparams.betas,
+                eps=self.hparams.eps,
+                weight_decay=float(self.hparams.voice_adapter_weight_decay),
+            )
+            g_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                g_opt, gamma=self.hparams.lr_decay
+            )
+        else:
+            g_opt = torch.optim.AdamW(
+                self.model_g.parameters(),
+                lr=self.hparams.learning_rate,
+                betas=self.hparams.betas,
+                eps=self.hparams.eps,
+            )
+            g_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                g_opt, gamma=self.hparams.lr_decay
+            )
+
+        if self.model_d is None:
+            raise RuntimeError("Training requires a discriminator")
+        frozen_discriminator_parameters = [
+            name
+            for name, parameter in self.model_d.named_parameters()
+            if not parameter.requires_grad
+        ]
+        if frozen_discriminator_parameters:
+            raise RuntimeError(
+                "The training discriminator must remain fully trainable in voice "
+                "adapter mode; frozen parameters: "
+                f"{frozen_discriminator_parameters}"
+            )
+        discriminator_parameters = list(self.model_d.parameters())
         d_opt = torch.optim.AdamW(
-            self.model_d.parameters(),
+            discriminator_parameters,
             lr=self.hparams.learning_rate,
             betas=self.hparams.betas,
             eps=self.hparams.eps,
         )
 
-        g_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            g_opt, gamma=self.hparams.lr_decay
-        )
+        if bool(getattr(self.hparams, "voice_adapter_enabled", False)):
+            _LOGGER.info(
+                "Voice adapter GAN optimizers: generator_adapter=%s parameters, "
+                "discriminator=%s parameters",
+                sum(
+                    parameter.numel()
+                    for group in g_opt.param_groups
+                    for parameter in group["params"]
+                ),
+                sum(parameter.numel() for parameter in discriminator_parameters),
+            )
+
         d_scheduler = torch.optim.lr_scheduler.ExponentialLR(
             d_opt, gamma=self.hparams.lr_decay
         )
@@ -907,8 +1153,11 @@ class VitsModel(pl.LightningModule):
         # Manually step schedulers with manual optimization
         schedulers = self.lr_schedulers()
         if schedulers:
-            for scheduler in schedulers:
-                scheduler.step()
+            if isinstance(schedulers, (list, tuple)):
+                for scheduler in schedulers:
+                    scheduler.step()
+            else:
+                schedulers.step()
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -963,6 +1212,22 @@ class VitsModel(pl.LightningModule):
             "--semantic-fusion-mode",
             choices=["aligned", "legacy_cross_attention"],
             help="Semantic fusion mode. Defaults to aligned for precomputed BERT features and legacy cross-attention otherwise.",
+        )
+        parser.add_argument(
+            "--voice-adapter-enabled",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        )
+        parser.add_argument("--voice-adapter-speaker")
+        parser.add_argument("--voice-adapter-rank", type=int, default=8)
+        parser.add_argument("--voice-adapter-alpha", type=float, default=8.0)
+        parser.add_argument("--voice-adapter-dropout", type=float, default=0.0)
+        parser.add_argument("--voice-adapter-target-modules", nargs="*")
+        parser.add_argument(
+            "--voice-adapter-speaker-learning-rate", type=float
+        )
+        parser.add_argument(
+            "--voice-adapter-weight-decay", type=float, default=0.0
         )
         #
         return parent_parser

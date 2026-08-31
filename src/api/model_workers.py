@@ -21,7 +21,6 @@ from .locale_utils import normalize_locale
 from .seed_vc_backend import (
     SeedVCBackend,
     SeedVCBatchRequest,
-    SeedVCFindVoiceRequest,
     SeedVCRequest,
 )
 from .worker_common import run_worker_loop
@@ -465,10 +464,6 @@ def seed_vc_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
                 max_chunk_batch_size=payload.get("max_chunk_batch_size"),
             )
             return {"ok": True, "data": {"items": data, "sample_rate": backend.sample_rate}}
-        if action == "find_voice":
-            request = SeedVCFindVoiceRequest(**payload["request"])
-            result = backend.find_voice(request, Path(payload["reference_path"]))
-            return {"ok": True, "data": {"voice_id": result}}
         raise ValueError(f"unknown worker action: {action}")
 
     run_worker_loop("Seed-VC", _with_gpu_cleanup(handler), request_queue, response_queue)

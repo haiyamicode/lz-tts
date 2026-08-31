@@ -21,6 +21,7 @@ import argparse
 import csv
 import json
 import math
+import random
 import re
 import subprocess
 import time
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 import yaml
 
 from src.piper import PiperInference
@@ -311,6 +313,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of independent stochastic generations for each prompt",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="Base sampling seed; each generated item uses seed + item index",
+    )
     parser.add_argument("--device", default="cuda", help="Torch device for synthesis")
     parser.add_argument("--noise-scale", type=float)
     parser.add_argument("--length-scale", type=float)
@@ -389,6 +397,13 @@ def main() -> None:
             name = f"{prompt_index:03d}_{language}_{safe_name(text)}{variant}.wav"
             wav_path = run_dir / name
 
+            sample_seed = args.seed + index
+            random.seed(sample_seed)
+            np.random.seed(sample_seed)
+            torch.manual_seed(sample_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(sample_seed)
+
             start = time.perf_counter()
             audio = inference.synthesize(text, speaker=speaker, **synth_kwargs)
             infer_sec = time.perf_counter() - start
@@ -401,6 +416,7 @@ def main() -> None:
                 "index": index,
                 "prompt_index": prompt_index,
                 "sample_index": sample_index,
+                "seed": sample_seed,
                 "language": language,
                 "speaker": speaker,
                 "source": prompt.get("source", ""),
@@ -462,6 +478,7 @@ def main() -> None:
         "index",
         "prompt_index",
         "sample_index",
+        "seed",
         "language",
         "speaker",
         "source",
@@ -492,6 +509,7 @@ def main() -> None:
         "num_prompts": len(rows),
         "source_prompt_count": len(prompts),
         "samples_per_prompt": args.samples_per_prompt,
+        "seed": args.seed,
         "synth_kwargs": synth_kwargs,
         "scoreq": {
             field: numeric_summary(

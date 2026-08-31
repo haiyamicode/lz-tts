@@ -9,6 +9,7 @@ from torch.nn.utils import remove_weight_norm, weight_norm
 
 from .commons import fused_add_tanh_sigmoid_multiply, get_padding, init_weights
 from .transforms import piecewise_rational_quadratic_transform
+from .voice_adapter import unwrap_lora_base
 
 
 class LayerNorm(nn.Module):
@@ -210,11 +211,11 @@ class WN(torch.nn.Module):
 
     def remove_weight_norm(self):
         if self.gin_channels != 0:
-            torch.nn.utils.remove_weight_norm(self.cond_layer)
+            torch.nn.utils.remove_weight_norm(unwrap_lora_base(self.cond_layer))
         for l in self.in_layers:
-            torch.nn.utils.remove_weight_norm(l)
+            torch.nn.utils.remove_weight_norm(unwrap_lora_base(l))
         for l in self.res_skip_layers:
-            torch.nn.utils.remove_weight_norm(l)
+            torch.nn.utils.remove_weight_norm(unwrap_lora_base(l))
 
 
 class ResBlock1(torch.nn.Module):
@@ -315,9 +316,9 @@ class ResBlock1(torch.nn.Module):
 
     def remove_weight_norm(self):
         for l in self.convs1:
-            remove_weight_norm(l)
+            remove_weight_norm(unwrap_lora_base(l))
         for l in self.convs2:
-            remove_weight_norm(l)
+            remove_weight_norm(unwrap_lora_base(l))
 
 
 class ResBlock2(torch.nn.Module):
@@ -365,7 +366,7 @@ class ResBlock2(torch.nn.Module):
 
     def remove_weight_norm(self):
         for l in self.convs:
-            remove_weight_norm(l)
+            remove_weight_norm(unwrap_lora_base(l))
 
 
 class Log(nn.Module):

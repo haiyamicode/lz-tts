@@ -19,6 +19,7 @@ _SECTIONS = (
     "dataloader",
     "trainer",
     "model",
+    "adapter",
     "optimizer",
     "checkpoint",
     "quality_monitor",
@@ -29,6 +30,7 @@ _DEFAULTS: dict[str, Any] = {
     "devices": "auto",
     "precision": "32",
     "max_epochs": 10_000,
+    "max_steps": -1,
     "default_root_dir": None,
     "log_every_n_steps": 50,
     "progress_log_every_n_steps": 0,
@@ -38,8 +40,11 @@ _DEFAULTS: dict[str, Any] = {
     "gradient_clip_val": 0.0,
     "accumulate_grad_batches": 1,
     "checkpoint_epochs": 1,
+    "checkpoint_steps": 0,
     "keep_last_checkpoints": 5,
     "retain_every": 0,
+    "retain_every_steps": 0,
+    "val_check_interval": 1.0,
     "batch_size": 1,
     "num_workers": 1,
     "use_length_buckets": False,
@@ -58,6 +63,15 @@ _DEFAULTS: dict[str, Any] = {
     "init_partial_include_prefixes": None,
     "init_partial_exclude_prefixes": ("dec.",),
     "speaker_embedding_init_map": None,
+    "voice_adapter_enabled": False,
+    "voice_adapter_speaker": None,
+    "voice_adapter_rank": 8,
+    "voice_adapter_alpha": 8.0,
+    "voice_adapter_dropout": 0.0,
+    "voice_adapter_target_modules": None,
+    "voice_adapter_speaker_learning_rate": None,
+    "voice_adapter_weight_decay": 0.0,
+    "voice_adapter_base_checkpoint": None,
     "utmos_enabled": False,
     "utmos_every_n_epochs": 10,
     "utmos_num_samples": 10,
@@ -142,7 +156,12 @@ def _args_from_config(cfg: DictConfig) -> SimpleNamespace:
         section_values = raw.get(section) or {}
         if not isinstance(section_values, dict):
             raise TypeError(f"Hydra section '{section}' must be a dictionary")
-        args.update(section_values)
+        if section == "adapter":
+            args.update(
+                {f"voice_adapter_{key}": value for key, value in section_values.items()}
+            )
+        else:
+            args.update(section_values)
 
     for key, value in raw.items():
         if key not in _SECTIONS and key != "hydra":

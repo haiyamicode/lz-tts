@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -63,6 +64,10 @@ def main() -> None:
     parser.add_argument(
         "--init_from_checkpoint",
         help="Initialize weights from another checkpoint without optimizer state",
+    )
+    parser.add_argument(
+        "--voice-adapter-base-checkpoint",
+        help="Serving checkpoint that exported voice adapters must be applied to",
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -140,6 +145,11 @@ def train_from_args(
     speaker_embedding_init_map = model_args.pop("speaker_embedding_init_map", None)
     if speaker_embedding_init_map is None:
         speaker_embedding_init_map = dataset_speaker_embedding_init_map
+    if (
+        model_args.get("grad_clip") is None
+        and float(model_args.get("gradient_clip_val", 0.0) or 0.0) > 0.0
+    ):
+        model_args["grad_clip"] = float(model_args["gradient_clip_val"])
     apply_quality_preset(model_args, args.quality)
 
     model = VitsModel(
@@ -173,6 +183,11 @@ def train_from_args(
         )
 
     if args.init_partial_from_checkpoint:
+        if bool(getattr(args, "voice_adapter_enabled", False)):
+            raise ValueError(
+                "Voice adapter training requires an exact init_from_checkpoint; "
+                "partial generator initialization is not supported"
+            )
         initialize_compatible_generator_from_checkpoint(
             model,
             args.init_partial_from_checkpoint,
@@ -181,13 +196,33 @@ def train_from_args(
             speaker_embedding_init_map=speaker_embedding_init_map,
         )
 
+    if (
+        bool(getattr(args, "voice_adapter_enabled", False))
+        and not args.init_from_checkpoint
+        and not args.resume_from_checkpoint
+    ):
+        raise ValueError(
+            "Voice adapter training requires init_from_checkpoint for a fresh run "
+            "or resume_from_checkpoint for an existing run"
+        )
+
     callbacks = []
-    if args.checkpoint_epochs and args.checkpoint_epochs > 0:
+    checkpoint_epochs = int(getattr(args, "checkpoint_epochs", 0) or 0)
+    checkpoint_steps = int(getattr(args, "checkpoint_steps", 0) or 0)
+    if checkpoint_epochs > 0 or checkpoint_steps > 0:
         callbacks.append(
             LatestCheckpointCallback(
-                every_n_epochs=args.checkpoint_epochs,
+                every_n_epochs=checkpoint_epochs,
+                every_n_train_steps=checkpoint_steps,
                 keep_last=int(getattr(args, "keep_last_checkpoints", 5)),
                 retain_every=int(getattr(args, "retain_every", 0)),
+                retain_every_steps=int(
+                    getattr(args, "retain_every_steps", 0) or 0
+                ),
+                base_checkpoint=(
+                    getattr(args, "voice_adapter_base_checkpoint", None)
+                    or getattr(args, "init_from_checkpoint", None)
+                ),
             )
         )
     if getattr(args, "utmos_enabled", False):
@@ -234,6 +269,7 @@ def train_from_args(
         devices=args.devices,
         precision=args.precision,
         max_epochs=args.max_epochs,
+        max_steps=int(getattr(args, "max_steps", -1)),
         default_root_dir=args.default_root_dir,
         callbacks=callbacks,
         logger=logger,
@@ -241,8 +277,12 @@ def train_from_args(
         enable_checkpointing=False,
         enable_progress_bar=bool(getattr(args, "enable_progress_bar", True)),
         benchmark=torch.backends.cudnn.benchmark,
-        gradient_clip_val=args.gradient_clip_val,
+        # VitsModel uses manual GAN optimization and clips explicitly inside
+        # training_step. Lightning rejects Trainer-level automatic clipping in
+        # manual optimization, even when its configured value is zero.
+        gradient_clip_val=None,
         accumulate_grad_batches=args.accumulate_grad_batches,
+        val_check_interval=getattr(args, "val_check_interval", 1.0),
     )
     trainer.fit(model, ckpt_path=args.resume_from_checkpoint)
 
@@ -252,6 +292,7 @@ def add_trainer_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--devices", default="auto")
     parser.add_argument("--precision", default="32")
     parser.add_argument("--max_epochs", type=int, default=10_000)
+    parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--default_root_dir")
     parser.add_argument("--log-every-n-steps", type=int, default=50)
     parser.add_argument("--progress-log-every-n-steps", type=int, default=0)
@@ -270,6 +311,9 @@ def add_trainer_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--accumulate-grad-batches", type=int, default=1)
     parser.add_argument("--keep-last-checkpoints", type=int, default=5)
     parser.add_argument("--retain-every", type=int, default=0)
+    parser.add_argument("--checkpoint-steps", type=int, default=0)
+    parser.add_argument("--retain-every-steps", type=int, default=0)
+    parser.add_argument("--val-check-interval", type=float, default=1.0)
     parser.add_argument("--use-length-buckets", action="store_true")
     parser.add_argument("--bucket-boundaries", nargs="*", type=int)
 
@@ -420,10 +464,19 @@ def initialize_from_checkpoint(
         generator_state = dict(generator_state)
         generator_state["emb_g.weight"] = remapped_embedding
 
-    load_state_dict(model.model_g, generator_state, allow_speaker_mismatch=True)
+    if bool(getattr(model.hparams, "voice_adapter_enabled", False)):
+        model.load_voice_adapter_base_state_dict(generator_state)
+    else:
+        load_state_dict(model.model_g, generator_state, allow_speaker_mismatch=True)
     if source_model.model_d is not None and model.model_d is not None:
         load_state_dict(model.model_d, source_model.model_d.state_dict())
     elif model.model_d is not None:
+        if bool(getattr(model.hparams, "voice_adapter_enabled", False)):
+            raise ValueError(
+                "Voice adapter initialization requires a training checkpoint with "
+                "discriminator weights; a frozen randomly initialized discriminator "
+                "would provide an invalid adversarial objective"
+            )
         _LOGGER.info(
             "Checkpoint has no discriminator weights; initializing the "
             "training discriminator from scratch"
@@ -655,7 +708,11 @@ def _remap_speaker_embeddings(
         }
         copied_initializers = []
         for speaker, target_idx in target_map.items():
-            source_speaker = init_map.get(speaker, speaker)
+            # Initialization aliases are only for speaker rows that do not
+            # exist in the source checkpoint. Existing rows must remain exact.
+            source_speaker = (
+                speaker if speaker in source_lookup else init_map.get(speaker, speaker)
+            )
             source_idx = source_lookup.get(source_speaker)
             if source_idx is None:
                 continue
@@ -665,6 +722,15 @@ def _remap_speaker_embeddings(
             copied += 1
             if source_speaker != speaker:
                 copied_initializers.append(f"{speaker}<-{source_speaker}")
+
+        shared_unnamed_indices = sorted(
+            set(range(min(saved_weight.shape[0], new_weight.shape[0])))
+            - set(source_map.values())
+            - set(target_map.values())
+        )
+        for index in shared_unnamed_indices:
+            new_weight[index] = saved_weight[index]
+            copied += 1
 
         dropped = sorted(set(source_map) - set(target_map))
         added = sorted(set(target_map) - set(source_map))
@@ -678,7 +744,12 @@ def _remap_speaker_embeddings(
                 len(copied_initializers),
                 ", ".join(copied_initializers),
             )
-        _LOGGER.info("Copied %s/%s speaker embedding(s)", copied, len(target_map))
+        _LOGGER.info(
+            "Copied %s/%s speaker embedding row(s), including %s unnamed row(s)",
+            copied,
+            new_weight.shape[0],
+            len(shared_unnamed_indices),
+        )
     else:
         count = min(saved_weight.shape[0], new_weight.shape[0])
         new_weight[:count] = saved_weight[:count]
@@ -701,6 +772,19 @@ class EpochSummaryCallback(Callback):
         self._epoch_start_time = time.perf_counter()
         self._epoch_start_step = int(trainer.global_step)
 
+    def on_train_batch_start(
+        self,
+        trainer: Trainer,
+        pl_module: VitsModel,
+        batch,
+        batch_idx: int,
+    ) -> None:
+        # Lightning can resume in the middle of an epoch without invoking the
+        # epoch-start hook for that partial epoch.
+        if self._epoch_start_time <= 0.0:
+            self._epoch_start_time = time.perf_counter()
+            self._epoch_start_step = int(trainer.global_step)
+
     def on_train_epoch_end(self, trainer: Trainer, pl_module: VitsModel) -> None:
         if not getattr(trainer, "is_global_zero", True):
             return
@@ -717,6 +801,7 @@ class EpochSummaryCallback(Callback):
             elapsed,
             self._format_metrics(trainer.callback_metrics),
         )
+        self._epoch_start_time = 0.0
 
     @staticmethod
     def _format_batches(value: Any) -> str:
@@ -753,29 +838,66 @@ class EpochSummaryCallback(Callback):
 
 
 class LatestCheckpointCallback(Callback):
-    """Keep recent epoch checkpoints plus sparse long-term milestones."""
+    """Keep recent checkpoints plus sparse epoch/step milestones."""
 
     _EPOCH_RE = re.compile(r"^epoch=(?P<epoch>\d+)-step=(?P<step>\d+)(?:-v\d+)?\.ckpt$")
+    _ADAPTER_RE = re.compile(r"^step=(?P<step>\d+)\.safetensors$")
 
     def __init__(
-        self, every_n_epochs: int, keep_last: int = 5, retain_every: int = 0
+        self,
+        every_n_epochs: int = 0,
+        every_n_train_steps: int = 0,
+        keep_last: int = 5,
+        retain_every: int = 0,
+        retain_every_steps: int = 0,
+        base_checkpoint: str | None = None,
     ) -> None:
         super().__init__()
-        self.every_n_epochs = max(1, int(every_n_epochs))
+        self.every_n_epochs = max(0, int(every_n_epochs))
+        self.every_n_train_steps = max(0, int(every_n_train_steps))
+        if self.every_n_epochs == 0 and self.every_n_train_steps == 0:
+            raise ValueError("At least one checkpoint interval must be positive")
         self.keep_last = max(1, int(keep_last))
         self.retain_every = max(0, int(retain_every))
+        self.retain_every_steps = max(0, int(retain_every_steps))
+        self.base_checkpoint = base_checkpoint
+        self._base_checkpoint_sha256: str | None = None
         self._last_global_step_saved = -1
 
+    def on_train_batch_end(
+        self,
+        trainer: Trainer,
+        pl_module: VitsModel,
+        outputs,
+        batch,
+        batch_idx: int,
+    ) -> None:
+        step = int(trainer.global_step)
+        if self.every_n_train_steps <= 0 or step <= 0:
+            return
+        if step % self.every_n_train_steps != 0:
+            return
+        if step == self._last_global_step_saved:
+            return
+        self._save_checkpoint(trainer, pl_module)
+
     def on_train_epoch_end(self, trainer: Trainer, pl_module: VitsModel) -> None:
+        if self.every_n_epochs <= 0:
+            return
         epoch = int(trainer.current_epoch)
         if epoch % self.every_n_epochs != 0 and (epoch + 1) != int(trainer.max_epochs):
             return
         if int(trainer.global_step) == self._last_global_step_saved:
             return
 
-        self._save_checkpoint(trainer)
+        self._save_checkpoint(trainer, pl_module)
 
-    def _save_checkpoint(self, trainer: Trainer) -> None:
+    def on_train_end(self, trainer: Trainer, pl_module: VitsModel) -> None:
+        if int(trainer.global_step) == self._last_global_step_saved:
+            return
+        self._save_checkpoint(trainer, pl_module)
+
+    def _save_checkpoint(self, trainer: Trainer, pl_module: VitsModel) -> None:
         if not getattr(trainer, "is_global_zero", True):
             return
 
@@ -790,12 +912,52 @@ class LatestCheckpointCallback(Callback):
         self._last_global_step_saved = int(trainer.global_step)
         self._update_last_checkpoint(checkpoint_path, checkpoint_dir / "last.ckpt")
         self._prune_old_checkpoints(checkpoint_dir)
+        if bool(getattr(pl_module.hparams, "voice_adapter_enabled", False)):
+            self._save_voice_adapter(trainer, pl_module)
         _LOGGER.info(
-            "Saved checkpoint %s; keeping last %s and retaining every %s epochs",
+            "Saved checkpoint %s; keeping last %s, retaining every %s epochs/%s steps",
             checkpoint_path,
             self.keep_last,
             self.retain_every or "disabled",
+            self.retain_every_steps or "disabled",
         )
+
+    def _save_voice_adapter(self, trainer: Trainer, pl_module: VitsModel) -> None:
+        adapter_dir = Path(trainer.log_dir or trainer.default_root_dir) / "voice_adapters"
+        step = int(trainer.global_step)
+        adapter_path = adapter_dir / f"step={step:09d}.safetensors"
+        metadata = {
+            "global_step": step,
+            "epoch": int(trainer.current_epoch),
+        }
+        if self.base_checkpoint:
+            base_path = Path(self.base_checkpoint).resolve()
+            metadata["base_checkpoint"] = str(base_path)
+            if self._base_checkpoint_sha256 is None:
+                self._base_checkpoint_sha256 = _sha256_file(base_path)
+            metadata["base_checkpoint_sha256"] = self._base_checkpoint_sha256
+
+        pl_module.export_voice_adapter(adapter_path, extra_metadata=metadata)
+        self._update_last_checkpoint(
+            adapter_path, adapter_dir / "last.safetensors"
+        )
+        metadata_path = adapter_path.with_suffix(".json")
+        self._update_last_checkpoint(metadata_path, adapter_dir / "last.json")
+        self._prune_old_adapters(adapter_dir)
+
+    def _prune_old_adapters(self, adapter_dir: Path) -> None:
+        adapters = []
+        for path in adapter_dir.glob("step=*.safetensors"):
+            match = self._ADAPTER_RE.match(path.name)
+            if match is not None:
+                adapters.append((int(match.group("step")), path))
+        adapters.sort(key=lambda item: item[0], reverse=True)
+
+        for step, path in adapters[self.keep_last :]:
+            if self._is_retained_step(step):
+                continue
+            path.unlink(missing_ok=True)
+            path.with_suffix(".json").unlink(missing_ok=True)
 
     @staticmethod
     def _update_last_checkpoint(checkpoint_path: Path, last_path: Path) -> None:
@@ -819,8 +981,8 @@ class LatestCheckpointCallback(Callback):
         checkpoints.sort(key=lambda item: (item[0], item[1]), reverse=True)
         recent_paths = {path for _, _, path in checkpoints[: self.keep_last]}
 
-        for epoch, _, path in checkpoints[self.keep_last :]:
-            if self._is_retained_epoch(epoch):
+        for epoch, step, path in checkpoints[self.keep_last :]:
+            if self._is_retained_epoch(epoch) or self._is_retained_step(step):
                 continue
             if path in recent_paths:
                 continue
@@ -831,6 +993,21 @@ class LatestCheckpointCallback(Callback):
 
     def _is_retained_epoch(self, epoch: int) -> bool:
         return self.retain_every > 0 and epoch > 0 and epoch % self.retain_every == 0
+
+    def _is_retained_step(self, step: int) -> bool:
+        return (
+            self.retain_every_steps > 0
+            and step > 0
+            and step % self.retain_every_steps == 0
+        )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _build_quality_bert_input(pl_module: VitsModel, utt):

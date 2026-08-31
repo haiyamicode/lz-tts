@@ -151,16 +151,28 @@ def test_reference_voice_routing_uses_model_capabilities() -> None:
 
     assert _voice_request_routes_to_voxcpm(**request, language="en-US", model=None)
     assert not _voice_request_routes_to_voxcpm(**request, language="bs-BA", model=None)
-    assert _voice_request_routes_to_voxcpm(
+    assert not _voice_request_routes_to_voxcpm(
         **request,
         language="en-US",
         model="sparrow",
     )
-    assert not _voice_request_routes_to_voxcpm(
+    assert _voice_request_routes_to_voxcpm(
         **request,
         language="bs-BA",
         model="voxcpm",
     )
+
+    explicit_voxcpm = BatchSynthesizeInputItem(
+        text="Ovo je test.",
+        model="voxcpm",
+        language="bs-BA",
+        language_override=True,
+        **request,
+    )
+    assert _batch_item_pipeline(explicit_voxcpm) == "voxcpm"
+    assert _shared_batch_from_items(
+        [(0, explicit_voxcpm, explicit_voxcpm.text or "")]
+    ).model == "voxcpm"
 
 
 def test_locale_routing_respects_native_adapter_and_reference_accents(

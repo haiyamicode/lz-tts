@@ -59,11 +59,6 @@ class SeedVCBatchRequest(BaseModel):
     max_chunk_batch_size: int = Field(1, ge=1, le=64)
 
 
-class SeedVCFindVoiceRequest(BaseModel):
-    reference_url: str
-    id: str
-
-
 class SeedVCBackend:
     """Embedded Seed-VC inference backend compatible with the standalone /vc API."""
 
@@ -186,17 +181,11 @@ class SeedVCBackend:
             )
 
             try:
-                from find_voice import find_base_voice  # pylint: disable=import-outside-toplevel
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                find_base_voice = None
-                _LOGGER.warning("Seed-VC find_voice unavailable: %s", exc)
-            try:
                 from glitch_remover import process_file  # pylint: disable=import-outside-toplevel
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 process_file = None
                 _LOGGER.warning("Seed-VC glitch remover unavailable: %s", exc)
 
-            self.find_base_voice = find_base_voice
             self.process_file = process_file
             _LOGGER.info(
                 "Seed-VC backend ready: sr=%d cached_embeddings=%d",
@@ -825,9 +814,3 @@ class SeedVCBackend:
             source_path.unlink(missing_ok=True)
             if wav_output_path is not None:
                 wav_output_path.unlink(missing_ok=True)
-
-    def find_voice(self, request: SeedVCFindVoiceRequest, reference_path: Path) -> str:
-        if self.find_base_voice is None:
-            raise RuntimeError("Seed-VC find_voice support is unavailable")
-        with self.lock, _temporary_cwd(self.root):
-            return str(self.find_base_voice(str(reference_path)))
