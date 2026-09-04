@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import logging
 import os
 import socket
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,6 +23,8 @@ from .api.server import InferenceOperationError, LzTtsInferenceSession
 _LOGGER = logging.getLogger(__name__)
 TASK_TYPES = ("tts-synthesis", "voice-enhance")
 _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
+_CALLBACK_FLUSH_INTERVAL_SECONDS = 2.0
+_CALLBACK_MAX_ATTEMPTS = 3
 
 
 class ProtocolError(RuntimeError):
@@ -206,6 +212,165 @@ class _LeaseWork:
     started_at: float
 
 
+def _callback_token(lease: dict[str, Any]) -> str | None:
+    """Extract the opaque completion token from a lease payload, if any."""
+    payload = lease.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    callback = payload.get("callback")
+    if not isinstance(callback, dict):
+        return None
+    token = callback.get("token")
+    return token if isinstance(token, str) and token else None
+
+
+def _token_project_id(token: str) -> str | None:
+    """Best-effort decode of the public projectId segment of a callback token.
+
+    Used purely to partition ack batches per project; verification happens
+    server-side.
+    """
+    body = token.split(".", 1)[0]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    project_id = claims.get("projectId") if isinstance(claims, dict) else None
+    return project_id if isinstance(project_id, str) and project_id else None
+
+
+def _measure_audio_duration(audio: bytes) -> float | None:
+    """Measure audio duration in seconds via ffprobe; None when unavailable."""
+    if not audio:
+        return 0.0
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as handle:
+            handle.write(audio)
+            path = handle.name
+    except OSError:
+        _LOGGER.exception("Failed to buffer audio for duration measurement")
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            _LOGGER.warning(
+                "ffprobe duration measurement failed: %s",
+                (result.stderr or result.stdout).strip()[:300],
+            )
+            return None
+        return float(result.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+        _LOGGER.warning("Audio duration measurement unavailable: %s", error)
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+class SynthesisAckBatcher:
+    """Batches synthesis completion acks and flushes them per project.
+
+    Acks are partitioned by projectId (one request per project per flush) so a
+    project's acks are applied strictly in order and never conflict with each
+    other. The API applies acks idempotently, so duplicate or dropped batches
+    (healed by the API's reconciliation) are safe.
+    """
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        *,
+        flush_interval: float = _CALLBACK_FLUSH_INTERVAL_SECONDS,
+    ) -> None:
+        self._client = client
+        self._endpoint = endpoint
+        self._flush_interval = flush_interval
+        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._flush_lock = asyncio.Lock()
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        await self.flush()
+
+    def enqueue(self, item: dict[str, Any]) -> None:
+        self._queue.put_nowait(item)
+
+    async def _run(self) -> None:
+        while True:
+            await asyncio.sleep(self._flush_interval)
+            await self.flush()
+
+    async def flush(self) -> None:
+        async with self._flush_lock:
+            items: list[dict[str, Any]] = []
+            while not self._queue.empty():
+                items.append(self._queue.get_nowait())
+            if not items:
+                return
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for item in items:
+                token = item.get("token", "")
+                key = _token_project_id(token) if isinstance(token, str) else None
+                groups.setdefault(key or f"run:{item.get('runId')}", []).append(item)
+            results = await asyncio.gather(
+                *(self._post_group(key, group) for key, group in groups.items()),
+                return_exceptions=True,
+            )
+            for key, outcome in zip(groups, results, strict=True):
+                if isinstance(outcome, BaseException):
+                    _LOGGER.error(
+                        "Dropping %d synthesis acks for %s after retries: %s",
+                        len(groups[key]),
+                        key,
+                        outcome,
+                    )
+
+    async def _post_group(self, key: str, items: list[dict[str, Any]]) -> None:
+        for attempt in range(_CALLBACK_MAX_ATTEMPTS):
+            try:
+                response = await self._client.post(self._endpoint, json={"items": items})
+                if response.is_error:
+                    raise ProtocolError(
+                        f"Synthesis ack batch failed ({response.status_code}): "
+                        f"{response.text[:500]}",
+                        response.status_code,
+                    )
+                _LOGGER.info(
+                    "Synthesis ack batch sent key=%s items=%d",
+                    key,
+                    len(items),
+                )
+                return
+            except Exception:
+                if attempt == _CALLBACK_MAX_ATTEMPTS - 1:
+                    raise
+                await asyncio.sleep(1.0 * (attempt + 1))
+
+
 def _prepare_lease(taskflow: TaskflowWorker, lease: dict[str, Any]) -> _LeaseWork:
     lease_id = lease["id"]
     run_id = lease.get("runId")
@@ -239,6 +404,7 @@ async def _finish_lease(
     taskflow: TaskflowWorker,
     work: _LeaseWork,
     outcome: Any,
+    acks: SynthesisAckBatcher | None = None,
 ) -> None:
     lease = work.lease
     lease_id = lease["id"]
@@ -276,15 +442,27 @@ async def _finish_lease(
         if not audio:
             raise RuntimeError("LZ-TTS returned an empty audio artifact")
         await taskflow.upload(lease, artifact_id, audio)
-        await taskflow.complete(
-            lease,
-            {
-                "kind": "artifact",
-                "artifactId": artifact_id,
-                "bytes": len(audio),
-                "contentType": result.content_type or "application/octet-stream",
-            },
-        )
+        duration = await asyncio.to_thread(_measure_audio_duration, audio)
+        completion: dict[str, Any] = {
+            "kind": "artifact",
+            "artifactId": artifact_id,
+            "bytes": len(audio),
+            "contentType": result.content_type or "application/octet-stream",
+        }
+        if duration is not None:
+            completion["duration"] = duration
+        await taskflow.complete(lease, completion)
+        token = _callback_token(lease)
+        if token and acks is not None:
+            acks.enqueue(
+                {
+                    "token": token,
+                    "runId": run_id,
+                    "artifactId": artifact_id,
+                    "ok": True,
+                    **({"duration": duration} if duration is not None else {}),
+                }
+            )
         _LOGGER.info(
             "LZ-TTS task completed type=%s lease=%s run=%s operation=%s kind=artifact bytes=%d "
             "wall_seconds=%.3f",
@@ -308,6 +486,26 @@ async def _finish_lease(
             retry,
             str(error.detail)[:1000],
         )
+        token = _callback_token(lease)
+        payload_artifact_id = lease.get("payload", {}).get("artifactId")
+        if (
+            token
+            and not retry
+            and acks is not None
+            and isinstance(payload_artifact_id, str)
+            and payload_artifact_id
+        ):
+            # Only terminal failures ack immediately; retriable failures get a
+            # fresh attempt (and eventually a terminal ack or a run.failed event).
+            acks.enqueue(
+                {
+                    "token": token,
+                    "runId": run_id,
+                    "artifactId": payload_artifact_id,
+                    "ok": False,
+                    "error": str(error)[:2000],
+                }
+            )
         try:
             await taskflow.fail(lease, error, retry=retry)
         except Exception:
@@ -344,6 +542,7 @@ async def _process_leases(
     taskflow: TaskflowWorker,
     inference: LzTtsInferenceSession,
     leases: list[dict[str, Any]],
+    acks: SynthesisAckBatcher | None = None,
 ) -> None:
     works: list[_LeaseWork] = []
     for lease in leases:
@@ -379,7 +578,7 @@ async def _process_leases(
         outcomes = [error] * len(works)
     await asyncio.gather(
         *(
-            _finish_lease(taskflow, work, outcome)
+            _finish_lease(taskflow, work, outcome, acks)
             for work, outcome in zip(works, outcomes, strict=True)
         )
     )
@@ -389,8 +588,9 @@ async def _process_lease(
     taskflow: TaskflowWorker,
     inference: LzTtsInferenceSession,
     lease: dict[str, Any],
+    acks: SynthesisAckBatcher | None = None,
 ) -> None:
-    await _process_leases(taskflow, inference, [lease])
+    await _process_leases(taskflow, inference, [lease], acks)
 
 
 async def _pull_task_batch(taskflow: TaskflowWorker) -> list[dict[str, Any]]:
@@ -424,6 +624,7 @@ async def _serve_taskflow(
     taskflow: TaskflowWorker,
     inference: LzTtsInferenceSession,
     synthesis_capabilities: dict[str, Any],
+    acks: SynthesisAckBatcher | None = None,
 ) -> None:
     while True:
         heartbeat_task: asyncio.Task[None] | None = None
@@ -438,7 +639,7 @@ async def _serve_taskflow(
             while not connection_lost.is_set():
                 leases = await _pull_task_batch(taskflow)
                 if leases:
-                    await _process_leases(taskflow, inference, leases)
+                    await _process_leases(taskflow, inference, leases, acks)
         except ProtocolError as error:
             if error.status_code in {401, 403, 404}:
                 taskflow.session_id = None
@@ -468,10 +669,16 @@ async def run_worker() -> None:
     )
     inference = LzTtsInferenceSession()
     await inference.start()
+    acks = SynthesisAckBatcher(
+        taskflow._client,
+        lazybird_url.rstrip("/") + "/internal/synthesis-events/v1/batch",
+    )
+    acks.start()
     try:
         synthesis_capabilities = inference.synthesis_capabilities()
-        await _serve_taskflow(taskflow, inference, synthesis_capabilities)
+        await _serve_taskflow(taskflow, inference, synthesis_capabilities, acks)
     finally:
+        await acks.stop()
         await taskflow.close()
         await inference.close()
 
