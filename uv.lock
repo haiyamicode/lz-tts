@@ -646,7 +646,7 @@ wheels = [
 [[package]]
 name = "ctc-forced-aligner"
 version = "0.3.0"
-source = { git = "https://github.com/MahmoudAshraf97/ctc-forced-aligner.git#11855d1de76af2b490dd2e8e2db2661805ae90a0" }
+source = { path = "data/runtime-wheels/ctc_forced_aligner-0.3.0-cp310-cp310-linux_x86_64.whl" }
 dependencies = [
     { name = "nltk" },
     { name = "torch" },
@@ -655,6 +655,24 @@ dependencies = [
     { name = "unidecode" },
     { name = "uroman" },
 ]
+wheels = [
+    { filename = "ctc_forced_aligner-0.3.0-cp310-cp310-linux_x86_64.whl", hash = "sha256:f094dc8510712cfdb4f9f50f58340f0ad6384c47d555b89563fcb7619e1e9874" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "nltk" },
+    { name = "pre-commit", marker = "extra == 'dev'" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = "==7.*" },
+    { name = "ruff", marker = "extra == 'dev'" },
+    { name = "torch" },
+    { name = "torchaudio", marker = "extra == 'dev'" },
+    { name = "torchcodec" },
+    { name = "transformers", specifier = ">=4.34" },
+    { name = "unidecode" },
+    { name = "uroman" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "cycler"
@@ -989,7 +1007,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/62/3d/8656290e2d537ef66
 [[package]]
 name = "epitran"
 version = "1.35.2"
-source = { git = "https://github.com/dmort27/epitran.git?rev=3ed96fd7d10f6f5eec75ba1deb10700fcaafe43f#3ed96fd7d10f6f5eec75ba1deb10700fcaafe43f" }
+source = { path = "data/runtime-wheels/epitran-1.35.2-py3-none-any.whl" }
 dependencies = [
     { name = "jamo" },
     { name = "marisa-trie" },
@@ -997,6 +1015,20 @@ dependencies = [
     { name = "regex" },
     { name = "requests" },
 ]
+wheels = [
+    { filename = "epitran-1.35.2-py3-none-any.whl", hash = "sha256:1651f82eb7f10c3a32c7721a19cefe19106f73a6761960a97db848a6f2fa5267" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "jamo" },
+    { name = "marisa-trie" },
+    { name = "panphon", specifier = ">=0.20" },
+    { name = "regex" },
+    { name = "requests" },
+    { name = "ruff", marker = "extra == 'dev'" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "exceptiongroup"
@@ -2223,6 +2255,7 @@ dependencies = [
     { name = "numpy" },
     { name = "onnxruntime-gpu" },
     { name = "peft" },
+    { name = "pesq" },
     { name = "phonemizer" },
     { name = "piper-phonemize" },
     { name = "praat-parselmouth" },
@@ -2262,6 +2295,7 @@ dependencies = [
     { name = "unidic-lite" },
     { name = "uvicorn" },
     { name = "vocos" },
+    { name = "webrtcvad" },
     { name = "wget" },
     { name = "wordfreq" },
     { name = "xxhash" },
@@ -2284,7 +2318,7 @@ requires-dist = [
     { name = "cached-path", specifier = ">=1.8.10" },
     { name = "cn2an", specifier = "==0.5.22" },
     { name = "conformer", specifier = ">=0.3.2" },
-    { name = "ctc-forced-aligner", git = "https://github.com/MahmoudAshraf97/ctc-forced-aligner.git" },
+    { name = "ctc-forced-aligner", path = "data/runtime-wheels/ctc_forced_aligner-0.3.0-cp310-cp310-linux_x86_64.whl" },
     { name = "datasets", specifier = ">=5.0.0" },
     { name = "defusedxml", specifier = ">=0.7.1,<0.8" },
     { name = "demucs", specifier = ">=4.0.1" },
@@ -2292,7 +2326,7 @@ requires-dist = [
     { name = "diffusers", specifier = ">=0.37.1" },
     { name = "edge-tts", specifier = ">=7.2.8" },
     { name = "eng-to-ipa", specifier = "==0.0.2" },
-    { name = "epitran", git = "https://github.com/dmort27/epitran.git?rev=3ed96fd7d10f6f5eec75ba1deb10700fcaafe43f" },
+    { name = "epitran", path = "data/runtime-wheels/epitran-1.35.2-py3-none-any.whl" },
     { name = "fastapi", specifier = ">=0.115.0,<0.116" },
     { name = "ffmpeg-normalize", specifier = ">=1.37.8" },
     { name = "ffmpeg-python", specifier = ">=0.2.0" },
@@ -2322,20 +2356,21 @@ requires-dist = [
     { name = "mecab-ko-dic", specifier = ">=1.0.0,<1.1" },
     { name = "mecab-python3", specifier = ">=1.0.0,<1.1" },
     { name = "modelscope", specifier = ">=1.37.1" },
-    { name = "monotonic-align", specifier = ">=1.0.0" },
+    { name = "monotonic-align", path = "data/runtime-wheels/monotonic_align-1.0.0-cp310-cp310-linux_x86_64.whl" },
     { name = "munch", specifier = ">=4.0.0" },
     { name = "nano-parakeet", specifier = ">=0.2.1" },
     { name = "numpy", specifier = "==1.23.5" },
     { name = "onnxruntime-gpu", specifier = ">=1.23.2" },
     { name = "peft", specifier = ">=0.19.1" },
+    { name = "pesq", path = "data/runtime-wheels/pesq-0.0.4-cp310-cp310-linux_x86_64.whl" },
     { name = "phonemizer", specifier = ">=3.3.0" },
-    { name = "piper-phonemize", directory = "src/phonemizer" },
+    { name = "piper-phonemize", path = "src/phonemizer/dist/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl" },
     { name = "praat-parselmouth", specifier = ">=0.4.2" },
     { name = "pyarrow", specifier = ">=23.0.0" },
-    { name = "pycld2", specifier = "==0.41" },
+    { name = "pycld2", path = "data/runtime-wheels/pycld2-0.41-cp310-cp310-linux_x86_64.whl" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydub", specifier = ">=0.25.1" },
-    { name = "pyicu", specifier = ">=2.16.2" },
+    { name = "pyicu", path = "data/runtime-wheels/pyicu-2.16.2-cp310-cp310-linux_x86_64.whl" },
     { name = "pykakasi", specifier = ">=2.3.0,<2.4" },
     { name = "pypinyin", specifier = "==0.50.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
@@ -2367,6 +2402,7 @@ requires-dist = [
     { name = "unidic-lite", specifier = "==1.0.8" },
     { name = "uvicorn", specifier = ">=0.34.0,<0.35" },
     { name = "vocos", specifier = ">=0.1.0" },
+    { name = "webrtcvad", path = "data/runtime-wheels/webrtcvad-2.0.10-cp310-cp310-linux_x86_64.whl" },
     { name = "wget", specifier = ">=3.2" },
     { name = "wordfreq", specifier = ">=3.1.0,<3.2" },
     { name = "xxhash", specifier = ">=3.0.0" },
@@ -2531,8 +2567,10 @@ wheels = [
 [[package]]
 name = "monotonic-align"
 version = "1.0.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/2e/fc/814cbd78dd57880267355179ef74ba24d12daeb68776221f58072ac70643/monotonic_align-1.0.0.tar.gz", hash = "sha256:10bed2cf6f5f3cab716d1d14064cee4c759cd06e0eba63d199306f0c6839ffb1", size = 4807, upload-time = "2023-03-09T03:10:06.281Z" }
+source = { path = "data/runtime-wheels/monotonic_align-1.0.0-cp310-cp310-linux_x86_64.whl" }
+wheels = [
+    { filename = "monotonic_align-1.0.0-cp310-cp310-linux_x86_64.whl", hash = "sha256:0e7b371c1dc567ea380d35b09606642620d9bfb0323ce9a804164f69a7830db0" },
+]
 
 [[package]]
 name = "more-itertools"
@@ -3081,8 +3119,10 @@ wheels = [
 [[package]]
 name = "pesq"
 version = "0.0.4"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/22/e6/f8bdcef3238ac10fb3ce37d150e9b03a152d971febd681f088c6e5e17d8e/pesq-0.0.4.tar.gz", hash = "sha256:b724b28f73fb638522982bd68e8c3c0957e2f45210639a460233b17aa7fc890b", size = 38702, upload-time = "2022-05-17T14:15:26.301Z" }
+source = { path = "data/runtime-wheels/pesq-0.0.4-cp310-cp310-linux_x86_64.whl" }
+wheels = [
+    { filename = "pesq-0.0.4-cp310-cp310-linux_x86_64.whl", hash = "sha256:66766e1aee47fb3bd6309e7b8ae437de9db811d663439866b9c3cf5e96355544" },
+]
 
 [[package]]
 name = "pexpect"
@@ -3134,12 +3174,10 @@ wheels = [
 [[package]]
 name = "piper-phonemize"
 version = "1.2.0"
-source = { directory = "src/phonemizer" }
-
-[package.metadata]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pybind11", specifier = ">=3.0.1" }]
+source = { path = "src/phonemizer/dist/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl" }
+wheels = [
+    { filename = "piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl", hash = "sha256:69595169db7129c0b88ff39cebceabfaced4dabccab9a7854b3aa9f34b4a6090" },
+]
 
 [[package]]
 name = "plac"
@@ -3348,8 +3386,10 @@ wheels = [
 [[package]]
 name = "pycld2"
 version = "0.41"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/21/d2/8b0def84a53c88d0eb27c67b05269fbd16ad68df8c78849e7b5d65e6aec3/pycld2-0.41.tar.gz", hash = "sha256:a42f6e974df8fdd70685c2baa8a9f523069a260e1140ce604fb9f1fb6c3064df", size = 41405351, upload-time = "2019-10-14T15:23:39.13Z" }
+source = { path = "data/runtime-wheels/pycld2-0.41-cp310-cp310-linux_x86_64.whl" }
+wheels = [
+    { filename = "pycld2-0.41-cp310-cp310-linux_x86_64.whl", hash = "sha256:1d91ce6eb6badf06086eaa62011c035ce5505acee06aeefbab68b06ca81be701" },
+]
 
 [[package]]
 name = "pycparser"
@@ -3452,8 +3492,10 @@ wheels = [
 [[package]]
 name = "pyicu"
 version = "2.16.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/b7/d5/354eb1bf84dcf4ab0bfa46f0620ecf68fe313bb082c26872ceb7a5021f94/pyicu-2.16.2.tar.gz", hash = "sha256:006d51e24b5ec76df6ec2130f3dde269c51db8b8cfebb7d45a427dde0d10aa52", size = 268223, upload-time = "2026-03-20T21:58:30.794Z" }
+source = { path = "data/runtime-wheels/pyicu-2.16.2-cp310-cp310-linux_x86_64.whl" }
+wheels = [
+    { filename = "pyicu-2.16.2-cp310-cp310-linux_x86_64.whl", hash = "sha256:54e61baa1d12500434d0c7569c0d698caf982106e907cbd3cf0c42a135037dcd" },
+]
 
 [[package]]
 name = "pykakasi"
@@ -4768,8 +4810,21 @@ wheels = [
 [[package]]
 name = "webrtcvad"
 version = "2.0.10"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/89/34/e2de2d97f3288512b9ea56f92e7452f8207eb5a0096500badf9dfd48f5e6/webrtcvad-2.0.10.tar.gz", hash = "sha256:f1bed2fb25b63fb7b1a55d64090c993c9c9167b28485ae0bcdd81cf6ede96aea", size = 66156, upload-time = "2017-01-07T23:05:18.732Z" }
+source = { path = "data/runtime-wheels/webrtcvad-2.0.10-cp310-cp310-linux_x86_64.whl" }
+wheels = [
+    { filename = "webrtcvad-2.0.10-cp310-cp310-linux_x86_64.whl", hash = "sha256:8c7c63153c9f3d096d56711d9c8f7877954c7828bd262d2b68df07c557e72664" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "check-manifest", marker = "extra == 'dev'" },
+    { name = "memory-profiler", marker = "extra == 'dev'" },
+    { name = "nose", marker = "extra == 'dev'" },
+    { name = "psutil", marker = "extra == 'dev'" },
+    { name = "unittest2", marker = "extra == 'dev'" },
+    { name = "zest-releaser", marker = "extra == 'dev'" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "werkzeug"

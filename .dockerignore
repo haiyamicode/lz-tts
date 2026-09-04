@@ -1,0 +1,42 @@
+# Never bake secrets or local state into the image
+# (local/server.json is re-included below: no secrets, baked into the image)
+.env
+local/*
+!local/server.json
+data/
+checkpoints/
+output/
+outputs/
+cache/
+dist/
+build/
+wheels/
+
+# Dev environments and tooling
+.venv/
+.git/
+.github/
+.claude/
+.kilo/
+.vscode/
+.idea/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[oc]
+*.egg-info/
+
+# phonemizer build artifacts — keep the wheel: pyproject [tool.uv.sources]
+# points uv sync at it, and there is no compiler in the image to rebuild it
+src/phonemizer/dist/*
+!src/phonemizer/dist/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl
+src/phonemizer/.venv/
+src/phonemizer/build/
+
+# Misc
+AGENTS.md
+CLAUDE.md
+Dockerfile
+Makefile
+docker/*
+!docker/entrypoint.sh

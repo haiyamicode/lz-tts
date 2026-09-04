@@ -20,6 +20,16 @@ After modifying C++ code in `src/phonemizer/src/`:
 cd /mnt/data/lz-tts/src/phonemizer && uv build
 cd /mnt/data/lz-tts && uv pip install --reinstall src/phonemizer/dist/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl
 ```
+The built wheel in `src/phonemizer/dist/` is what `uv sync` (and the Docker
+image bootstrap) installs — no compiler exists in the container.
+
+# Prebuilt runtime wheels (Docker bootstrap)
+C extensions without PyPI wheels (pyicu, pycld2, monotonic-align) are prebuilt
+into `data/runtime-wheels/` and referenced from `[tool.uv.sources]`, same as
+flash-attn. They are uploaded to S3 (`scripts/upload_data.py --model
+runtime-wheels`) and downloaded at Docker bootstrap before `uv sync`. To add a
+new sdist-only dependency: build a cp310 linux wheel into
+`data/runtime-wheels/`, add a `[tool.uv.sources]` entry, `uv lock`, upload.
 
 # NO FAKE TESTS
 

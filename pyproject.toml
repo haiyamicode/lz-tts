@@ -63,6 +63,13 @@ dependencies = [
     "descript-audio-codec==1.0.0",
     "h5py>=3.16.0",
     "resemblyzer>=0.1.4",
+    # Transitive via resemblyzer; pinned + sourced to the prebuilt wheel so the
+    # container can install it without a compiler ([tool.uv.sources] only
+    # applies to direct dependencies)
+    "webrtcvad==2.0.10",
+    # Same as webrtcvad: transitive C extension (via bigvgan) pinned to the
+    # prebuilt wheel so containers install without a compiler
+    "pesq==0.0.4",
     "cn2an==0.5.22",
     "anyascii==0.3.2",
     "eng-to-ipa==0.0.2",
@@ -134,10 +141,17 @@ flash-attn = ["packaging", { requirement = "torch", match-runtime = true }]
 flash-attn = { MAX_JOBS = "24" }
 
 [tool.uv.sources]
-piper-phonemize = { path = "./src/phonemizer" }
+piper-phonemize = { path = "./src/phonemizer/dist/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl" }
 flash-attn = { path = "data/runtime-wheels/flash_attn-2.8.3.post1-cp310-cp310-linux_x86_64.whl" }
-epitran = { git = "https://github.com/dmort27/epitran.git", rev = "3ed96fd7d10f6f5eec75ba1deb10700fcaafe43f" }
-ctc-forced-aligner = { git = "https://github.com/MahmoudAshraf97/ctc-forced-aligner.git" }
+# Prebuilt wheels (no PyPI wheels exist for these; see data/runtime-wheels/ and
+# scripts/upload_data.py). Git deps are prebuilt too so containers need no git.
+pyicu = { path = "data/runtime-wheels/pyicu-2.16.2-cp310-cp310-linux_x86_64.whl" }
+pycld2 = { path = "data/runtime-wheels/pycld2-0.41-cp310-cp310-linux_x86_64.whl" }
+monotonic-align = { path = "data/runtime-wheels/monotonic_align-1.0.0-cp310-cp310-linux_x86_64.whl" }
+epitran = { path = "data/runtime-wheels/epitran-1.35.2-py3-none-any.whl" }
+ctc-forced-aligner = { path = "data/runtime-wheels/ctc_forced_aligner-0.3.0-cp310-cp310-linux_x86_64.whl" }
+webrtcvad = { path = "data/runtime-wheels/webrtcvad-2.0.10-cp310-cp310-linux_x86_64.whl" }
+pesq = { path = "data/runtime-wheels/pesq-0.0.4-cp310-cp310-linux_x86_64.whl" }
 
 [dependency-groups]
 dev = [
