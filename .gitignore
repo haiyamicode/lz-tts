@@ -25,5 +25,9 @@ checkpoints
 .vscode
 .idea
 
+# Local agent setup
+AGENTS.md
+CLAUDE.md
+
 # Environment variables
 .env
