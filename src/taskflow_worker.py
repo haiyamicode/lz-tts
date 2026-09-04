@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
-from .api.server import InferenceOperationError, LzTtsInferenceSession
+from .api.server import InferenceOperationError, LzTtsInferenceSession, _env_bool, create_app
 
 _LOGGER = logging.getLogger(__name__)
 TASK_TYPES = ("tts-synthesis", "voice-enhance")
@@ -656,6 +656,22 @@ async def _serve_taskflow(
         await asyncio.sleep(2)
 
 
+def _start_dev_http_server(inference: LzTtsInferenceSession) -> tuple[Any, asyncio.Task] | None:
+    """Optionally serve the development /task/sync adapter in-process.
+
+    Disabled by default; enable explicitly with LZ_TTS_DEV_HTTP=1.
+    """
+    if not _env_bool("LZ_TTS_DEV_HTTP", False):
+        return None
+    import uvicorn
+
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
+    app = create_app(session=inference)
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
+    return server, asyncio.create_task(server.serve())
+
+
 async def run_worker() -> None:
     load_dotenv()
     worker_token = os.environ.get("TASKFLOW_WORKER_TOKEN", "").strip()
@@ -670,6 +686,7 @@ async def run_worker() -> None:
     )
     inference = LzTtsInferenceSession()
     await inference.start()
+    dev_http = _start_dev_http_server(inference)
     acks = SynthesisAckBatcher(
         taskflow._client,
         lazybird_url.rstrip("/") + "/internal/synthesis-events/v1/batch",
@@ -679,6 +696,11 @@ async def run_worker() -> None:
         synthesis_capabilities = inference.synthesis_capabilities()
         await _serve_taskflow(taskflow, inference, synthesis_capabilities, acks)
     finally:
+        if dev_http is not None:
+            dev_server, dev_server_task = dev_http
+            dev_server.should_exit = True
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await dev_server_task
         await acks.stop()
         await taskflow.close()
         await inference.close()

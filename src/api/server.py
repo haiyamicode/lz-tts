@@ -4583,10 +4583,10 @@ class SyncTaskRequest(BaseModel):
     input: SyncTaskInput
 
 
-def create_app(config: ServerConfig | None = None) -> FastAPI:
+def create_app(config: ServerConfig | None = None, session: LzTtsInferenceSession | None = None) -> FastAPI:
     """Create the development-only synchronous task adapter."""
     global _server_config
-    session = LzTtsInferenceSession(config)
+    session = session or LzTtsInferenceSession(config)
     _server_config = session.config
 
     @contextlib.asynccontextmanager
