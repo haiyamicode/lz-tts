@@ -2356,21 +2356,21 @@ requires-dist = [
     { name = "mecab-ko-dic", specifier = ">=1.0.0,<1.1" },
     { name = "mecab-python3", specifier = ">=1.0.0,<1.1" },
     { name = "modelscope", specifier = ">=1.37.1" },
-    { name = "monotonic-align", path = "data/runtime-wheels/monotonic_align-1.0.0-cp310-cp310-linux_x86_64.whl" },
+    { name = "monotonic-align", specifier = ">=1.0.0" },
     { name = "munch", specifier = ">=4.0.0" },
     { name = "nano-parakeet", specifier = ">=0.2.1" },
     { name = "numpy", specifier = "==1.23.5" },
     { name = "onnxruntime-gpu", specifier = ">=1.23.2" },
     { name = "peft", specifier = ">=0.19.1" },
-    { name = "pesq", path = "data/runtime-wheels/pesq-0.0.4-cp310-cp310-linux_x86_64.whl" },
+    { name = "pesq", specifier = "==0.0.4" },
     { name = "phonemizer", specifier = ">=3.3.0" },
     { name = "piper-phonemize", path = "data/runtime-wheels/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl" },
     { name = "praat-parselmouth", specifier = ">=0.4.2" },
     { name = "pyarrow", specifier = ">=23.0.0" },
-    { name = "pycld2", path = "data/runtime-wheels/pycld2-0.41-cp310-cp310-linux_x86_64.whl" },
+    { name = "pycld2", specifier = ">=0.42" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydub", specifier = ">=0.25.1" },
-    { name = "pyicu", path = "data/runtime-wheels/pyicu-2.16.2-cp310-cp310-linux_x86_64.whl" },
+    { name = "pyicu", specifier = ">=2.16.2" },
     { name = "pykakasi", specifier = ">=2.3.0,<2.4" },
     { name = "pypinyin", specifier = "==0.50.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
@@ -2402,7 +2402,7 @@ requires-dist = [
     { name = "unidic-lite", specifier = "==1.0.8" },
     { name = "uvicorn", specifier = ">=0.34.0,<0.35" },
     { name = "vocos", specifier = ">=0.1.0" },
-    { name = "webrtcvad", path = "data/runtime-wheels/webrtcvad-2.0.10-cp310-cp310-linux_x86_64.whl" },
+    { name = "webrtcvad", specifier = "==2.0.10" },
     { name = "wget", specifier = ">=3.2" },
     { name = "wordfreq", specifier = ">=3.1.0,<3.2" },
     { name = "xxhash", specifier = ">=3.0.0" },
@@ -2567,10 +2567,8 @@ wheels = [
 [[package]]
 name = "monotonic-align"
 version = "1.0.0"
-source = { path = "data/runtime-wheels/monotonic_align-1.0.0-cp310-cp310-linux_x86_64.whl" }
-wheels = [
-    { filename = "monotonic_align-1.0.0-cp310-cp310-linux_x86_64.whl", hash = "sha256:0e7b371c1dc567ea380d35b09606642620d9bfb0323ce9a804164f69a7830db0" },
-]
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2e/fc/814cbd78dd57880267355179ef74ba24d12daeb68776221f58072ac70643/monotonic_align-1.0.0.tar.gz", hash = "sha256:10bed2cf6f5f3cab716d1d14064cee4c759cd06e0eba63d199306f0c6839ffb1", size = 4807, upload-time = "2023-03-09T03:10:06.281Z" }
 
 [[package]]
 name = "more-itertools"
@@ -3119,10 +3117,8 @@ wheels = [
 [[package]]
 name = "pesq"
 version = "0.0.4"
-source = { path = "data/runtime-wheels/pesq-0.0.4-cp310-cp310-linux_x86_64.whl" }
-wheels = [
-    { filename = "pesq-0.0.4-cp310-cp310-linux_x86_64.whl", hash = "sha256:66766e1aee47fb3bd6309e7b8ae437de9db811d663439866b9c3cf5e96355544" },
-]
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/22/e6/f8bdcef3238ac10fb3ce37d150e9b03a152d971febd681f088c6e5e17d8e/pesq-0.0.4.tar.gz", hash = "sha256:b724b28f73fb638522982bd68e8c3c0957e2f45210639a460233b17aa7fc890b", size = 38702, upload-time = "2022-05-17T14:15:26.301Z" }
 
 [[package]]
 name = "pexpect"
@@ -3385,10 +3381,17 @@ wheels = [
 
 [[package]]
 name = "pycld2"
-version = "0.41"
-source = { path = "data/runtime-wheels/pycld2-0.41-cp310-cp310-linux_x86_64.whl" }
+version = "0.42"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/89/81/d4d348e224ac0994234992c6d5fb3a78cc9b660337d5bd17c67fac1baf6a/pycld2-0.42.tar.gz", hash = "sha256:5188084c97f99e896cf464057c64f6b0f91f68d111182dceb5bcfe487d7f4c0f", size = 41372203, upload-time = "2025-03-28T06:47:10.803Z" }
 wheels = [
-    { filename = "pycld2-0.41-cp310-cp310-linux_x86_64.whl", hash = "sha256:1d91ce6eb6badf06086eaa62011c035ce5505acee06aeefbab68b06ca81be701" },
+    { url = "https://files.pythonhosted.org/packages/0a/f2/7f9b04717a9f2592b180d5e34b94e29b5e176ffca60effaa058b34d503af/pycld2-0.42-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:0770612afeeab2e5ca72889553e8e7850b865f9b3ca7b2a783e2a43fb1792a26", size = 4825692, upload-time = "2025-03-28T06:45:20.001Z" },
+    { url = "https://files.pythonhosted.org/packages/99/e7/0a245c375b41ad3533e6b6110d9459124d7e7432dc8dcd4a29fdf8e284c8/pycld2-0.42-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ce384bb927415a60ef69ff07781491e5305b80d4ae995a1948d396b3b22f564c", size = 9876867, upload-time = "2025-03-28T06:45:22.21Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/87/12150b7d7c668e7b77252cb0cb5d891b43951f40215394e608a40b96ccd4/pycld2-0.42-cp310-cp310-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:f6e3460474f1de15932facc444dc2ba9d391fb97b11c0b48eeab15e58488b152", size = 9842102, upload-time = "2025-03-28T06:45:24.971Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/7a/06f9ba1976fc0a7b398fafbb590b399d60fe6d643fc9d10c6170135ed02e/pycld2-0.42-cp310-cp310-musllinux_1_2_i686.whl", hash = "sha256:7073d0fe8803045286e96de2c48553f1de32c85ca765108eb379ab871bd4d6e2", size = 10985055, upload-time = "2025-03-28T06:45:27.376Z" },
+    { url = "https://files.pythonhosted.org/packages/56/da/a28226f6eb0cfd5368619469f62f3909f8b41f7ba43f78c5112f7319d860/pycld2-0.42-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:13f3dc267e02710dc8bf4a87a547e24768982a8f415921b54936a2925d45a31d", size = 10909331, upload-time = "2025-03-28T06:45:29.761Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/30/0196b4e40fe1a8ff4129828370d500b66ea6f8e5cb7982553120a41382b0/pycld2-0.42-cp310-cp310-win32.whl", hash = "sha256:67b71c0448a0ce48ac60b5c2c1646afbada573f46f027a61bb399e56c1ad18d9", size = 4749125, upload-time = "2025-03-28T06:45:32.013Z" },
+    { url = "https://files.pythonhosted.org/packages/14/71/a02a2d57f169e80247fec316cf441915f2fde9d33a5972e33e65ae74e001/pycld2-0.42-cp310-cp310-win_amd64.whl", hash = "sha256:8880f0495845e2646546f369cc2a6897f8c2d0974d4a9639d500fa10f7f28020", size = 4755325, upload-time = "2025-03-28T06:45:34.111Z" },
 ]
 
 [[package]]
@@ -3492,10 +3495,8 @@ wheels = [
 [[package]]
 name = "pyicu"
 version = "2.16.2"
-source = { path = "data/runtime-wheels/pyicu-2.16.2-cp310-cp310-linux_x86_64.whl" }
-wheels = [
-    { filename = "pyicu-2.16.2-cp310-cp310-linux_x86_64.whl", hash = "sha256:54e61baa1d12500434d0c7569c0d698caf982106e907cbd3cf0c42a135037dcd" },
-]
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b7/d5/354eb1bf84dcf4ab0bfa46f0620ecf68fe313bb082c26872ceb7a5021f94/pyicu-2.16.2.tar.gz", hash = "sha256:006d51e24b5ec76df6ec2130f3dde269c51db8b8cfebb7d45a427dde0d10aa52", size = 268223, upload-time = "2026-03-20T21:58:30.794Z" }
 
 [[package]]
 name = "pykakasi"
@@ -4810,21 +4811,8 @@ wheels = [
 [[package]]
 name = "webrtcvad"
 version = "2.0.10"
-source = { path = "data/runtime-wheels/webrtcvad-2.0.10-cp310-cp310-linux_x86_64.whl" }
-wheels = [
-    { filename = "webrtcvad-2.0.10-cp310-cp310-linux_x86_64.whl", hash = "sha256:8c7c63153c9f3d096d56711d9c8f7877954c7828bd262d2b68df07c557e72664" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "check-manifest", marker = "extra == 'dev'" },
-    { name = "memory-profiler", marker = "extra == 'dev'" },
-    { name = "nose", marker = "extra == 'dev'" },
-    { name = "psutil", marker = "extra == 'dev'" },
-    { name = "unittest2", marker = "extra == 'dev'" },
-    { name = "zest-releaser", marker = "extra == 'dev'" },
-]
-provides-extras = ["dev"]
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/89/34/e2de2d97f3288512b9ea56f92e7452f8207eb5a0096500badf9dfd48f5e6/webrtcvad-2.0.10.tar.gz", hash = "sha256:f1bed2fb25b63fb7b1a55d64090c993c9c9167b28485ae0bcdd81cf6ede96aea", size = 66156, upload-time = "2017-01-07T23:05:18.732Z" }
 
 [[package]]
 name = "werkzeug"

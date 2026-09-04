@@ -13,7 +13,7 @@ dependencies = [
     "transformers>=4.57",
     "sentencepiece>=0.2.0,<0.3",
     # piper_train dependencies for inference
-    "pycld2==0.41",
+    "pycld2>=0.42",
     "wordfreq>=3.1.0,<3.2",
     "six>=1.17.0,<1.18",
     "librosa==0.9.1",
@@ -104,7 +104,7 @@ dependencies = [
     "khmerphonemizer>=0.0.3",
     "epitran>=1.35.2",
     "km-num2text>=1.0.1",
-    "ctc-forced-aligner",
+    "ctc-forced-aligner==0.3.0",
     "langcodes>=3.5.1",
     "xxhash>=3.0.0",
     "triton>=3.0.0",
@@ -143,15 +143,16 @@ flash-attn = { MAX_JOBS = "24" }
 [tool.uv.sources]
 piper-phonemize = { path = "data/runtime-wheels/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl" }
 flash-attn = { path = "data/runtime-wheels/flash_attn-2.8.3.post1-cp310-cp310-linux_x86_64.whl" }
-# Prebuilt wheels (no PyPI wheels exist for these; see data/runtime-wheels/ and
-# scripts/upload_data.py). Git deps are prebuilt too so containers need no git.
-pyicu = { path = "data/runtime-wheels/pyicu-2.16.2-cp310-cp310-linux_x86_64.whl" }
-pycld2 = { path = "data/runtime-wheels/pycld2-0.41-cp310-cp310-linux_x86_64.whl" }
-monotonic-align = { path = "data/runtime-wheels/monotonic_align-1.0.0-cp310-cp310-linux_x86_64.whl" }
+# Pure-python pinned git forks, vendored as py3-none-any wheels (no ABI, so
+# portable by construction):
 epitran = { path = "data/runtime-wheels/epitran-1.35.2-py3-none-any.whl" }
 ctc-forced-aligner = { path = "data/runtime-wheels/ctc_forced_aligner-0.3.0-cp310-cp310-linux_x86_64.whl" }
-webrtcvad = { path = "data/runtime-wheels/webrtcvad-2.0.10-cp310-cp310-linux_x86_64.whl" }
-pesq = { path = "data/runtime-wheels/pesq-0.0.4-cp310-cp310-linux_x86_64.whl" }
+# Compiled extensions install from PyPI normally — the image carries
+# g++/libicu-dev so sdist-only C extensions (pyicu, webrtcvad, pesq,
+# monotonic-align) build at uv sync against THIS image's libicu: no
+# prebuilt-wheel/system-library mismatch on other machines.
+# Compiled wheels that cannot build at install time stay prebuilt:
+# flash-attn (torch/CUDA-matched, hours) and piper-phonemize (our fork).
 
 [dependency-groups]
 dev = [

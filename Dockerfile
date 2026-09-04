@@ -31,14 +31,18 @@ ENV PYTHONUNBUFFERED=1 \
     # HF model downloads at runtime
     HF_HOME=/app/cache/huggingface
 
-# Runtime libraries (all Python C extensions ship as prebuilt wheels):
+# Runtime libraries:
 #   libicu72 — PyICU runtime; libsndfile1/libgomp1 — soundfile/torch runtime
 #   sox — audio post-processing used by the worker (ffmpeg comes from ffmpeg-static)
 #   gcc — runtime C compiler: torch inductor + triton JIT-compile host code at first model load
+#   g++ + libicu-dev — build toolchain so uv sync can compile sdist-only C
+#     extensions (pyicu, webrtcvad, pesq, monotonic-align) against THIS
+#     image's libicu — no prebuilt-wheel/system-library mismatch
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         sox \
-        gcc \
+        gcc g++ \
+        libicu-dev \
         libicu72 \
         libsndfile1 \
         libgomp1 \
