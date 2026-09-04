@@ -287,8 +287,9 @@ class SynthesisAckBatcher:
 
     Acks are partitioned by projectId (one request per project per flush) so a
     project's acks are applied strictly in order and never conflict with each
-    other. The API applies acks idempotently, so duplicate or dropped batches
-    (healed by the API's reconciliation) are safe.
+    other. The API applies acks idempotently, so duplicate batches are safe.
+    A permanently dropped batch leaves the block pending; re-saving the
+    project re-submits it via the API's synthesis sync.
     """
 
     def __init__(
