@@ -2363,8 +2363,11 @@ def _voxcpm_ipa_guide_text(
         forced_language,
     )
     if _get_base_language(language) == "en":
-        return approximate_ipa_spelling(operation.phonemes, language)
-
+        spelling = approximate_ipa_spelling(operation.phonemes, language)
+        if spelling:
+            return spelling
+    # Non-English, or English IPA with no speakable spelling: the visible
+    # text is already the best guide.
     guide = document.text[operation.start : operation.end].strip()
     if not guide:
         raise ValueError("SSML pronunciation spans must contain visible text")

@@ -15,15 +15,26 @@ from torch import nn
 
 
 _ENGLISH_IPA_RESPELLINGS = {
+    # Multi-phone sequences (matched longest-first, before single symbols).
     "t͡ʃ": "ch",
     "d͡ʒ": "j",
     "tʃ": "ch",
     "dʒ": "j",
+    "t͡s": "ts",
+    "d͡z": "dz",
+    "t͡ʂ": "sh",
+    "d͡ʐ": "zh",
+    "t͡ɕ": "sh",
+    "d͡ʑ": "zh",
+    "k͡x": "kh",
     "eɪ": "ay",
     "aɪ": "eye",
     "aʊ": "ow",
+    "ɔʊ": "ow",
     "ɔɪ": "oy",
     "oʊ": "oh",
+    "ɪu": "ew",
+    "ɪʊ": "ew",
     "ɪə": "ear",
     "eə": "air",
     "ʊə": "oor",
@@ -35,32 +46,100 @@ _ENGLISH_IPA_RESPELLINGS = {
     "ɝ": "er",
     "ɚ": "er",
     "˞": "r",
+    # Plosives: bilabial, alveolar, retroflex, palatal, velar, uvular, glottal.
+    "ɡ": "g",
+    "ʈ": "t",
+    "ɖ": "d",
+    "c": "k",
+    "ɟ": "j",
+    "q": "k",
+    "ɢ": "g",
+    "ʔ": "",
+    # Nasals.
+    "ɱ": "m",
+    "ɳ": "n",
+    "ɲ": "ny",
+    "ŋ": "ng",
+    "ɴ": "n",
+    # Trills and taps.
+    "ʙ": "r",
+    "ʀ": "r",
+    "ɾ": "t",
+    # Fricatives: bilabial, labiodental, dental, alveolar, postalveolar,
+    # retroflex, palatal, velar, uvular, pharyngeal, laryngeal, lateral.
+    "ɸ": "f",
+    "β": "v",
     "θ": "th",
     "ð": "th",
     "ʃ": "sh",
     "ʒ": "zh",
-    "ŋ": "ng",
-    "ɡ": "g",
-    "ɹ": "r",
-    "ɾ": "t",
-    "j": "y",
-    "ɫ": "l",
+    "ʂ": "sh",
+    "ʐ": "zh",
+    "ç": "sh",
+    "ʝ": "zh",
+    "x": "kh",
+    "ɣ": "g",
+    "ʁ": "r",
+    "χ": "kh",
+    "ħ": "h",
+    "ʕ": "r",
+    "ʢ": "g",
+    "ɦ": "h",
     "ɬ": "l",
-    "ʔ": "",
-    "æ": "a",
-    "ɑ": "ah",
-    "ɒ": "o",
-    "ɔ": "aw",
-    "ə": "uh",
-    "ɛ": "eh",
-    "ɜ": "er",
+    "ɮ": "sh",
+    # Approximants.
+    "ɹ": "r",
+    "ʋ": "w",
+    "ɻ": "r",
+    "j": "y",
+    "ɰ": "w",
+    "ɥ": "w",
+    "ʍ": "w",
+    # Lateral approximations.
+    "ɫ": "l",
+    "ʎ": "y",
+    # Clicks: bilabial, dental, lateral, alveolar.
+    "ʘ": "p",
+    "ǀ": "t",
+    "ǁ": "l",
+    "ǂ": "k",
+    # Implosives.
+    "ɓ": "b",
+    "ɗ": "d",
+    "ʄ": "d",
+    "ɠ": "g",
+    "ʛ": "g",
+    # Ejective marker.
+    "ʼ": "",
+    # Vowels: close, near-close, close-mid, mid, open-mid, open.
+    "i": "ee",
+    "y": "ee",
+    "ɨ": "ih",
+    "ʉ": "oo",
+    "ɯ": "uh",
+    "u": "oo",
     "ɪ": "ih",
-    "ʊ": "oo",
-    "ʌ": "uh",
+    "ʏ": "uh",
+    "e": "eh",
+    "ø": "ee",
+    "ɘ": "eh",
+    "ɵ": "oo",
+    "ɤ": "uh",
+    "ɜ": "er",
+    "ə": "uh",
+    "ɞ": "er",
+    "ɛ": "eh",
+    "ɔ": "aw",
+    "æ": "a",
+    "ɶ": "uh",
+    "ɒ": "o",
+    "ɑ": "ah",
+    "a": "ah",
     "ɐ": "uh",
+    "o": "oh",
     "ᵻ": "ih",
 }
-_IPA_NOTATION = frozenset("/ˈˌːˑ[](){}͡")
+_IPA_NOTATION = frozenset("/ˈˌːˑ[](){}͡ˀ˂˃˄˅ˆˇ˔˕")
 _IPA_PHONE_DELIMITERS = frozenset(
     {
         *"abcdefghijklmnopqrstuvwxyz0123456789",
@@ -121,13 +200,13 @@ def approximate_ipa_spelling(ipa: str, language: str = "en-US") -> str:
             output.append(symbol)
             index += 1
             continue
-        raise ValueError(
-            f"No approximate English spelling for IPA symbol {symbol!r} in {ipa!r}"
-        )
-    spelling = " ".join("".join(output).split())
-    if not spelling:
-        raise ValueError(f"IPA pronunciation produced an empty spelling: {ipa!r}")
-    return spelling
+        # Unknown symbol: skip it. This is only a rough LM guide; the exact
+        # IPA travels in the side channel, so an unmappable symbol degrades
+        # gracefully instead of failing the request.
+        index += 1
+    # The spelling may legitimately be empty (e.g. a pure glottal stop). Callers
+    # fall back to the original display text in that case.
+    return " ".join("".join(output).split())
 
 
 def replace_span_with_ipa_spelling(
@@ -142,6 +221,8 @@ def replace_span_with_ipa_spelling(
     if not 0 <= start < end <= len(text):
         raise ValueError(f"Invalid IPA source span [{start}, {end}) for {text!r}")
     spelling = approximate_ipa_spelling(ipa, language)
+    # Nothing speakable in the IPA: keep the original text for this span.
+    spelling = spelling or text[start:end]
     return f"{text[:start]}{spelling}{text[end:]}", spelling
 
 
