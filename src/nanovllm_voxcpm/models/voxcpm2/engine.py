@@ -221,11 +221,11 @@ class VoxCPM2Engine(LLMEngineBase):
         if ipa_controls:
             if prompt_text:
                 raise ValueError("IPA controls with prompt_text are not supported")
-            encoded = self.tokenizer.tokenizer(
-                target_text, add_special_tokens=False, return_offsets_mapping=True
-            )
-            offsets = list(encoded["offset_mapping"])
-            if list(encoded["input_ids"]) != raw_text_tokens:
+            # Offsets must live in the same token space as the prefill
+            # sequence (the char-split wrapper tokenization); base-tokenizer
+            # offsets misindex ipa_prefill_to_control for CJK text.
+            offsets = self.tokenizer.tokenize_with_offsets(target_text)
+            if len(offsets) != len(raw_text_tokens):
                 raise ValueError("IPA span tokenization differs from VoxCPM target tokenization")
             ipa_prefill_to_control = np.full(len(text_tokens), -1, dtype=np.int64)
             ipa_prefill_progress = np.zeros(len(text_tokens), dtype=np.float32)
