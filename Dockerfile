@@ -42,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         sox \
         gcc g++ \
+        pkg-config \
         libicu-dev \
         libicu72 \
         libsndfile1 \
