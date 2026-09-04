@@ -1,20 +1,21 @@
-"""Strict parsing for the SSML subset supported by the synthesis API.
+"""Parsing for the SSML subset supported by the synthesis API.
 
-The parser deliberately handles XML as XML.  It produces the plain text sent
-to the normal TTS route plus source-character spans for the two operations we
-currently implement: timed breaks and IPA pronunciation overrides.
+Documents are parsed with the standard library HTML parser, so plain text
+that an XML parser would reject (bare ``&``, unescaped ``<``) passes through
+unchanged.  The tag set stays strict: a single ``<speak>`` root containing
+text, ``<break>`` and ``<phoneme>`` elements is accepted, and the parser
+produces the plain text sent to the normal TTS route plus source-character
+spans for the two operations we currently implement: timed breaks and IPA
+pronunciation overrides.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from html.parser import HTMLParser
 from typing import TypeAlias
 
-from defusedxml import ElementTree as SafeElementTree
-from defusedxml.common import DefusedXmlException
-
-SSML_NAMESPACE = "http://www.w3.org/2001/10/synthesis"
 MAX_BREAK_SECONDS = Decimal("60")
 
 
@@ -53,22 +54,6 @@ class SSMLDocument:
     @property
     def pronunciations(self) -> tuple[PronunciationOperation, ...]:
         return tuple(op for op in self.operations if isinstance(op, PronunciationOperation))
-
-
-def _expanded_name(tag: str) -> tuple[str | None, str]:
-    if tag.startswith("{"):
-        namespace, separator, local_name = tag[1:].partition("}")
-        if not separator:
-            raise ValueError(f"Invalid XML element name {tag!r}")
-        return namespace, local_name
-    return None, tag
-
-
-def _validate_element_name(tag: str) -> str:
-    namespace, local_name = _expanded_name(tag)
-    if namespace not in {None, SSML_NAMESPACE}:
-        raise ValueError(f"Unsupported SSML namespace {namespace!r}")
-    return local_name
 
 
 def _parse_break_time(value: str) -> float:
@@ -165,62 +150,36 @@ class _DocumentBuilder:
         self._text_parts.append(value)
         self._length += len(value)
 
-    def visit_contents(self, element) -> None:
-        self.append_text(element.text)
-        for child in element:
-            self.visit_element(child)
-            self.append_text(child.tail)
-
-    def visit_element(self, element) -> None:
-        name = _validate_element_name(element.tag)
-        if name == "break":
-            unsupported = set(element.attrib) - {"time"}
-            if unsupported:
-                names = ", ".join(sorted(unsupported))
-                raise ValueError(f"Unsupported SSML <break> attribute(s): {names}")
-            if len(element) or (element.text and element.text.strip()):
-                raise ValueError("SSML <break> must be empty")
-            self.operations.append(
-                BreakOperation(
-                    position=self.position,
-                    duration_seconds=_parse_break_time(element.attrib.get("time", "1s")),
-                )
+    def add_break(self, time: str | None) -> None:
+        self.operations.append(
+            BreakOperation(
+                position=self.position,
+                duration_seconds=_parse_break_time(time if time is not None else "1s"),
             )
-            # A break is a boundary in the decoded text stream. Treating it as
-            # whitespace lets the one normalization pass handle punctuation,
-            # adjacent breaks, indentation, and languages without spaces alike.
-            self.append_text(" ")
-            return
+        )
+        # A break is a boundary in the decoded text stream. Treating it as
+        # whitespace lets the one normalization pass handle punctuation,
+        # adjacent breaks, indentation, and languages without spaces alike.
+        self.append_text(" ")
 
-        if name == "phoneme":
-            unsupported = set(element.attrib) - {"alphabet", "ph"}
-            if unsupported:
-                names = ", ".join(sorted(unsupported))
-                raise ValueError(f"Unsupported SSML <phoneme> attribute(s): {names}")
-            if len(element):
-                raise ValueError("SSML <phoneme> may contain text only")
-            alphabet = element.attrib.get("alphabet")
-            phonemes = element.attrib.get("ph")
-            if alphabet is None or alphabet.strip().lower() != "ipa":
-                raise ValueError("SSML <phoneme> currently requires alphabet='ipa'")
-            if phonemes is None or not phonemes.strip():
-                raise ValueError("SSML <phoneme> requires a non-empty 'ph' attribute")
-            display_text = element.text or ""
-            if not display_text.strip():
-                raise ValueError("SSML <phoneme> requires non-empty display text")
-            start = self.position
-            self.append_text(display_text)
-            self.operations.append(
-                PronunciationOperation(
-                    start=start,
-                    end=self.position,
-                    alphabet="ipa",
-                    phonemes=phonemes.strip(),
-                )
+    def open_phoneme(self, alphabet: str | None, phonemes: str | None) -> int:
+        if alphabet is None or alphabet.strip().lower() != "ipa":
+            raise ValueError("SSML <phoneme> currently requires alphabet='ipa'")
+        if phonemes is None or not phonemes.strip():
+            raise ValueError("SSML <phoneme> requires a non-empty 'ph' attribute")
+        return self.position
+
+    def close_phoneme(self, start: int, phonemes: str) -> None:
+        if start == self.position:
+            raise ValueError("SSML <phoneme> requires non-empty display text")
+        self.operations.append(
+            PronunciationOperation(
+                start=start,
+                end=self.position,
+                alphabet="ipa",
+                phonemes=phonemes.strip(),
             )
-            return
-
-        raise ValueError(f"Unsupported SSML element <{name}>")
+        )
 
     def finish(self) -> SSMLDocument:
         raw_text = "".join(self._text_parts)
@@ -253,26 +212,95 @@ class _DocumentBuilder:
         return SSMLDocument(text=text, operations=tuple(adjusted))
 
 
-def parse_ssml(ssml: str) -> SSMLDocument:
-    """Parse a complete SSML document without HTML recovery or regex stripping.
+class _SSMLParser(HTMLParser):
+    """Lenient-text, strict-tag SSML front end built on the HTML parser."""
 
-    XML character/entity references are decoded by the XML parser before text
-    offsets are recorded.  DTDs and entity declarations are rejected by
-    ``defusedxml`` rather than expanded.
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.builder = _DocumentBuilder()
+        self._root_open = False
+        self._root_closed = False
+        self._phonemes: list[tuple[int, str]] = []
+
+    def _require_root(self, tag: str) -> None:
+        if self._root_open:
+            return
+        if self._root_closed:
+            raise ValueError("SSML must contain exactly one <speak> root element")
+        if tag != "speak":
+            raise ValueError("SSML root element must be <speak>")
+        self._root_open = True
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._require_root(tag)
+        if tag == "speak":
+            return
+        if tag == "break":
+            unsupported = {name for name, _ in attrs} - {"time"}
+            if unsupported:
+                names = ", ".join(sorted(unsupported))
+                raise ValueError(f"Unsupported SSML <break> attribute(s): {names}")
+            self.builder.add_break(dict(attrs).get("time"))
+            return
+        if tag == "phoneme":
+            unsupported = {name for name, _ in attrs} - {"alphabet", "ph"}
+            if unsupported:
+                names = ", ".join(sorted(unsupported))
+                raise ValueError(f"Unsupported SSML <phoneme> attribute(s): {names}")
+            values = dict(attrs)
+            start = self.builder.open_phoneme(values.get("alphabet"), values.get("ph"))
+            self._phonemes.append((start, values.get("ph") or ""))
+            return
+        raise ValueError(f"Unsupported SSML element <{tag}>")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "speak":
+            if not self._root_open:
+                raise ValueError("SSML root element must be <speak>")
+            self._root_open = False
+            self._root_closed = True
+            return
+        if not self._root_open:
+            raise ValueError("SSML root element must be <speak>")
+        if tag == "break":
+            return
+        if tag == "phoneme":
+            if not self._phonemes:
+                raise ValueError("SSML </phoneme> has no matching <phoneme> start tag")
+            start, phonemes = self._phonemes.pop()
+            self.builder.close_phoneme(start, phonemes)
+            return
+        raise ValueError(f"Unsupported SSML element <{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if not self._root_open:
+            if data.strip():
+                raise ValueError("SSML root element must be <speak>")
+            return
+        self.builder.append_text(data)
+
+    def handle_decl(self, decl: str) -> None:
+        raise ValueError("Invalid SSML: DOCTYPE declarations are not allowed")
+
+
+def parse_ssml(ssml: str) -> SSMLDocument:
+    """Parse an SSML document into decoded text and post-processing operations.
+
+    Character references (``&amp;``, ``&#x26;``) are decoded by the parser.
+    Text that is not valid XML, such as a bare ``&``, is accepted as-is.
     """
     if not isinstance(ssml, str) or not ssml.strip():
         raise ValueError("SSML input is empty")
-    try:
-        root = SafeElementTree.fromstring(ssml)
-    except (SafeElementTree.ParseError, DefusedXmlException) as exc:
-        raise ValueError(f"Invalid SSML: {exc}") from exc
-
-    if _validate_element_name(root.tag) != "speak":
-        raise ValueError("SSML root element must be <speak>")
-
-    builder = _DocumentBuilder()
-    builder.visit_contents(root)
-    return builder.finish()
+    parser = _SSMLParser()
+    parser.feed(ssml)
+    parser.close()
+    if not parser._root_closed:
+        raise ValueError("SSML must end with </speak>")
+    return parser.builder.finish()
 
 
 __all__ = [
@@ -280,6 +308,5 @@ __all__ = [
     "PronunciationOperation",
     "SSMLDocument",
     "SSMLOperation",
-    "SSML_NAMESPACE",
     "parse_ssml",
 ]

@@ -111,7 +111,6 @@ dependencies = [
     "safetensors>=0.4.0",
     "pydantic>=2.0.0",
     "tqdm>=4.0.0",
-    "defusedxml>=0.7.1,<0.8",
 ]
 
 [build-system]

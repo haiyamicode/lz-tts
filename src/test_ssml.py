@@ -28,10 +28,32 @@ def test_parse_ssml_accepts_standard_namespace_and_xml_character_references() ->
     assert document.operations == ()
 
 
+def test_parse_ssml_accepts_plain_text_with_bare_ampersands() -> None:
+    document = parse_ssml(
+        "<speak>Day 4 \u2014 September 10: Journaling and reviewing the process.\n\n"
+        "   Day 5 \u2014 September 11: Q&A and grading the week's results.\n\n"
+        "   The official page says participants use $100,000 of virtual practice money "
+        "during the training, rather than immediately putting their own capital at\n"
+        " risk.</speak>"
+    )
+    assert document.text == (
+        "Day 4 \u2014 September 10: Journaling and reviewing the process. "
+        "Day 5 \u2014 September 11: Q&A and grading the week's results. "
+        "The official page says participants use $100,000 of virtual practice money "
+        "during the training, rather than immediately putting their own capital at risk."
+    )
+    assert document.operations == ()
+
+
+def test_parse_ssml_tolerates_characters_xml_rejects() -> None:
+    assert parse_ssml("<speak>Q&A</speak>").text == "Q&A"
+    assert parse_ssml("<speak>5 < 6 & 7 > 3</speak>").text == "5 < 6 & 7 > 3"
+    assert parse_ssml("<speak>Tom &amp; Jerry</speak>").text == "Tom & Jerry"
+
+
 @pytest.mark.parametrize(
     "ssml, message",
     [
-        ("<speak>Tom & Jerry</speak>", "Invalid SSML"),
         ("<speak><break time='2'/></speak>", "'ms' or 's'"),
         ("<speak><break time='0s'/>hello</speak>", "greater than 0"),
         ("<speak>hello<break strength='strong'/></speak>", "Unsupported SSML <break> attribute"),
@@ -40,6 +62,9 @@ def test_parse_ssml_accepts_standard_namespace_and_xml_character_references() ->
         ("<speak><phoneme alphabet='ipa' ph='wɜːd' ignored='x'>word</phoneme></speak>", "Unsupported SSML <phoneme> attribute"),
         ("<speak><prosody rate='slow'>hello</prosody></speak>", "Unsupported SSML element"),
         ("<voice>hello</voice>", "root element"),
+        ("oops <speak>hello</speak>", "root element"),
+        ("<speak>hello</speak> oops", "root element"),
+        ("<speak>hello", "end with </speak>"),
     ],
 )
 def test_parse_ssml_rejects_invalid_or_unsupported_input(ssml: str, message: str) -> None:
