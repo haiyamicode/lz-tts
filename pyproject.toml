@@ -141,7 +141,7 @@ flash-attn = ["packaging", { requirement = "torch", match-runtime = true }]
 flash-attn = { MAX_JOBS = "24" }
 
 [tool.uv.sources]
-piper-phonemize = { path = "./src/phonemizer/dist/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl" }
+piper-phonemize = { path = "data/runtime-wheels/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl" }
 flash-attn = { path = "data/runtime-wheels/flash_attn-2.8.3.post1-cp310-cp310-linux_x86_64.whl" }
 # Prebuilt wheels (no PyPI wheels exist for these; see data/runtime-wheels/ and
 # scripts/upload_data.py). Git deps are prebuilt too so containers need no git.

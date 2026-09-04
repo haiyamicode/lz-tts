@@ -2364,7 +2364,7 @@ requires-dist = [
     { name = "peft", specifier = ">=0.19.1" },
     { name = "pesq", path = "data/runtime-wheels/pesq-0.0.4-cp310-cp310-linux_x86_64.whl" },
     { name = "phonemizer", specifier = ">=3.3.0" },
-    { name = "piper-phonemize", path = "src/phonemizer/dist/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl" },
+    { name = "piper-phonemize", path = "data/runtime-wheels/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl" },
     { name = "praat-parselmouth", specifier = ">=0.4.2" },
     { name = "pyarrow", specifier = ">=23.0.0" },
     { name = "pycld2", path = "data/runtime-wheels/pycld2-0.41-cp310-cp310-linux_x86_64.whl" },
@@ -3174,7 +3174,7 @@ wheels = [
 [[package]]
 name = "piper-phonemize"
 version = "1.2.0"
-source = { path = "src/phonemizer/dist/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl" }
+source = { path = "data/runtime-wheels/piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl" }
 wheels = [
     { filename = "piper_phonemize-1.2.0-cp310-cp310-linux_x86_64.whl", hash = "sha256:69595169db7129c0b88ff39cebceabfaced4dabccab9a7854b3aa9f34b4a6090" },
 ]
