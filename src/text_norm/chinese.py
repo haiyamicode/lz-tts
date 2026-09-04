@@ -6,8 +6,6 @@ import re
 
 import cn2an
 
-PUNCTUATION = ["!", "?", "...", ",", ".", "'", "-", "¿", "¡"]
-
 _REP_MAP = {
     "：": ",",
     "；": ",",
@@ -43,14 +41,12 @@ _REP_MAP = {
 }
 
 _PUNCT_PATTERN = re.compile("|".join(re.escape(p) for p in _REP_MAP))
-_ALLOWED_PATTERN = re.compile(r"[^\u4e00-\u9fa5" + "".join(map(re.escape, PUNCTUATION)) + r"]+")
 _NUMBER_PATTERN = re.compile(r"\d+(?:\.?\d+)?")
 
 
 def _replace_punctuation(text: str) -> str:
     text = text.replace("嗯", "恩").replace("呣", "母")
-    text = _PUNCT_PATTERN.sub(lambda match: _REP_MAP[match.group()], text)
-    return _ALLOWED_PATTERN.sub("", text)
+    return _PUNCT_PATTERN.sub(lambda match: _REP_MAP[match.group()], text)
 
 
 def normalize_chinese(text: str) -> str:

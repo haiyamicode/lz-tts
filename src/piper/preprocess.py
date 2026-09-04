@@ -1723,7 +1723,9 @@ def _normalized_override_bounds(
             continue
         normalized_start = normalized_marked.index(opening)
         normalized_end_with_marker = normalized_marked.index(closing)
-        if normalized_start >= normalized_end_with_marker:
+        # At least one character must survive between the sentinels; a
+        # collapsed span would map to a degenerate (n, n) override.
+        if normalized_start + 1 >= normalized_end_with_marker:
             continue
         unmarked = normalized_marked.replace(opening, "").replace(closing, "")
         if unmarked == normalized_text:
