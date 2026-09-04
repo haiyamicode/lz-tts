@@ -9,11 +9,14 @@ Usage:
     uv run python scripts/download_data.py --filter lzspeech
     uv run python scripts/download_data.py --data-dir ./data
     uv run python scripts/download_data.py --dry-run
+    uv run python scripts/download_data.py --parallel 8
 """
 import argparse
 import hashlib
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import boto3
@@ -24,22 +27,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PRIORITY_DATA_DIRS = ("runtime-wheels",)
+DEFAULT_PARALLELISM = 8
+
+_thread_local = threading.local()
 
 
 def get_s3_client():
-    import botocore.config
-    return boto3.client(
-        "s3",
-        endpoint_url=f"https://{os.getenv('AWS_S3_ENDPOINT')}",
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.getenv("AWS_REGION", "us-east-1"),
-        config=botocore.config.Config(
-            connect_timeout=10,
-            read_timeout=30,
-            retries={"max_attempts": 3, "mode": "standard"},
-        ),
-    )
+    """One S3 client per thread (boto3 clients are not guaranteed thread-safe)."""
+    if not hasattr(_thread_local, "client"):
+        import botocore.config
+        _thread_local.client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{os.getenv('AWS_S3_ENDPOINT')}",
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            region_name=os.getenv("AWS_REGION", "us-east-1"),
+            config=botocore.config.Config(
+                connect_timeout=10,
+                read_timeout=30,
+                retries={"max_attempts": 3, "mode": "standard"},
+            ),
+        )
+    return _thread_local.client
 
 
 # ---------------------------------------------------------------------------
@@ -74,53 +83,32 @@ def _should_skip(local_path: Path, s3_obj: dict, force: bool) -> bool:
     return _local_etag(str(local_path)) == s3_etag
 
 
-# ---------------------------------------------------------------------------
-# Download with progress
-# ---------------------------------------------------------------------------
-
-class _Progress:
-    def __init__(self, label: str, total: int):
-        self._label = label
-        self._total = total
-        self._seen = 0
-
-    def __call__(self, nbytes: int):
-        self._seen += nbytes
-        done_mb = self._seen / (1024 * 1024)
-        total_mb = self._total / (1024 * 1024)
-        pct = (self._seen / self._total * 100) if self._total else 0
-        print(f"\r  {self._label}  {done_mb:.1f}/{total_mb:.1f} MB ({pct:.0f}%)", end="", flush=True)
-
-
-def download_file(s3_client, bucket, s3_key, local_path):
-    """Download a single file from S3 with progress output."""
+def download_file(bucket: str, s3_key: str, local_path: Path, size_mb: float = 0.0) -> bool:
+    """Download one file from S3 to a temp file, then atomically move into place."""
     try:
         local_path = Path(local_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
+        s3 = get_s3_client()
+
         cfg = boto3.s3.transfer.TransferConfig(
             multipart_threshold=8 * 1024 * 1024,
             multipart_chunksize=8 * 1024 * 1024,
-            max_concurrency=8,
+            max_concurrency=4,
         )
 
-        label = local_path.name
-        if len(label) > 30:
-            label = label[:27] + "..."
-        seen = {"n": 0}
-
-        def _cb(nbytes):
-            seen["n"] += nbytes
-            mb = seen["n"] / (1024 * 1024)
-            print(f"\r  {label}  {mb:.1f} MB", end="", flush=True)
-
-        s3_client.download_file(
-            bucket, s3_key, str(local_path), Config=cfg, Callback=_cb
-        )
-        print()
+        tmp_path = local_path.with_suffix(local_path.suffix + ".part")
+        # botocore writes multipart downloads to <tmp_path>.<uuid8>; clean stale leftovers
+        for stale in local_path.parent.glob(local_path.name + ".part.*"):
+            stale.unlink(missing_ok=True)
+        if tmp_path.exists():
+            tmp_path.unlink()
+        s3.download_file(bucket, s3_key, str(tmp_path), Config=cfg)
+        os.replace(tmp_path, local_path)
+        print(f"  done: {s3_key} ({size_mb:.1f} MB)", flush=True)
         return True
-    except ClientError as e:
-        print(f"\n  Error downloading {s3_key}: {e}")
+    except (ClientError, OSError) as e:
+        print(f"  Error downloading {s3_key}: {e}", flush=True)
         return False
 
 
@@ -138,6 +126,7 @@ def sync_data_from_s3(
     name_filter: str | None = None,
     force: bool = False,
     dry_run: bool = False,
+    parallel: int = DEFAULT_PARALLELISM,
 ):
     bucket = os.getenv('AWS_S3_BUCKET_NAME')
     s3_data_path = os.getenv('S3_DATA_PATH', 'lz-tts/data')
@@ -190,8 +179,9 @@ def sync_data_from_s3(
 
         print(f"Found {len(filtered)} files → {local_data_dir}/\n")
 
-        downloaded = skipped = failed = 0
-
+        # Pass 1: skip checks (local etag compare) — single-threaded, fast
+        to_download = []
+        skipped = 0
         for obj, rel in filtered:
             if any(rel.startswith(p) for p in _EXCLUDE_PREFIXES):
                 print(f"Skipping {rel} (handled separately)")
@@ -208,14 +198,37 @@ def sync_data_from_s3(
 
             if dry_run:
                 print(f"  WOULD DOWNLOAD {rel} ({size_mb:.1f} MB)")
-                downloaded += 1
                 continue
 
-            print(f"Downloading {rel} ({size_mb:.1f} MB)")
-            if download_file(s3, bucket, obj['Key'], local_path):
-                downloaded += 1
-            else:
-                failed += 1
+            to_download.append((obj, rel, size_mb))
+
+        if dry_run:
+            print(f"\nDone: {len(to_download)} to download, {skipped} skipped (dry run)")
+            return 0
+
+        if not to_download:
+            print(f"\nDone: 0 downloaded, {skipped} skipped")
+            return 0
+
+        total_mb = sum(m for _, _, m in to_download)
+        print(f"Downloading {len(to_download)} files ({total_mb:.1f} MB) with {parallel} parallel workers:\n")
+
+        # Pass 2: parallel downloads
+        downloaded = failed = 0
+        done_mb = 0.0
+        with ThreadPoolExecutor(max_workers=parallel) as pool:
+            futures = {
+                pool.submit(download_file, bucket, obj['Key'], local_data_dir / rel, size_mb): (rel, size_mb)
+                for obj, rel, size_mb in to_download
+            }
+            for fut in as_completed(futures):
+                rel, size_mb = futures[fut]
+                if fut.result():
+                    downloaded += 1
+                    done_mb += size_mb
+                    print(f"  [{downloaded + failed}/{len(futures)}] {done_mb:.0f}/{total_mb:.0f} MB total", flush=True)
+                else:
+                    failed += 1
 
         print(f"\nDone: {downloaded} downloaded, {skipped} skipped, {failed} failed")
 
@@ -238,6 +251,8 @@ def parse_args():
     parser.add_argument("--filter", help="Substring filter for model names.")
     parser.add_argument("--force", action="store_true", help="Re-download even if unchanged.")
     parser.add_argument("--dry-run", action="store_true", help="Show plan without downloading.")
+    parser.add_argument("--parallel", type=int, default=DEFAULT_PARALLELISM,
+                        help=f"Concurrent downloads (default: {DEFAULT_PARALLELISM})")
     return parser.parse_args()
 
 
@@ -249,5 +264,6 @@ if __name__ == "__main__":
         name_filter=args.filter,
         force=args.force,
         dry_run=args.dry_run,
+        parallel=max(1, args.parallel),
     )
     sys.exit(rc)

@@ -1,12 +1,13 @@
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 import torch
 from transformers import AutoTokenizer
 
-from .hf_cache import resolve_hf_model_path
+from .hf_cache import resolve_hf_tokenizer_path
 
 
 _DEFAULT_MODEL_NAME = "distilbert/distilbert-base-multilingual-cased"
@@ -42,10 +43,10 @@ class SemanticTokenizer:
             os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
             for name in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE")
         )
-        model_path = resolve_hf_model_path(self.model_name)
+        model_path = resolve_hf_tokenizer_path(self.model_name)
         self._tokenizer = AutoTokenizer.from_pretrained(
             model_path,
-            local_files_only=local_files_only,
+            local_files_only=True,
             use_fast=True,
         )
 

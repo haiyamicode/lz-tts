@@ -23,7 +23,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .hf_cache import get_shared_hf_encoder, resolve_hf_model_path
+from .hf_cache import get_shared_hf_encoder, resolve_hf_tokenizer_path
 from .word_segmentation import icu_word_spans as _icu_word_spans
 
 _LOGGER = logging.getLogger(__name__)
@@ -316,14 +316,16 @@ class ContextReplacer:
 
         from transformers import AutoTokenizer
 
-        tokenizer_path = resolve_hf_model_path(self._context_model_name)
+        from .hf_cache import resolve_hf_tokenizer_path
+
+        tokenizer_path = resolve_hf_tokenizer_path(self._context_model_name)
         local_files_only = any(
             os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
             for name in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE")
         )
         self._tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path,
-            local_files_only=local_files_only,
+            local_files_only=True,
             use_fast=True,
         )
         self._bert = get_shared_hf_encoder(

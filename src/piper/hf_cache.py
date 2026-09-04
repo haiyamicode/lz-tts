@@ -18,6 +18,55 @@ _HF_MODEL_ALIASES = {
     "distilbert-base-multilingual-cased": "distilbert/distilbert-base-multilingual-cased",
 }
 
+# Required files for a usable (fast) tokenizer. AutoTokenizer.from_pretrained
+# silently yields vocab_file=None when a HF snapshot is incomplete, which then
+# crashes deep inside transformers with a cryptic `stat: path ... NoneType`.
+# To make deploys deterministic, tokenizers are vendored in
+# data/hf-tokenizers/<name>/ (synced from S3 by scripts/download_data.py) and
+# verified here. Live HF downloads are intentionally not used.
+_REQUIRED_TOKENIZER_FILES = ("vocab.txt", "tokenizer.json", "tokenizer_config.json")
+
+
+def resolve_hf_tokenizer_path(model_name: str) -> str:
+    """Return a verified local tokenizer directory for model_name.
+
+    Prefers the vendored dir data/hf-tokenizers/<name>/ (synced from S3 by
+    scripts/download_data.py, overridable via PIPER_SEMANTIC_TOKENIZER_DIR /
+    LZ_DATA_DIR). Raises if not present and verified -- we never fall back to a
+    live HF download: incomplete snapshots resolve vocab_file=None and crash.
+    """
+    raw_name = model_name
+    model_name = _HF_MODEL_ALIASES.get(model_name, model_name)
+    names = [raw_name, model_name]
+    for alias_key, alias_val in _HF_MODEL_ALIASES.items():
+        if alias_val == model_name:
+            names.append(alias_key)
+            break
+    candidates = []
+    env_dir = os.environ.get("PIPER_SEMANTIC_TOKENIZER_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+    env_data = os.environ.get("LZ_DATA_DIR")
+    data_root = (
+        Path(env_data) if env_data else Path(__file__).resolve().parents[2] / "data"
+    )
+    for name in names:
+        candidates.append(data_root / "hf-tokenizers" / name)
+    for cand in candidates:
+        missing = [f for f in _REQUIRED_TOKENIZER_FILES if not (cand / f).is_file()]
+        if not missing:
+            _LOGGER.info("Using vendored tokenizer: %s", cand)
+            return str(cand)
+        _LOGGER.debug("tokenizer dir %s not usable (missing: %s)", cand, missing)
+    raise RuntimeError(
+        f"Vendored tokenizer for {model_name!r} not found or incomplete "
+        f"(requires {', '.join(_REQUIRED_TOKENIZER_FILES)}). It is synced from S3 "
+        "to data/hf-tokenizers/ by scripts/download_data.py — run that or set "
+        "PIPER_SEMANTIC_TOKENIZER_DIR. Live HF downloads are intentionally not "
+        "used (unreliable: snapshots keep coming back without a resolvable "
+        "vocab.txt)."
+    )
+
 _MODEL_WEIGHT_FILES = {
     "pytorch_model.bin",
     "pytorch_model.bin.index.json",
