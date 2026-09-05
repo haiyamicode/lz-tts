@@ -56,7 +56,7 @@ from .seed_vc_backend import (
 )
 from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
 from .voxcpm_runtime import VoxCPMRuntime
-from .worker_common import WorkerProcessClient
+from .worker_common import ChildWorkerDied, WorkerProcessClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -144,6 +144,35 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Process-wide readiness flag driven by the worker's Taskflow join lifecycle.
+# Surfaced through the in-process HTTP server's /health endpoint so container
+# orchestrators / load balancers can avoid routing traffic to a worker that
+# hasn't joined the cluster yet.
+#
+#   starting -- process is up, models may still be loading, no cluster join yet.
+#   ok       -- joined the Taskflow cluster and the inference runtime is healthy.
+#   error    -- joined but currently unhealthy (lost the Taskflow session, the
+#               inference runtime threw, etc.). Orchestrators should pull
+#               traffic; the worker recovers to ``ok`` once it reconnects.
+_HEALTH_STATUS: dict[str, str] = {"status": "starting", "reason": ""}
+_VALID_HEALTH_STATUSES = {"starting", "ok", "error"}
+
+
+def get_health_status() -> dict[str, str]:
+    return {
+        "status": _HEALTH_STATUS.get("status", "starting"),
+        "reason": _HEALTH_STATUS.get("reason", ""),
+    }
+
+
+def set_status(status: str, reason: str = "") -> None:
+    """Set the worker's /health status. Unknown values are coerced to ``error``."""
+    if status not in _VALID_HEALTH_STATUSES:
+        status = "error"
+    _HEALTH_STATUS["status"] = status
+    _HEALTH_STATUS["reason"] = reason
 
 
 def _resolve_project_path(value: str | Path) -> Path:
@@ -1008,6 +1037,30 @@ def _ensure_seed_vc_worker() -> WorkerProcessClient:
             args=(_worker_settings_data(),),
         )
     return _seed_vc_worker
+
+
+def _worker_name_to_engine(name: str) -> str | None:
+    if name == "sparrow":
+        return "pipertts"
+    if name in {"starling", "matcha"}:
+        return "starling"
+    if name == "seed-vc":
+        return "seed_vc"
+    return None
+
+
+def _mark_engine_failed_from_child(worker_name: str, exc: BaseException) -> None:
+    """Mark the engine backing a child worker as failed in ``_engine_load_states``.
+
+    Subsequent ``_wait_for_engine_ready`` calls will return 503 instead of
+    silently cold-loading the dead process again on every request.
+    """
+    engine = _worker_name_to_engine(worker_name)
+    if engine is None or engine not in _engine_load_states:
+        return
+    state = _engine_state(engine)
+    if state.status in {"loading", "ready", "error"}:
+        _mark_engine_failed(engine, exc)
 
 
 def _stop_model_workers() -> None:
@@ -4492,6 +4545,12 @@ class LzTtsInferenceSession:
                 )
                 for batch_item_index, _, _ in plan.records:
                     outcomes[batch_operation_indices[batch_item_index]] = outcome
+            except ChildWorkerDied as error:
+                # A backend subprocess is gone (OOM, crash). Don't retry the
+                # leases in this batch — escalate to the worker so it surfaces
+                # ``error`` and stops pulling new leases.
+                _mark_engine_failed_from_child(error.name, error)
+                raise
             except Exception as error:
                 _LOGGER.exception(
                     "Inference task batch failed pipeline=%s count=%d",
@@ -4505,6 +4564,10 @@ class LzTtsInferenceSession:
             operation, request_data = operations[operation_index]
             try:
                 outcomes[operation_index] = await self.execute(operation, request_data)
+            except ChildWorkerDied:
+                # Backend subprocess died -- propagate so the worker surfaces
+                # ``error`` instead of retrying leases against a dead process.
+                raise
             except Exception as error:
                 outcomes[operation_index] = error
 
@@ -4559,6 +4622,12 @@ class LzTtsInferenceSession:
                 exc.detail,
             )
             raise InferenceOperationError(exc.status_code, exc.detail) from exc
+        except ChildWorkerDied as exc:
+            # Backend subprocess is gone (OOM, crash). Mark the engine as
+            # failed and re-raise so the worker surfaces ``error`` rather than
+            # spinning this lease on retries against a dead process.
+            _mark_engine_failed_from_child(exc.name, exc)
+            raise
         except Exception:
             _LOGGER.exception("Inference operation failed context=%s", context)
             raise
@@ -4622,6 +4691,10 @@ def create_app(config: ServerConfig | None = None, session: LzTtsInferenceSessio
 
     @app.middleware("http")
     async def api_key_auth_middleware(request: Request, call_next):
+        # Health probes must work without credentials so the orchestrator can
+        # gate traffic on the worker's Taskflow readiness.
+        if request.url.path == "/health":
+            return await call_next(request)
         provided_api_key = _request_api_key(request)
         _scrub_api_key_query_param(request)
         expected_api_key = _configured_api_key()
@@ -4630,6 +4703,17 @@ def create_app(config: ServerConfig | None = None, session: LzTtsInferenceSessio
         if not provided_api_key or not secrets.compare_digest(provided_api_key, expected_api_key):
             return JSONResponse(status_code=401, content={"error": "Invalid or missing API key"})
         return await call_next(request)
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        info = get_health_status()
+        # 200 only when fully joined and healthy. Both ``starting`` (still
+        # booting / reconnecting from cold) and ``error`` (joined but
+        # unhealthy) return 503 so orchestrators pull traffic in both cases.
+        return JSONResponse(
+            status_code=200 if info["status"] == "ok" else 503,
+            content=info,
+        )
 
     @app.post("/task/sync")
     async def sync_task(task: SyncTaskRequest):

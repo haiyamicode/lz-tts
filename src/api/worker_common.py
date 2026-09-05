@@ -54,6 +54,20 @@ def error_response(exc: Exception) -> dict[str, Any]:
     }
 
 
+class ChildWorkerDied(RuntimeError):
+    """Raised when a child worker process exits without producing a response.
+
+    Distinct from a normal ``HTTPException(502, ...)`` so the inference
+    session can tell a per-lease failure (retry) apart from the underlying
+    backend being dead (escalate to ``error`` and disable the engine).
+    """
+
+    def __init__(self, name: str, exit_detail: str):
+        self.name = name
+        self.exit_detail = exit_detail
+        super().__init__(f"{name} worker exited without response ({exit_detail})")
+
+
 def run_worker_loop(engine_name: str, handler: Callable[[str, Any], dict[str, Any]], request_queue: Any, response_queue: Any) -> None:
     """Run a simple action/payload worker loop."""
     _LOGGER.info("%s worker ready pid=%s", engine_name, os.getpid())
@@ -175,10 +189,7 @@ class WorkerProcessClient:
                         exit_detail,
                         time.perf_counter() - started,
                     )
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"{self.name} worker exited without response ({exit_detail})",
-                    )
+                    raise ChildWorkerDied(self.name, exit_detail)
                 response = self.responses.get()
                 if not isinstance(response, dict):
                     raise HTTPException(status_code=502, detail=f"{self.name} worker returned invalid response")

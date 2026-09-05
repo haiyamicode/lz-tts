@@ -18,7 +18,14 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
-from .api.server import InferenceOperationError, LzTtsInferenceSession, _env_bool, create_app
+from .api.server import (
+    InferenceOperationError,
+    LzTtsInferenceSession,
+    create_app,
+    get_health_status,
+    set_status,
+)
+from .api.worker_common import ChildWorkerDied
 
 _LOGGER = logging.getLogger(__name__)
 TASK_TYPES = ("tts-synthesis", "voice-enhance")
@@ -574,6 +581,11 @@ async def _process_leases(
             raise RuntimeError(
                 "Inference batch returned a different number of outcomes"
             )
+    except ChildWorkerDied:
+        # A backend subprocess died. Don't waste retries on these leases; let
+        # the worker's serve loop drop the Taskflow session and surface
+        # ``error`` on /health so the orchestrator pulls traffic.
+        raise
     except Exception as error:
         _LOGGER.exception("LZ-TTS task batch planning or execution failed")
         outcomes = [error] * len(works)
@@ -627,8 +639,10 @@ async def _serve_taskflow(
     synthesis_capabilities: dict[str, Any],
     acks: SynthesisAckBatcher | None = None,
 ) -> None:
+    set_status("starting")
     while True:
         heartbeat_task: asyncio.Task[None] | None = None
+        was_ok = get_health_status()["status"] == "ok"
         try:
             if taskflow.session_token:
                 await taskflow.heartbeat()
@@ -636,11 +650,20 @@ async def _serve_taskflow(
                 await taskflow.join({"service": "lz-tts", "synthesis": synthesis_capabilities})
             connection_lost = asyncio.Event()
             heartbeat_task = asyncio.create_task(taskflow.heartbeat_loop(connection_lost))
+            set_status("ok")
             _LOGGER.info("LZ-TTS Taskflow worker ready id=%s", taskflow.worker_id)
             while not connection_lost.is_set():
                 leases = await _pull_task_batch(taskflow)
                 if leases:
-                    await _process_leases(taskflow, inference, leases, acks)
+                    try:
+                        await _process_leases(taskflow, inference, leases, acks)
+                    except Exception as error:
+                        # _process_leases only re-raises when the inference
+                        # runtime itself is broken (per-lease errors are
+                        # handled internally). Drop to ``error`` so the
+                        # orchestrator pulls traffic before reconnect storms.
+                        set_status("error", reason=f"inference runtime failed: {error}")
+                        raise
         except ProtocolError as error:
             if error.status_code in {401, 403, 404}:
                 taskflow.session_id = None
@@ -649,6 +672,10 @@ async def _serve_taskflow(
         except Exception:
             _LOGGER.exception("Taskflow connection lost; reconnecting without reloading models")
         finally:
+            if was_ok:
+                set_status("error", reason="taskflow connection lost")
+            else:
+                set_status("starting")
             if heartbeat_task:
                 heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -656,13 +683,14 @@ async def _serve_taskflow(
         await asyncio.sleep(2)
 
 
-def _start_dev_http_server(inference: LzTtsInferenceSession) -> tuple[Any, asyncio.Task] | None:
-    """Optionally serve the development /task/sync adapter in-process.
+def _start_http_server(inference: LzTtsInferenceSession) -> tuple[Any, asyncio.Task]:
+    """Serve the in-process HTTP adapter (health probe + dev /task/sync).
 
-    Disabled by default; enable explicitly with LZ_TTS_DEV_HTTP=1.
+    The HTTP server is always on. ``/health`` is unauthenticated and reflects
+    whether the worker has joined the Taskflow cluster (``ok``) or is still
+    starting up / reconnecting (``starting``). ``/task/sync`` is gated by the
+    standard API key middleware and reuses the worker's inference session.
     """
-    if not _env_bool("LZ_TTS_DEV_HTTP", False):
-        return None
     import uvicorn
 
     host = os.environ.get("HOST", "0.0.0.0")
@@ -686,7 +714,7 @@ async def run_worker() -> None:
     )
     inference = LzTtsInferenceSession()
     await inference.start()
-    dev_http = _start_dev_http_server(inference)
+    http_server, http_task = _start_http_server(inference)
     acks = SynthesisAckBatcher(
         taskflow._client,
         lazybird_url.rstrip("/") + "/internal/synthesis-events/v1/batch",
@@ -696,11 +724,10 @@ async def run_worker() -> None:
         synthesis_capabilities = inference.synthesis_capabilities()
         await _serve_taskflow(taskflow, inference, synthesis_capabilities, acks)
     finally:
-        if dev_http is not None:
-            dev_server, dev_server_task = dev_http
-            dev_server.should_exit = True
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await dev_server_task
+        http_server.should_exit = True
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await http_task
+        set_status("starting")
         await acks.stop()
         await taskflow.close()
         await inference.close()
