@@ -33,18 +33,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Optional health endpoint for serverless platforms (vast.ai etc. that
-#    healthcheck an HTTP port). Serves 200 on / once the worker starts.
-# ---------------------------------------------------------------------------
-if [ -n "${LZ_TTS_HEALTH_PORT:-}" ]; then
-    echo "[bootstrap] Starting health server on port ${LZ_TTS_HEALTH_PORT}"
-    mkdir -p /tmp/lz-health && : > /tmp/lz-health/index.html
-    cd /tmp/lz-health
-    python3 -m http.server "${LZ_TTS_HEALTH_PORT}" --bind 0.0.0.0 >/dev/null 2>&1 &
-    cd /app
-fi
-
-# ---------------------------------------------------------------------------
-# 4. Hand off to the service command (default: lz-tts-worker, like pm2).
+# 3. Hand off to the service command (default: lz-tts-worker, like pm2).
+#    The worker serves /health itself on PORT; no separate health server needed.
 # ---------------------------------------------------------------------------
 exec "$@"
