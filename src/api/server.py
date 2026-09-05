@@ -1660,7 +1660,7 @@ def _plan_text_segments(
         return segments, {forced_locale}
 
     result = _split_multilingual_text(text, language_hint)
-    main_lang = result.effective_main_language(language_hint or "en")
+    main_lang = result.effective_main_language(language_hint or "en-us")
     primary_lang = _get_base_language(primary_speaker) if primary_speaker else None
     if primary_speaker is not None and validate_primary_speaker:
         _resolve_speaker_and_model(primary_speaker, explicit=True)
@@ -2004,7 +2004,7 @@ def _ssml_language_plan(
         return language, [CtcLanguageSpan(0, len(text), language)]
 
     result = _split_multilingual_text(text, language_hint)
-    main_language = result.effective_main_language(language_hint or "en")
+    main_language = result.effective_main_language(language_hint or "en-us")
     spans: list[CtcLanguageSpan] = []
     cursor = 0
 
@@ -2065,7 +2065,7 @@ def _language_at_source_position(
     if forced_language:
         return _normalize_locale_with_region(forced_language)
     result = _split_multilingual_text(text, language_hint)
-    main_language = result.effective_main_language(language_hint or "en")
+    main_language = result.effective_main_language(language_hint or "en-us")
     for segment in result.segments:
         if segment.start <= position < segment.end:
             detected = segment.language if segment.language and segment.language != "und" else main_language
@@ -3330,7 +3330,7 @@ def _prepare_voxcpm_input(
         return normalize_spoken_text(text, language), language
 
     result = _get_multilingual_splitter().split(text)
-    main_language = result.effective_main_language(fallback_language or "en")
+    main_language = result.effective_main_language(fallback_language or "en-us")
     prepared_segments = []
     for segment in result.segments:
         segment_text = segment.text.strip()

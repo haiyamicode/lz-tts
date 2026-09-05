@@ -21,7 +21,7 @@ def _repeated_number_text() -> str:
 def test_effective_main_language_falls_back_for_und() -> None:
     result = MultilingualSplitter().split("67 67 67 6767 6767")
     assert result.main_language == "und"
-    assert result.effective_main_language() == "en"
+    assert result.effective_main_language() == "en-us"
     # A request/voice language is used as the fallback base when given.
     assert result.effective_main_language("fr-FR") == "fr-FR"
 

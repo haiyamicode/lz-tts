@@ -34,7 +34,7 @@ class SplitResult:
     main_language: str
     segments: list[Segment]
 
-    def effective_main_language(self, default: str = "en") -> str:
+    def effective_main_language(self, default: str = "en-us") -> str:
         """Main language, falling back to `default` when undetermined."""
         return (
             self.main_language

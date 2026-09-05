@@ -87,7 +87,7 @@ def test_voxcpm_input_falls_back_to_request_language_for_undetectable_text() -> 
     _, language = server._prepare_voxcpm_input(text, None, "fr-FR")
     assert language == "fr-FR"
     _, default_language = server._prepare_voxcpm_input(text, None)
-    assert default_language == "en"
+    assert default_language == "en-us"
     _, explicit_language = server._prepare_voxcpm_input(text, "de-DE", "fr-FR")
     assert explicit_language == "de-DE"
 
