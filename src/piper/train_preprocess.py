@@ -903,7 +903,7 @@ def phonemize_spans_with_speakers(
     splitter = MultilingualSplitter()
     split_result = splitter.split(text)
     segments = split_result.segments
-    main_lang = split_result.main_language
+    main_lang = split_result.effective_main_language()
     _LOGGER.debug("infer-multispan: segments=%s (main=%s)", [(seg.language, _short_text(seg.text, 60)) for seg in segments], main_lang)
 
     # Helper to check if a language has an available speaker
@@ -933,7 +933,7 @@ def phonemize_spans_with_speakers(
         if not span_text.strip():
             continue
         # Use main language as fallback for undetermined segments
-        lang = (seg.language if seg.language and seg.language != "und" else main_lang or "en").lower()
+        lang = (seg.language if seg.language and seg.language != "und" else main_lang).lower()
 
         # Try to find a speaker for the detected language
         speaker_info = _find_speaker_for_lang(lang)

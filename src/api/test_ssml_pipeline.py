@@ -78,3 +78,32 @@ def test_native_root_voice_ssml_does_not_route_through_seed_vc(monkeypatch) -> N
         request.model_copy(update={"language": "as-IN"}),
         None,
     )
+
+
+def test_voxcpm_input_falls_back_to_request_language_for_undetectable_text() -> None:
+    # A run of bare numbers is undetectable by CLD2 ("und"); the
+    # request/voice language must be the fallback base, not hardcoded "en".
+    text = "67 67 67 6767 6767 6767 6767 6767 6767 6"
+    _, language = server._prepare_voxcpm_input(text, None, "fr-FR")
+    assert language == "fr-FR"
+    _, default_language = server._prepare_voxcpm_input(text, None)
+    assert default_language == "en"
+    _, explicit_language = server._prepare_voxcpm_input(text, "de-DE", "fr-FR")
+    assert explicit_language == "de-DE"
+
+
+def test_configured_voice_language_prefers_request_language(monkeypatch) -> None:
+    voice = server.RootVoiceConfig(voice_id="v1", model="m", languages=["fr-FR"])
+    monkeypatch.setattr(
+        server, "_configured_root_voice_for_voice_id", lambda _id: voice
+    )
+    assert server._configured_voice_language("v1", "de-DE") == "de-DE"
+    assert server._configured_voice_language("v1", None) == "fr-FR"
+
+    multi = server.RootVoiceConfig(
+        voice_id="v2", model="m", languages=["fr-FR", "de-DE"]
+    )
+    monkeypatch.setattr(
+        server, "_configured_root_voice_for_voice_id", lambda _id: multi
+    )
+    assert server._configured_voice_language("v2", None) is None

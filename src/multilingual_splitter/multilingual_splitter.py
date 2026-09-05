@@ -34,6 +34,14 @@ class SplitResult:
     main_language: str
     segments: list[Segment]
 
+    def effective_main_language(self, default: str = "en") -> str:
+        """Main language, falling back to `default` when undetermined."""
+        return (
+            self.main_language
+            if self.main_language and self.main_language != "und"
+            else default
+        )
+
 
 # =============================================================================
 # LANGUAGE DETECTION THRESHOLDS CONFIGURATION

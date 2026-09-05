@@ -642,7 +642,11 @@ def _phonemize_espeak_with_mapping_dp(
 
     mappings: List[Tuple[int, int, int, int, int]] = []
     previous_end = 0
+    pending_start: Optional[int] = None
     for token_index, (start, end, _) in enumerate(active_spans):
+        if pending_start is not None:
+            start = pending_start
+        pending_start = None
         matched = matched_by_token[token_index]
         if not matched:
             if mappings:
@@ -655,7 +659,8 @@ def _phonemize_espeak_with_mapping_dp(
                     punct_len,
                 )
                 continue
-            raise ValueError(f"unmatched token {text[start:end]!r}")
+            pending_start = start
+            continue
 
         ph_start = min(matched)
         ph_end = max(matched) + 1
@@ -679,7 +684,8 @@ def _phonemize_espeak_with_mapping_dp(
                     punct_len,
                 )
                 continue
-            raise ValueError(f"empty token range {text[start:end]!r}")
+            pending_start = start
+            continue
 
         base_ph_end = ph_end
         next_start = len(full_phonemes)
@@ -697,6 +703,9 @@ def _phonemize_espeak_with_mapping_dp(
         punct_len = max(punct_len, ph_end - punct_scan)
         mappings.append((start + 1, end - start, ph_start, ph_end, punct_len))
         previous_end = ph_end
+
+    if not mappings and active_spans:
+        return _phonemize_espeak_with_mapping_raw(text, voice, data_path)
 
     return [full_phonemes], [mappings]
 
@@ -976,6 +985,8 @@ def _map_cld2_to_espeak(lang_code: str, primary_voice: str = "en-us") -> str:
         return "en-us"
 
     code = lang_code.strip().lower().replace("_", "-")
+    if not code or code in ("und", "undetermined"):
+        return primary_voice
     base = code.split("-", 1)[0] if code else "en"
 
     if code in ("en-us", "en-us+f3", "en-us+f4"):
@@ -1091,7 +1102,7 @@ def _phonemize_multilingual_with_spans(
     splitter = MultilingualSplitter()
     result = splitter.split(text)
     segments = result.segments
-    main_lang = result.main_language
+    main_lang = result.effective_main_language()
 
     _LOGGER.debug(
         "multilingual_splitter segments: %s (main=%s)",
@@ -1104,7 +1115,7 @@ def _phonemize_multilingual_with_spans(
     semantic_parts: List[str] = []
     for idx, seg in enumerate(segments):
         span_text = seg.text
-        lang = seg.language if seg.language and seg.language != "und" else main_lang or "en"
+        lang = seg.language if seg.language and seg.language != "und" else main_lang
 
         if not span_text.strip():
             continue
@@ -1460,7 +1471,7 @@ def phonemize_spans_with_speakers(
     casing = get_text_casing("ignore")
     split_result = splitter.split(text)
     segments = split_result.segments
-    main_lang = split_result.main_language
+    main_lang = split_result.effective_main_language()
     if main_lang not in supported_langs:
         primary_lang = primary.split("-")[0]
         main_lang = primary_lang if primary_lang in supported_langs else next(iter(supported_langs), primary_lang)
@@ -1497,7 +1508,7 @@ def phonemize_spans_with_speakers(
         if not span_text.strip():
             continue
 
-        lang = (seg.language if seg.language and seg.language != "und" else main_lang or "en").lower()
+        lang = (seg.language if seg.language and seg.language != "und" else main_lang).lower()
         if supported_langs and lang.split("-")[0] not in supported_langs:
             lang = main_lang or primary.split("-")[0]
 

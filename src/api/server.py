@@ -1660,7 +1660,7 @@ def _plan_text_segments(
         return segments, {forced_locale}
 
     result = _split_multilingual_text(text, language_hint)
-    main_lang = result.main_language or "en"
+    main_lang = result.effective_main_language(language_hint or "en")
     primary_lang = _get_base_language(primary_speaker) if primary_speaker else None
     if primary_speaker is not None and validate_primary_speaker:
         _resolve_speaker_and_model(primary_speaker, explicit=True)
@@ -2004,7 +2004,7 @@ def _ssml_language_plan(
         return language, [CtcLanguageSpan(0, len(text), language)]
 
     result = _split_multilingual_text(text, language_hint)
-    main_language = result.main_language or "en"
+    main_language = result.effective_main_language(language_hint or "en")
     spans: list[CtcLanguageSpan] = []
     cursor = 0
 
@@ -2065,7 +2065,7 @@ def _language_at_source_position(
     if forced_language:
         return _normalize_locale_with_region(forced_language)
     result = _split_multilingual_text(text, language_hint)
-    main_language = result.main_language or "en"
+    main_language = result.effective_main_language(language_hint or "en")
     for segment in result.segments:
         if segment.start <= position < segment.end:
             detected = segment.language if segment.language and segment.language != "und" else main_language
@@ -2378,6 +2378,7 @@ def _prepare_voxcpm_ipa_text(
     document: SSMLDocument,
     language_hint: str | None,
     forced_language: str | None,
+    fallback_language: str | None = None,
 ) -> tuple[str, str, list[dict[str, Any]]]:
     operations = sorted(document.pronunciations, key=lambda item: item.start)
     cursor = 0
@@ -2395,7 +2396,7 @@ def _prepare_voxcpm_ipa_text(
     marked_parts.append(document.text[cursor:])
 
     marked_text, detected_language = _prepare_voxcpm_input(
-        "".join(marked_parts), forced_language
+        "".join(marked_parts), forced_language, fallback_language
     )
     located_replacements: list[tuple[int, str, PronunciationOperation]] = []
     for marker, operation in replacements:
@@ -2589,6 +2590,7 @@ async def _synthesize_voxcpm_ipa_ssml(
         document,
         request.language,
         forced_language,
+        _configured_voice_language(request.voice_id, request.language),
     )
     controlled_operations = _voxcpm_controlled_operations(controls)
     baseline_timestamps = await _align_ssml_audio(
@@ -3319,12 +3321,16 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
     return response
 
 
-def _prepare_voxcpm_input(text: str, language: str | None) -> tuple[str, str]:
+def _prepare_voxcpm_input(
+    text: str,
+    language: str | None,
+    fallback_language: str | None = None,
+) -> tuple[str, str]:
     if language is not None:
         return normalize_spoken_text(text, language), language
 
     result = _get_multilingual_splitter().split(text)
-    main_language = result.main_language or "en"
+    main_language = result.effective_main_language(fallback_language or "en")
     prepared_segments = []
     for segment in result.segments:
         segment_text = segment.text.strip()
@@ -3344,8 +3350,12 @@ def _prepare_voxcpm_input(text: str, language: str | None) -> tuple[str, str]:
     return prepared_text, main_language
 
 
-def _prepare_voxcpm_text(text: str, language: str | None) -> str:
-    return _prepare_voxcpm_input(text, language)[0]
+def _prepare_voxcpm_text(
+    text: str,
+    language: str | None,
+    fallback_language: str | None = None,
+) -> str:
+    return _prepare_voxcpm_input(text, language, fallback_language)[0]
 
 
 def _get_voxcpm_runtime() -> VoxCPMRuntime:
@@ -3492,8 +3502,9 @@ async def synthesize_voxcpm_batch(
         lora_name = await runtime.resolve_lora_combination(requested_loras)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Could not apply VoxCPM LoRAs: {exc}") from exc
+    fallback_language = _configured_voice_language(request.voice_id, request.language)
     prepared_inputs = [
-        _prepare_voxcpm_input(text, language)
+        _prepare_voxcpm_input(text, language, fallback_language)
         for text, language in zip(texts, languages)
     ]
     prepared_texts = [prepared_text for prepared_text, _ in prepared_inputs]
