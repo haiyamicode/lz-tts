@@ -16,6 +16,8 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from ..process_guard import exit_with_parent
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,6 +72,7 @@ class ChildWorkerDied(RuntimeError):
 
 def run_worker_loop(engine_name: str, handler: Callable[[str, Any], dict[str, Any]], request_queue: Any, response_queue: Any) -> None:
     """Run a simple action/payload worker loop."""
+    exit_with_parent()
     _LOGGER.info("%s worker ready pid=%s", engine_name, os.getpid())
     while True:
         message = request_queue.get()
@@ -129,10 +132,23 @@ class WorkerProcessClient:
             )
             self.process.start()
 
+    @staticmethod
+    def _close_queues(*queues: Any) -> None:
+        """Release queue pipes so reloading a worker does not leak fds/threads."""
+        for queue in queues:
+            if queue is None:
+                continue
+            try:
+                queue.cancel_join_thread()
+                queue.close()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+
     def stop(self) -> None:
         with self.start_lock:
             process = self.process
             requests = self.requests
+            self._close_queues(self.requests, self.responses)
             if process is not None and process.is_alive() and requests is not None:
                 try:
                     requests.put({"action": "shutdown", "payload": None})
@@ -178,6 +194,7 @@ class WorkerProcessClient:
                     exit_detail = _process_exit_description(self.process.exitcode)
                     with self.start_lock:
                         if self.process is not None and self.process.exitcode is not None:
+                            self._close_queues(self.requests, self.responses)
                             self.process = None
                             self.requests = None
                             self.responses = None

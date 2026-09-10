@@ -501,15 +501,19 @@ class AsyncVoxCPMServer:
                 await asyncio.to_thread(self.process.join, 2.0)
 
         # The parent process created these multiprocessing Queues. If we don't
-        # close/join them, Python may warn at interpreter shutdown about leaked
-        # semaphore objects via multiprocessing.resource_tracker.
+        # close them, Python may warn at interpreter shutdown about leaked
+        # semaphore objects via multiprocessing.resource_tracker. A dead child
+        # leaves our writes unread, so the feeder thread can be parked forever in
+        # pipe_write; joining it here would wedge the event loop.
+        # cancel_join_thread() closes our copy of the read end, which breaks the
+        # pipe and releases the feeder thread.
         for q in (getattr(self, "queue_in", None), getattr(self, "queue_out", None)):
             if q is None:
                 continue
             with contextlib.suppress(Exception):
-                q.close()
+                q.cancel_join_thread()
             with contextlib.suppress(Exception):
-                q.join_thread()
+                q.close()
 
     async def register_lora(self, name: str, path: str) -> RegisterLoRAResponse:
         return await self.submit("register_lora", name, path)

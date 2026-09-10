@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import socket
 import subprocess
 import tempfile
@@ -715,6 +716,15 @@ async def run_worker() -> None:
     inference = LzTtsInferenceSession()
     await inference.start()
     http_server, http_task = _start_http_server(inference)
+    # uvicorn installs its own handlers when the server task starts; ours run
+    # afterwards so SIGINT/SIGTERM end the whole worker instead of leaving the
+    # lease loop running until pm2 SIGKILLs us (which would orphan the children).
+    await asyncio.sleep(0)
+    main_task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(shutdown_signal, main_task.cancel)
     acks = SynthesisAckBatcher(
         taskflow._client,
         lazybird_url.rstrip("/") + "/internal/synthesis-events/v1/batch",
@@ -723,6 +733,8 @@ async def run_worker() -> None:
     try:
         synthesis_capabilities = inference.synthesis_capabilities()
         await _serve_taskflow(taskflow, inference, synthesis_capabilities, acks)
+    except asyncio.CancelledError:
+        _LOGGER.info("LZ-TTS worker shutdown requested")
     finally:
         http_server.should_exit = True
         with contextlib.suppress(asyncio.CancelledError, Exception):

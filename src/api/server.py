@@ -999,7 +999,16 @@ def _wait_for_engine_ready(engine: str, *, timeout: float | None = None) -> None
 
 
 async def _await_engine_ready(engine: str, *, timeout: float | None = None) -> None:
-    await asyncio.to_thread(_wait_for_engine_ready, engine, timeout=timeout)
+    while True:
+        try:
+            await asyncio.to_thread(_wait_for_engine_ready, engine, timeout=timeout)
+            return
+        except HTTPException:
+            # An engine that failed to load (or whose child died while loading)
+            # is retried on the next request instead of staying broken forever.
+            if not _engine_reload_due(engine):
+                raise
+            _schedule_engine_reload(engine)
 
 
 def _worker_settings_data() -> dict[str, Any]:
@@ -1046,21 +1055,25 @@ def _worker_name_to_engine(name: str) -> str | None:
         return "starling"
     if name == "seed-vc":
         return "seed_vc"
+    if name == "voxcpm":
+        return "voxcpm"
     return None
 
 
 def _mark_engine_failed_from_child(worker_name: str, exc: BaseException) -> None:
-    """Mark the engine backing a child worker as failed in ``_engine_load_states``.
+    """Recover from a backend child process that died mid-request.
 
-    Subsequent ``_wait_for_engine_ready`` calls will return 503 instead of
-    silently cold-loading the dead process again on every request.
+    The request that hit the dead child fails with its error, and the engine is
+    reloaded so the next lease gets a fresh process (with freshly allocated GPU
+    memory) instead of a permanently broken backend.
     """
     engine = _worker_name_to_engine(worker_name)
     if engine is None or engine not in _engine_load_states:
         return
-    state = _engine_state(engine)
-    if state.status in {"loading", "ready", "error"}:
-        _mark_engine_failed(engine, exc)
+    if _engine_state(engine).status == "disabled":
+        return
+    _LOGGER.error("Backend %s worker died (%s); reloading %s backend", worker_name, exc, engine)
+    _schedule_engine_reload(engine)
 
 
 def _stop_model_workers() -> None:
@@ -4034,6 +4047,116 @@ class InferenceOperationError(RuntimeError):
         super().__init__(str(detail))
 
 
+async def _load_sparrow_engine() -> None:
+    global _sparrow_model_info
+    with _logged_startup_step("sparrow_worker", preload_models=_preloaded_piper_models()):
+        worker = _ensure_sparrow_worker()
+        worker.stop()
+        worker.start()
+        response = await asyncio.to_thread(worker.call, "health")
+        data = response.get("data") or {}
+        _sparrow_model_info = dict(data.get("models") or {})
+        _LOGGER.info("Sparrow worker loaded models=%s", list(_sparrow_model_info.keys()))
+
+
+async def _load_voxcpm_engine() -> None:
+    global _voxcpm_runtime
+    config = _server_config.voxcpm
+    with _logged_startup_step(
+        "voxcpm_nanovllm",
+        model=config.model_path,
+        model_id=config.model_id,
+        device=config.device,
+        kv_blocks=config.num_kvcache_blocks,
+    ):
+        previous = _voxcpm_runtime
+        _voxcpm_runtime = None
+        if previous is not None:
+            await previous.stop()
+        runtime = VoxCPMRuntime(config.model_dump(mode="python"))
+        try:
+            await runtime.start()
+        except BaseException:
+            # A runtime that failed to start must not leave a child process
+            # holding GPU memory behind for the next attempt.
+            with contextlib.suppress(Exception):
+                await runtime.stop()
+            raise
+        _voxcpm_runtime = runtime
+
+
+async def _load_starling_engine() -> None:
+    global _starling_info
+    with _logged_startup_step(
+        "starling_worker",
+        device=_server_config.starling.device,
+        checkpoint=_server_config.starling.checkpoint,
+        vocoder=_server_config.starling.vocoder,
+    ):
+        worker = _ensure_starling_worker()
+        worker.stop()
+        worker.start()
+        response = await asyncio.to_thread(worker.call, "health")
+        _starling_info = dict(response.get("data") or {})
+
+
+async def _load_seed_vc_engine() -> None:
+    global _seed_vc_info
+    with _logged_startup_step(
+        "seed_vc_worker",
+        device=_server_config.seed_vc.device,
+        root=_server_config.seed_vc.root,
+    ):
+        worker = _ensure_seed_vc_worker()
+        worker.stop()
+        worker.start()
+        response = await asyncio.to_thread(worker.call, "health")
+        _seed_vc_info = dict(response.get("data") or {})
+
+
+_ENGINE_LOADERS: dict[str, Callable[[], Awaitable[None]]] = {
+    "pipertts": _load_sparrow_engine,
+    "voxcpm": _load_voxcpm_engine,
+    "starling": _load_starling_engine,
+    "seed_vc": _load_seed_vc_engine,
+}
+_engine_reload_tasks: dict[str, asyncio.Task[None]] = {}
+_ENGINE_RELOAD_BACKOFF_SECONDS = 10.0
+
+
+async def _run_engine_loader(engine: str, loader: Callable[[], Awaitable[None]]) -> None:
+    try:
+        await loader()
+        _mark_engine_ready(engine)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOGGER.exception("Failed loading %s backend", engine)
+        _mark_engine_failed(engine, exc)
+
+
+def _schedule_engine_reload(engine: str) -> None:
+    """Reload one backend, at most one reload in flight per engine."""
+    task = _engine_reload_tasks.get(engine)
+    if task is not None and not task.done():
+        return
+    loader = _ENGINE_LOADERS.get(engine)
+    if loader is None:
+        return
+    _mark_engine_loading(engine)
+    _engine_reload_tasks[engine] = asyncio.get_running_loop().create_task(_run_engine_loader(engine, loader))
+
+
+def _engine_reload_due(engine: str) -> bool:
+    """Rate limit request-driven reloads of an engine that keeps failing to load."""
+    state = _engine_state(engine)
+    if state.status != "error":
+        return False
+    if state.finished_at is None:
+        return True
+    return time.perf_counter() - state.finished_at >= _ENGINE_RELOAD_BACKOFF_SECONDS
+
+
 async def _start_inference_runtime(config: ServerConfig) -> None:
     """Initialize the process-wide model runtime without constructing an API app."""
     global _server_config, _speaker_routes, _ssml_aligner
@@ -4071,93 +4194,33 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
             else:
                 _mark_engine_disabled(engine)
 
-    async def run_loader(engine: str, loader: Callable[[], Awaitable[None]]) -> None:
-        try:
-            await loader()
-            _mark_engine_ready(engine)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            _LOGGER.exception("Failed loading %s backend", engine)
-            _mark_engine_failed(engine, exc)
-
     async def load_models_background() -> None:
         load_started = time.perf_counter()
         startup_tasks: list[asyncio.Task] = []
 
         if _engine_enabled("pipertts"):
-            allowed_models = _allowed_models()
-            preload_models = _preloaded_piper_models()
-            if not allowed_models:
+            if not _allowed_models():
                 _mark_engine_failed(
                     "pipertts",
                     RuntimeError("PiperTTS is enabled but no Sparrow models are configured or available"),
                 )
             else:
-                async def start_sparrow() -> None:
-                    global _sparrow_model_info
-                    with _logged_startup_step("sparrow_worker", preload_models=preload_models):
-                        worker = _ensure_sparrow_worker()
-                        worker.start()
-                        response = await asyncio.to_thread(worker.call, "health")
-                        data = response.get("data") or {}
-                        _sparrow_model_info = dict(data.get("models") or {})
-                        _LOGGER.info("Sparrow worker loaded models=%s", list(_sparrow_model_info.keys()))
-
-                startup_tasks.append(asyncio.create_task(run_loader("pipertts", start_sparrow)))
+                startup_tasks.append(asyncio.create_task(_run_engine_loader("pipertts", _load_sparrow_engine)))
         else:
             _LOGGER.info("PiperTTS backend disabled")
 
         if _engine_enabled("voxcpm"):
-            async def start_voxcpm() -> None:
-                global _voxcpm_runtime
-                with _logged_startup_step(
-                    "voxcpm_nanovllm",
-                    model=_server_config.voxcpm.model_path,
-                    model_id=_server_config.voxcpm.model_id,
-                    device=_server_config.voxcpm.device,
-                    kv_blocks=_server_config.voxcpm.num_kvcache_blocks,
-                ):
-                    runtime = VoxCPMRuntime(_server_config.voxcpm.model_dump(mode="python"))
-                    await runtime.start()
-                    _voxcpm_runtime = runtime
-
-            startup_tasks.append(asyncio.create_task(run_loader("voxcpm", start_voxcpm)))
+            startup_tasks.append(asyncio.create_task(_run_engine_loader("voxcpm", _load_voxcpm_engine)))
         else:
             _LOGGER.info("VoxCPM backend disabled")
 
         if _engine_enabled("starling"):
-            async def start_starling() -> None:
-                global _starling_info
-                with _logged_startup_step(
-                    "starling_worker",
-                    device=_server_config.starling.device,
-                    checkpoint=_server_config.starling.checkpoint,
-                    vocoder=_server_config.starling.vocoder,
-                ):
-                    worker = _ensure_starling_worker()
-                    worker.start()
-                    response = await asyncio.to_thread(worker.call, "health")
-                    _starling_info = dict(response.get("data") or {})
-
-            startup_tasks.append(asyncio.create_task(run_loader("starling", start_starling)))
+            startup_tasks.append(asyncio.create_task(_run_engine_loader("starling", _load_starling_engine)))
         else:
             _LOGGER.info("Starling backend disabled")
 
         if _engine_enabled("seed_vc"):
-            async def start_seed_vc() -> None:
-                global _seed_vc_info
-                with _logged_startup_step(
-                    "seed_vc_worker",
-                    device=_server_config.seed_vc.device,
-                    root=_server_config.seed_vc.root,
-                ):
-                    worker = _ensure_seed_vc_worker()
-                    worker.start()
-                    response = await asyncio.to_thread(worker.call, "health")
-                    _seed_vc_info = dict(response.get("data") or {})
-
-            startup_tasks.append(asyncio.create_task(run_loader("seed_vc", start_seed_vc)))
+            startup_tasks.append(asyncio.create_task(_run_engine_loader("seed_vc", _load_seed_vc_engine)))
         else:
             _LOGGER.info("Seed-VC backend disabled")
 
@@ -4214,6 +4277,13 @@ async def _stop_inference_runtime() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await _startup_loader_task
     _startup_loader_task = None
+    pending_reloads = [task for task in _engine_reload_tasks.values() if not task.done()]
+    for task in pending_reloads:
+        task.cancel()
+    for task in pending_reloads:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    _engine_reload_tasks.clear()
     if _voxcpm_runtime is not None:
         await _voxcpm_runtime.stop()
         _voxcpm_runtime = None

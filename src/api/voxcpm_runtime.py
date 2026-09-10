@@ -16,10 +16,17 @@ from typing import Any
 
 import numpy as np
 
+from ..nanovllm_voxcpm.models.voxcpm2.server import VoxCPMServerDied
 from .voxcpm_lora import compose_voxcpm_loras
+from .worker_common import ChildWorkerDied
 
 _LOGGER = logging.getLogger(__name__)
 _KV_BLOCKS_ENV = "NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"
+
+
+def _as_child_death(exc: VoxCPMServerDied) -> ChildWorkerDied:
+    """Report a dead VoxCPM child the way the API server handles child deaths."""
+    return ChildWorkerDied("voxcpm", exc.exit_detail)
 
 
 class VoxCPMRuntime:
@@ -321,11 +328,14 @@ class VoxCPMRuntime:
                 self._reference_latents.move_to_end(cache_key)
                 return cached
 
-        latents = await self.server.encode_latents(
-            audio,
-            audio_format,
-            float(self.settings.get("max_reference_seconds", 25.0)),
-        )
+        try:
+            latents = await self.server.encode_latents(
+                audio,
+                audio_format,
+                float(self.settings.get("max_reference_seconds", 25.0)),
+            )
+        except VoxCPMServerDied as exc:
+            raise _as_child_death(exc) from exc
         async with self._reference_cache_lock:
             cached = self._reference_latents.get(cache_key)
             if cached is not None:
@@ -362,10 +372,13 @@ class VoxCPMRuntime:
         }
         if seed is not None:
             generation_kwargs["seed"] = seed
-        chunks = [
-            np.asarray(chunk, dtype=np.float32)
-            async for chunk in self.server.generate(**generation_kwargs)
-        ]
+        try:
+            chunks = [
+                np.asarray(chunk, dtype=np.float32)
+                async for chunk in self.server.generate(**generation_kwargs)
+            ]
+        except VoxCPMServerDied as exc:
+            raise _as_child_death(exc) from exc
         if not chunks:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(chunks).astype(np.float32, copy=False)

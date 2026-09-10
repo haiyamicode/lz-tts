@@ -1,13 +1,14 @@
 import asyncio
 import contextlib
 import io
+import logging
 import os
 import threading
 import time
 import traceback
 import uuid
 from queue import Empty
-from typing import Any, AsyncGenerator, List, Optional, cast
+from typing import Any, AsyncGenerator, Callable, List, Optional, cast
 
 import librosa
 import numpy as np
@@ -20,8 +21,19 @@ from src.nanovllm_voxcpm.config import Config, resolve_model_dtype
 from src.nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig, VoxCPM2Config
 from src.nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
 from src.nanovllm_voxcpm.models.voxcpm2.runner import VoxCPM2Runner
+from src.process_guard import exit_with_parent
+
+_LOGGER = logging.getLogger(__name__)
 
 Waveform = NDArray[np.float32]
+
+
+class VoxCPMServerDied(RuntimeError):
+    """The VoxCPM child process is gone and can no longer serve requests."""
+
+    def __init__(self, exit_detail: str):
+        self.exit_detail = exit_detail
+        super().__init__(f"VoxCPM server process is gone ({exit_detail})")
 
 
 class HealthResponse(TypedDict):
@@ -227,6 +239,7 @@ class VoxCPM2ServerImpl:
 def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
     import signal
 
+    exit_with_parent()
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     devices = kwargs.get("devices")
     if devices is None and len(args) > 8:
@@ -296,6 +309,10 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
             if states["is_stoped"]:
                 break
 
+            # Failures here (CUDA OOM and friends) are deliberately not caught:
+            # the child exits together with its CUDA context, the parent sees
+            # the process die, fails the in-flight sequences and reloads the
+            # engine with a fresh process.
             output = srv.step()
             for seq in output:
                 latest_waveform = seq.custom_payload.generated_waveforms[-1]
@@ -326,6 +343,7 @@ class AsyncVoxCPM2Server:
         lora_config: Optional[LoRAConfig] = None,
         ipa_adapter_path: str | None = None,
         dtype: str = "auto",
+        target: Optional[Callable[..., None]] = None,
         **kwargs,
     ) -> None:
         if len(kwargs) > 0:
@@ -334,7 +352,7 @@ class AsyncVoxCPM2Server:
         self.queue_in = ctx.Queue()
         self.queue_out = ctx.Queue()
         self.process = ctx.Process(
-            target=main_loop,
+            target=target or main_loop,
             args=(
                 self.queue_in,
                 self.queue_out,
@@ -358,6 +376,8 @@ class AsyncVoxCPM2Server:
         )
         self.process.start()
         loop = asyncio.get_running_loop()
+        self._death: Optional[VoxCPMServerDied] = None
+        self._stopping = False
         self._init_fut: asyncio.Future[None] = loop.create_future()
         self.op_table: dict[str, asyncio.Future[Any]] = {}
         self.stream_table: dict[str, asyncio.Queue[Waveform | None]] = {}
@@ -371,6 +391,39 @@ class AsyncVoxCPM2Server:
         )
         self._queue_out_thread.start()
         self.recv_task: asyncio.Task = asyncio.create_task(self.recv_queue())
+        # Requests that are already waiting on the child have to fail as soon as
+        # the process is gone; the queue bridge alone cannot notice it.
+        self._watch_thread = threading.Thread(
+            target=self._watch_process,
+            args=(loop,),
+            name="voxcpm2-child-watch",
+            daemon=True,
+        )
+        self._watch_thread.start()
+
+    def _watch_process(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.process.join()
+        detail = f"exitcode {self.process.exitcode}"
+        log = _LOGGER.info if self._stopping else _LOGGER.error
+        log("VoxCPM server process exited %s", detail)
+        try:
+            loop.call_soon_threadsafe(self._mark_dead, detail)
+        except RuntimeError:  # event loop already closed
+            return
+
+    def _mark_dead(self, detail: str) -> None:
+        if self._death is not None:
+            return
+        self._death = VoxCPMServerDied(detail)
+        death = self._death
+        if not self._init_fut.done():
+            self._init_fut.set_exception(death)
+        for fut in self.op_table.values():
+            if not fut.done():
+                fut.set_exception(death)
+        self.op_table.clear()
+        for queue in self.stream_table.values():
+            queue.put_nowait(death)
 
     def _queue_out_bridge(self, loop: asyncio.AbstractEventLoop) -> None:
         while not self._queue_out_stop.is_set():
@@ -415,6 +468,8 @@ class AsyncVoxCPM2Server:
             return
 
     async def submit(self, cmd: str, *args: object, **kwargs: object) -> Any:
+        if self._death is not None:
+            raise self._death
         op_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Any] = loop.create_future()
@@ -453,6 +508,7 @@ class AsyncVoxCPM2Server:
         )
 
     async def stop(self) -> None:
+        self._stopping = True
         graceful_stop = False
         if self.process.exitcode is None and self.process.is_alive():
             try:
@@ -479,10 +535,14 @@ class AsyncVoxCPM2Server:
         for q in (getattr(self, "queue_in", None), getattr(self, "queue_out", None)):
             if q is None:
                 continue
+            # A dead child leaves our writes unread, so the feeder thread can be
+            # parked forever in pipe_write; joining it here would wedge the event
+            # loop. cancel_join_thread() closes our copy of the read end, which
+            # breaks the pipe and releases the feeder thread.
+            with contextlib.suppress(Exception):
+                q.cancel_join_thread()
             with contextlib.suppress(Exception):
                 q.close()
-            with contextlib.suppress(Exception):
-                q.join_thread()
 
     async def register_lora(self, name: str, path: str) -> RegisterLoRAResponse:
         return await self.submit("register_lora", name, path)
@@ -531,9 +591,11 @@ class AsyncVoxCPM2Server:
                 if data is None:
                     is_normal_exit = True
                     break
+                if isinstance(data, BaseException):
+                    raise data
                 yield data
         finally:
-            if not is_normal_exit:
+            if not is_normal_exit and self._death is None:
                 await self.submit("cancel", seq_id)
             del self.stream_table[seq_id]
 
