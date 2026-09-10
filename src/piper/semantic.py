@@ -14,6 +14,10 @@ _DEFAULT_MODEL_NAME = "distilbert/distilbert-base-multilingual-cased"
 _LOGGER = logging.getLogger("vits.semantic")
 _DEBUG_SEMANTIC = bool(int(os.environ.get("PIPER_SEMANTIC_DEBUG", "0")))
 
+# Piper phoneme ids are laid out as BOS, blank, (phoneme, blank)*, EOS, so a
+# text without any phonemes yields exactly BOS + blank + EOS.
+_EMPTY_PHONEME_ID_COUNT = 3
+
 # Hugging Face tokenizers and Python multiprocessing don't mix well when
 # tokenizers are initialized before a fork. Disable parallelism to avoid
 # deadlocks and suppress the noisy warning.
@@ -177,13 +181,19 @@ def _build_word2ph_counts(
     BOS, blank, (phoneme, blank)*, EOS. Therefore raw phoneme span [s, e)
     maps to id span [2 + 2*s, 2 + 2*e).
     """
-    if phoneme_length <= 0:
+    # Texts that reduce to punctuation/whitespace only produce no phonemes at
+    # all, i.e. exactly the BOS/blank/EOS skeleton. There is no phoneme-to-word
+    # alignment to build for those spans; all-zero counts are the documented
+    # "no semantic features" outcome and are handled by both consumers
+    # (bert word2ph expansion and precomputed feature alignment).
+    if phoneme_length <= _EMPTY_PHONEME_ID_COUNT:
         return [0 for _ in attention_mask]
 
     spans = _normalize_word_spans(word_spans)
     if not spans:
         raise ValueError(
-            "word_spans are required when building phoneme-aligned BERT input"
+            "word_spans are required when building phoneme-aligned BERT input "
+            f"(phoneme_length={phoneme_length})"
         )
 
     active_tokens = [idx for idx, value in enumerate(attention_mask) if value]
