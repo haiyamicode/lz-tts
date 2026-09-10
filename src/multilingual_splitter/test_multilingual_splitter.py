@@ -772,6 +772,481 @@ class TestMainLanguageHint(unittest.TestCase):
                 )
 
 
+
+
+class TestCodeSwitchScriptCoverage(unittest.TestCase):
+    """Native-script sentence followed by an English sentence, one language set per case.
+
+    Guards the same-script code-switch contract across the script families the voice
+    registry routes: the native sentence stays a single span and the English sentence
+    another, whatever the script's own segmentation rules are (no spaces in Thai or Han,
+    RTL text, Indic clusters, diacritics).
+    """
+
+    ENGLISH = "Regular movement can support metabolism."
+
+    CASES = {
+        "ar": (
+            "هذه جملة بسيطة عن الصحة العامة.",
+            [("ar", 0, 32), ("en", 32, 72)],
+        ),
+        "as": (
+            "এইটো স্বাস্থ্যৰ বিষয়ে এটা সাধাৰণ বাক্য।",
+            [("as", 0, 41), ("en", 41, 81)],
+        ),
+        "el": (
+            "Αυτή είναι μια απλή πρόταση για την υγεία.",
+            [("el", 0, 43), ("en", 43, 83)],
+        ),
+        "fa": (
+            "این یک جمله ساده درباره سلامتی است.",
+            [("fa", 0, 36), ("en", 36, 76)],
+        ),
+        "gu": (
+            "આ સ્વાસ્થ્ય વિશે એક સામાન્ય વાક્ય છે.",
+            [("gu", 0, 38), ("en", 38, 78)],
+        ),
+        "he": (
+            "זהו משפט פשוט על בריאות.",
+            [("he", 0, 25), ("en", 25, 65)],
+        ),
+        "hi": (
+            "यह एक साधारण वाक्य है जो स्वास्थ्य के बारे में बताता है।",
+            [("hi", 0, 57), ("en", 57, 97)],
+        ),
+        "hy": (
+            "Սա պարզ նախադասություն է առողջության մասին։",
+            [("hy", 0, 44), ("en", 44, 84)],
+        ),
+        "id": (
+            "Ini adalah kalimat sederhana tentang kesehatan.",
+            [("id", 0, 47), ("en", 47, 88)],
+        ),
+        "ja": (
+            "これは健康についての簡単な文です。",
+            [("ja", 0, 18), ("en", 18, 58)],
+        ),
+        "ka": (
+            "ეს არის მარტივი წინადადება ჯანმრთელობაზე.",
+            [("ka", 0, 42), ("en", 42, 82)],
+        ),
+        "km": (
+            "នេះគឺជាប្រយោគសាមញ្ញអំពីសុខភាព។",
+            [("km", 0, 31), ("en", 31, 71)],
+        ),
+        "kn": (
+            "ಇದು ಆರೋಗ್ಯದ ಬಗ್ಗೆ ಒಂದು ಸಾಮಾನ್ಯ ವಾಕ್ಯ.",
+            [("kn", 0, 38), ("en", 38, 78)],
+        ),
+        "ko": (
+            "이것은 건강에 관한 간단한 문장입니다.",
+            [("ko", 0, 22), ("en", 22, 62)],
+        ),
+        "lo": (
+            "ນີ້ແມ່ນປະໂຫຍກງ່າຍໆກ່ຽວກັບສຸຂະພາບ",
+            [("lo", 0, 33), ("en", 33, 73)],
+        ),
+        "ml": (
+            "ഇത് ആരോഗ്യത്തെക്കുറിച്ചുള്ള ഒരു സാധാരണ വാക്യമാണ്.",
+            [("ml", 0, 50), ("en", 50, 90)],
+        ),
+        "mn": (
+            "Энэ бол эрүүл мэндийн тухай энгийн өгүүлбэр.",
+            [("mn", 0, 45), ("en", 45, 85)],
+        ),
+        "mr": (
+            "हे एक साधारण वाक्य आहे जे आरोग्याबद्दल सांगते।",
+            [("mr", 0, 47), ("en", 47, 87)],
+        ),
+        "my": (
+            "ဤသည် ကျန်းမာရေးအကြောင်း ရိုးရှင်းသော စာကြောင်းဖြစ်သည်။",
+            [("my", 0, 55), ("en", 55, 95)],
+        ),
+        "ne": (
+            "यो एक साधारण वाक्य हो जुन स्वास्थ्यको बारेमा बताउँछ।",
+            [("ne", 0, 53), ("en", 53, 93)],
+        ),
+        "or": (
+            "ଏହା ସ୍ୱାସ୍ଥ୍ୟ ବିଷୟରେ ଏକ ସାଧାରଣ ବାକ୍ୟ।",
+            [("or", 0, 38), ("en", 38, 78)],
+        ),
+        "pa": (
+            "ਇਹ ਸਿਹਤ ਬਾਰੇ ਇੱਕ ਸਧਾਰਨ ਵਾਕ ਹੈ।",
+            [("pa", 0, 31), ("en", 31, 71)],
+        ),
+        "ps": (
+            "دا د روغتیا په اړه ساده جمله ده.",
+            [("ps", 0, 33), ("en", 33, 73)],
+        ),
+        "ru": (
+            "Это простое предложение о здоровье.",
+            [("ru", 0, 36), ("en", 36, 76)],
+        ),
+        "si": (
+            "මෙය සෞඛ්\u200dයය පිළිබඳ සරල වාක්\u200dයයකි.",
+            [("si", 0, 34), ("en", 34, 74)],
+        ),
+        "ta": (
+            "இது ஆரோக்கியம் பற்றிய ஒரு எளிய வாக்கியம்.",
+            [("ta", 0, 42), ("en", 42, 82)],
+        ),
+        "te": (
+            "ఇది ఆరోగ్యం గురించి ఒక సాధారణ వాక్యం.",
+            [("te", 0, 38), ("en", 38, 78)],
+        ),
+        "th": (
+            "นี่คือประโยคง่ายๆ เกี่ยวกับสุขภาพ",
+            [("th", 0, 34), ("en", 34, 74)],
+        ),
+        "uk": (
+            "Це просте речення про здоров'я.",
+            [("uk", 0, 32), ("en", 32, 72)],
+        ),
+        "ur": (
+            "یہ صحت کے بارے میں ایک سادہ جملہ ہے۔",
+            [("ur", 0, 37), ("en", 37, 77)],
+        ),
+        "vi": (
+            "Đây là một câu đơn giản về sức khỏe.",
+            [("vi", 0, 36), ("en", 36, 77)],
+        ),
+        "zh": (
+            "这是一句关于健康的简单句子。",
+            [("zh", 0, 15), ("en", 15, 55)],
+        ),
+    }
+
+    def test_native_sentence_stays_one_span(self):
+        for language, (native, expected) in self.CASES.items():
+            with self.subTest(language=language):
+                text = native + " " + self.ENGLISH
+                result = MultilingualSplitter(languages=[language, "en"]).split(
+                    text, main_lang=language
+                )
+                self.assertEqual(result.main_language, language)
+                self.assertEqual(
+                    [(segment.language, segment.start, segment.end) for segment in result.segments],
+                    expected,
+                )
+                self.assertEqual("".join(segment.text for segment in result.segments), text)
+                for segment in result.segments:
+                    self.assertTrue(
+                        any(char.isalnum() for char in segment.text),
+                        "segment without phoneme content: " + repr(segment.text),
+                    )
+
+
+class TestCodeSwitchWhitespaceAndPunctuation(unittest.TestCase):
+    """Separator, bidi, symbol and degenerate variants inside a code switch.
+
+    Script-neutral pieces between two runs carry a sentence-context language tag; in
+    production that tag turned every word of a same-script run into its own span and
+    left punctuation-only spans without phonemes for the aligner to consume.
+    """
+
+    CASES = {
+        "tab separated": (
+            "bn",
+            "রাখুন।\tRegular\tmovement\tcan\tsupport\tmetabolism.",
+            [("bn", 0, 7), ("en", 7, 47)],
+        ),
+        "nbsp separated": (
+            "bn",
+            "রাখুন।\xa0Regular\xa0movement\xa0can\xa0support\xa0metabolism.",
+            [("bn", 0, 7), ("en", 7, 47)],
+        ),
+        "double spaces": (
+            "bn",
+            "রাখুন। Regular  movement  can  support  metabolism.",
+            [("bn", 0, 7), ("en", 7, 51)],
+        ),
+        "lf inside run": (
+            "bn",
+            "রাখুন। Regular\nmovement can support metabolism.",
+            [("bn", 0, 7), ("en", 7, 47)],
+        ),
+        "crlf inside run": (
+            "bn",
+            "রাখুন। Regular\r\nmovement can support metabolism.",
+            [("bn", 0, 7), ("en", 7, 48)],
+        ),
+        "zero width space": (
+            "bn",
+            "রাখুন। Regular\u200bmovement can support metabolism.",
+            [("bn", 0, 7), ("en", 7, 47)],
+        ),
+        "soft hyphen": (
+            "bn",
+            "রাখুন। Regular move\xadment can support metabolism.",
+            [("bn", 0, 7), ("en", 7, 48)],
+        ),
+        "zero width joiner": (
+            "bn",
+            "রাখুন। Regular\u200dmovement can support metabolism.",
+            [("bn", 0, 7), ("en", 7, 47)],
+        ),
+        "right to left mark": (
+            "bn",
+            "রাখুন।\u200f Regular movement can support metabolism.",
+            [("bn", 0, 8), ("en", 8, 48)],
+        ),
+        "left to right mark": (
+            "bn",
+            "রাখুন।\u200e Regular movement can support metabolism.",
+            [("bn", 0, 8), ("en", 8, 48)],
+        ),
+        "ideographic space": (
+            "ja",
+            "毎日の運動は大切です。\u3000Regular movement can support metabolism.",
+            [("ja", 0, 12), ("en", 12, 52)],
+        ),
+        "curly quotes inside": (
+            "bn",
+            "রাখুন। Regular “movement” can support metabolism.",
+            [("bn", 0, 7), ("en", 7, 49)],
+        ),
+        "parentheses inside": (
+            "bn",
+            "রাখুন। (Regular movement) can support metabolism.",
+            [("bn", 0, 8), ("en", 8, 49)],
+        ),
+        "em dash inside": (
+            "bn",
+            "রাখুন। Regular movement — can support metabolism.",
+            [("bn", 0, 7), ("en", 7, 49)],
+        ),
+        "colon and semicolon": (
+            "bn",
+            "রাখুন। First point; second point: done. রাখুন।",
+            [("bn", 0, 7), ("en", 7, 38), ("bn", 38, 46)],
+        ),
+        "digits inside": (
+            "bn",
+            "রাখুন। move 10 minutes daily রাখুন।",
+            [("bn", 0, 7), ("en", 7, 28), ("bn", 28, 35)],
+        ),
+        "symbols inside": (
+            "bn",
+            "রাখুন। vitamin D & B12 @ 100% daily রাখুন।",
+            [("bn", 0, 7), ("en", 7, 35), ("bn", 35, 42)],
+        ),
+        "emoji inside": (
+            "bn",
+            "রাখুন। Regular movement 💪 can support metabolism.",
+            [("bn", 0, 7), ("en", 7, 49)],
+        ),
+        "ellipsis tail": (
+            "bn",
+            "রাখুন। Regular movement can support metabolism…",
+            [("bn", 0, 7), ("en", 7, 47)],
+        ),
+        "url inside": (
+            "bn",
+            "রাখুন। Visit https://example.com now রাখুন।",
+            [("bn", 0, 7), ("en", 7, 36), ("bn", 36, 43)],
+        ),
+        "uppercase run": (
+            "bn",
+            "রাখুন। SMALL HABITS.",
+            [("bn", 0, 7), ("en", 7, 20)],
+        ),
+        "apostrophe inside": (
+            "bn",
+            "রাখুন। Regular movement isn’t optional.",
+            [("bn", 0, 7), ("en", 7, 39)],
+        ),
+        "leading quote": (
+            "bn",
+            "“রাখুন। Regular movement.",
+            [("bn", 0, 8), ("en", 8, 25)],
+        ),
+        "leading whitespace": (
+            "bn",
+            "   রাখুন। Regular movement.",
+            [("bn", 0, 10), ("en", 10, 27)],
+        ),
+        "trailing whitespace": (
+            "bn",
+            "রাখুন। Regular movement.   ",
+            [("bn", 0, 7), ("en", 7, 27)],
+        ),
+        "arabic comma": (
+            "ar",
+            "النشاط البدني مهم، والتغذية متوازنة. Regular movement helps.",
+            [("ar", 0, 37), ("en", 37, 60)],
+        ),
+        "urdu full stop": (
+            "ur",
+            "باقاعدہ ورزش ضروری ہے۔ Regular movement helps.",
+            [("ur", 0, 23), ("en", 23, 46)],
+        ),
+        "persian question mark": (
+            "fa",
+            "آیا ورزش مهم است؟ Regular movement helps.",
+            [("fa", 0, 18), ("en", 18, 41)],
+        ),
+        "thai without spaces": (
+            "th",
+            "การออกกำลังกายสม่ำเสมอRegular movement helps.",
+            [("th", 0, 22), ("en", 22, 45)],
+        ),
+        "burmese tail": (
+            "my",
+            "ပုံမှန် လေ့ကျင့်ခန်း လုပ်ပါ။ Regular movement helps.",
+            [("my", 0, 29), ("en", 29, 52)],
+        ),
+        "digits only run": (
+            "bn",
+            "রাখুন। 123 রাখুন।",
+            [("bn", 0, 17)],
+        ),
+        "emoji only run": (
+            "bn",
+            "রাখুন। 🙂 রাখুন।",
+            [("bn", 0, 15)],
+        ),
+        "punctuation only run": (
+            "bn",
+            "রাখুন। ... রাখুন।",
+            [("bn", 0, 17)],
+        ),
+        "quotes only tail": (
+            "bn",
+            "রাখুন।.” “",
+            [("bn", 0, 10)],
+        ),
+        "only punctuation": (
+            "bn",
+            ".",
+            [("und", 0, 1)],
+        ),
+        "only em dash": (
+            "bn",
+            "—",
+            [("und", 0, 1)],
+        ),
+        "only emoji": (
+            "bn",
+            "🙂",
+            [("und", 0, 1)],
+        ),
+        "only spaces": (
+            "bn",
+            "   ",
+            [("und", 0, 3)],
+        ),
+        "empty string": (
+            "bn",
+            "",
+            [],
+        ),
+    }
+
+    def test_span_plan_survives_separator_and_symbol_variants(self):
+        for name, (main_language, text, expected) in self.CASES.items():
+            with self.subTest(case=name):
+                result = MultilingualSplitter(languages=[main_language, "en"]).split(
+                    text, main_lang=main_language
+                )
+                self.assertEqual(
+                    [(segment.language, segment.start, segment.end) for segment in result.segments],
+                    expected,
+                )
+                self.assertEqual("".join(segment.text for segment in result.segments), text)
+                for segment in result.segments:
+                    self.assertTrue(
+                        any(char.isalnum() for char in segment.text) or segment.language == "und",
+                        "segment without phoneme content: " + repr(segment.text),
+                    )
+
+
+class TestCodeMixedMainLanguageRegression(unittest.TestCase):
+    """Regression: Bangla document with English inserts (production run a5pXJx4YCBEiUA4H3Mg2FF).
+
+    ``_stabilize_main_language_sentences`` assigns sentence-context language tags to
+    script-neutral pieces (whitespace, punctuation). Those tags are routing hints, not
+    code-switch boundaries: treating them as switches split every English word into its
+    own span and produced punctuation-only spans with no phonemes to align. The splitter
+    is constrained to Sparrow-routable languages here, as the API server does.
+    """
+
+    LANGUAGES = ["en", "bn", "sk"]
+
+    PRODUCTION_TEXT = " ".join([
+        "“Hormonal and metabolic health isn’t only about Tests or treatment. A few everyday habits can support it too.”",
+        "“প্রতিদিন কিছুটা physical activity রাখুন। Regular movement can support metabolism and insulin sensitivity.”",
+        "“Meals-এ protein, fibre-rich foods আর healthy fats রাখুন। Balanced nutrition helps support steady energy and metabolic health.”",
+        "“প্রতিদিন পর্যাপ্ত ও consistent sleep-এর চেষ্টা করুন। Good sleep plays an important role in maintaining hormonal and metabolic balance.”",
+        "SMALL HABITS.",
+    ])
+
+    PRODUCTION_SPANS = [
+        ("en", 0, 109),
+        ("bn", 109, 128),
+        ("en", 128, 145),
+        ("bn", 145, 153),
+        ("en", 153, 225),
+        ("bn", 225, 228),
+        ("en", 228, 237),
+        ("sk", 237, 243),  # CLD2 reads the English word "fibre-" as Slovak
+        ("en", 243, 253),
+        ("bn", 253, 257),
+        ("en", 257, 269),
+        ("bn", 269, 277),
+        ("en", 277, 344),
+        ("bn", 344, 368),
+        ("en", 368, 384),
+        ("bn", 384, 401),
+        ("en", 401, 497),
+    ]
+
+    def test_production_text_keeps_whole_language_runs(self):
+        result = MultilingualSplitter(languages=self.LANGUAGES).split(
+            self.PRODUCTION_TEXT, main_lang="bn"
+        )
+        self.assertEqual(result.main_language, "bn")
+        self.assertEqual(result.original_text, self.PRODUCTION_TEXT)
+        self.assertEqual(
+            [(segment.language, segment.start, segment.end) for segment in result.segments],
+            self.PRODUCTION_SPANS,
+        )
+        covered = 0
+        for segment in result.segments:
+            self.assertEqual(segment.text, self.PRODUCTION_TEXT[segment.start:segment.end])
+            self.assertEqual(self.PRODUCTION_TEXT[covered:segment.start].strip(), "")
+            self.assertTrue(
+                any(char.isalnum() for char in segment.text),
+                "segment without phoneme content: " + repr(segment.text),
+            )
+            covered = segment.end
+        self.assertEqual(self.PRODUCTION_TEXT[covered:].strip(), "")
+
+    def test_code_mixed_sentence_keeps_same_script_words_together(self):
+        splitter = MultilingualSplitter(languages=self.LANGUAGES)
+        cases = [
+            (
+                "রাখুন। Regular movement can support metabolism.",
+                [("bn", 0, 7), ("en", 7, 47)],
+            ),
+            (
+                "sensitivity.” “Meals-এ protein.",
+                [("en", 0, 20), ("bn", 20, 23), ("en", 23, 31)],
+            ),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                result = splitter.split(text, main_lang="bn")
+                self.assertEqual(
+                    [(segment.language, segment.start, segment.end) for segment in result.segments],
+                    expected,
+                )
+                for segment in result.segments:
+                    self.assertTrue(
+                        any(char.isalnum() for char in segment.text),
+                        "segment without phoneme content: " + repr(segment.text),
+                    )
+
+
 class TestNoUndInFinalOutput(unittest.TestCase):
     """Test that no segments have 'und' language in final output (except edge cases)."""
 

@@ -123,6 +123,7 @@ EQUIVALENT_LANGUAGE_CODES = (
     frozenset({"no", "nb", "nn"}),
     frozenset({"tl", "fil"}),
     frozenset({"jw", "jv"}),
+    frozenset({"iw", "he"}),
 )
 
 # The application uses current locale language codes while CLD2 still expects
@@ -131,6 +132,7 @@ CLD2_LANGUAGE_CODES = {
     "nb": "no",
     "fil": "tl",
     "jv": "jw",
+    "he": "iw",
 }
 
 # Script-specific configurations for language groups that share scripts
@@ -177,6 +179,17 @@ SCRIPT_DETECTION_CONFIG: dict[str, ScriptConfig] = {
             min_detected_confidence=0.85,
             max_main_confidence=0.08,
             description="Devanagari: Hindi/Marathi/Nepali share vocabulary",
+        ),
+    ),
+    # Bengali script: Assamese (as) and Bengali (bn) are nearly identical in
+    # writing; the few distinguishing characters (ৰ/ৱ) are not enough for a
+    # word-level detector, which flips isolated Assamese words to Bengali.
+    "Bengali": ScriptConfig(
+        languages=frozenset({"as", "bn"}),
+        threshold=DetectionThreshold(
+            min_detected_confidence=0.97,
+            max_main_confidence=0.03,
+            description="Bengali/Assamese: nearly identical written forms",
         ),
     ),
     # Latin script: Many European languages, but generally distinguishable
@@ -279,6 +292,7 @@ SHARED_SCRIPTS: dict[str, set[str]] = {
     "Cyrillic": set(SCRIPT_DETECTION_CONFIG["Cyrillic"].languages),
     "Arabic": set(SCRIPT_DETECTION_CONFIG["Arabic"].languages),
     "Devanagari": set(SCRIPT_DETECTION_CONFIG["Devanagari"].languages),
+    "Bengali": set(SCRIPT_DETECTION_CONFIG["Bengali"].languages),
     "Han": {"zh", "ja"},  # Chinese and Japanese (Korean rarely uses Hanja now)
     "Common": set(),  # Punctuation, numbers - valid for all languages
 }
@@ -773,9 +787,29 @@ class MultilingualSplitter:
         merged: list[Segment] = []
         current = segments[0]
 
-        for seg in segments[1:]:
+        for index, seg in enumerate(segments[1:], start=1):
+            next_language = (
+                segments[index + 1].language if index + 1 < len(segments) else None
+            )
+            # Script-neutral pieces (whitespace, punctuation) can carry a real
+            # language tag assigned from sentence context. That tag is only a
+            # routing hint: it must not act as a code-switch boundary that splits
+            # a same-language run into one segment per word. Such a piece is
+            # absorbed by the preceding segment unless it genuinely introduces
+            # the run that follows.
+            neutral = seg.script in {"Common", "Inherited", "Unknown"}
+            introduces_next = (
+                neutral
+                and next_language is not None
+                and seg.language == next_language
+                and seg.language != current.language
+            )
             # Merge if same language OR if this segment is "und" (Common script)
-            if seg.language == current.language or seg.language == "und":
+            if (
+                seg.language == current.language
+                or seg.language == "und"
+                or (neutral and not introduces_next)
+            ):
                 # Merge: extend current segment, keep current's language
                 current = Segment(
                     text=current.text + seg.text,
