@@ -130,9 +130,13 @@ class TaskflowWorker:
             try:
                 await self.heartbeat()
             except Exception:
+                # Signal the serve loop to reconnect, but never stop beating:
+                # heartbeats are also what extends the leases of an in-flight
+                # batch, and the serve loop cannot start a new loop while it is
+                # still awaiting that batch. A transient failure here must not
+                # leave a running batch without lease renewal until it ends.
                 _LOGGER.exception("Taskflow worker heartbeat failed")
                 connection_lost.set()
-                return
 
     async def pull(
         self,
