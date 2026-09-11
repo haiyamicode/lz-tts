@@ -1,3 +1,5 @@
+import logging
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -6,6 +8,49 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache, flash_attn_func
 from src.nanovllm_voxcpm.utils.context import get_context
+
+logger = logging.getLogger(__name__)
+
+# Prebuilt flash-attn wheels only carry SASS for the architectures they were
+# compiled for, and ours ships no PTX (data/runtime-wheels). Launching one of
+# its kernels on a device whose compute capability is absent from the build
+# fails with CUDA error 209 ("no kernel image is available for execution on
+# the device"). Probe once per device and cache whether flash-attn is usable;
+# when it is not, :class:`Attention` falls back to the SDPA path below.
+_FLASH_ATTN_SUPPORT: dict[int, bool] = {}
+
+
+def _probe_flash_attn(device_index: int) -> bool:
+    device = torch.device("cuda", device_index)
+    try:
+        q = torch.zeros((1, 1, 64), dtype=torch.float16, device=device)
+        cu_seqlens = torch.zeros(2, dtype=torch.int32, device=device)
+        flash_attn_varlen_func(q, q, q, cu_seqlens, cu_seqlens, 1, 1)
+        torch.cuda.synchronize(device)
+        return True
+    except Exception as exc:  # any failure means "use the SDPA fallback"
+        logger.warning(
+            "flash-attn cannot run on %s (compute capability %s): %s; "
+            "using the SDPA attention fallback",
+            torch.cuda.get_device_name(device_index),
+            torch.cuda.get_device_capability(device_index),
+            exc,
+        )
+        return False
+
+
+def flash_attn_supported(device: torch.device) -> bool:
+    """Whether the installed flash-attn build can execute on ``device``.
+
+    A missing/mismatched kernel image only surfaces at launch time, so this
+    runs a tiny probe kernel once per device and caches the outcome.
+    """
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    supported = _FLASH_ATTN_SUPPORT.get(device_index)
+    if supported is None:
+        supported = _probe_flash_attn(device_index)
+        _FLASH_ATTN_SUPPORT[device_index] = supported
+    return supported
 
 
 @triton.jit
@@ -251,7 +296,7 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.block_tables is not None:
                 raise RuntimeError(
-                    "V100 SDPA fallback does not support prefix-cache prefill"
+                    "SDPA attention fallback does not support prefix-cache prefill"
                 )
             q_offsets = context.cu_seqlens_q.tolist()
             k_offsets = context.cu_seqlens_k.tolist()
@@ -277,7 +322,7 @@ class Attention(nn.Module):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ):
-        if torch.cuda.get_device_capability(q.device)[0] < 8:
+        if not flash_attn_supported(q.device):
             if self.is_causal:
                 return self._sdpa_causal(q, k, v)
             return self._sdpa(q, k, v, is_causal=False)

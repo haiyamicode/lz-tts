@@ -6,6 +6,7 @@ from src.nanovllm_voxcpm.models.voxcpm.engine import (
 )
 from src.nanovllm_voxcpm.models.voxcpm.config import LoRAConfig
 from src.nanovllm_voxcpm.config import resolve_model_dtype
+from src.nanovllm_voxcpm.layers.attention import flash_attn_supported
 import os
 import torch
 import torch.multiprocessing as mp
@@ -78,6 +79,10 @@ class VoxCPMServerImpl:
         devices = devices or [device_index]
         self.dtype = resolve_model_dtype(dtype, device_index)
         model_config.dtype = self.dtype
+        # Prefix caching consumes the flash-attn prefill path; the SDPA
+        # fallback used on unsupported archs cannot read prefix-cache block
+        # tables during prefill.
+        use_flash_attn = flash_attn_supported(torch.device("cuda", device_index))
 
         engine_config = Config(
             model=model_path,
@@ -89,7 +94,7 @@ class VoxCPMServerImpl:
             model_config=model_config,
             devices=devices,
             lora_config=lora_config,
-            enable_prefix_caching=torch.cuda.get_device_capability(device_index)[0] >= 8,
+            enable_prefix_caching=use_flash_attn,
         )
 
         self.llm = VoxCPMEngine(engine_config)

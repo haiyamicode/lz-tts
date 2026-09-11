@@ -18,6 +18,7 @@ from numpy.typing import NDArray
 from typing_extensions import Literal, TypedDict
 
 from src.nanovllm_voxcpm.config import Config, resolve_model_dtype
+from src.nanovllm_voxcpm.layers.attention import flash_attn_supported
 from src.nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig, VoxCPM2Config
 from src.nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
 from src.nanovllm_voxcpm.models.voxcpm2.runner import VoxCPM2Runner
@@ -93,6 +94,10 @@ class VoxCPM2ServerImpl:
         devices = devices or [device_index]
         self.dtype = resolve_model_dtype(dtype, device_index)
         model_config.dtype = self.dtype
+        # Prefix caching consumes the flash-attn prefill path; the SDPA
+        # fallback used on unsupported archs cannot read prefix-cache block
+        # tables during prefill.
+        use_flash_attn = flash_attn_supported(torch.device("cuda", device_index))
 
         engine_config = Config(
             model=model_path,
@@ -106,7 +111,7 @@ class VoxCPM2ServerImpl:
             devices=devices,
             lora_config=lora_config,
             ipa_adapter_path=ipa_adapter_path,
-            enable_prefix_caching=torch.cuda.get_device_capability(device_index)[0] >= 8,
+            enable_prefix_caching=use_flash_attn,
         )
         self.llm = VoxCPM2Engine(engine_config)
         model_runner = cast(VoxCPM2Runner, self.llm.model_runner)
