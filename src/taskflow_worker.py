@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from .api.server import (
     InferenceOperationError,
     LzTtsInferenceSession,
+    _env_bool,
     create_app,
     get_health_status,
     set_status,
@@ -47,6 +48,7 @@ class TaskflowWorker:
     worker_token: str
     worker_id: str
     concurrency: int = 8
+    persistent: bool = False
     session_id: str | None = None
     session_token: str | None = None
     heartbeat_interval: float = 15.0
@@ -93,7 +95,7 @@ class TaskflowWorker:
             token=self.worker_token,
             json={
                 "workerId": self.worker_id,
-                "ephemeral": False,
+                "ephemeral": not self.persistent,
                 "metadata": metadata,
                 "capabilities": {"taskTypes": list(TASK_TYPES), "concurrency": self.concurrency},
             },
@@ -712,6 +714,7 @@ async def run_worker() -> None:
         worker_token=worker_token,
         worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lz-tts-{socket.gethostname()}"),
         concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "8"))),
+        persistent=_env_bool("TASKFLOW_WORKER_PERSISTENT", False),
     )
     inference = LzTtsInferenceSession()
     await inference.start()
