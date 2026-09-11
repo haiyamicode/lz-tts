@@ -296,8 +296,8 @@ class VoxCPMDurationBudgetConfig(BaseModel):
     language: str = "multilingual"
     length_scale: float = Field(default=1.0, gt=0)
     token_rate: float = Field(default=6.25, gt=0)
-    min_margin: float = Field(default=1.0, gt=0)
-    max_margin: float = Field(default=1.35, gt=0)
+    min_margin: float = Field(default=1.0, ge=0)
+    max_margin: float = Field(default=1.35, ge=0)
     min_extra_tokens: int = Field(default=0, ge=0)
     max_extra_tokens: int = Field(default=38, ge=0)
     soft_text_token_limit: int = Field(default=64, ge=1)
@@ -336,7 +336,7 @@ class VoxCPMConfig(BaseModel):
     ipa_adapter_path: str | None = None
     fallback_max_generate_length: int = Field(default=4096, ge=1)
     duration_budget: VoxCPMDurationBudgetConfig = Field(default_factory=VoxCPMDurationBudgetConfig)
-    temperature: float = Field(default=1.0, gt=0)
+    temperature: float = Field(default=1.0, ge=0)
     cfg_value: float = Field(default=2.0, ge=0)
     reference_cache_size: int = Field(default=128, ge=1)
     max_reference_seconds: float = Field(default=25.0, gt=0)
@@ -444,7 +444,6 @@ class SeedVCConfig(BaseModel):
     max_chunk_batch_size: int = Field(
         default_factory=lambda: int(os.environ.get("SEED_VC_MAX_CHUNK_BATCH_SIZE", "1")),
         ge=1,
-        le=64,
     )
 
 
@@ -480,8 +479,8 @@ class SSMLConfig(BaseModel):
     ctc_dtype: str = Field(default_factory=lambda: os.environ.get("SSML_CTC_DTYPE", "float16"))
     voxcpm_ipa_stop_cushion_patches: int = Field(default=1, ge=0)
     voxcpm_ipa_max_length_cushion_patches: int = Field(default=12, ge=1)
-    voxcpm_ipa_alignment_tolerance_patches: int = Field(default=2, ge=0, le=10)
-    voxcpm_ipa_refinement_passes: int = Field(default=1, ge=0, le=3)
+    voxcpm_ipa_alignment_tolerance_patches: int = Field(default=2, ge=0)
+    voxcpm_ipa_refinement_passes: int = Field(default=1, ge=0)
 
 
 class ServerConfig(BaseModel):
@@ -546,9 +545,9 @@ class SynthesizeRequest(BaseModel):
     options: Optional[SparrowSynthesizeOptions] = Field(None, description="Sparrow/VITS-specific synthesis options")
     format: Literal["wav", "mp3"] = Field("wav", description="Output audio format (wav or mp3)")
     neural: bool = Field(True, description="Use neural heteronym disambiguation for more accurate pronunciation of ambiguous words")
-    speed: float = Field(1.0, ge=0.5, le=1.5, description="Playback speed ratio")
-    pitch: float = Field(1.0, ge=0.5, le=1.5, description="Pitch ratio without changing duration")
-    volume: float = Field(1.0, ge=0.0, le=1.0, description="Output volume multiplier")
+    speed: float = Field(1.0, gt=0, description="Playback speed ratio")
+    pitch: float = Field(1.0, gt=0, description="Pitch ratio without changing duration")
+    volume: float = Field(1.0, ge=0.0, description="Output volume multiplier")
 
 
 class BatchSynthesizeInputItem(BaseModel):
@@ -591,7 +590,7 @@ class BatchSynthesizeRequest(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    items: list[BatchSynthesizeInputItem] = Field(..., min_length=1, max_length=64, description="Synthesize inputs")
+    items: list[BatchSynthesizeInputItem] = Field(..., min_length=1, description="Synthesize inputs")
 
 
 @dataclass(frozen=True)
@@ -664,7 +663,7 @@ class MatchaSynthesizeRequest(BaseModel):
     language: str = Field("en", description="Language code used for phonemization and speaker/language conditioning")
     format: Literal["wav", "json"] = "wav"
     input_type: Literal["aligned"] = "aligned"
-    speaker_id: Optional[int] = Field(None, description="Override language speaker id; 0 means auto")
+    speaker_id: Optional[int] = Field(None, ge=0, description="Override language speaker id; 0 means auto")
     neural: bool = True
     steps: Optional[int] = None
     temperature: Optional[float] = None

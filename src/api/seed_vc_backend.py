@@ -43,9 +43,9 @@ class SeedVCRequest(BaseModel):
     intensity: Optional[float] = 1.0
     preset: Optional[str] = None
     remove_glitches: Optional[bool] = False
-    speed: float = Field(1.0, ge=0.5, le=1.5, description="Playback speed ratio")
-    pitch: float = Field(1.0, ge=0.5, le=1.5, description="Pitch ratio without changing duration")
-    volume: float = Field(1.0, ge=0.0, le=1.0, description="Output volume multiplier")
+    speed: float = Field(1.0, gt=0, description="Playback speed ratio")
+    pitch: float = Field(1.0, gt=0, description="Pitch ratio without changing duration")
+    volume: float = Field(1.0, ge=0.0, description="Output volume multiplier")
 
 
 class SeedVCBatchRequest(BaseModel):
@@ -56,7 +56,7 @@ class SeedVCBatchRequest(BaseModel):
     """
 
     items: list[SeedVCRequest] = Field(..., min_length=1)
-    max_chunk_batch_size: int = Field(1, ge=1, le=64)
+    max_chunk_batch_size: int = Field(1, ge=1)
 
 
 class SeedVCBackend:
