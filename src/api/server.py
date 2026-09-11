@@ -18,6 +18,7 @@ import threading
 import time
 import httpx
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Optional
@@ -42,6 +43,7 @@ from ..ssml_postprocessing import (
     resolve_ssml_breaks,
 )
 from ..text_norm import normalize_spoken_text
+from ..text_splitter import count_cl100k_tokens
 from ..voxcpm_ipa_adapter import approximate_ipa_spelling, resolve_ipa_control_schedules
 from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
 from ..matcha_inference import MatchaBatcher as ProductionStarlingBatcher
@@ -53,6 +55,13 @@ from .seed_vc_backend import (
     SeedVCBackend as _SeedVCBackend,
     SeedVCBatchRequest,
     SeedVCRequest,
+)
+from .text_chunking import (
+    batch_groups_by_weight,
+    chunk_synthesis_texts,
+    concat_chunk_audios,
+    expand_chunks,
+    sparrow_batch_weights,
 )
 from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
 from .voxcpm_runtime import VoxCPMRuntime
@@ -249,6 +258,10 @@ class PiperTTSConfig(BaseModel):
     lang_speaker_map: dict[str, str] = Field(default_factory=dict)
     root_voices: dict[str, RootVoiceConfig] = Field(default_factory=dict)
     voice_adapter_cache_size: int = Field(1, ge=1)
+    max_batch_items: int = Field(
+        default_factory=lambda: int(os.environ.get("SPARROW_MAX_BATCH_ITEMS", "8")),
+        ge=1,
+    )
     voice_adapters: dict[str, SparrowVoiceAdapterConfig] = Field(default_factory=dict)
     model_config_overrides: dict[str, ModelConfig] = Field(default_factory=dict, alias="model_config")
 
@@ -435,6 +448,29 @@ class SeedVCConfig(BaseModel):
     )
 
 
+class SynthesisChunkingConfig(BaseModel):
+    """Bound how much text one backend generation call sees.
+
+    Long inputs are split on text boundaries with the shared recursive
+    splitter and the generated audio is concatenated, so every generation
+    stays inside the model's own limits instead of failing or running for
+    minutes.
+    """
+
+    enabled: bool = True
+    soft_text_token_limit: int = Field(default=100, ge=1)
+    hard_text_token_limit: int = Field(default=150, ge=1)
+
+    @model_validator(mode="after")
+    def validate_limits(self) -> "SynthesisChunkingConfig":
+        if self.hard_text_token_limit < self.soft_text_token_limit:
+            raise ValueError(
+                "hard_text_token_limit must be greater than or equal to "
+                "soft_text_token_limit"
+            )
+        return self
+
+
 class SSMLConfig(BaseModel):
     """Settings for SSML operations that require audio alignment."""
 
@@ -452,6 +488,7 @@ class ServerConfig(BaseModel):
     """Server configuration."""
 
     engines: EngineEnableConfig = Field(default_factory=EngineEnableConfig)
+    chunking: SynthesisChunkingConfig = Field(default_factory=SynthesisChunkingConfig)
     pipertts: PiperTTSConfig = Field(default_factory=PiperTTSConfig)
     voxcpm: VoxCPMConfig = Field(default_factory=VoxCPMConfig)
     starling: MatchaConfig = Field(default_factory=MatchaConfig)
@@ -691,6 +728,103 @@ def _log_synthesize_batch_summary(**data: Any) -> None:
         "Synthesize batch summary: %s",
         json.dumps(data, ensure_ascii=False, default=str),
     )
+
+
+async def _synthesize_sparrow_batch(
+    inference: Any,
+    texts: Sequence[str],
+    *,
+    speaker: str | Sequence[str | None] | None = None,
+    **synth_kwargs: Any,
+) -> list[np.ndarray]:
+    """Synthesize Sparrow texts in batches bounded by their weighted size.
+
+    Each 500 characters of text count as one batch item, so a long text
+    occupies the batch slots its cost implies rather than a single slot, and no
+    model call sees more than ``pipertts.max_batch_items`` weighted items.
+    """
+    text_items = [str(text) for text in texts]
+    weights = sparrow_batch_weights(text_items)
+    max_batch_items = int(_server_config.pipertts.max_batch_items)
+    groups = batch_groups_by_weight(weights, max_batch_items)
+    if len(groups) == 1:
+        return await asyncio.to_thread(
+            inference.synthesize_batch,
+            text_items,
+            speaker=speaker,
+            batch_size=len(text_items),
+            **synth_kwargs,
+        )
+
+    _log_synthesize_batch_stage(
+        "sparrow_sub_batches",
+        item_count=len(text_items),
+        weighted_item_count=sum(weights),
+        max_batch_items=max_batch_items,
+        sub_batch_count=len(groups),
+        sub_batch_items=[sum(weights[index] for index in group) for group in groups],
+    )
+    outputs: list[np.ndarray] = []
+    for group in groups:
+        group_texts = [text_items[index] for index in group]
+        group_speaker = (
+            [speaker[index] for index in group]
+            if isinstance(speaker, Sequence) and not isinstance(speaker, str)
+            else speaker
+        )
+        outputs.extend(
+            await asyncio.to_thread(
+                inference.synthesize_batch,
+                group_texts,
+                speaker=group_speaker,
+                batch_size=len(group_texts),
+                **synth_kwargs,
+            )
+        )
+    return outputs
+
+
+def _chunk_voxcpm_texts(texts: list[str]) -> tuple[list[str], list[int]]:
+    """Split long VoxCPM inputs on cl100k-token boundaries."""
+    chunking = _server_config.chunking
+    if not chunking.enabled:
+        return list(texts), [1] * len(texts)
+    return chunk_synthesis_texts(
+        texts,
+        length_function=count_cl100k_tokens,
+        soft_limit=chunking.soft_text_token_limit,
+        hard_limit=chunking.hard_text_token_limit,
+    )
+
+
+def _sparrow_chunk_segments(segments: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expand planned Sparrow segments into chunks inside the text token budget."""
+    chunking = _server_config.chunking
+    if not chunking.enabled:
+        return list(segments)
+
+    pieces: list[dict[str, Any]] = []
+    for segment in segments:
+        text = str(segment["text"])
+        chunk_texts, chunk_counts = chunk_synthesis_texts(
+            [text],
+            length_function=count_cl100k_tokens,
+            soft_limit=chunking.soft_text_token_limit,
+            hard_limit=chunking.hard_text_token_limit,
+        )
+        if chunk_counts[0] > 1:
+            _log_synthesize_batch_stage(
+                "text_chunking",
+                backend="sparrow",
+                language=segment.get("lang"),
+                model=segment.get("model"),
+                chunk_count=chunk_counts[0],
+                chunk_token_counts=[count_cl100k_tokens(chunk) for chunk in chunk_texts],
+                text_chars=len(text),
+                hard_text_token_limit=chunking.hard_text_token_limit,
+            )
+        pieces.extend({**segment, "text": chunk_text} for chunk_text in chunk_texts)
+    return pieces
 
 
 # Global state
@@ -1522,7 +1656,8 @@ def _synthesize_multilingual(
         for p in routing_plan
     ], ensure_ascii=False))
 
-    # Second pass: synthesize
+    # Second pass: synthesize, expanding each segment into phoneme-window pieces
+    routing_plan = _sparrow_chunk_segments(routing_plan)
     audio_parts: list[np.ndarray] = []
     sample_rate = 22050
 
@@ -1819,8 +1954,9 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
                         segment["speaker"] = root_voice.speaker
                     segment["model"] = root_voice.model
                     segment["voice_adapter"] = root_voice.adapter
-        item_segments.append(segments)
-        for segment_idx, segment in enumerate(segments):
+        pieces = _sparrow_chunk_segments(segments)
+        item_segments.append(pieces)
+        for segment_idx, segment in enumerate(pieces):
             record = {**segment, "item_idx": item_idx, "segment_idx": segment_idx}
             group_key = (segment["model"], segment["voice_adapter"])
             segment_groups.setdefault(group_key, []).append(record)
@@ -1926,11 +2062,10 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
             neural=request.neural,
             synth_kwargs=synth_kwargs,
         )
-        batch_audios = await asyncio.to_thread(
-            inference.synthesize_batch,
+        batch_audios = await _synthesize_sparrow_batch(
+            inference,
             batch_texts,
             speaker=batch_speakers,
-            batch_size=len(batch_texts),
             neural=request.neural,
             voice_adapter=voice_adapter,
             **synth_kwargs,
@@ -3114,6 +3249,17 @@ async def synthesize_sparrow_batch(
         )
 
     synth_kwargs = _synth_kwargs_from_request(request)
+    chunk_texts: list[str] = []
+    chunk_counts: list[int] = []
+    for text in texts:
+        segments, _ = _plan_text_segments(
+            text,
+            primary_speaker=None,
+            language_hint=request.language,
+        )
+        pieces = _sparrow_chunk_segments(segments)
+        chunk_texts.extend(str(piece["text"]) for piece in pieces)
+        chunk_counts.append(len(pieces))
     started = time.perf_counter()
     _log_synthesize_batch_stage(
         "sparrow_batch_start",
@@ -3122,20 +3268,20 @@ async def synthesize_sparrow_batch(
         speaker=resolved_speaker,
         internal_speaker=internal_speaker,
         item_count=len(texts),
-        segment_count=len(texts),
-        batch_size=len(texts),
+        chunk_count=len(chunk_texts),
+        batch_size=len(chunk_texts),
         neural=request.neural,
         synth_kwargs=synth_kwargs,
         reference_url=bool(request.reference_url),
     )
-    audios = await asyncio.to_thread(
-        inference.synthesize_batch,
-        texts,
+    chunk_audios = await _synthesize_sparrow_batch(
+        inference,
+        chunk_texts,
         speaker=internal_speaker,
-        batch_size=len(texts),
         neural=request.neural,
         **synth_kwargs,
     )
+    audios = concat_chunk_audios(chunk_audios, chunk_counts)
     wall_seconds = time.perf_counter() - started
 
     sample_rate = inference.sample_rate
@@ -3235,8 +3381,9 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
             primary_speaker=None,
             language_hint=request.language,
         )
-        item_segments.append(segments)
-        for segment_idx, segment in enumerate(segments):
+        pieces = _sparrow_chunk_segments(segments)
+        item_segments.append(pieces)
+        for segment_idx, segment in enumerate(pieces):
             record = {**segment, "item_idx": item_idx, "segment_idx": segment_idx}
             segment_groups.setdefault(segment["model"], []).append(record)
 
@@ -3282,11 +3429,10 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
             synth_kwargs=synth_kwargs,
             reference_url=bool(request.reference_url),
         )
-        batch_audios = await asyncio.to_thread(
-            inference.synthesize_batch,
+        batch_audios = await _synthesize_sparrow_batch(
+            inference,
             batch_texts,
             speaker=batch_speakers,
-            batch_size=len(batch_texts),
             neural=request.neural,
             **synth_kwargs,
         )
@@ -3557,6 +3703,21 @@ async def synthesize_voxcpm_batch(
     if len(languages) != len(texts):
         raise HTTPException(status_code=400, detail="VoxCPM languages length must match texts length")
 
+    chunk_texts, chunk_counts = _chunk_voxcpm_texts(texts)
+    chunk_languages = expand_chunks(languages, chunk_counts) or []
+    chunk_seeds = expand_chunks(request.seeds, chunk_counts)
+    chunk_reference_audios = expand_chunks(reference_audios, chunk_counts)
+    chunk_reference_formats = expand_chunks(reference_formats, chunk_counts)
+    if len(chunk_texts) > len(texts):
+        _log_synthesize_batch_stage(
+            "text_chunking",
+            backend="voxcpm",
+            item_count=len(texts),
+            chunk_count=len(chunk_texts),
+            chunk_token_counts=[count_cl100k_tokens(chunk_text) for chunk_text in chunk_texts],
+            hard_text_token_limit=_server_config.chunking.hard_text_token_limit,
+        )
+
     await _await_engine_ready("voxcpm")
     runtime = _get_voxcpm_runtime()
     requested_loras = _effective_voxcpm_lora_names(
@@ -3571,7 +3732,7 @@ async def synthesize_voxcpm_batch(
     fallback_language = _configured_voice_language(request.voice_id, request.language)
     prepared_inputs = [
         _prepare_voxcpm_input(text, language, fallback_language)
-        for text, language in zip(texts, languages)
+        for text, language in zip(chunk_texts, chunk_languages)
     ]
     prepared_texts = [prepared_text for prepared_text, _ in prepared_inputs]
     dp_languages = [dp_language for _, dp_language in prepared_inputs]
@@ -3586,16 +3747,17 @@ async def synthesize_voxcpm_batch(
         )
 
     started = time.perf_counter()
-    audios = await runtime.synthesize_batch(
+    chunk_audios = await runtime.synthesize_batch(
         prepared_texts,
         languages=dp_languages,
-        seeds=request.seeds,
+        seeds=chunk_seeds,
         reference_audio=reference_audio,
         reference_format=resolved_reference_format,
-        reference_audios=reference_audios,
-        reference_formats=reference_formats,
+        reference_audios=chunk_reference_audios,
+        reference_formats=chunk_reference_formats,
         lora_names=[lora_name] * len(prepared_texts),
     )
+    audios = concat_chunk_audios(chunk_audios, chunk_counts)
     generation_wall_seconds = time.perf_counter() - started
     sample_rate = runtime.sample_rate
 
@@ -4437,15 +4599,20 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
         )
     else:
         inference = _get_inference(model)
-        batch_audios = await asyncio.to_thread(
-            inference.synthesize_batch,
-            [request.text],
-            speaker=None,
-            batch_size=1,
+        plan, _ = _plan_text_segments(
+            request.text or "",
+            primary_speaker=None,
+            language_hint=request.language,
+        )
+        pieces = _sparrow_chunk_segments(plan)
+        piece_texts = [str(piece["text"]) for piece in pieces]
+        batch_audios = await _synthesize_sparrow_batch(
+            inference,
+            piece_texts,
             neural=request.neural,
             **synth_kwargs,
         )
-        audio = batch_audios[0]
+        audio = np.concatenate(batch_audios, axis=0) if len(batch_audios) > 1 else batch_audios[0]
         sample_rate = inference.sample_rate
 
     if _request_routes_to_seed_vc(request, model):
@@ -4736,6 +4903,37 @@ class SyncTaskRequest(BaseModel):
     input: SyncTaskInput
 
 
+class SyncTaskBatchRequest(BaseModel):
+    """Batch of task envelopes accepted by /task/batch."""
+
+    model_config = {"extra": "forbid"}
+
+    inputs: list[SyncTaskInput] = Field(..., min_length=1)
+
+
+def _task_output_payload(result: InferenceResult) -> dict[str, Any]:
+    """Shape one inference result for /task/sync and /task/batch alike."""
+    if result.kind == "json":
+        return {"status": "COMPLETED", "kind": "json", "data": result.data}
+    return {
+        "status": "COMPLETED",
+        "kind": "audio",
+        "contentType": result.content_type,
+        "audioBase64": base64.b64encode(result.audio or b"").decode("ascii"),
+    }
+
+
+def _task_failure_payload(error: BaseException) -> dict[str, Any]:
+    """Shape one per-task failure for /task/batch."""
+    if isinstance(error, InferenceOperationError):
+        return {
+            "status": "FAILED",
+            "httpStatus": error.status_code,
+            "error": jsonable_encoder(error.detail),
+        }
+    return {"status": "FAILED", "httpStatus": 500, "error": str(error)}
+
+
 def create_app(config: ServerConfig | None = None, session: LzTtsInferenceSession | None = None) -> FastAPI:
     """Create the development-only synchronous task adapter."""
     global _server_config
@@ -4802,22 +5000,50 @@ def create_app(config: ServerConfig | None = None, session: LzTtsInferenceSessio
                 content={"status": "FAILED", "error": str(exc)},
             )
 
-        if result.kind == "json":
-            output: dict[str, Any] = {"kind": "json", "data": result.data}
-        else:
-            output = {
-                "kind": "audio",
-                "contentType": result.content_type,
-                "audioBase64": base64.b64encode(result.audio or b"").decode("ascii"),
-            }
         return {
             "status": "COMPLETED",
             "executionTime": time.perf_counter() - started,
-            "output": output,
+            "output": _task_output_payload(result),
+        }
+
+    @app.post("/task/batch")
+    async def batch_tasks(batch: SyncTaskBatchRequest):
+        """Run inputs exactly like a Taskflow lease batch does.
+
+        This calls ``LzTtsInferenceSession.execute_many``, the same entry point
+        the headless worker feeds its pulled lease batch into, so batch
+        planning and backend batching behave like production.
+        """
+        started = time.perf_counter()
+        try:
+            outcomes = await session.execute_many(
+                [(item.operation, item.request) for item in batch.inputs]
+            )
+        except InferenceOperationError as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"status": "FAILED", "error": jsonable_encoder(exc.detail)},
+            )
+        except Exception as exc:
+            _LOGGER.exception("Synchronous inference batch failed")
+            return JSONResponse(
+                status_code=500,
+                content={"status": "FAILED", "error": str(exc)},
+            )
+
+        outputs = [
+            _task_failure_payload(outcome)
+            if isinstance(outcome, BaseException)
+            else _task_output_payload(outcome)
+            for outcome in outcomes
+        ]
+        return {
+            "status": "COMPLETED",
+            "executionTime": time.perf_counter() - started,
+            "outputs": outputs,
         }
 
     return app
-
 
 app = create_app()
 
