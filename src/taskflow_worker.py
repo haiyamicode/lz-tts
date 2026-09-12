@@ -36,10 +36,61 @@ _CALLBACK_FLUSH_INTERVAL_SECONDS = 2.0
 _CALLBACK_MAX_ATTEMPTS = 3
 
 
+# Taskflow error codes. A lease that a cancelled, expired or superseded run no
+# longer owns is a different thing from a worker session that was fenced or
+# expired, and the worker has to keep them apart: a released lease is a routine
+# outcome, while a dead session needs a rejoin.
+_LEASE_GONE_CODES = frozenset(
+    {"INVALID_LEASE", "LEASE_LOST", "RUN_CANCELLED", "RUN_TERMINAL"}
+)
+_SESSION_GONE_CODES = frozenset(
+    {"INVALID_WORKER", "INVALID_WORKER_SESSION", "WORKER_NOT_AVAILABLE"}
+)
+
+
+def _error_code(response: httpx.Response) -> str | None:
+    """Machine-readable code from a Taskflow error body (``{"error":{"code":...}}``)."""
+    try:
+        code = response.json()["error"]["code"]
+    except Exception:
+        return None
+    return code if isinstance(code, str) else None
+
+
 class ProtocolError(RuntimeError):
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        code: str | None = None,
+        *,
+        scope: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
+        self.scope = scope
+
+    @property
+    def loses_lease(self) -> bool:
+        """The lease is gone: its run was cancelled, expired or superseded."""
+        if self.code is not None:
+            return self.code in _LEASE_GONE_CODES
+        # Lease endpoints authenticate with the lease token alone, and the
+        # artifact route turns every authorization failure into a bare 401, so a
+        # code-less client error there can only mean the lease was released.
+        return (
+            self.scope == "lease"
+            and self.status_code is not None
+            and 400 <= self.status_code < 500
+        )
+
+    @property
+    def loses_session(self) -> bool:
+        """The worker session is invalid: fenced by another join, expired or disabled."""
+        if self.code is not None:
+            return self.code in _SESSION_GONE_CODES
+        return self.scope == "session" and self.status_code in {401, 403, 404}
 
 
 @dataclass
@@ -53,6 +104,8 @@ class TaskflowWorker:
     session_token: str | None = None
     heartbeat_interval: float = 15.0
     active_lease_ids: set[str] = field(default_factory=set)
+    # lease id -> "cancelled" | "lost", as reported by the server heartbeat.
+    dropped_lease_ids: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
@@ -85,6 +138,8 @@ class TaskflowWorker:
             raise ProtocolError(
                 f"Taskflow {method} {path} failed ({response.status_code}): {response.text[:500]}",
                 response.status_code,
+                _error_code(response),
+                scope="session" if path.startswith("/workers/") else "lease",
             )
         return response
 
@@ -121,7 +176,22 @@ class TaskflowWorker:
             json={"activeLeaseIds": sorted(self.active_lease_ids)},
         )
         body = response.json()
-        for lease_id in (*body.get("cancelledLeaseIds", []), *body.get("lostLeaseIds", [])):
+        cancelled = body.get("cancelledLeaseIds", [])
+        lost = body.get("lostLeaseIds", [])
+        if cancelled or lost:
+            # Report it where it happens; otherwise the only trace of a cancelled
+            # run is a confusing 401 on the artifact upload minutes later, after
+            # the worker has already generated the audio.
+            _LOGGER.info(
+                "Taskflow released in-flight leases cancelled=%s lost=%s",
+                sorted(cancelled),
+                sorted(lost),
+            )
+        for lease_id in cancelled:
+            self.dropped_lease_ids[lease_id] = "cancelled"
+        for lease_id in lost:
+            self.dropped_lease_ids.setdefault(lease_id, "lost")
+        for lease_id in (*cancelled, *lost):
             self.active_lease_ids.discard(lease_id)
 
     async def heartbeat_loop(self, connection_lost: asyncio.Event) -> None:
@@ -207,6 +277,8 @@ class TaskflowWorker:
             raise ProtocolError(
                 f"Artifact upload failed ({response.status_code}): {response.text[:500]}",
                 response.status_code,
+                _error_code(response),
+                scope="lease",
             )
         _LOGGER.info(
             "Artifact upload completed lease=%s artifact=%s bytes=%d wall_seconds=%.3f",
@@ -426,10 +498,13 @@ async def _finish_lease(
     run_id = lease.get("runId")
     try:
         if lease_id not in taskflow.active_lease_ids:
-            _LOGGER.warning(
-                "Discarding completed inference for inactive lease=%s run=%s",
+            # The heartbeat already watched the server release this lease, which
+            # normally means the client cancelled or superseded the run.
+            _LOGGER.info(
+                "Discarding completed inference for released lease=%s run=%s reason=%s",
                 lease_id,
                 run_id,
+                taskflow.dropped_lease_ids.get(lease_id, "unknown"),
             )
             return
         if isinstance(outcome, BaseException):
@@ -521,16 +596,20 @@ async def _finish_lease(
                     "error": str(error)[:2000],
                 }
             )
-        try:
-            await taskflow.fail(lease, error, retry=retry)
-        except Exception:
-            _LOGGER.exception(
-                "Failed to report rejected LZ-TTS task to Taskflow type=%s lease=%s run=%s",
-                work.task_type,
-                lease_id,
-                run_id,
-            )
+        await _report_failure(taskflow, work, error, retry=retry)
+    except ProtocolError as error:
+        if not error.loses_lease:
             raise
+        # Uploading or completing a result the server no longer wants is a
+        # routine race with a run that got cancelled while we were generating
+        # it. The lease is gone, not the session.
+        _LOGGER.warning(
+            "Dropped result for lease the server released lease=%s run=%s operation=%s: %s",
+            lease_id,
+            run_id,
+            work.operation,
+            error,
+        )
     except Exception as error:
         _LOGGER.exception(
             "LZ-TTS task failed type=%s lease=%s run=%s operation=%s",
@@ -539,18 +618,50 @@ async def _finish_lease(
             run_id,
             work.operation,
         )
-        try:
-            await taskflow.fail(lease, error, retry=True)
-        except Exception:
+        await _report_failure(taskflow, work, error, retry=True)
+    finally:
+        taskflow.active_lease_ids.discard(lease_id)
+        taskflow.dropped_lease_ids.pop(lease_id, None)
+
+
+async def _report_failure(
+    taskflow: TaskflowWorker,
+    work: _LeaseWork,
+    error: BaseException,
+    *,
+    retry: bool,
+) -> None:
+    """Report a failed lease, tolerating one the server already released.
+
+    A released lease means the run was cancelled, expired or superseded while we
+    were working on it: the server has already reclaimed the work, so there is
+    nothing left to report and nothing worth reconnecting for.
+    """
+    lease = work.lease
+    try:
+        await taskflow.fail(lease, error, retry=retry)
+    except ProtocolError as report_error:
+        if not report_error.loses_lease:
             _LOGGER.exception(
                 "Failed to report failed LZ-TTS task to Taskflow type=%s lease=%s run=%s",
                 work.task_type,
-                lease_id,
-                run_id,
+                lease["id"],
+                lease.get("runId"),
             )
             raise
-    finally:
-        taskflow.active_lease_ids.discard(lease_id)
+        _LOGGER.warning(
+            "Taskflow already released lease=%s run=%s; dropped failure report",
+            lease["id"],
+            lease.get("runId"),
+        )
+    except Exception:
+        _LOGGER.exception(
+            "Failed to report failed LZ-TTS task to Taskflow type=%s lease=%s run=%s",
+            work.task_type,
+            lease["id"],
+            lease.get("runId"),
+        )
+        raise
 
 
 async def _process_leases(
@@ -596,12 +707,18 @@ async def _process_leases(
     except Exception as error:
         _LOGGER.exception("LZ-TTS task batch planning or execution failed")
         outcomes = [error] * len(works)
-    await asyncio.gather(
+    results = await asyncio.gather(
         *(
             _finish_lease(taskflow, work, outcome, acks)
             for work, outcome in zip(works, outcomes, strict=True)
-        )
+        ),
+        return_exceptions=True,
     )
+    for result in results:
+        if isinstance(result, BaseException):
+            # Let every lease finish cleaning up before the serve loop drops the
+            # session and reconnects (only inference-runtime failures get here).
+            raise result
 
 
 async def _process_lease(
@@ -672,10 +789,20 @@ async def _serve_taskflow(
                         set_status("error", reason=f"inference runtime failed: {error}")
                         raise
         except ProtocolError as error:
-            if error.status_code in {401, 403, 404}:
-                taskflow.session_id = None
-                taskflow.session_token = None
-            _LOGGER.exception("Taskflow connection lost; reconnecting without reloading models")
+            if error.loses_lease:
+                # A lease-level rejection (cancelled run, expired lease) says
+                # nothing about the session, so keep it and keep pulling.
+                # Clearing it here would fence this session and release the
+                # leases of the worker's other in-flight tasks, making them run
+                # a second time.
+                _LOGGER.warning("Taskflow released a lease; keeping the session: %s", error)
+            else:
+                if error.loses_session:
+                    taskflow.session_id = None
+                    taskflow.session_token = None
+                _LOGGER.exception(
+                    "Taskflow connection lost; reconnecting without reloading models"
+                )
         except Exception:
             _LOGGER.exception("Taskflow connection lost; reconnecting without reloading models")
         finally:
