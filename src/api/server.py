@@ -2251,8 +2251,18 @@ async def _align_ssml_audio(
         language=language,
         language_spans=language_spans,
     )
-    if not result.get("valid") or not result.get("word_timestamps"):
-        raise ValueError(f"Could not force-align SSML audio: {result.get('reason') or 'unknown error'}")
+    if not result.get("valid"):
+        if result.get("reason") == "empty_transcript":
+            # Nothing in the document tokenizes as a word (punctuation-only or
+            # symbol-only SSML), so there is no word anchor to align to. The
+            # audio was still synthesized: let the caller place the pauses on
+            # the audio boundaries instead of failing the whole task.
+            return []
+        raise ValueError(
+            f"Could not force-align SSML audio: {result.get('reason') or 'unknown error'}"
+        )
+    if not result.get("word_timestamps"):
+        raise ValueError("Could not force-align SSML audio: no word timestamps")
     return list(result["word_timestamps"])
 
 

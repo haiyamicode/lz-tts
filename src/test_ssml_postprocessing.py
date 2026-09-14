@@ -60,3 +60,35 @@ def test_adjacent_ssml_words_map_to_distinct_alignment_units() -> None:
     assert report[0]["left_word"] == "Hello "
     assert report[0]["right_word"] == "world"
     assert report[0]["cut_seconds"] == 0.5
+
+
+def test_punctuation_only_ssml_breaks_fall_back_to_audio_boundaries() -> None:
+    # A document with no words still gets synthesized; there is nothing to align,
+    # so the break resolves against the audio boundary its position points at.
+    document = parse_ssml('<speak>\u201d<break time="1s"/></speak>')
+
+    output, report = insert_ssml_breaks(
+        document.text,
+        np.ones(200, dtype=np.float32),
+        1000,
+        document.breaks,
+        [],
+    )
+
+    assert output.size == 1200
+    assert report[0]["cut_strategy"] == "audio_end_unaligned"
+    assert report[0]["cut_seconds"] == 0.2
+    assert np.all(output[200:] == 0)
+
+    leading, leading_report = insert_ssml_breaks(
+        "!",
+        np.ones(200, dtype=np.float32),
+        1000,
+        [BreakOperation(0, 0.5)],
+        [],
+    )
+
+    assert leading.size == 700
+    assert leading_report[0]["cut_strategy"] == "audio_start_unaligned"
+    assert np.all(leading[:500] == 0)
+    assert np.all(leading[500:] == 1)

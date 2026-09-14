@@ -217,6 +217,64 @@ def _resolve_cut(
     }
 
 
+def _resolve_unaligned_cut(
+    audio_samples: int,
+    marker: PauseMarker,
+) -> tuple[int, dict[str, Any]]:
+    """Resolve a marker when the transcript holds no words to align against.
+
+    Punctuation-only documents (``<speak>”<break time="1s"/></speak>``) are still
+    synthesized, but they offer no word anchors. The break then falls back to the
+    audio boundary its source position points at: a non-empty prefix means the
+    pause trails the audio, no prefix means it leads the audio.
+    """
+    trailing = bool(marker.prefix_text.strip())
+    return (
+        audio_samples if trailing else 0,
+        {
+            "left_word": None,
+            "right_word": None,
+            "left_alignment_index": None,
+            "right_alignment_index": None,
+            "alignment_gap_start_seconds": None,
+            "alignment_gap_end_seconds": None,
+            "cut_strategy": "audio_end_unaligned" if trailing else "audio_start_unaligned",
+        },
+    )
+
+
+def _resolve_unaligned_pauses(
+    audio_samples: int,
+    sample_rate: int,
+    markers: list[PauseMarker],
+) -> list[ResolvedPause]:
+    """Resolve every marker on the audio boundary its source prefix points at."""
+    insertions_by_boundary: dict[int, dict[str, Any]] = {}
+    for marker in markers:
+        cut, cut_details = _resolve_unaligned_cut(audio_samples, marker)
+        insertion = insertions_by_boundary.setdefault(
+            cut,
+            {
+                "markers": [],
+                "details": {
+                    **cut_details,
+                    "alignment_word_index": None,
+                    "cut_seconds": cut / sample_rate,
+                },
+            },
+        )
+        insertion["markers"].append(marker)
+
+    return [
+        ResolvedPause(
+            cut_sample=int(cut),
+            markers=tuple(insertion["markers"]),
+            details=dict(insertion["details"]),
+        )
+        for cut, insertion in sorted(insertions_by_boundary.items())
+    ]
+
+
 def resolve_aligned_pauses(
     audio_samples: int,
     sample_rate: int,
@@ -229,7 +287,7 @@ def resolve_aligned_pauses(
     if sample_rate <= 0:
         raise ValueError("sample_rate must be positive")
     if not word_timestamps:
-        raise ValueError("Forced aligner returned no word timestamps")
+        return _resolve_unaligned_pauses(audio_samples, sample_rate, markers)
 
     insertions_by_boundary: dict[int, dict[str, Any]] = {}
     for marker in markers:
