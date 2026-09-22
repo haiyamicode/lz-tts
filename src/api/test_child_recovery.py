@@ -8,6 +8,7 @@ child process outlives the worker that spawned it.
 from __future__ import annotations
 
 import asyncio
+import multiprocessing as mp
 import os
 import signal
 import subprocess
@@ -18,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from src.api.worker_common import WorkerProcessClient
 from src.nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, VoxCPMServerDied
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -59,6 +61,108 @@ def test_voxcpm_child_death_fails_pending_requests() -> None:
             await server.stop()
 
     asyncio.run(scenario())
+
+
+def _stubborn_child(ready, request_queue, response_queue) -> None:
+    """Stand-in for a child parked in an uninterruptible CUDA/driver call."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    from src.process_guard import exit_with_parent
+
+    exit_with_parent()
+    ready.value = os.getpid()
+    while True:
+        request_queue.get()
+
+
+def test_stop_kills_child_that_ignores_sigterm() -> None:
+    """``stop()`` must not forget a child that survives SIGTERM.
+
+    A CUDA-stuck child can defer SIGTERM indefinitely; if ``stop()`` drops it
+    anyway, the orphan keeps its CUDA context while the engine is respawned and
+    the reload OOMs forever. SIGKILL is the only guarantee that the memory is
+    gone before the next load.
+    """
+    ctx = mp.get_context("spawn")
+    ready = ctx.Value("i", 0)
+    client = WorkerProcessClient(
+        name="stubborn-test",
+        target=_stubborn_child,
+        args=(ready,),
+        stop_timeout=1.0,
+    )
+    try:
+        client.start()
+        assert client.process is not None
+        deadline = time.monotonic() + 60
+        while not ready.value and time.monotonic() < deadline:
+            time.sleep(0.05)
+        pid = client.process.pid
+        assert pid is not None and _process_is_alive(pid)
+
+        client.stop()
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and _process_is_alive(pid):
+            time.sleep(0.1)
+        assert not _process_is_alive(pid), "stop() orphaned a child that ignored SIGTERM"
+    finally:
+        if client.process is not None and client.process.is_alive():
+            client.process.kill()
+            client.process.join(timeout=10)
+
+
+_HARD_EXIT_HARNESS = """
+import subprocess
+import sys
+import time
+
+from src.process_guard import hard_exit
+
+grandchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+time.sleep(0.5)
+print(grandchild.pid, flush=True)
+hard_exit("hard-exit harness")
+"""
+
+
+def test_hard_exit_kills_the_whole_process_tree(tmp_path: Path) -> None:
+    """``hard_exit`` must SIGKILL its descendants and then itself.
+
+    This is the escape hatch for when in-process recovery cannot free GPU
+    memory: the supervisor only gets a clean slate if no process from the old
+    tree survives.
+    """
+    script = tmp_path / "hard_exit_harness.py"
+    script.write_text(textwrap.dedent(_HARD_EXIT_HARNESS))
+    harness = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+        text=True,
+    )
+    grandchild_pid: int | None = None
+    try:
+        assert harness.stdout is not None
+        grandchild_pid = int(harness.stdout.readline().strip())
+        assert _process_is_alive(grandchild_pid)
+
+        returncode = harness.wait(timeout=30)
+        assert returncode == -signal.SIGKILL, f"hard_exit did not SIGKILL itself (rc={returncode})"
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and _process_is_alive(grandchild_pid):
+            time.sleep(0.1)
+        assert not _process_is_alive(grandchild_pid), "hard_exit left a GPU-holding descendant alive"
+    finally:
+        if harness.poll() is None:
+            harness.kill()
+            harness.wait(timeout=10)
+        if grandchild_pid is not None:
+            try:
+                os.kill(grandchild_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 _HARNESS = """

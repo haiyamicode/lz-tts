@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ..multilingual_splitter import MultilingualSplitter, SplitResult
 from ..piper import PiperInference
+from ..process_guard import hard_exit
 from ..ctc_forced_alignment import CtcAlignmentConfig, CtcForcedAligner, CtcLanguageSpan
 from ..aligned_pauses import ResolvedPause, insert_resolved_pauses
 from ..ssml import BreakOperation, PronunciationOperation, SSMLDocument, parse_ssml
@@ -877,6 +878,20 @@ def _maybe_cleanup_gpu() -> None:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def _release_gpu_cache() -> None:
+    """Drop this process' cached CUDA blocks before (re)loading an engine.
+
+    PyTorch's caching allocator keeps freed blocks in the process, and a
+    half-failed load can leave unreachable model graphs alive until a
+    collection. A fresh worker process (manual restart) starts from an empty
+    allocator; an in-process engine reload has to do this explicitly, or the
+    reload peaks against memory that a manual restart would have discarded.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _extract_locale_from_voice_id(voice_id: str) -> str | None:
@@ -4244,6 +4259,10 @@ async def _load_voxcpm_engine() -> None:
         _voxcpm_runtime = None
         if previous is not None:
             await previous.stop()
+        # The VoxCPM runtime owns GPU models in this process too (the DP
+        # duration budget); ``stop()`` only drops the references. Return their
+        # cached blocks to the driver before allocating the replacement.
+        await asyncio.to_thread(_release_gpu_cache)
         runtime = VoxCPMRuntime(config.model_dump(mode="python"))
         try:
             await runtime.start()
@@ -4293,17 +4312,45 @@ _ENGINE_LOADERS: dict[str, Callable[[], Awaitable[None]]] = {
 }
 _engine_reload_tasks: dict[str, asyncio.Task[None]] = {}
 _ENGINE_RELOAD_BACKOFF_SECONDS = 10.0
+_engine_reload_failures: dict[str, int] = {}
+
+
+def _max_engine_reload_failures() -> int:
+    """Consecutive failed loads of one engine before we hard-restart.
+
+    Read lazily (not at import time) so a value in ``.env`` is honoured, since
+    the dotenv file is only loaded once the worker starts.
+    """
+    try:
+        return max(1, int(os.environ.get("LZ_TTS_MAX_ENGINE_RELOAD_FAILURES", "3")))
+    except ValueError:
+        return 3
 
 
 async def _run_engine_loader(engine: str, loader: Callable[[], Awaitable[None]]) -> None:
     try:
+        # Reloading an engine in-process is not a fresh process: return this
+        # process' cached CUDA blocks to the driver first so the new engine
+        # does not OOM against memory a full restart would have released.
+        await asyncio.to_thread(_release_gpu_cache)
         await loader()
+        _engine_reload_failures[engine] = 0
         _mark_engine_ready(engine)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # pylint: disable=broad-exception-caught
         _LOGGER.exception("Failed loading %s backend", engine)
         _mark_engine_failed(engine, exc)
+        failures = _engine_reload_failures.get(engine, 0) + 1
+        _engine_reload_failures[engine] = failures
+        if failures >= _max_engine_reload_failures():
+            # In-process recovery is not working. A manual pm2 restart always
+            # frees the GPU because it replaces the whole process tree and the
+            # CUDA allocator; do exactly that so we stop looping with resident
+            # memory instead of serving errors forever.
+            hard_exit(
+                f"{engine} backend failed to load {failures}x in a row: {exc}"
+            )
 
 
 def _schedule_engine_reload(engine: str) -> None:

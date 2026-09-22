@@ -107,10 +107,12 @@ class WorkerProcessClient:
         name: str,
         target: Callable[..., None],
         args: tuple[Any, ...] = (),
+        stop_timeout: float = 10.0,
     ):
         self.name = name
         self.target = target
         self.args = args
+        self.stop_timeout = stop_timeout
         self.process: mp.Process | None = None
         self.requests: Any | None = None
         self.responses: Any | None = None
@@ -145,19 +147,55 @@ class WorkerProcessClient:
                 pass
 
     def stop(self) -> None:
+        """Stop the child and guarantee it is gone before returning.
+
+        The graceful shutdown message has to be sent *before* the queues are
+        closed, otherwise the child keeps its model resident. SIGTERM is not
+        enough for a child parked in an uninterruptible CUDA/driver call: it
+        has to be escalated to SIGKILL, or the orphan keeps its multi-gigabyte
+        CUDA context while the engine is respawned and OOMs on load.
+        """
         with self.start_lock:
             process = self.process
             requests = self.requests
-            self._close_queues(self.requests, self.responses)
             if process is not None and process.is_alive() and requests is not None:
                 try:
                     requests.put({"action": "shutdown", "payload": None})
-                    process.join(timeout=10)
                 except Exception:  # pylint: disable=broad-exception-caught
                     _LOGGER.exception("Failed graceful %s worker shutdown", self.name)
+                process.join(timeout=self.stop_timeout)
+                if process.is_alive():
+                    _LOGGER.warning(
+                        "%s worker pid=%s ignored graceful shutdown; terminating",
+                        self.name,
+                        process.pid,
+                    )
             if process is not None and process.is_alive():
                 process.terminate()
-                process.join(timeout=10)
+                process.join(timeout=self.stop_timeout)
+            if process is not None and process.is_alive():
+                # SIGTERM is catchable and a CUDA-stuck child can defer it
+                # forever. SIGKILL is not catchable: the kernel reaps the
+                # process (and frees its CUDA context) as soon as it is
+                # schedulable, so the next engine load is not racing a
+                # still-resident orphan for VRAM.
+                _LOGGER.error(
+                    "%s worker pid=%s survived SIGTERM after %.0fs; sending SIGKILL",
+                    self.name,
+                    process.pid,
+                    self.stop_timeout,
+                )
+                kill = getattr(process, "kill", None)
+                if callable(kill):
+                    kill()
+                process.join(timeout=self.stop_timeout)
+            if process is not None and process.is_alive():
+                _LOGGER.error(
+                    "%s worker pid=%s survived SIGKILL; its GPU memory may still be resident",
+                    self.name,
+                    process.pid,
+                )
+            self._close_queues(self.requests, self.responses)
             self.process = None
             self.requests = None
             self.responses = None

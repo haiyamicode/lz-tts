@@ -12,6 +12,7 @@ import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,6 +29,7 @@ from .api.server import (
     set_status,
 )
 from .api.worker_common import ChildWorkerDied
+from .process_guard import hard_exit
 
 _LOGGER = logging.getLogger(__name__)
 TASK_TYPES = ("tts-synthesis", "voice-enhance")
@@ -848,7 +850,14 @@ async def run_worker() -> None:
         persistent=_env_bool("TASKFLOW_WORKER_PERSISTENT", False),
     )
     inference = LzTtsInferenceSession()
-    await inference.start()
+    try:
+        await inference.start()
+    except BaseException:  # pylint: disable=broad-exception-caught
+        # A partial startup may have spawned children that already hold GPU
+        # memory. Kill the whole tree immediately rather than trusting loop
+        # teardown (which can itself wedge on a stuck child).
+        _LOGGER.exception("Failed to start the inference runtime; killing the process tree")
+        hard_exit("inference runtime startup failed")
     http_server, http_task = _start_http_server(inference)
     # uvicorn installs its own handlers when the server task starts; ours run
     # afterwards so SIGINT/SIGTERM end the whole worker instead of leaving the
@@ -856,9 +865,31 @@ async def run_worker() -> None:
     await asyncio.sleep(0)
     main_task = asyncio.current_task()
     loop = asyncio.get_running_loop()
+    # Backstop: if graceful shutdown wedges (a child stuck in an uninterruptible
+    # CUDA call, a thread that will not join), don't wait for pm2 to SIGKILL us
+    # at kill_timeout. Tear the whole tree down ourselves so the GPU is free
+    # before the supervisor restarts the worker.
+    shutdown_grace = max(1.0, float(os.environ.get("LZ_TTS_SHUTDOWN_GRACE_SECONDS", "20")))
+    shutdown_watchdog = threading.Timer(
+        shutdown_grace,
+        hard_exit,
+        args=("graceful shutdown exceeded its grace period",),
+    )
+    shutdown_watchdog.daemon = True
+    shutdown_requested = False
+
+    def _request_shutdown() -> None:
+        nonlocal shutdown_requested
+        # SIGINT and SIGTERM can both arrive; only arm the watchdog once.
+        if shutdown_requested:
+            return
+        shutdown_requested = True
+        shutdown_watchdog.start()
+        main_task.cancel()
+
     for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(shutdown_signal, main_task.cancel)
+            loop.add_signal_handler(shutdown_signal, _request_shutdown)
     acks = SynthesisAckBatcher(
         taskflow._client,
         lazybird_url.rstrip("/") + "/internal/synthesis-events/v1/batch",
@@ -870,6 +901,7 @@ async def run_worker() -> None:
     except asyncio.CancelledError:
         _LOGGER.info("LZ-TTS worker shutdown requested")
     finally:
+        shutdown_watchdog.cancel()
         http_server.should_exit = True
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await http_task
@@ -882,4 +914,11 @@ async def run_worker() -> None:
 def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    asyncio.run(run_worker())
+    try:
+        asyncio.run(run_worker())
+    except BaseException:  # pylint: disable=broad-exception-caught
+        # Anything that escapes the worker loop means we cannot guarantee the
+        # backend children are still healthy. Never leave them holding GPU
+        # memory: kill the tree and let the supervisor start us clean.
+        _LOGGER.exception("LZ-TTS worker failed; killing the whole process tree")
+        hard_exit("unhandled worker error")
