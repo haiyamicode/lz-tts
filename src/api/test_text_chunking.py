@@ -15,6 +15,7 @@ import pytest
 from src.api.server import SynthesisChunkingConfig, _sparrow_chunk_segments
 from src.api.text_chunking import (
     batch_groups_by_weight,
+    chunk_source_ranges,
     chunk_synthesis_texts,
     concat_chunk_audios,
     expand_chunks,
@@ -162,3 +163,62 @@ def test_chunking_config_rejects_inverted_limits() -> None:
     assert config.enabled is True
     assert config.soft_text_token_limit == SOFT_LIMIT
     assert config.hard_text_token_limit == HARD_LIMIT
+
+
+def _is_subsequence(needle: str, hay: str) -> bool:
+    iterator = iter(hay)
+    return all(char in iterator for char in needle)
+
+
+def test_chunk_source_ranges_short_text_is_identity() -> None:
+    assert chunk_source_ranges("  hello world  ", ["  hello world  "]) == [(0, 15)]
+    assert chunk_source_ranges("", [""]) == [(0, 0)]
+
+
+def test_chunk_source_ranges_recover_despite_eaten_separators() -> None:
+    """Chunk ranges must locate each chunk even when the splitter drops the
+    separator character at split boundaries."""
+    texts = [
+        ("The quick brown fox jumps over the lazy dog. " * 30).strip(),
+        ("word word word word word word " * 60).strip(),
+        ("الرحمن الرحيم الرحمن الرحيم " * 40).strip(),
+        ("今天天气很好我们去公园散步 " * 30).strip(),
+        "\n\n  " + ("line one. line two, line three; " * 30) + "  \t\n",
+    ]
+    for text in texts:
+        assert count_cl100k_tokens(text) > HARD_LIMIT
+        chunks = _split(text)
+        ranges = chunk_source_ranges(text, chunks)
+
+        assert all(r is not None for r in ranges), (text[:40], chunks, ranges)
+        previous_end = 0
+        for chunk, (start, end) in zip(chunks, ranges):
+            assert start >= previous_end, (chunk, start, previous_end)
+            previous_end = end
+            # The chunk is the source slice minus dropped separator chars:
+            # every chunk character appears in order inside its range.
+            assert _is_subsequence(chunk, text[start:end]), (chunk, text[start:end])
+            assert text[start] == chunk[0] or not chunk
+        # No content is lost: joining the ranges' content covers all words.
+        joined = "".join(text[start:end] for start, end in ranges if (start, end) != (0, 0))
+        assert _collapse(joined) == _collapse(text.strip())
+
+
+def test_chunk_source_ranges_cjk_chunks_are_exact_slices() -> None:
+    text = "今天天气很好我们一起去公园散步吧" * 24
+    assert count_cl100k_tokens(text) > HARD_LIMIT
+    chunks = _split(text)
+
+    ranges = chunk_source_ranges(text, chunks)
+    assert all(r is not None for r in ranges)
+    # CJK text has no separators to drop: chunks are exact contiguous slices.
+    for chunk, (start, end) in zip(chunks, ranges):
+        assert text[start:end] == chunk
+    assert ranges[-1][1] == len(text)
+
+
+def test_chunk_source_ranges_fails_closed_on_unplaceable_chunks() -> None:
+    # A chunk that cannot be embedded in the source poisons its range and
+    # every range after it: callers degrade instead of guessing offsets.
+    assert chunk_source_ranges("abc def", ["zzz", "def"]) == [None, None]
+    assert chunk_source_ranges("abc def", ["abc", "xyz", "def"]) == [(0, 3), None, None]

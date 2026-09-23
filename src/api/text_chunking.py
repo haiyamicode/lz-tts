@@ -58,6 +58,45 @@ def chunk_synthesis_texts(
     return chunks, counts
 
 
+def chunk_source_ranges(
+    source_text: str,
+    chunks: Sequence[str],
+) -> list[tuple[int, int] | None]:
+    """Half-open ``[start, end)`` ranges of ``chunks`` inside ``source_text``.
+
+    ``chunk_synthesis_texts`` returns the text unchanged when it fits the
+    token budget, otherwise a partition of the stripped text in which
+    separator characters at split boundaries are dropped. The chunks
+    therefore form a monotone subsequence of the source text; each chunk's
+    range is recovered by one greedy walk that consumes both in order.
+    The walk is exact except in pathological cases (repetitive text where a
+    dropped separator is identical to the following chunk character); an
+    unplaceable chunk — and any chunk after it — is reported as ``None`` so
+    callers can degrade gracefully instead of guessing offsets.
+    """
+    if len(chunks) == 1 and chunks[0] == source_text:
+        return [(0, len(source_text))]
+    stripped = source_text.strip()
+    lead = len(source_text) - len(source_text.lstrip())
+    ranges: list[tuple[int, int] | None] = []
+    cursor = 0
+    for chunk in chunks:
+        start: int | None = None
+        for char in chunk:
+            index = stripped.find(char, cursor)
+            if index < 0:
+                break
+            if start is None:
+                start = index
+            cursor = index + 1
+        if start is None:
+            ranges.append(None)
+            ranges.extend([None] * (len(chunks) - len(ranges)))
+            break
+        ranges.append((start + lead, cursor + lead))
+    return ranges
+
+
 def sparrow_batch_weights(
     texts: Sequence[str],
     *,

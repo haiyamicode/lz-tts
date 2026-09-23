@@ -59,6 +59,7 @@ from .seed_vc_backend import (
 )
 from .text_chunking import (
     batch_groups_by_weight,
+    chunk_source_ranges,
     chunk_synthesis_texts,
     concat_chunk_audios,
     expand_chunks,
@@ -2483,6 +2484,32 @@ async def _synthesize_sparrow_ipa_ssml(
                 segment["model"] = root_voice.model
                 segment["voice_adapter"] = root_voice.adapter
 
+    # Chunk every language segment with the shared token-budget splitter so
+    # no single Sparrow decode exceeds the model's sequence budget. Chunk
+    # texts are the segment text minus separator characters dropped at split
+    # boundaries, so each chunk's source range is recovered by a monotone
+    # walk and overrides are re-expressed in chunk-local offsets.
+    language_segments = segments
+    chunked_segments: list[dict[str, Any]] = []
+    for segment in segments:
+        pieces = _sparrow_chunk_segments([segment])
+        ranges = chunk_source_ranges(
+            str(segment["text"]), [str(piece["text"]) for piece in pieces]
+        )
+        for piece, chunk_range in zip(pieces, ranges):
+            if chunk_range is None:
+                # Unplaceable chunk: it still synthesizes, but its text can
+                # no longer be located in the source, so it carries no
+                # overrides (they are reported as skipped below).
+                piece["source_start"] = 1
+                piece["source_end"] = 0
+            else:
+                base = int(segment["source_start"])
+                piece["source_start"] = base + chunk_range[0]
+                piece["source_end"] = base + chunk_range[1]
+            chunked_segments.append(piece)
+    segments = chunked_segments
+
     assigned_operations: set[int] = set()
     for segment in segments:
         source_start = int(segment["source_start"])
@@ -2492,7 +2519,9 @@ async def _synthesize_sparrow_ipa_ssml(
             if operation.end <= source_start or operation.start >= source_end:
                 continue
             if operation.start < source_start or operation.end > source_end:
-                raise ValueError("SSML <phoneme> span crosses a Sparrow language boundary")
+                # Crosses a language boundary: reported as skipped below; the
+                # text is pronounced as written.
+                continue
             local_overrides.append((
                 operation.start - source_start,
                 operation.end - source_start,
@@ -2501,8 +2530,45 @@ async def _synthesize_sparrow_ipa_ssml(
             assigned_operations.add(index)
         segment["ipa_overrides"] = local_overrides
 
-    if len(assigned_operations) != len(document.pronunciations):
-        raise ValueError("Could not assign every SSML <phoneme> span to a Sparrow language segment")
+    # Overrides that fit inside no chunk (e.g. one crossing a language or a
+    # synthesis-chunk boundary, or one inside a gap between segments) are
+    # skipped with a warning instead of failing the request: that text is
+    # pronounced as written.
+    for index, operation in enumerate(document.pronunciations):
+        if index in assigned_operations:
+            continue
+        inside_language = any(
+            segment["source_start"] <= operation.start
+            and operation.end <= segment["source_end"]
+            for segment in language_segments
+        )
+        crosses_chunk = any(
+            segment["source_start"] < operation.end
+            and operation.start < segment["source_end"]
+            for segment in segments
+        )
+        crosses_language = any(
+            segment["source_start"] < operation.end
+            and operation.start < segment["source_end"]
+            for segment in language_segments
+        )
+        if inside_language and not crosses_chunk:
+            # Fully inside one language segment but matched no chunk: the
+            # chunk source-range walk failed (pathological repetitive text).
+            reason = "could not be located inside a Sparrow synthesis chunk"
+        elif crosses_language:
+            reason = "crosses a Sparrow language boundary"
+        elif crosses_chunk:
+            reason = "crosses a Sparrow synthesis chunk boundary"
+        else:
+            reason = "does not match any Sparrow language segment"
+        _LOGGER.warning(
+            "Skipping SSML <phoneme> span [%d, %d) %r: %s",
+            operation.start,
+            operation.end,
+            operation.phonemes,
+            reason,
+        )
 
     synth_kwargs = _synth_kwargs_from_request(request)
     generated: list[tuple[np.ndarray, int]] = []
@@ -2746,11 +2812,147 @@ def _voxcpm_ipa_pass_controls(
     return result
 
 
-async def _predict_ssml_ipa_durations(
+def _baseline_window_seconds(
+    timestamps: list[dict[str, Any]],
+    source_start: int,
+    source_end: int,
+) -> tuple[float, float] | None:
+    """Baseline-audio seconds covering a document.text range, or None."""
+    matching = [
+        item
+        for item in timestamps
+        if int(item.get("source_start", -1)) < source_end
+        and int(item.get("source_end", -1)) > source_start
+    ]
+    if not matching:
+        return None
+    return (
+        min(float(item["start_seconds"]) for item in matching),
+        max(float(item["end_seconds"]) for item in matching),
+    )
+
+
+def _voxcpm_ipa_chunk_plans(
+    controlled_text: str,
+    controls: list[dict[str, Any]],
+    document: SSMLDocument,
+) -> list[dict[str, Any]]:
+    """Chunk the controlled text and map each chunk back to the source text.
+
+    Each plan carries the chunk text, its ``document.text`` range, the
+    controls whose full controlled span fits inside it (re-expressed in
+    chunk-local offsets), and a plain-text twin in which every fully
+    contained control spelling is replaced by the original source span —
+    the twin is the length prior and the duration-model context for the
+    chunk. Controls crossing a chunk boundary are left unassigned (the
+    caller skips them with a warning); their visible spelling stays in the
+    chunk text and is pronounced as written.
+    """
+    chunks = _chunk_voxcpm_texts([controlled_text])[0]
+    ranges = chunk_source_ranges(controlled_text, chunks)
+    operations = sorted(document.pronunciations, key=lambda item: item.start)
+
+    # Pieces: gaps (document text between spans, as normalized) and control
+    # spellings, each with its controlled and source extents.
+    pieces: list[tuple[int, int, int, int, str | None]] = []
+    controlled_cursor = 0
+    for index, control in enumerate(controls):
+        source_start = int(control["source_start"])
+        source_end = int(control["source_end"])
+        controlled_start = int(control["controlled_start"])
+        controlled_end = int(control["controlled_end"])
+        gap_start = int(operations[index - 1].end) if index else 0
+        if controlled_start > controlled_cursor:
+            pieces.append(
+                (controlled_cursor, controlled_start, gap_start, source_start, None)
+            )
+        pieces.append(
+            (controlled_start, controlled_end, source_start, source_end,
+             str(control["target_ipa"]))
+        )
+        controlled_cursor = controlled_end
+    if controlled_cursor < len(controlled_text):
+        gap_start = int(operations[-1].end) if operations else 0
+        pieces.append(
+            (controlled_cursor, len(controlled_text), gap_start, len(document.text), None)
+        )
+
+    def source_position(controlled_index: int) -> int:
+        """document.text coordinate of a controlled-text character index."""
+        for piece_start, piece_end, src_start, src_end, _ipa in pieces:
+            if controlled_index < piece_start:
+                break
+            if piece_start <= controlled_index < piece_end:
+                offset = controlled_index - piece_start
+                return src_start + min(offset, max(src_end - src_start, 0))
+        return len(document.text)
+
+    plans: list[dict[str, Any]] = []
+    for chunk, chunk_range in zip(chunks, ranges):
+        if chunk_range is None:
+            plans.append({
+                "text": chunk,
+                "unplaced": True,
+                "source_start": 0,
+                "source_end": -1,
+                "controls": [],
+                "control_indices": [],
+                "twin_text": chunk,
+                "twin_overrides": [],
+            })
+            continue
+        chunk_start, chunk_end = chunk_range
+        local_controls: list[dict[str, Any]] = []
+        control_indices: list[int] = []
+        for index, control in enumerate(controls):
+            controlled_start = int(control["controlled_start"])
+            controlled_end = int(control["controlled_end"])
+            if controlled_start >= chunk_start and controlled_end <= chunk_end:
+                local_controls.append({
+                    **control,
+                    "controlled_start": controlled_start - chunk_start,
+                    "controlled_end": controlled_end - chunk_start,
+                })
+                control_indices.append(index)
+        twin_parts: list[str] = []
+        twin_overrides: list[tuple[int, int, str]] = []
+        for piece_start, piece_end, src_start, src_end, ipa in pieces:
+            low = max(piece_start, chunk_start)
+            high = min(piece_end, chunk_end)
+            if low >= high:
+                continue
+            if piece_start >= low and high == piece_end:
+                twin_piece = document.text[src_start:src_end]
+                twin_start = sum(len(part) for part in twin_parts)
+                twin_parts.append(twin_piece)
+                if ipa is not None:
+                    twin_overrides.append((twin_start, twin_start + len(twin_piece), ipa))
+            else:
+                twin_parts.append(chunk[low - chunk_start : high - chunk_start])
+        plans.append({
+            "text": chunk,
+            "unplaced": False,
+            "source_start": source_position(chunk_start),
+            "source_end": source_position(chunk_end - 1) + 1,
+            "controls": local_controls,
+            "control_indices": control_indices,
+            "twin_text": "".join(twin_parts),
+            "twin_overrides": twin_overrides,
+        })
+    return plans
+
+
+async def _predict_ssml_ipa_chunk_durations(
     request: SynthesizeRequest,
     document: SSMLDocument,
     resolved_model: str | None,
-) -> list[float]:
+    chunk_plans: list[dict[str, Any]],
+) -> list[list[float]]:
+    """Predict target durations per chunk with the shared Sparrow model.
+
+    Each chunk's plain twin is decoded once with its chunk-local overrides,
+    so no single duration-model decode exceeds the chunk token budget.
+    """
     await _await_engine_ready("pipertts")
     routes = [
         _ssml_sparrow_route(request, document.text, operation, resolved_model)
@@ -2761,25 +2963,32 @@ async def _predict_ssml_ipa_durations(
     speaker, model_name = routes[0]
     inference = _get_inference(model_name)
     internal_speaker = _resolve_internal_speaker(model_name, speaker, inference)
-    _audio, timestamps = await asyncio.to_thread(
-        inference.synthesize_with_ipa_overrides,
-        document.text,
-        [
-            (operation.start, operation.end, operation.phonemes)
-            for operation in document.pronunciations
-        ],
-        speaker=internal_speaker,
-        noise_scale=0.0,
-        length_scale=1.0,
-        noise_w=0.0,
-        sdp_ratio=0.0,
-        neural=False,
-        return_alignment=True,
-    )
-    spans = _aligned_pronunciation_spans(document.pronunciations, list(timestamps))
-    durations = [span["end_seconds"] - span["start_seconds"] for span in spans]
-    if any(duration <= 0.0 for duration in durations):
-        raise ValueError("Sparrow predicted a non-positive IPA pronunciation duration")
+    durations: list[list[float]] = []
+    for plan in chunk_plans:
+        if not plan["twin_overrides"]:
+            durations.append([])
+            continue
+        _audio, timestamps = await asyncio.to_thread(
+            inference.synthesize_with_ipa_overrides,
+            plan["twin_text"],
+            [tuple(item) for item in plan["twin_overrides"]],
+            speaker=internal_speaker,
+            noise_scale=0.0,
+            length_scale=1.0,
+            noise_w=0.0,
+            sdp_ratio=0.0,
+            neural=False,
+            return_alignment=True,
+        )
+        twin_operations = tuple(
+            PronunciationOperation(start=start, end=end, alphabet="ipa", phonemes=ipa)
+            for start, end, ipa in plan["twin_overrides"]
+        )
+        spans = _aligned_pronunciation_spans(twin_operations, list(timestamps))
+        chunk_durations = [span["end_seconds"] - span["start_seconds"] for span in spans]
+        if any(duration <= 0.0 for duration in chunk_durations):
+            raise ValueError("Sparrow predicted a non-positive IPA pronunciation duration")
+        durations.append(chunk_durations)
     return durations
 
 
@@ -2811,13 +3020,19 @@ async def _synthesize_voxcpm_ipa_ssml(
         request.language,
         request.language_override,
     )
-    controlled_text, _language, controls = _prepare_voxcpm_ipa_text(
+    controlled_text, language, controls = _prepare_voxcpm_ipa_text(
         document,
         request.language,
         forced_language,
         _configured_voice_language(request.voice_id, request.language),
     )
-    controlled_operations = _voxcpm_controlled_operations(controls)
+    patch_samples = runtime.output_patch_samples
+    patch_seconds = patch_samples / runtime.sample_rate
+    baseline_patch_count, remainder = divmod(len(baseline_audio), patch_samples)
+    if baseline_patch_count <= 0 or remainder:
+        raise ValueError(
+            "VoxCPM baseline audio does not contain an integral number of output patches"
+        )
     baseline_timestamps = await _align_ssml_audio(
         document.text,
         baseline_audio,
@@ -2825,29 +3040,28 @@ async def _synthesize_voxcpm_ipa_ssml(
         request.language,
         forced_language,
     )
-    baseline_spans = _aligned_pronunciation_spans(
-        document.pronunciations, baseline_timestamps
-    )
-    target_durations = await _predict_ssml_ipa_durations(
-        request, document, resolved_model
-    )
-    patch_samples = runtime.output_patch_samples
-    baseline_patch_count, remainder = divmod(len(baseline_audio), patch_samples)
-    if baseline_patch_count <= 0 or remainder:
-        raise ValueError(
-            "VoxCPM baseline audio does not contain an integral number of output patches"
+
+    # Split the controlled text with the shared token-budget splitter so no
+    # single controlled generation exceeds the model budget. Every chunk
+    # runs the same gateless-pass/schedule/refinement loop over its own
+    # controls; chunk audio is concatenated. Controls that cannot be
+    # assigned to a single chunk are skipped with a warning: their visible
+    # spelling is pronounced as written.
+    chunk_plans = _voxcpm_ipa_chunk_plans(controlled_text, controls, document)
+    assigned_control_indices: set[int] = set()
+    for plan in chunk_plans:
+        assigned_control_indices.update(plan["control_indices"])
+    for index, control in enumerate(controls):
+        if index in assigned_control_indices:
+            continue
+        _LOGGER.warning(
+            "Skipping SSML <phoneme> span [%d, %d) %r: could not be assigned to a "
+            "single VoxCPM synthesis chunk; the span is pronounced as written",
+            int(control["source_start"]),
+            int(control["source_end"]),
+            control["target_ipa"],
         )
-    initial_expected_patches = baseline_patch_count
-    for span, target_duration in zip(baseline_spans, target_durations, strict=True):
-        resolved, _expected = resolve_ipa_control_schedules(
-            [span],
-            [target_duration],
-            baseline_patch_count=baseline_patch_count,
-            patch_seconds=patch_samples / runtime.sample_rate,
-            fade_out_ratio=runtime.ipa_fade_out_ratio,
-        )
-        initial_expected_patches += int(resolved[0]["duration_shift_patches"])
-    initial_expected_patches = max(2, initial_expected_patches)
+
     stop_cushion = _server_config.ssml.voxcpm_ipa_stop_cushion_patches
     max_cushion = _server_config.ssml.voxcpm_ipa_max_length_cushion_patches
     requested_loras = _effective_voxcpm_lora_names(
@@ -2860,49 +3074,189 @@ async def _synthesize_voxcpm_ipa_ssml(
     except (OSError, ValueError) as exc:
         raise ValueError(f"Could not apply VoxCPM LoRAs: {exc}") from exc
     reference_audio, reference_format = await _load_voxcpm_ssml_reference(request)
+    chunk_durations = await _predict_ssml_ipa_chunk_durations(
+        request, document, resolved_model, chunk_plans
+    )
 
-    async def generate_pass(
-        schedules: list[dict[str, object]],
+    def chunk_expected_patches(plan: dict[str, Any], durations: list[float]) -> int:
+        window = _baseline_window_seconds(
+            baseline_timestamps, int(plan["source_start"]), int(plan["source_end"])
+        )
+        if window is None:
+            # Fallback: scale the full baseline by the twin's text share.
+            baseline_seconds = len(baseline_audio) / runtime.sample_rate
+            share = len(plan["twin_text"]) / max(1, len(document.text))
+            expected = int(baseline_seconds * share / patch_seconds)
+        else:
+            expected = int((window[1] - window[0]) / patch_seconds)
+        for control, target_duration in zip(plan["controls"], durations, strict=True):
+            span = {"start_seconds": 0.0, "end_seconds": 0.0}
+            if window is not None:
+                control_window = _baseline_window_seconds(
+                    baseline_timestamps,
+                    int(control["source_start"]),
+                    int(control["source_end"]),
+                )
+                if control_window is not None:
+                    span = {
+                        "start_seconds": max(0.0, control_window[0] - window[0]),
+                        "end_seconds": max(0.0, control_window[1] - window[0]),
+                    }
+            resolved, _ = resolve_ipa_control_schedules(
+                [span],
+                [target_duration],
+                baseline_patch_count=max(1, expected),
+                patch_seconds=patch_seconds,
+                fade_out_ratio=runtime.ipa_fade_out_ratio,
+            )
+            expected += int(resolved[0]["duration_shift_patches"])
+        return max(2, expected)
+
+    async def generate_chunk(
+        plan: dict[str, Any],
+        durations: list[float],
         expected_patches: int,
     ) -> np.ndarray:
-        pass_controls = _voxcpm_ipa_pass_controls(controls, schedules)
-        target_end = max(
-            (
-                int(schedule["start_patch"])
-                + int(schedule["target_patch_count"])
-                for schedule in schedules
-            ),
-            default=0,
-        )
-        gate_end = max(
-            (
-                int(control["start_patch"]) + len(control["gates"])
-                for control in pass_controls
-                if control["audio_enabled"]
-            ),
-            default=0,
-        )
-        return await runtime.synthesize_controlled(
-            controlled_text,
-            ipa_controls=pass_controls,
-            min_generate_length=max(
-                2,
-                expected_patches - stop_cushion,
-                target_end,
-            ),
-            max_generate_length=max(
-                expected_patches + max_cushion,
-                gate_end,
-            ),
-            seed=request.seed,
-            reference_audio=reference_audio,
-            reference_format=reference_format,
-            lora_name=lora_name,
-        )
+        chunk_text = str(plan["text"])
+        chunk_controls = list(plan["controls"])
+        if not chunk_controls:
+            (chunk_audio,) = await runtime.synthesize_batch(
+                [chunk_text],
+                languages=[language],
+                seeds=[request.seed],
+                reference_audio=reference_audio,
+                reference_format=reference_format,
+                lora_names=[lora_name],
+            )
+            return chunk_audio
+        chunk_operations = _voxcpm_controlled_operations(chunk_controls)
 
-    async def align_controlled(
-        audio: np.ndarray,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, float]]]:
+        async def generate_pass(
+            schedules: list[dict[str, object]],
+            pass_expected: int,
+        ) -> np.ndarray:
+            pass_controls = _voxcpm_ipa_pass_controls(chunk_controls, schedules)
+            target_end = max(
+                (
+                    int(schedule["start_patch"]) + int(schedule["target_patch_count"])
+                    for schedule in schedules
+                ),
+                default=0,
+            )
+            gate_end = max(
+                (
+                    int(control["start_patch"]) + len(control["gates"])
+                    for control in pass_controls
+                    if control["audio_enabled"]
+                ),
+                default=0,
+            )
+            return await runtime.synthesize_controlled(
+                chunk_text,
+                ipa_controls=pass_controls,
+                min_generate_length=max(2, pass_expected - stop_cushion, target_end),
+                max_generate_length=max(pass_expected + max_cushion, gate_end),
+                seed=request.seed,
+                reference_audio=reference_audio,
+                reference_format=reference_format,
+                lora_name=lora_name,
+            )
+
+        async def align_controlled(
+            audio: np.ndarray,
+        ) -> tuple[list[dict[str, Any]], list[dict[str, float]]]:
+            timestamps = await _align_ssml_audio(
+                chunk_text,
+                audio,
+                runtime.sample_rate,
+                request.language,
+                forced_language,
+            )
+            return timestamps, _aligned_pronunciation_spans(
+                chunk_operations,
+                timestamps,
+            )
+
+        # Establish one invariant text-conditioned timeline before enabling
+        # any audio gate. Each subsequent pass adds exactly one future
+        # audio control.
+        audio = await generate_pass([], expected_patches)
+        timestamps, observed_spans = await align_controlled(audio)
+        schedules: list[dict[str, object]] = []
+        generation_passes = 1
+
+        async def build_schedule_suffix(start_index: int) -> None:
+            nonlocal audio, timestamps, observed_spans, generation_passes
+            del schedules[start_index:]
+            for control_index in range(start_index, len(chunk_controls)):
+                previous_patch_count, rem = divmod(len(audio), patch_samples)
+                if previous_patch_count <= 0 or rem:
+                    raise RuntimeError(
+                        "VoxCPM IPA pass did not contain an integral number of output patches"
+                    )
+                resolved, pass_expected = resolve_ipa_control_schedules(
+                    [observed_spans[control_index]],
+                    [durations[control_index]],
+                    baseline_patch_count=previous_patch_count,
+                    patch_seconds=patch_seconds,
+                    fade_out_ratio=runtime.ipa_fade_out_ratio,
+                )
+                schedules.append(resolved[0])
+                audio = await generate_pass(schedules, pass_expected)
+                generation_passes += 1
+                timestamps, observed_spans = await align_controlled(audio)
+
+        await build_schedule_suffix(0)
+
+        tolerance = _server_config.ssml.voxcpm_ipa_alignment_tolerance_patches
+        drifts: list[int] = []
+        for refinement in range(_server_config.ssml.voxcpm_ipa_refinement_passes + 1):
+            observed_starts = [
+                max(0, int(float(span["start_seconds"]) * runtime.sample_rate // patch_samples))
+                for span in observed_spans
+            ]
+            drifts = [
+                observed_start - int(schedule["start_patch"])
+                for observed_start, schedule in zip(observed_starts, schedules, strict=True)
+            ]
+            mismatches = [
+                index for index, drift in enumerate(drifts) if abs(drift) > tolerance
+            ]
+            if not mismatches:
+                break
+            if refinement >= _server_config.ssml.voxcpm_ipa_refinement_passes:
+                raise RuntimeError(
+                    "VoxCPM IPA control timeline did not converge after observed-alignment refinement: "
+                    f"drift_patches={drifts}"
+                )
+            await build_schedule_suffix(mismatches[0])
+
+        _LOGGER.info(
+            "VoxCPM IPA SSML chunk generated controls=%d passes=%d actual_patches=%d "
+            "schedule_starts=%s observed_drift_patches=%s",
+            len(chunk_controls),
+            generation_passes,
+            len(audio) // patch_samples,
+            [int(schedule["start_patch"]) for schedule in schedules],
+            drifts,
+        )
+        return audio
+
+    chunk_audios: list[np.ndarray] = []
+    for plan, durations in zip(chunk_plans, chunk_durations, strict=True):
+        expected_patches = chunk_expected_patches(plan, durations)
+        chunk_audios.append(await generate_chunk(plan, durations, expected_patches))
+    audio = np.concatenate(chunk_audios)
+    _LOGGER.info(
+        "VoxCPM IPA SSML generated chunks=%d controls=%d baseline_patches=%d "
+        "actual_patches=%d",
+        len(chunk_plans),
+        len(controls),
+        baseline_patch_count,
+        len(audio) // patch_samples,
+    )
+
+    if document.breaks:
         timestamps = await _align_ssml_audio(
             controlled_text,
             audio,
@@ -2910,85 +3264,15 @@ async def _synthesize_voxcpm_ipa_ssml(
             request.language,
             forced_language,
         )
-        return timestamps, _aligned_pronunciation_spans(
-            controlled_operations,
-            timestamps,
-        )
-
-    # Establish one invariant text-conditioned timeline before enabling any
-    # audio gate. Each subsequent pass adds exactly one future audio control.
-    audio = await generate_pass([], initial_expected_patches)
-    timestamps, observed_spans = await align_controlled(audio)
-    schedules: list[dict[str, object]] = []
-    generation_passes = 1
-
-    async def build_schedule_suffix(start_index: int) -> None:
-        nonlocal audio, timestamps, observed_spans, generation_passes
-        del schedules[start_index:]
-        for control_index in range(start_index, len(controls)):
-            previous_patch_count, remainder = divmod(len(audio), patch_samples)
-            if previous_patch_count <= 0 or remainder:
-                raise RuntimeError(
-                    "VoxCPM IPA pass did not contain an integral number of output patches"
-                )
-            resolved, expected_patches = resolve_ipa_control_schedules(
-                [observed_spans[control_index]],
-                [target_durations[control_index]],
-                baseline_patch_count=previous_patch_count,
-                patch_seconds=patch_samples / runtime.sample_rate,
-                fade_out_ratio=runtime.ipa_fade_out_ratio,
-            )
-            schedules.append(resolved[0])
-            audio = await generate_pass(schedules, expected_patches)
-            generation_passes += 1
-            timestamps, observed_spans = await align_controlled(audio)
-
-    await build_schedule_suffix(0)
-
-    tolerance = _server_config.ssml.voxcpm_ipa_alignment_tolerance_patches
-    drifts: list[int] = []
-    for refinement in range(_server_config.ssml.voxcpm_ipa_refinement_passes + 1):
-        observed_starts = [
-            max(0, int(float(span["start_seconds"]) * runtime.sample_rate // patch_samples))
-            for span in observed_spans
-        ]
-        drifts = [
-            observed_start - int(schedule["start_patch"])
-            for observed_start, schedule in zip(observed_starts, schedules, strict=True)
-        ]
-        mismatches = [
-            index for index, drift in enumerate(drifts) if abs(drift) > tolerance
-        ]
-        if not mismatches:
-            break
-        if refinement >= _server_config.ssml.voxcpm_ipa_refinement_passes:
-            raise RuntimeError(
-                "VoxCPM IPA control timeline did not converge after observed-alignment refinement: "
-                f"drift_patches={drifts}"
-            )
-        await build_schedule_suffix(mismatches[0])
-
-    _LOGGER.info(
-        "VoxCPM IPA SSML generated controls=%d passes=%d baseline_patches=%d "
-        "actual_patches=%d schedule_starts=%s observed_drift_patches=%s eager=true",
-        len(controls),
-        generation_passes,
-        baseline_patch_count,
-        len(audio) // patch_samples,
-        [int(schedule["start_patch"]) for schedule in schedules],
-        drifts,
-    )
-    controlled_breaks = (
-        resolve_ssml_breaks(
+        controlled_breaks = resolve_ssml_breaks(
             controlled_text,
             len(audio),
             runtime.sample_rate,
             _voxcpm_controlled_breaks(document, controls),
             timestamps,
         )
-        if document.breaks
-        else []
-    )
+    else:
+        controlled_breaks = []
     return audio, runtime.sample_rate, controlled_breaks
 
 

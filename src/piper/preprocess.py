@@ -6,6 +6,8 @@ import logging
 import os
 import re
 from collections import Counter
+
+from rapidfuzz.distance import Levenshtein
 from ctypes import CFUNCTYPE, POINTER, Structure, Union, c_char, c_int, c_short, c_uint, c_void_p
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -1688,61 +1690,96 @@ def phonemize_texts_for_speaker(
     return outputs
 
 
+def _normalized_char_intervals(
+    source_text: str, normalized_text: str
+) -> List[Tuple[int, int]]:
+    """Half-open ``[start, end)`` intervals of ``normalized_text`` per source char.
+
+    The Levenshtein edit script between the two strings splits them into
+    contiguous blocks (``rapidfuzz`` runs it in C; ``difflib`` degrades to
+    super-quadratic time on repetitive text like Arabic). Text normalization
+    is a monotone, local transduction — it rewrites, expands, and annotates
+    characters but never reorders them — so the edit blocks are exactly the
+    source-character to normalized-character correspondence:
+
+    - ``equal`` blocks pair characters one to one.
+    - ``replace`` blocks pair a source run with a normalized run (e.g.
+      ``Dr.`` to ``doctor``); inner boundaries interpolate linearly.
+    - ``delete`` blocks are characters the normalization dropped.
+    - ``insert`` blocks are characters the normalization added after the
+      preceding source character (e.g. Arabic tashkeel diacritics); they
+      extend that character's interval.
+
+    The edit script is the unique one in practice for every normalizer in
+    this codebase (in-place diacritics, 1:1 case/punctuation rewrites, whole
+    word expansions), which keeps the mapping exact. If a future normalizer
+    creates a genuinely ambiguous region — several minimum-cost edit scripts
+    for the same strings — a span boundary *inside* that region may shift by
+    a couple of characters within the same word (never across it).
+    """
+    intervals: List[Tuple[int, int]] = [(0, 0)] * len(source_text)
+    for tag, i1, i2, j1, j2 in Levenshtein.opcodes(source_text, normalized_text):
+        if tag == "equal":
+            for index in range(i1, i2):
+                j = j1 + (index - i1)
+                intervals[index] = (j, j + 1)
+        elif tag == "replace":
+            width = j2 - j1
+            count = i2 - i1
+            for offset, index in enumerate(range(i1, i2)):
+                intervals[index] = (
+                    j1 + width * offset // count,
+                    j1 + width * (offset + 1) // count,
+                )
+        elif tag == "delete":
+            for index in range(i1, i2):
+                intervals[index] = (j1, j1)
+        else:  # insert: belongs to the preceding source character
+            if i1 > 0:
+                insert_start, insert_end = intervals[i1 - 1]
+                intervals[i1 - 1] = (insert_start, max(insert_end, j2))
+    return intervals
+
+
 def _normalized_override_bounds(
     source_text: str,
     source_start: int,
     source_end: int,
-    voice: str,
     normalized_text: str,
-) -> Tuple[int, int]:
-    """Map source offsets through the same text normalization as phonemization.
+) -> Optional[Tuple[int, int]]:
+    """Map a source span ``[source_start, source_end)`` into ``normalized_text``.
 
-    The normalizers can expand text before the frontend creates word mappings
-    (for example ``Dr.`` to ``doctor``).  Sentinels let us carry an exact source
-    boundary through that transformation without guessing from string
-    similarity or assuming normalization preserves string length.  Most
-    normalizers preserve Unicode private-use characters; restrictive
-    normalizers such as Chinese require markers from their accepted script.
+    Normalizers may rewrite, expand, or annotate the text (punctuation
+    normalization, number reading, Arabic tashkeel), and neural normalizers
+    are context-sensitive. The span is located by aligning the source with
+    the normalized text and reading off where its characters landed.
+
+    Returns ``None`` when the span has no content in ``normalized_text``
+    (every character was removed by normalization): there is nothing to
+    override.
     """
-    private_use: list[str] = []
-    for codepoint in range(0xE000, 0xF900):
-        candidate = chr(codepoint)
-        if candidate not in source_text:
-            private_use.append(candidate)
-            if len(private_use) == 2:
-                break
-
-    candidates: list[Tuple[str, str]] = []
-    if len(private_use) == 2:
-        candidates.append((private_use[0], private_use[1]))
-    candidates.extend(
-        pair
-        for pair in (("龘", "龖"), ("齉", "爨"))
-        if pair[0] not in source_text and pair[1] not in source_text
+    return _bounds_within_intervals(
+        _normalized_char_intervals(source_text, normalized_text),
+        source_start,
+        source_end,
     )
 
-    for opening, closing in candidates:
-        marked = (
-            source_text[:source_start]
-            + opening
-            + source_text[source_start:source_end]
-            + closing
-            + source_text[source_end:]
-        )
-        normalized_marked = _normalize_text_for_mapping(marked, voice)
-        if normalized_marked.count(opening) != 1 or normalized_marked.count(closing) != 1:
-            continue
-        normalized_start = normalized_marked.index(opening)
-        normalized_end_with_marker = normalized_marked.index(closing)
-        # At least one character must survive between the sentinels; a
-        # collapsed span would map to a degenerate (n, n) override.
-        if normalized_start + 1 >= normalized_end_with_marker:
-            continue
-        unmarked = normalized_marked.replace(opening, "").replace(closing, "")
-        if unmarked == normalized_text:
-            return normalized_start, normalized_end_with_marker - 1
 
-    raise ValueError("Text normalization did not preserve IPA override boundaries")
+def _bounds_within_intervals(
+    intervals: List[Tuple[int, int]],
+    source_start: int,
+    source_end: int,
+) -> Optional[Tuple[int, int]]:
+    """Map a source span onto precomputed character intervals (see
+    ``_normalized_char_intervals``). Returns ``None`` when the span has no
+    content there."""
+    if not 0 <= source_start < source_end <= len(intervals):
+        raise ValueError(f"Invalid IPA override [{source_start}, {source_end})")
+    normalized_start = intervals[source_start][0]
+    normalized_end = intervals[source_end - 1][1]
+    if normalized_start >= normalized_end:
+        return None
+    return normalized_start, normalized_end
 
 
 def _phoneme_edit_distance(left: List[str], right: List[str]) -> int:
@@ -1805,37 +1842,57 @@ def apply_ipa_overrides(
     offsets, while a forced-speaker result represents the complete source
     string. Partial frontend words are rebuilt from their untouched fragments
     when ``partial_word_phonemizer`` is provided.
+
+    An override that cannot be applied (malformed, vanished under
+    normalization, covering no pronounced text, unsupported phonemes, or
+    crossing language spans) is skipped with a warning instead of failing
+    the whole synthesis: that text is then pronounced as written.
     """
     prepared = [dict(span) for span in spans]
     ordered = sorted(overrides, key=lambda item: (item[0], item[1]))
+    assigned: set[int] = set()
+    skipped: set[int] = set()
+
+    def skip(override_index: int, reason: str) -> None:
+        start, end, ipa = ordered[override_index]
+        _LOGGER.warning(
+            "Skipping IPA override [%d, %d) %r: %s", start, end, ipa, reason
+        )
+        skipped.add(override_index)
+
+    max_kept_end: Optional[int] = None
     for index, (start, end, ipa) in enumerate(ordered):
         if not 0 <= start < end or not ipa:
-            raise ValueError(f"Invalid IPA override [{start}, {end})")
-        if index and start < ordered[index - 1][1]:
-            raise ValueError("IPA pronunciation spans must not overlap")
+            skip(index, "malformed override")
+            continue
+        if max_kept_end is not None and start < max_kept_end:
+            skip(index, "overlaps an earlier IPA override")
+            continue
+        max_kept_end = end if max_kept_end is None else max(max_kept_end, end)
 
-    assigned: set[int] = set()
     for span_index, span in enumerate(prepared):
         source_start = int(span.get("source_start", 0))
         source_end = int(span.get("source_end", source_start + len(str(span.get("text", "")))))
         source_text = str(span.get("source_text", span.get("text", "")))
         normalized_text = str(span.get("text", ""))
         voice = str(span.get("voice", span.get("language", "en-us")))
-        local_overrides = [
-            (
-                override_index,
-                *_normalized_override_bounds(
-                    source_text,
-                    start - source_start,
-                    end - source_start,
-                    voice,
-                    normalized_text,
-                ),
-                ipa,
-            )
-            for override_index, (start, end, ipa) in enumerate(ordered)
-            if source_start <= start and end <= source_end
-        ]
+        local_overrides = []
+        intervals: Optional[List[Tuple[int, int]]] = None
+        for override_index, (start, end, ipa) in enumerate(ordered):
+            if override_index in skipped or not (
+                source_start <= start and end <= source_end
+            ):
+                continue
+            if intervals is None:  # align this span's texts once
+                intervals = _normalized_char_intervals(source_text, normalized_text)
+            bounds = _bounds_within_intervals(intervals, start - source_start, end - source_start)
+            if bounds is None:
+                skip(
+                    override_index,
+                    "the span has no pronounced content after normalization",
+                )
+                continue
+            local_overrides.append((override_index, *bounds, ipa))
         if not local_overrides:
             continue
 
@@ -1851,9 +1908,8 @@ def apply_ipa_overrides(
                 if mapping[1] > local_start and mapping[0] < local_end
             ]
             if not selected_indices:
-                raise ValueError(
-                    f"IPA override [{local_start}, {local_end}) does not cover a pronounced text unit"
-                )
+                skip(override_index, "does not cover a pronounced text unit")
+                continue
             first_index, last_index = selected_indices[0], selected_indices[-1]
             first, last = mappings[first_index], mappings[last_index]
             replacement_start = local_start
@@ -1885,16 +1941,16 @@ def apply_ipa_overrides(
                 replacement_end = last[1]
 
             if not replacement:
-                raise ValueError(
-                    "IPA override and its preserved frontend fragments produced no phonemes"
-                )
+                skip(override_index, "produced no phonemes")
+                continue
 
             phoneme_start, phoneme_end = first[2], last[3]
             missing: Counter[str] = Counter()
             phoneme_ids_espeak(replacement, missing_phonemes=missing)
             if missing:
                 unsupported = ", ".join(repr(value) for value in sorted(missing))
-                raise ValueError(f"IPA override contains unsupported Sparrow phonemes: {unsupported}")
+                skip(override_index, f"unsupported Sparrow phonemes: {unsupported}")
+                continue
 
             phonemes[phoneme_start:phoneme_end] = replacement
             shift = len(replacement) - (phoneme_end - phoneme_start)
@@ -1915,8 +1971,7 @@ def apply_ipa_overrides(
         span["word_spans"] = mappings
         prepared[span_index] = span
 
-    missing_overrides = sorted(set(range(len(ordered))) - assigned)
-    if missing_overrides:
-        start, end, _ipa = ordered[missing_overrides[0]]
-        raise ValueError(f"IPA override [{start}, {end}) crosses a Sparrow language span")
+    for index in range(len(ordered)):
+        if index not in assigned and index not in skipped:
+            skip(index, "crosses a Sparrow language span")
     return prepared
