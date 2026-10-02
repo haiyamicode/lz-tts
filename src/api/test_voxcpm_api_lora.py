@@ -345,7 +345,9 @@ def test_root_voice_with_reference_skips_seed_vc_for_its_native_language(
     assert _batch_item_pipeline(unsupported) == "sparrow_reference"
     native_shared = _shared_batch_from_items([(0, native, native.text or "")])
     assert native_shared.voice_id == "root"
-    assert native_shared.reference_url is None
+    # Root-voice batches carry the reference: the conversion decision is
+    # made per detected segment inside synthesize_configured_voice_batch.
+    assert native_shared.reference_url == "https://example.com/root.mp3"
     assert native_shared.language == "bs-BA"
     assert native_shared.languages == [None]
 

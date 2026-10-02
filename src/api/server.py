@@ -1969,6 +1969,12 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
                         segment["speaker"] = root_voice.speaker
                     segment["model"] = root_voice.model
                     segment["voice_adapter"] = root_voice.adapter
+                    segment["voice_conversion"] = False
+                else:
+                    # The voice cannot speak this language: the segment is
+                    # synthesized with the generic speaker and converted to
+                    # the voice afterwards with Seed-VC (see convert step).
+                    segment["voice_conversion"] = True
         pieces = _sparrow_chunk_segments(segments)
         item_segments.append(pieces)
         for segment_idx, segment in enumerate(pieces):
@@ -1988,7 +1994,12 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         primary_speaker=primary_speaker,
         item_count=len(texts),
         item_segment_counts=[len(segments) for segments in item_segments],
-        convert_indices=[],
+        convert_indices=[
+            [int(record["item_idx"]), int(record["segment_idx"])]
+            for records in segment_groups.values()
+            for record in records
+            if record.get("voice_conversion")
+        ],
         model_groups=[
             {
                 "model": model_name,
@@ -2102,6 +2113,54 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
         for record, audio in zip(records, batch_audios):
             generated_segments[record["item_idx"]][record["segment_idx"]] = (audio, model_sample_rate)
 
+    # Segments whose language the root voice cannot speak were synthesized
+    # with the generic speaker; convert them to the voice with Seed-VC.
+    convert_records = [
+        record
+        for records in segment_groups.values()
+        for record in records
+        if record.get("voice_conversion")
+    ]
+    if convert_records:
+        if request.reference_url is None:
+            _LOGGER.warning(
+                "Skipping Seed-VC voice conversion for %d Sparrow segment(s): no reference_url",
+                len(convert_records),
+            )
+        elif not _engine_enabled("seed_vc"):
+            _LOGGER.warning(
+                "Skipping Seed-VC voice conversion for %d Sparrow segment(s): seed_vc engine disabled",
+                len(convert_records),
+            )
+        else:
+            convert_started = time.perf_counter()
+            converted_batch, _backend_rate = await _convert_generated_audio_to_sample_batch(
+                source_audios=[
+                    generated_segments[int(record["item_idx"])][int(record["segment_idx"])][0]
+                    for record in convert_records
+                ],
+                source_sample_rates=[
+                    generated_segments[int(record["item_idx"])][int(record["segment_idx"])][1]
+                    for record in convert_records
+                ],
+                reference_url=request.reference_url,
+                output_format="wav",
+            )
+            for record, (audio_bytes, _size) in zip(convert_records, converted_batch, strict=True):
+                audio, audio_rate = _decode_wav_bytes(audio_bytes)
+                generated_segments[int(record["item_idx"])][int(record["segment_idx"])] = (
+                    audio,
+                    audio_rate,
+                )
+            _maybe_cleanup_gpu()
+            _log_synthesize_batch_stage(
+                "configured_voice_seed_vc_done",
+                voice_id=request.voice_id,
+                reference_url=request.reference_url,
+                segment_count=len(convert_records),
+                wall_seconds=round(time.perf_counter() - convert_started, 6),
+            )
+
     item_audios: list[np.ndarray] = []
     item_source_sample_rates: list[int] = []
     for segments in generated_segments:
@@ -2171,6 +2230,7 @@ async def _synthesize_configured_voice(request: SynthesizeRequest) -> Response:
             texts=[request.text],
             seeds=[request.seed],
             voice_id=request.voice_id,
+            reference_url=request.reference_url,
             reference_language=request.reference_language,
             language=request.language,
             language_override=request.language_override,
@@ -4281,11 +4341,12 @@ def _shared_batch_from_items(records: list[tuple[int, BatchSynthesizeInputItem, 
         texts=[text for _, _, text in records],
         seeds=[item.seed for _, item, _ in records],
         voice_id=first.voice_id if native_root_voice else None,
-        # Once routing selected native Sparrow, its registry reference is
-        # metadata only. Passing it into the Sparrow backend means Seed-VC.
+        # Root-voice batches need the reference to convert the languages
+        # the voice cannot speak. VoxCPM uses it as the cloning reference.
         reference_url=(
             first.reference_url
             if pipeline in {"voxcpm", "sparrow_reference"}
+            or _configured_root_voice_for_voice_id(first.voice_id) is not None
             else None
         ),
         reference_language=first.reference_language,
