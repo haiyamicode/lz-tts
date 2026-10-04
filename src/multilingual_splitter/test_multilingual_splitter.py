@@ -69,9 +69,12 @@ SCRIPT_SEGMENTATION_CASES = [
 CODE_SWITCHING_CASES = [
     # Clear script switches (always detected)
     ("This is English これは日本語です", "en", {"en", "ja"}, "English with Japanese"),
-    ("Привет Hello мир", "ru", {"ru", "en"}, "Russian with English"),
-    ("안녕 Hello 세상", "ko", {"ko", "en"}, "Korean with English"),
-    ("مرحبا Hello عالم", "ar", {"ar", "en"}, "Arabic with English"),
+    # Latin islands inside non-Latin-script mains stay in the main language
+    # (espeak-ng reads Latin through English word rules; see
+    # _merge_short_embedded_latin_islands) — no short-Latin code-switch here.
+    ("Привет Hello мир", "ru", {"ru"}, "Russian with English"),
+    ("안녕 Hello 세상", "ko", {"ko"}, "Korean with English"),
+    ("مرحبا Hello عالم", "ar", {"ar"}, "Arabic with English"),
 ]
 
 # False positive prevention - should NOT switch away from main language
@@ -141,18 +144,16 @@ CJK_EDGE_CASES = [
 
 # Script boundary edge cases - no spaces between scripts
 BOUNDARY_CASES = [
-    # No space between scripts
-    ("Hello世界", {"en", "zh"}, "Latin-Han no space"),
-    ("世界Hello", {"zh", "en"}, "Han-Latin no space"),
-    ("Hello日本語です", {"en", "ja"}, "Latin-Japanese no space"),
-    ("안녕Hello", {"ko", "en"}, "Hangul-Latin no space"),
-    # Multiple spaces
-    ("Hello    世界", {"en", "zh"}, "Multiple spaces between"),
-    # Punctuation between
-    ("Hello,世界", {"en", "zh"}, "Comma between scripts"),
-    ("Hello。世界", {"en", "zh"}, "Chinese period between"),
-    # Numbers between
-    ("Hello123世界", {"en", "zh"}, "Numbers between scripts"),
+    # Latin islands inside non-Latin-script mains stay in the main language
+    # (Latin island merge policy); scripts remain visible on the segments.
+    ("Hello世界", {"zh"}, "Latin-Han no space"),
+    ("世界Hello", {"zh"}, "Han-Latin no space"),
+    ("Hello日本語です", {"ja"}, "Latin-Japanese no space"),
+    ("안녕Hello", {"ko"}, "Hangul-Latin no space"),
+    ("Hello    世界", {"zh"}, "Multiple spaces between"),
+    ("Hello,世界", {"zh"}, "Comma between scripts"),
+    ("Hello。世界", {"zh"}, "Chinese period between"),
+    ("Hello123世界", {"zh"}, "Numbers between scripts"),
 ]
 
 # Punctuation variations: (text, expected_segments_contain, description)
@@ -237,8 +238,8 @@ TECHNICAL_CASES = [
 # Multiple language switches in one sentence
 MULTI_SWITCH_CASES = [
     ("Hello 世界 and 안녕", {"en", "zh", "ko"}, "Three languages"),
-    # Note: short "中文" segment gets labeled as ja (main lang) due to nearby hiragana
-    ("This is 中文 and これ and 한글", {"en", "ja", "ko"}, "Four scripts - Han biased to main lang"),
+    # Latin islands stay in the (Han-biased) main language
+    ("This is 中文 and これ and 한글", {"ja", "ko"}, "Four scripts - Han biased to main lang"),
     ("English 中文 English 中文", {"en", "zh"}, "Alternating languages"),
 ]
 
@@ -1023,12 +1024,12 @@ class TestCodeSwitchWhitespaceAndPunctuation(unittest.TestCase):
         "digits inside": (
             "bn",
             "রাখুন। move 10 minutes daily রাখুন।",
-            [("bn", 0, 7), ("en", 7, 28), ("bn", 28, 35)],
+            [("bn", 0, 7), ("bn", 7, 28), ("bn", 28, 35)],
         ),
         "symbols inside": (
             "bn",
             "রাখুন। vitamin D & B12 @ 100% daily রাখুন।",
-            [("bn", 0, 7), ("en", 7, 35), ("bn", 35, 42)],
+            [("bn", 0, 7), ("bn", 7, 35), ("bn", 35, 42)],
         ),
         "emoji inside": (
             "bn",
@@ -1048,7 +1049,7 @@ class TestCodeSwitchWhitespaceAndPunctuation(unittest.TestCase):
         "uppercase run": (
             "bn",
             "রাখুন। SMALL HABITS.",
-            [("bn", 0, 7), ("en", 7, 20)],
+            [("bn", 0, 7), ("bn", 7, 20)],
         ),
         "apostrophe inside": (
             "bn",
@@ -1058,42 +1059,42 @@ class TestCodeSwitchWhitespaceAndPunctuation(unittest.TestCase):
         "leading quote": (
             "bn",
             "“রাখুন। Regular movement.",
-            [("bn", 0, 8), ("en", 8, 25)],
+            [("bn", 0, 8), ("bn", 8, 25)],
         ),
         "leading whitespace": (
             "bn",
             "   রাখুন। Regular movement.",
-            [("bn", 0, 10), ("en", 10, 27)],
+            [("bn", 0, 10), ("bn", 10, 27)],
         ),
         "trailing whitespace": (
             "bn",
             "রাখুন। Regular movement.   ",
-            [("bn", 0, 7), ("en", 7, 27)],
+            [("bn", 0, 7), ("bn", 7, 27)],
         ),
         "arabic comma": (
             "ar",
             "النشاط البدني مهم، والتغذية متوازنة. Regular movement helps.",
-            [("ar", 0, 37), ("en", 37, 60)],
+            [("ar", 0, 37), ("ar", 37, 60)],
         ),
         "urdu full stop": (
             "ur",
             "باقاعدہ ورزش ضروری ہے۔ Regular movement helps.",
-            [("ur", 0, 23), ("en", 23, 46)],
+            [("ur", 0, 23), ("ur", 23, 46)],
         ),
         "persian question mark": (
             "fa",
             "آیا ورزش مهم است؟ Regular movement helps.",
-            [("fa", 0, 18), ("en", 18, 41)],
+            [("fa", 0, 18), ("fa", 18, 41)],
         ),
         "thai without spaces": (
             "th",
             "การออกกำลังกายสม่ำเสมอRegular movement helps.",
-            [("th", 0, 22), ("en", 22, 45)],
+            [("th", 0, 22), ("th", 22, 45)],
         ),
         "burmese tail": (
             "my",
             "ပုံမှန် လေ့ကျင့်ခန်း လုပ်ပါ။ Regular movement helps.",
-            [("my", 0, 29), ("en", 29, 52)],
+            [("my", 0, 29), ("my", 29, 52)],
         ),
         "digits only run": (
             "bn",
@@ -1183,19 +1184,19 @@ class TestCodeMixedMainLanguageRegression(unittest.TestCase):
     PRODUCTION_SPANS = [
         ("en", 0, 109),
         ("bn", 109, 128),
-        ("en", 128, 145),
+        ("bn", 128, 145),
         ("bn", 145, 153),
         ("en", 153, 225),
         ("bn", 225, 228),
-        ("en", 228, 237),
-        ("sk", 237, 243),  # CLD2 reads the English word "fibre-" as Slovak
-        ("en", 243, 253),
+        ("bn", 228, 237),
+        ("bn", 237, 243),  # Latin island policy: stays in the main (bn) voice
+        ("bn", 243, 253),
         ("bn", 253, 257),
-        ("en", 257, 269),
+        ("bn", 257, 269),
         ("bn", 269, 277),
         ("en", 277, 344),
         ("bn", 344, 368),
-        ("en", 368, 384),
+        ("bn", 368, 384),
         ("bn", 384, 401),
         ("en", 401, 497),
     ]
@@ -1230,7 +1231,7 @@ class TestCodeMixedMainLanguageRegression(unittest.TestCase):
             ),
             (
                 "sensitivity.” “Meals-এ protein.",
-                [("en", 0, 20), ("bn", 20, 23), ("en", 23, 31)],
+                [("bn", 0, 20), ("bn", 20, 23), ("bn", 23, 31)],
             ),
         ]
         for text, expected in cases:

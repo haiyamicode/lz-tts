@@ -945,6 +945,78 @@ class MultilingualSplitter:
 
         return self._merge_adjacent_segments(adjusted)
 
+    def _merge_short_embedded_latin_islands(
+        self,
+        segments: list[Segment],
+        main_lang: str,
+    ) -> list[Segment]:
+        """Keep short Latin islands inside a non-Latin-script main language.
+
+        A one/few-word Latin run inside, say, Armenian or Russian text is not
+        a meaningful code-switch: CLD2 returns junk detections on tiny Latin
+        runs ("Anahit" -> id @87%, "Anahit Hayastan im" -> sa) while espeak-ng
+        reads Latin mixed into any non-Latin-script voice through English
+        word rules with no unknown phonemes (surveyed 15 script-diverse
+        voices) and that rendering is preferred over segregating the island
+        to a foreign speaker + Seed-VC roundtrip. Real English phrases (3+
+        words) detect reliably, so the gate below (<= 4 words and < 32
+        letters) covers the junk zone; longer Latin runs are real bilingual
+        passages and keep their own (native) speaker.
+
+        Islands are relabelled to the main language but keep their segment
+        boundaries — the script tag stays readable and the caller's merge
+        steps decide whether adjacent segments fold.
+        """
+        if self._is_script_valid_for_language("Latin", main_lang):
+            return segments
+
+        # Consecutive non-main Latin segments form one island group: CLD2 may
+        # tag each word separately ("Anahit " -> id, "Hayastan " -> sa, "im"
+        # -> en), and only the group's outer flanks see main-language text.
+        run_indexes: list[list[int]] = []
+        run: list[int] = []
+        for idx, seg in enumerate(segments):
+            if seg.script == "Latin" and seg.language != main_lang:
+                run.append(idx)
+            elif run:
+                run_indexes.append(run)
+                run = []
+        if run:
+            run_indexes.append(run)
+
+        relabelled: dict[int, bool] = {}
+        for indexes in run_indexes:
+            prev_seg = segments[indexes[0] - 1] if indexes[0] > 0 else None
+            next_seg = segments[indexes[-1] + 1] if indexes[-1] + 1 < len(segments) else None
+            touches_main = any(
+                flank is not None and flank.language == main_lang
+                for flank in (prev_seg, next_seg)
+            )
+            if not touches_main:
+                continue
+            words = regex.findall(r"\p{Letter}+", "".join(segments[i].text for i in indexes))
+            letters = "".join(words)
+            if len(words) <= 4 and len(letters) < 32:
+                for i in indexes:
+                    relabelled[i] = True
+
+        adjusted: list[Segment] = []
+        for idx, seg in enumerate(segments):
+            if relabelled.get(idx):
+                adjusted.append(
+                    Segment(
+                        text=seg.text,
+                        start=seg.start,
+                        end=seg.end,
+                        script=seg.script,
+                        language=main_lang,
+                    )
+                )
+            else:
+                adjusted.append(seg)
+
+        return adjusted
+
     def _stabilize_main_language_sentences(
         self,
         text: str,
@@ -1190,6 +1262,10 @@ class MultilingualSplitter:
         # Final merge of adjacent same-language segments
         merged_segments = self._merge_adjacent_segments(segments)
         merged_segments = self._merge_short_embedded_same_script_switches(
+            merged_segments,
+            main_lang,
+        )
+        merged_segments = self._merge_short_embedded_latin_islands(
             merged_segments,
             main_lang,
         )
