@@ -11,6 +11,7 @@ from .server import (
     RootVoiceConfig,
     SparrowVoiceAdapterConfig,
     VoxCPMConfig,
+    _assemble_pcm_item_audio,
     _batch_item_pipeline,
     _batch_item_compatibility_key,
     _effective_voxcpm_lora_names,
@@ -315,6 +316,26 @@ def test_native_british_voice_does_not_infer_an_accent_override(monkeypatch) -> 
         native.model_copy(update={"text": "Another native request."})
     )
     assert _effective_voxcpm_lora_names([], native.language, native.language_override) == ()
+
+
+def test_assemble_pcm_item_audio_mixes_int16_and_float_parts() -> None:
+    """Converted (Seed-VC) float parts must not double-scale the int16 parts."""
+    import numpy as np
+
+    native_a = (np.array([1000, -2000, 3000], dtype=np.int16), 24000)
+    sine = 0.5 * np.sin(np.arange(2205, dtype=np.float32) * 0.05)
+    converted = (sine.astype(np.float32), 22050)
+    native_b = (np.array([-500, 750], dtype=np.int16), 24000)
+
+    audio, rate = _assemble_pcm_item_audio([native_a, converted, native_b])
+
+    assert rate == 24000
+    assert audio.dtype == np.int16
+    assert len(audio) == 3 + 2205 * 24000 // 22050 + 2
+    resampled_part = audio[3 : 3 + 2205 * 24000 // 22050]
+    assert abs(int(resampled_part.max())) - 16383 <= 500  # 0.5 * 32767 (resample ringing)
+    assert list(audio[:3]) == [1000, -2000, 3000]
+    assert list(audio[-2:]) == [-500, 750]
 
 
 def test_root_voice_with_reference_skips_seed_vc_for_its_native_language(

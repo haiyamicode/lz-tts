@@ -48,7 +48,7 @@ from ..text_splitter import count_cl100k_tokens
 from ..voxcpm_ipa_adapter import approximate_ipa_spelling, resolve_ipa_control_schedules
 from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
 from ..matcha_inference import MatchaBatcher as ProductionStarlingBatcher
-from .audio_utils import _audio_to_mp3_bytes, _audio_to_wav_bytes, _resample_audio
+from .audio_utils import _audio_to_mp3_bytes, _audio_to_pcm16, _audio_to_wav_bytes, _resample_audio
 from .audio_adjustments import adjust_audio
 from .locale_utils import normalize_locale as _normalize_locale_with_region
 from .model_workers import seed_vc_worker_main, sparrow_worker_main, starling_worker_main
@@ -1791,6 +1791,24 @@ def _seed_vc_chunk_batch_size(backend: _SeedVCBackend) -> int:
     return max(1, int(backend.settings.max_chunk_batch_size))
 
 
+def _assemble_pcm_item_audio(parts: list[tuple[np.ndarray, int]]) -> tuple[np.ndarray, int]:
+    """Concatenate audio parts with different rates/dtypes into one pcm16 array.
+
+    Generated parts may mix int16 (Sparrow/VITS decodes) with float32 in
+    [-1, 1] (Seed-VC output decoded from WAV). ``np.concatenate`` promotes the
+    dtype while keeping the raw magnitude values, so a later re-encode of the
+    promoted float array double-scales the int16 parts into a saturated wall.
+    Normalize every part to pcm16 (float parts scaled by their [-1, 1] range)
+    before concatenating at the first part's sample rate.
+    """
+    target_rate = parts[0][1]
+    normalized = [
+        _audio_to_pcm16(_resample_audio(audio, source_rate, target_rate))
+        for audio, source_rate in parts
+    ]
+    return np.concatenate(normalized, axis=0), target_rate
+
+
 async def _convert_generated_audio_to_sample_batch(
     *,
     source_audios: list[np.ndarray],
@@ -2163,7 +2181,7 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
 
     item_audios: list[np.ndarray] = []
     item_source_sample_rates: list[int] = []
-    for segments in generated_segments:
+    for item_idx, segments in enumerate(generated_segments):
         parts = [segment for segment in segments if segment is not None]
         if not parts:
             item_audios.append(np.zeros(0, dtype=np.int16))
@@ -2173,12 +2191,12 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
             item_audios.append(audio)
             item_source_sample_rates.append(source_rate)
         else:
-            target_rate = parts[0][1]
-            item_audios.append(np.concatenate([
-                _resample_audio(audio, source_rate, target_rate)
-                for audio, source_rate in parts
-            ], axis=0))
-            item_source_sample_rates.append(target_rate)
+            # Different-script segments keep their own detected language; the
+            # converted (Seed-VC) parts arrive as float32 in [-1, 1] while the
+            # native Sparrow parts are int16. Normalize before concatenating.
+            audio, rate = _assemble_pcm_item_audio(parts)
+            item_audios.append(audio)
+            item_source_sample_rates.append(rate)
 
     encoded_items: list[bytes | None] = [None for _ in item_audios]
     item_sample_rates = list(item_source_sample_rates)
