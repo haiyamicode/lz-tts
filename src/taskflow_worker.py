@@ -32,7 +32,14 @@ from .api.worker_common import ChildWorkerDied
 from .process_guard import hard_exit
 
 _LOGGER = logging.getLogger(__name__)
-TASK_TYPES = ("tts-synthesis", "voice-enhance")
+TASK_TYPES = ("tts-synthesis", "voice-enhance", "nudity-detect")
+
+# Task types whose payload carries no operation field: the task type implies
+# exactly one operation. Everything else (tts-synthesis) reads payload["operation"].
+_TYPE_OPERATIONS = {
+    "voice-enhance": "voice-enhance",
+    "nudity-detect": "detect-nudity",
+}
 _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
 _CALLBACK_FLUSH_INTERVAL_SECONDS = 2.0
 _CALLBACK_MAX_ATTEMPTS = 3
@@ -465,7 +472,7 @@ def _prepare_lease(taskflow: TaskflowWorker, lease: dict[str, Any]) -> _LeaseWor
     run_id = lease.get("runId")
     task_type = lease.get("type", "unknown")
     payload = lease["payload"]
-    operation = "voice-enhance" if task_type == "voice-enhance" else payload["operation"]
+    operation = _TYPE_OPERATIONS.get(task_type) or payload["operation"]
     request = payload["request"]
     taskflow.active_lease_ids.add(lease_id)
     _LOGGER.info(

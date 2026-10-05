@@ -65,6 +65,7 @@ from .text_chunking import (
     expand_chunks,
     sparrow_batch_weights,
 )
+from .nudity_detection import NudityDetectRequest, NudityDetector, NudityInputError
 from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
 from .voxcpm_runtime import VoxCPMRuntime
 from .worker_common import ChildWorkerDied, WorkerProcessClient
@@ -5086,6 +5087,7 @@ class LzTtsInferenceSession:
         self.voice_enhancer = VoiceEnhancer(
             os.environ.get("VOICE_ENHANCE_TMP_DIR", "data/voice-enhance/tmp")
         )
+        self.nudity_detector = NudityDetector()
         self._started = False
 
     async def start(self) -> None:
@@ -5265,6 +5267,11 @@ class LzTtsInferenceSession:
                 )
             elif operation == "voice-enhance":
                 result = await self._enhance(VoiceEnhanceRequest.model_validate(request_data))
+            elif operation == "detect-nudity":
+                try:
+                    result = await self._detect_nudity(request_data)
+                except NudityInputError as exc:
+                    raise InferenceOperationError(400, str(exc)) from exc
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported TTS operation: {operation}")
         except ValidationError as exc:
@@ -5304,13 +5311,27 @@ class LzTtsInferenceSession:
         audio = await asyncio.to_thread(self.voice_enhancer.enhance, response.content)
         return InferenceResult(kind="audio", content_type="audio/mpeg", audio=audio)
 
+    async def _detect_nudity(self, request_data: dict[str, Any]) -> InferenceResult:
+        request = NudityDetectRequest.model_validate(request_data)
+        if request.image_base64:
+            image_bytes = base64.b64decode(request.image_base64)
+        elif request.image_url:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+                response = await client.get(request.image_url)
+                response.raise_for_status()
+            image_bytes = response.content
+        else:
+            raise InferenceOperationError(400, "Provide 'image_url' or 'image_base64'")
+        data = await asyncio.to_thread(self.nudity_detector.classify, image_bytes, request.threshold)
+        return InferenceResult(kind="json", data=data)
+
 
 class SyncTaskInput(BaseModel):
     """Generic development task accepted by /task/sync."""
 
     model_config = {"extra": "forbid"}
 
-    operation: Literal["synthesize", "voice-enhance"]
+    operation: Literal["synthesize", "voice-enhance", "detect-nudity"]
     request: dict[str, Any]
 
 
