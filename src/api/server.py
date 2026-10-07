@@ -3933,19 +3933,35 @@ def _voxcpm_speakable_bracket_groups(text: str) -> str:
     "Simple request"). Parentheses/square brackets never reach the model;
     each balanced group becomes ``text, group, text`` (commas render
     correctly and fully), empty groups vanish, and leftover unbalanced
-    brackets are dropped while keeping their content. espeak/Sparrow reads
-    these glyphs natively, so this is applied only on the VoxCPM path.
+    brackets are dropped while keeping their content. Mixed or unmatched
+    closers close the innermost open bracket (the same lenient pairs the
+    previous iterative-regex version consumed); extra closers are dropped.
+    espeak/Sparrow reads these glyphs natively, so this is applied only on
+    the VoxCPM path.
+
+    Single left-to-right pass with a bracket stack: O(n) in text length,
+    independent of nesting depth.
     """
 
-    def _replace_pair(match: re.Match[str]) -> str:
-        inner = match.group(1).strip()
-        return f", {inner}, " if inner else " "
-
-    previous = None
-    while previous != text:
-        previous = text
-        text = _VOXCPM_BRACKET_PAIR_RE.sub(_replace_pair, text)
-    text = text.replace("(", " ").replace(")", " ").replace("[", " ").replace("]", " ")
+    out: list[str] = []
+    stack: list[int] = []  # `out` indices where each open bracket's content starts
+    for char in text:
+        if char in "([":
+            stack.append(len(out))
+            continue
+        if char in ")]":
+            if not stack:
+                continue
+            content_start = stack.pop()
+            inner = "".join(out[content_start:]).strip(" ,")
+            del out[content_start:]
+            if inner:
+                out.extend(f", {inner}, ")
+            else:
+                out.append(" ")
+            continue
+        out.append(char)
+    text = "".join(out)
     text = re.sub(r"(?:\s*,\s*){2,}", ", ", text)
     text = re.sub(r"\s+,", ",", text)
     text = re.sub(r"\s+", " ", text).strip()
