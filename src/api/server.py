@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import sys
@@ -3920,11 +3921,43 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
     return response
 
 
+_VOXCPM_BRACKET_PAIR_RE = re.compile(r"[\(\[]\s*([^()\[\]]*?)\s*[\)\]]")
+
+
+def _voxcpm_speakable_bracket_groups(text: str) -> str:
+    """Demote bracketed groups to spoken punctuation for the VoxCPM route.
+
+    VoxCPM2's LM was pretrained on spoken-style text: an open ``(`` in the
+    token stream reliably truncates generation (premature EOS, mid-word —
+    e.g. "Simple requests (short prompt...) work correctly." produced only
+    "Simple request"). Parentheses/square brackets never reach the model;
+    each balanced group becomes ``text, group, text`` (commas render
+    correctly and fully), empty groups vanish, and leftover unbalanced
+    brackets are dropped while keeping their content. espeak/Sparrow reads
+    these glyphs natively, so this is applied only on the VoxCPM path.
+    """
+
+    def _replace_pair(match: re.Match[str]) -> str:
+        inner = match.group(1).strip()
+        return f", {inner}, " if inner else " "
+
+    previous = None
+    while previous != text:
+        previous = text
+        text = _VOXCPM_BRACKET_PAIR_RE.sub(_replace_pair, text)
+    text = text.replace("(", " ").replace(")", " ").replace("[", " ").replace("]", " ")
+    text = re.sub(r"(?:\s*,\s*){2,}", ", ", text)
+    text = re.sub(r"\s+,", ",", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.strip(", ")
+
+
 def _prepare_voxcpm_input(
     text: str,
     language: str | None,
     fallback_language: str | None = None,
 ) -> tuple[str, str]:
+    text = _voxcpm_speakable_bracket_groups(text)
     if language is not None:
         return normalize_spoken_text(text, language), language
 

@@ -448,3 +448,34 @@ def test_non_english_voxcpm_ipa_keeps_native_visible_text_as_guide(
     assert visible_text in controlled_text
     assert detected_language == language
     assert controls[0]["target_ipa"] == document.pronunciations[0].phonemes
+
+
+def test_voxcpm_speakable_bracket_groups():
+    """VoxCPM2 truncates generation at an open paren; brackets must not
+    reach the model — balanced groups become spoken clause punctuation,
+    empty/unbalanced leftovers vanish, and content always survives."""
+    from src.api.server import _prepare_voxcpm_input, _voxcpm_speakable_bracket_groups
+
+    cases = [
+        (
+            "Simple requests (short prompt, no tools, or a single simple tool) work correctly.",
+            "Simple requests, short prompt, no tools, or a single simple tool, work correctly.",
+        ),
+        ("(Note) The rest of the text.", "Note, The rest of the text."),
+        ("Text ending with an aside (footnote)", "Text ending with an aside, footnote"),
+        ("Empty parens () here.", "Empty parens here."),
+        ("Nested ((deep)) parens.", "Nested, deep, parens."),
+        ("Unbalanced (open paren keeps content", "Unbalanced open paren keeps content"),
+        ("Brackets [Music] hello.", "Brackets, Music, hello."),
+        ("No brackets at all.", "No brackets at all."),
+    ]
+    for source, expected in cases:
+        assert _voxcpm_speakable_bracket_groups(source) == expected
+
+    # The transform runs inside the shared VoxCPM input preparation.
+    prepared, detected = _prepare_voxcpm_input(
+        "Simple requests (short prompt) work correctly.",
+        "en-US",
+    )
+    assert "(" not in prepared and ")" not in prepared and "[" not in prepared
+    assert "short prompt" in prepared
