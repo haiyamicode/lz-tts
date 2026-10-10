@@ -325,7 +325,7 @@ class VoxCPMConfig(BaseModel):
     enabled: bool = Field(default_factory=lambda: _env_bool("VOXCPM_ENABLED", False))
     preload: bool = Field(default_factory=lambda: _env_bool("VOXCPM_PRELOAD", True))
     model_id: Literal["voxcpm"] = "voxcpm"
-    model_path: str = Field(default_factory=lambda: os.environ.get("VOXCPM_MODEL_PATH", "data/voxcpm2-stable"))
+    model_path: str = Field(default_factory=lambda: os.environ.get("VOXCPM_MODEL_PATH", "data/voxcpm2-original"))
     device: int = Field(default_factory=lambda: int(os.environ.get("VOXCPM_DEVICE", "1")), ge=0)
     dtype: Literal["auto", "bfloat16", "float16"] = Field(
         default_factory=lambda: os.environ.get("VOXCPM_DTYPE", "auto")

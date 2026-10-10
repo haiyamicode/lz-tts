@@ -8,7 +8,7 @@ from transformers import LlamaTokenizerFast
 from src.nanovllm_voxcpm.models.voxcpm2.utils import mask_multichar_chinese_tokens
 
 MODEL_DIR = (
-    Path(__file__).resolve().parents[4] / "data" / "voxcpm2-stable"
+    Path(__file__).resolve().parents[4] / "data" / "voxcpm2-original"
 )
 
 MIXED_TEXT = (
