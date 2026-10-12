@@ -11,6 +11,9 @@ from src.api.language_id import (
     ACCENT_MIN_SCORE,
     MAX_SECONDS,
     SAMPLE_RATE,
+    LANGUAGE_DROPS,
+    LANGUAGE_FOLDS,
+    LANGUAGE_MIN_SCORE,
     LanguageDetectRequest,
     LanguageInputError,
     SpokenLanguageIdentifier,
@@ -68,6 +71,7 @@ def test_identifies_locale(identifier: SpokenLanguageIdentifier, name: str, loca
     result = identifier.identify(_sample(name))
     assert result["locale"] == locale
     language = result["language"]
+    assert language["fallback"] is False
     assert result["locale"].split("-")[0] == language["code"]
     assert language["candidates"][0] == {"code": language["code"], "name": language["name"], "score": language["score"]}
     scores = [c["score"] for c in language["candidates"]]
@@ -106,3 +110,51 @@ def test_request_validation() -> None:
         LanguageDetectRequest(top_k=0)
     with pytest.raises(Exception):
         LanguageDetectRequest(top_k=11)
+
+
+def test_batch_matches_single_clip(identifier: SpokenLanguageIdentifier) -> None:
+    # Mixed lengths and languages in one padded batch. Pooling masks the
+    # padding, but the convolutions still see zeros past a short clip's end:
+    # scores drift slightly (~0.01 on low-confidence clips), labels hold.
+    names = ["vntintuc.wav", "ava_zh.wav", "andrew.mp3", "en-gb/p226_003.wav"]
+    clips = [decode_audio_16k_mono(_sample(name)) for name in names]
+    batched = identifier.identify_samples(clips)
+    for clip, result in zip(clips, batched, strict=True):
+        single = identifier.identify_samples([clip])[0]
+        assert result["locale"] == single["locale"]
+        assert result["language"]["code"] == single["language"]["code"]
+        assert result["language"]["score"] == pytest.approx(single["language"]["score"], abs=0.03)
+        assert (result["accent"] is None) == (single["accent"] is None)
+        if single["accent"] is not None:
+            assert result["accent"]["code"] == single["accent"]["code"]
+            assert result["accent"]["score"] == pytest.approx(single["accent"]["score"], abs=0.03)
+    assert identifier.identify_samples([]) == []
+
+
+def test_folds_confusable_minority_languages(identifier: SpokenLanguageIdentifier) -> None:
+    # VCTK p225 (southern English) is VoxLingua107's "cy: Welsh" before folding.
+    result = identifier.identify(_sample("en-gb/p225_003.wav"))
+    assert result["language"]["rawCandidates"][0]["code"] == "cy"
+    assert result["language"]["code"] == "en"
+    assert result["accent"] is not None
+    codes = [c["code"] for c in result["language"]["candidates"]]
+    assert not set(codes) & (set(LANGUAGE_FOLDS) | LANGUAGE_DROPS)
+
+
+def test_fold_and_drop_codes_are_model_labels() -> None:
+    text = Path(_MODEL_DIR, "label_encoder.txt").read_text()
+    codes = {line.split("'")[1].split(":")[0] for line in text.splitlines() if line.startswith("'") and ": " in line}
+    assert len(codes) == 107
+    assert set(LANGUAGE_FOLDS) <= codes and set(LANGUAGE_FOLDS.values()) <= codes and LANGUAGE_DROPS <= codes
+    # A fold target is never itself folded or dropped.
+    assert not set(LANGUAGE_FOLDS.values()) & (set(LANGUAGE_FOLDS) | LANGUAGE_DROPS)
+
+
+def test_silence_falls_back_to_english(identifier: SpokenLanguageIdentifier) -> None:
+    # Digital silence: the model's "no speech" output (Nynorsk 0.27 / Welsh 0.14).
+    result = identifier.identify_samples([np.zeros(5 * SAMPLE_RATE, dtype=np.float32)])[0]
+    language = result["language"]
+    assert result["locale"] == "en"
+    assert language["code"] == "en" and language["fallback"] is True
+    assert language["candidates"][0]["score"] < LANGUAGE_MIN_SCORE
+    assert result["accent"] is None and "accent" not in result["models"]

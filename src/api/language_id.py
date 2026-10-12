@@ -7,13 +7,21 @@ task. Two SpeechBrain ECAPA-TDNN classifiers (~21M params / 85 MB each):
 - ``Jzuluaga/accent-id-commonaccent_ecapa`` — 16 CommonAccent English
   accents, run only when the language is English.
 
+Language scores fold confusable minority classes into their major neighbour
+and drop languages without native speakers (LANGUAGE_FOLDS / LANGUAGE_DROPS);
+``language.rawCandidates`` keeps the model's own top labels. When no folded
+language reaches LANGUAGE_MIN_SCORE the result falls back to bare ``en``
+(``language.fallback``; the accent model is skipped).
+
 The result's ``locale`` is a BCP-47 tag: ``en-GB``-style when the language is
 English and the accent is confident and maps to one region, otherwise the
 bare language code (``vi``, ``zh``, ``en``).
 
-Both run on CPU inside the main worker process — no backend child
-subprocess, no CUDA — and load lazily on first use so workers that never
-identify never pay the load cost. Model directory resolution: the pre-baked
+In the worker both run on CPU inside the main worker process — no backend
+child subprocess, no CUDA — and load lazily on first use so workers that
+never identify never pay the load cost. Offline jobs (the voice language
+backfill, scripts/backfill_language_id.py) pass ``device="cuda"`` and score
+padded batches through ``identify_samples``. Model directory resolution: the pre-baked
 ``data/language-id`` snapshots (baked into Docker images via
 scripts/download_data.py) when present, else the Hugging Face hub.
 """
@@ -47,6 +55,47 @@ ACCENT_COSINE_SCALE = 30.0
 # On VCTK (out of domain) and GLOBE speakers, >=0.9 keeps ~80% of speakers
 # and lifts top-1 accent accuracy from 0.59 to 0.67 (VCTK) / 0.72 to 0.82 (GLOBE).
 ACCENT_MIN_SCORE = 0.9
+
+# VoxLingua107 minority-language classes that, on voice-clone audio (accented
+# speech, old recordings, YouTube rips), almost always absorb a neighbouring
+# major language: Lazybird's backfill of ~1.2k clones put Attenborough, Richard
+# Burton and "Older Brit Woman" under Welsh, Pedro Sánchez under Galician and a
+# Russian sample under Belarusian. Their probability is folded into that
+# language (so British English still reaches the accent model). The rest are
+# the same pattern: regional languages, dialect continua and mutually
+# intelligible standards that the model splits off their major neighbour.
+LANGUAGE_FOLDS: dict[str, str] = {
+    "cy": "en",
+    "gv": "en",
+    "sco": "en",
+    "af": "en",
+    "gl": "es",
+    "be": "ru",
+    "lb": "de",
+    "yi": "de",
+    "nn": "no",
+    "fo": "is",
+    "oc": "fr",
+    "br": "fr",
+    "jw": "id",
+    "su": "id",
+    "ceb": "tl",
+    "war": "tl",
+    "bs": "hr",
+    "sr": "hr",
+    "ur": "hi",
+}
+# Languages without native speakers: never a voice's spoken language. Their
+# probability is dropped (not renormalized), so the best real language has to
+# be confident on its own.
+LANGUAGE_DROPS = frozenset({"la", "eo", "ia", "sa"})
+# Below this folded score no language is trusted and the result falls back to
+# bare "en" (language.fallback). Silence lands here too: VoxLingua107 scores
+# digital silence as Nynorsk 0.27 / Welsh 0.14. On the ~1.2k-clone backfill,
+# 104 clips (8%) fall below 0.5 — silence, music, chant and weak niche-language
+# guesses (Javanese, Swahili, Maori, ...) — of which 23 were English already.
+LANGUAGE_MIN_SCORE = 0.5
+FALLBACK_LANGUAGE = {"code": "en", "name": "English"}
 
 # CommonAccent labels -> BCP-47 English locale. Labels without one region
 # (pan-African, South Atlantic) fall back to "en". The upstream label is
@@ -127,15 +176,16 @@ def accent_locale(accent: str, score: float) -> str:
 
 
 class SpokenLanguageIdentifier:
-    """Lazy CPU classifiers; returns the spoken language/locale for one clip."""
+    """Lazy classifiers; returns the spoken language/locale of clips."""
 
-    def __init__(self, model_root: str | Path | None = None):
+    def __init__(self, model_root: str | Path | None = None, device: str = "cpu"):
         repo_root = Path(__file__).resolve().parents[2]
         self._model_root = (
             Path(model_root)
             if model_root is not None
             else repo_root / "data" / "language-id"
         )
+        self._device = device
         self._models: dict[str, Any] = {}
         self._lock = threading.Lock()
 
@@ -163,7 +213,7 @@ class SpokenLanguageIdentifier:
                     source=source,
                     savedir=str(savedir),
                     overrides={"pretrained_path": source},
-                    run_opts={"device": "cpu"},
+                    run_opts={"device": self._device},
                 )
                 model.eval()
                 self._models[spec.snapshot_dir] = model
@@ -174,50 +224,133 @@ class SpokenLanguageIdentifier:
                 raise RuntimeError(f"Language identifier load failed: {exc}") from exc
 
     @staticmethod
-    def _top(model: Any, wavs: torch.Tensor, top_k: int, logit_scale: float) -> list[tuple[str, float]]:
+    def _probabilities(
+        model: Any, wavs: torch.Tensor, wav_lens: torch.Tensor | None, logit_scale: float
+    ) -> tuple[torch.Tensor, list[str]]:
+        """(B, classes) probabilities for a padded batch, plus the class labels."""
         with torch.inference_mode():
-            outputs = model.classify_batch(wavs)[0][0]
-        probabilities = torch.softmax(outputs.float() * logit_scale, dim=0)
-        scores, indices = probabilities.topk(min(top_k, probabilities.numel()))
-        labels = model.hparams.label_encoder.decode_ndim(indices.tolist())
-        return [(str(label), round(float(score), 6)) for label, score in zip(labels, scores.tolist(), strict=True)]
+            outputs = model.classify_batch(wavs, wav_lens)[0]
+        probabilities = torch.softmax(outputs.float().reshape(outputs.shape[0], -1) * logit_scale, dim=1)
+        labels = model.hparams.label_encoder.decode_ndim(list(range(probabilities.shape[1])))
+        return probabilities.cpu(), [str(label) for label in labels]
+
+    @staticmethod
+    def _top(row: list[float], labels: list[str], top_k: int) -> list[tuple[str, float]]:
+        ranked = sorted(zip(labels, row, strict=True), key=lambda item: item[1], reverse=True)
+        return [(label, round(score, 6)) for label, score in ranked[:top_k]]
+
+    @staticmethod
+    def _languages(row: list[float], labels: list[str], top_k: int) -> dict[str, Any]:
+        """Folded language candidates ({code, name, score}) and the raw top labels."""
+        names: dict[str, str] = {}
+        folded: dict[str, float] = {}
+        for label, score in zip(labels, row, strict=True):
+            # VoxLingua107 labels are "vi: Vietnamese".
+            code, _, name = label.partition(": ")
+            names[code] = name or code
+            if code in LANGUAGE_DROPS:
+                continue
+            target = LANGUAGE_FOLDS.get(code, code)
+            folded[target] = folded.get(target, 0.0) + score
+        ranked = sorted(folded.items(), key=lambda item: item[1], reverse=True)[:top_k]
+        candidates = [{"code": code, "name": names[code], "score": round(score, 6)} for code, score in ranked]
+        raw = []
+        for label, score in SpokenLanguageIdentifier._top(row, labels, top_k):
+            code, _, name = label.partition(": ")
+            raw.append({"code": code, "name": name or code, "score": score})
+        if candidates[0]["score"] >= LANGUAGE_MIN_SCORE:
+            chosen = {**candidates[0], "fallback": False}
+        else:
+            score = round(folded.get(FALLBACK_LANGUAGE["code"], 0.0), 6)
+            chosen = {**FALLBACK_LANGUAGE, "score": score, "fallback": True}
+        return {"chosen": chosen, "candidates": candidates, "raw": raw}
+
+    def _batch(self, clips: list[np.ndarray]) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Zero-pad clips into one (B, T) tensor plus SpeechBrain relative lengths.
+
+        Pooling masks the padding, but the convolutions see zeros past a
+        short clip's end, so its scores drift slightly (~0.01 on
+        low-confidence clips) from scoring it alone."""
+        if len(clips) == 1:
+            return torch.from_numpy(clips[0].copy()).unsqueeze(0).to(self._device), None
+        longest = max(clip.size for clip in clips)
+        wavs = torch.zeros(len(clips), longest, dtype=torch.float32)
+        for row, clip in enumerate(clips):
+            wavs[row, : clip.size] = torch.tensor(clip)
+        lens = torch.tensor([clip.size / longest for clip in clips], dtype=torch.float32)
+        return wavs.to(self._device), lens.to(self._device)
 
     def identify(self, audio: bytes, top_k: int = TOP_K) -> dict[str, Any]:
         """Identify the spoken language (and English accent) of one clip."""
-        samples = decode_audio_16k_mono(audio)
-        wavs = torch.from_numpy(samples.copy()).unsqueeze(0)
+        return self.identify_samples([decode_audio_16k_mono(audio)], top_k)[0]
 
-        # VoxLingua107 outputs log-probabilities; labels are "vi: Vietnamese".
-        languages = []
-        for label, score in self._top(self._model(LANGUAGE_MODEL), wavs, top_k, 1.0):
-            code, _, name = label.partition(": ")
-            languages.append({"code": code, "name": name or code, "score": score})
-        language = {**languages[0], "candidates": languages}
-        locale = language["code"]
+    def identify_samples(self, clips: list[np.ndarray], top_k: int = TOP_K) -> list[dict[str, Any]]:
+        """Identify decoded 16 kHz mono clips as one padded batch per model.
 
-        accent = None
-        if language["code"] == "en":
-            accents = [
-                {"code": label, "locale": ACCENT_LOCALES.get(label), "score": score}
-                for label, score in self._top(self._model(ACCENT_MODEL), wavs, top_k, ACCENT_COSINE_SCALE)
-            ]
-            accent = {**accents[0], "candidates": accents}
-            locale = accent_locale(accent["code"], accent["score"])
+        Callers batching many clips should group similar lengths: padding
+        costs compute (the masked pooling keeps it out of the result).
+        """
+        if not clips:
+            return []
+        wavs, lens = self._batch(clips)
 
-        return {
-            "locale": locale,
-            "language": language,
-            "accent": accent,
-            "analyzedSeconds": round(samples.size / SAMPLE_RATE, 3),
-            "models": {
-                "language": LANGUAGE_MODEL.snapshot_dir,
-                **({"accent": ACCENT_MODEL.snapshot_dir} if accent is not None else {}),
-            },
-        }
+        # VoxLingua107 outputs log-probabilities: softmax at scale 1 recovers them.
+        probabilities, labels = self._probabilities(self._model(LANGUAGE_MODEL), wavs, lens, 1.0)
+        languages_per_clip = [self._languages(row, labels, top_k) for row in probabilities.tolist()]
+
+        # A fallback "en" is not evidence of English speech: no accent for it.
+        english = [
+            row
+            for row, languages in enumerate(languages_per_clip)
+            if languages["chosen"]["code"] == "en" and not languages["chosen"]["fallback"]
+        ]
+        accents_per_clip: dict[int, list[dict[str, Any]]] = {}
+        if english:
+            accent_wavs, accent_lens = (
+                (wavs, lens) if len(english) == len(clips) else self._batch([clips[row] for row in english])
+            )
+            accent_probabilities, accent_labels = self._probabilities(
+                self._model(ACCENT_MODEL), accent_wavs, accent_lens, ACCENT_COSINE_SCALE
+            )
+            for row, accent_row in zip(english, accent_probabilities.tolist(), strict=True):
+                accents_per_clip[row] = [
+                    {"code": label, "locale": ACCENT_LOCALES.get(label), "score": score}
+                    for label, score in self._top(accent_row, accent_labels, top_k)
+                ]
+
+        results = []
+        for row, (clip, languages) in enumerate(zip(clips, languages_per_clip, strict=True)):
+            language = {
+                **languages["chosen"],
+                "candidates": languages["candidates"],
+                "rawCandidates": languages["raw"],
+            }
+            locale = language["code"]
+            accent = None
+            if row in accents_per_clip:
+                accents = accents_per_clip[row]
+                accent = {**accents[0], "candidates": accents}
+                locale = accent_locale(accent["code"], accent["score"])
+            results.append(
+                {
+                    "locale": locale,
+                    "language": language,
+                    "accent": accent,
+                    "analyzedSeconds": round(clip.size / SAMPLE_RATE, 3),
+                    "models": {
+                        "language": LANGUAGE_MODEL.snapshot_dir,
+                        **({"accent": ACCENT_MODEL.snapshot_dir} if accent is not None else {}),
+                    },
+                }
+            )
+        return results
 
 
 __all__ = [
     "ACCENT_LOCALES",
+    "LANGUAGE_DROPS",
+    "LANGUAGE_FOLDS",
+    "LANGUAGE_MIN_SCORE",
     "LanguageDetectRequest",
     "LanguageInputError",
     "SpokenLanguageIdentifier",
