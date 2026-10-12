@@ -154,10 +154,17 @@ class ForwardingInferenceSession:
             audio = base64.b64decode(audio_b64, validate=False)
         except (ValueError, TypeError) as error:
             return InferenceOperationError(502, f"remote audio base64 invalid: {error}")
+        # Fields reported alongside the audio (voice-enhance ``locale``).
+        extra = {
+            key: value
+            for key, value in output.items()
+            if key not in {"status", "kind", "contentType", "audioBase64"}
+        }
         return InferenceResult(
             kind="audio",
             content_type=output.get("contentType") or "audio/mpeg",
             audio=audio,
+            data=extra or None,
         )
 
 

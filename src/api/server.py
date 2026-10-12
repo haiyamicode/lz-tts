@@ -66,7 +66,7 @@ from .text_chunking import (
     expand_chunks,
     sparrow_batch_weights,
 )
-from .language_id import SpokenLanguageIdentifier
+from .language_id import LanguageDetectRequest, LanguageInputError, SpokenLanguageIdentifier
 from .nudity_detection import NudityDetectRequest, NudityDetector, NudityInputError
 from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
 from .voxcpm_runtime import VoxCPMRuntime
@@ -4626,7 +4626,7 @@ class InferenceResult:
     """Transport-independent result returned by the preloaded inference session.
 
     ``data`` is the payload of a json result; on an audio result it carries
-    extra fields reported alongside the audio (e.g. voice-enhance ``language``).
+    extra fields reported alongside the audio (e.g. voice-enhance ``locale``).
     """
 
     kind: Literal["audio", "json"]
@@ -5351,6 +5351,11 @@ class LzTtsInferenceSession:
                     result = await self._detect_nudity(request_data)
                 except NudityInputError as exc:
                     raise InferenceOperationError(400, str(exc)) from exc
+            elif operation == "detect-language":
+                try:
+                    result = await self._detect_language(request_data)
+                except LanguageInputError as exc:
+                    raise InferenceOperationError(400, str(exc)) from exc
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported TTS operation: {operation}")
         except ValidationError as exc:
@@ -5389,16 +5394,19 @@ class LzTtsInferenceSession:
             response.raise_for_status()
         audio = await asyncio.to_thread(self.voice_enhancer.enhance, response.content)
         try:
-            language = await asyncio.to_thread(self.language_identifier.identify, audio)
+            detection = await asyncio.to_thread(self.language_identifier.identify, audio)
         except Exception:
             # The enhanced sample is the product; a missing language must not fail it.
             _LOGGER.exception("Language identification failed id=%s", request.id)
-            language = None
+            detection = None
         return InferenceResult(
             kind="audio",
             content_type="audio/mpeg",
             audio=audio,
-            data={"language": language},
+            data={
+                "locale": detection["locale"] if detection else None,
+                "languageDetection": detection,
+            },
         )
 
     async def _detect_nudity(self, request_data: dict[str, Any]) -> InferenceResult:
@@ -5415,13 +5423,27 @@ class LzTtsInferenceSession:
         data = await asyncio.to_thread(self.nudity_detector.classify, image_bytes, request.threshold)
         return InferenceResult(kind="json", data=data)
 
+    async def _detect_language(self, request_data: dict[str, Any]) -> InferenceResult:
+        request = LanguageDetectRequest.model_validate(request_data)
+        if request.audio_base64:
+            audio = base64.b64decode(request.audio_base64)
+        elif request.audio_url:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+                response = await client.get(request.audio_url)
+                response.raise_for_status()
+            audio = response.content
+        else:
+            raise InferenceOperationError(400, "Provide 'audio_url' or 'audio_base64'")
+        data = await asyncio.to_thread(self.language_identifier.identify, audio, request.top_k)
+        return InferenceResult(kind="json", data=data)
+
 
 class SyncTaskInput(BaseModel):
     """Generic development task accepted by /task/sync."""
 
     model_config = {"extra": "forbid"}
 
-    operation: Literal["synthesize", "voice-enhance", "detect-nudity"]
+    operation: Literal["synthesize", "voice-enhance", "detect-nudity", "detect-language"]
     request: dict[str, Any]
 
 

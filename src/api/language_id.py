@@ -1,14 +1,21 @@
-"""Spoken language identification for the ``voice-enhance`` task.
+"""Spoken language (and English accent) identification.
 
-SpeechBrain ``lang-id-voxlingua107-ecapa`` (ECAPA-TDNN, 21M params / 85 MB,
-107 VoxLingua107 languages, 16 kHz mono input). Runs on CPU inside the main
-worker process — no backend child subprocess, no CUDA. Weights load lazily on
-the first identification so workers that never enhance never pay the load
-cost.
+Used by the ``voice-enhance`` task and the standalone ``detect-language``
+task. Two SpeechBrain ECAPA-TDNN classifiers (~21M params / 85 MB each):
 
-Model directory resolution: the pre-baked ``data/language-id`` snapshot
-(baked into Docker images via scripts/download_data.py) when present, else
-the Hugging Face hub.
+- ``speechbrain/lang-id-voxlingua107-ecapa`` — 107 VoxLingua107 languages.
+- ``Jzuluaga/accent-id-commonaccent_ecapa`` — 16 CommonAccent English
+  accents, run only when the language is English.
+
+The result's ``locale`` is a BCP-47 tag: ``en-GB``-style when the language is
+English and the accent is confident and maps to one region, otherwise the
+bare language code (``vi``, ``zh``, ``en``).
+
+Both run on CPU inside the main worker process — no backend child
+subprocess, no CUDA — and load lazily on first use so workers that never
+identify never pay the load cost. Model directory resolution: the pre-baked
+``data/language-id`` snapshots (baked into Docker images via
+scripts/download_data.py) when present, else the Hugging Face hub.
 """
 
 from __future__ import annotations
@@ -17,21 +24,69 @@ import logging
 import subprocess
 import tempfile
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from pydantic import BaseModel, Field
 
 _LOGGER = logging.getLogger(__name__)
 
-HUB_MODEL_ID = "speechbrain/lang-id-voxlingua107-ecapa"
-SNAPSHOT_DIR = "lang-id-voxlingua107-ecapa"
 SAMPLE_RATE = 16000
 # The language of a voice sample is settled well within a minute; CPU cost is
-# linear in length (~0.9 s for 60 s on the dev box).
+# linear in length (~0.9 s per model for 60 s on the dev box).
 MAX_SECONDS = 60
 TOP_K = 3
+
+# The accent classifier ends in a cosine head trained with an additive
+# angular margin loss at scale 30; softmax(30 * cos) recovers its posterior.
+ACCENT_COSINE_SCALE = 30.0
+# Below this the accent is reported but the locale stays the bare "en".
+# On VCTK (out of domain) and GLOBE speakers, >=0.9 keeps ~80% of speakers
+# and lifts top-1 accent accuracy from 0.59 to 0.67 (VCTK) / 0.72 to 0.82 (GLOBE).
+ACCENT_MIN_SCORE = 0.9
+
+# CommonAccent labels -> BCP-47 English locale. Labels without one region
+# (pan-African, South Atlantic) fall back to "en". The upstream label is
+# spelled "southatlandtic".
+ACCENT_LOCALES: dict[str, str | None] = {
+    "us": "en-US",
+    "england": "en-GB",
+    "scotland": "en-GB",
+    "wales": "en-GB",
+    "ireland": "en-IE",
+    "canada": "en-CA",
+    "australia": "en-AU",
+    "newzealand": "en-NZ",
+    "indian": "en-IN",
+    "malaysia": "en-MY",
+    "philippines": "en-PH",
+    "singapore": "en-SG",
+    "hongkong": "en-HK",
+    "bermuda": "en-BM",
+    "african": None,
+    "southatlandtic": None,
+}
+
+
+@dataclass(frozen=True)
+class _ModelSpec:
+    hub_id: str
+    snapshot_dir: str
+
+
+LANGUAGE_MODEL = _ModelSpec("speechbrain/lang-id-voxlingua107-ecapa", "lang-id-voxlingua107-ecapa")
+ACCENT_MODEL = _ModelSpec("Jzuluaga/accent-id-commonaccent_ecapa", "accent-id-commonaccent_ecapa")
+
+
+class LanguageDetectRequest(BaseModel):
+    """Input for the ``detect-language`` operation (one audio clip)."""
+
+    audio_url: str | None = None
+    audio_base64: str | None = None
+    top_k: int = Field(default=TOP_K, ge=1, le=10)
 
 
 class LanguageInputError(ValueError):
@@ -64,8 +119,15 @@ def decode_audio_16k_mono(audio: bytes, max_seconds: float = MAX_SECONDS) -> np.
     return samples
 
 
+def accent_locale(accent: str, score: float) -> str:
+    """Locale for an English accent prediction: region tag or bare "en"."""
+    if score < ACCENT_MIN_SCORE:
+        return "en"
+    return ACCENT_LOCALES.get(accent) or "en"
+
+
 class SpokenLanguageIdentifier:
-    """Lazy CPU classifier; returns the top spoken languages for one clip."""
+    """Lazy CPU classifiers; returns the spoken language/locale for one clip."""
 
     def __init__(self, model_root: str | Path | None = None):
         repo_root = Path(__file__).resolve().parents[2]
@@ -74,34 +136,29 @@ class SpokenLanguageIdentifier:
             if model_root is not None
             else repo_root / "data" / "language-id"
         )
-        self._snapshot_dir = self._model_root / SNAPSHOT_DIR
-        self._model: Any = None
+        self._models: dict[str, Any] = {}
         self._lock = threading.Lock()
 
-    @property
-    def model_source(self) -> str:
+    def model_source(self, spec: _ModelSpec) -> str:
         """Pre-baked snapshot when available, else the hub model id."""
-        if (self._snapshot_dir / "embedding_model.ckpt").exists():
-            return str(self._snapshot_dir)
-        return HUB_MODEL_ID
+        snapshot = self._model_root / spec.snapshot_dir
+        if (snapshot / "embedding_model.ckpt").exists():
+            return str(snapshot)
+        return spec.hub_id
 
-    @property
-    def model_label(self) -> str:
-        """Short model name for result payloads."""
-        return Path(self.model_source).name
-
-    def _ensure_loaded(self) -> None:
+    def _model(self, spec: _ModelSpec) -> Any:
         with self._lock:
-            if self._model is not None:
-                return
+            model = self._models.get(spec.snapshot_dir)
+            if model is not None:
+                return model
             try:
                 from speechbrain.inference.classifiers import EncoderClassifier
 
-                source = self.model_source
-                _LOGGER.info("Language identifier loading model=%s", self.model_label)
+                source = self.model_source(spec)
+                _LOGGER.info("Language identifier loading model=%s", spec.snapshot_dir)
                 # SpeechBrain links every checkpoint into ``savedir``; keep
                 # those links out of the baked data directory.
-                savedir = Path(tempfile.gettempdir()) / "lz-tts-language-id"
+                savedir = Path(tempfile.gettempdir()) / "lz-tts-language-id" / spec.snapshot_dir
                 model = EncoderClassifier.from_hparams(
                     source=source,
                     savedir=str(savedir),
@@ -109,40 +166,61 @@ class SpokenLanguageIdentifier:
                     run_opts={"device": "cpu"},
                 )
                 model.eval()
-                self._model = model
-                _LOGGER.info("Language identifier loaded model=%s", self.model_label)
+                self._models[spec.snapshot_dir] = model
+                _LOGGER.info("Language identifier loaded model=%s", spec.snapshot_dir)
+                return model
             except Exception as exc:
-                _LOGGER.exception("Language identifier load failed model=%s", self.model_label)
+                _LOGGER.exception("Language identifier load failed model=%s", spec.snapshot_dir)
                 raise RuntimeError(f"Language identifier load failed: {exc}") from exc
 
-    def identify(self, audio: bytes, top_k: int = TOP_K) -> dict[str, Any]:
-        """Identify the spoken language of one encoded audio clip."""
-        samples = decode_audio_16k_mono(audio)
-        self._ensure_loaded()
-        wavs = torch.from_numpy(samples.copy()).unsqueeze(0)
+    @staticmethod
+    def _top(model: Any, wavs: torch.Tensor, top_k: int, logit_scale: float) -> list[tuple[str, float]]:
         with torch.inference_mode():
-            log_probs = self._model.classify_batch(wavs)[0][0]
-        probabilities = torch.softmax(log_probs.float(), dim=0)
+            outputs = model.classify_batch(wavs)[0][0]
+        probabilities = torch.softmax(outputs.float() * logit_scale, dim=0)
         scores, indices = probabilities.topk(min(top_k, probabilities.numel()))
-        labels = self._model.hparams.label_encoder.decode_ndim(indices.tolist())
+        labels = model.hparams.label_encoder.decode_ndim(indices.tolist())
+        return [(str(label), round(float(score), 6)) for label, score in zip(labels, scores.tolist(), strict=True)]
 
-        candidates = []
-        for label, score in zip(labels, scores.tolist(), strict=True):
-            code, _, name = str(label).partition(": ")
-            candidates.append({"code": code, "name": name or code, "score": round(float(score), 6)})
-        top = candidates[0]
+    def identify(self, audio: bytes, top_k: int = TOP_K) -> dict[str, Any]:
+        """Identify the spoken language (and English accent) of one clip."""
+        samples = decode_audio_16k_mono(audio)
+        wavs = torch.from_numpy(samples.copy()).unsqueeze(0)
+
+        # VoxLingua107 outputs log-probabilities; labels are "vi: Vietnamese".
+        languages = []
+        for label, score in self._top(self._model(LANGUAGE_MODEL), wavs, top_k, 1.0):
+            code, _, name = label.partition(": ")
+            languages.append({"code": code, "name": name or code, "score": score})
+        language = {**languages[0], "candidates": languages}
+        locale = language["code"]
+
+        accent = None
+        if language["code"] == "en":
+            accents = [
+                {"code": label, "locale": ACCENT_LOCALES.get(label), "score": score}
+                for label, score in self._top(self._model(ACCENT_MODEL), wavs, top_k, ACCENT_COSINE_SCALE)
+            ]
+            accent = {**accents[0], "candidates": accents}
+            locale = accent_locale(accent["code"], accent["score"])
+
         return {
-            "code": top["code"],
-            "name": top["name"],
-            "score": top["score"],
-            "candidates": candidates,
+            "locale": locale,
+            "language": language,
+            "accent": accent,
             "analyzedSeconds": round(samples.size / SAMPLE_RATE, 3),
-            "model": self.model_label,
+            "models": {
+                "language": LANGUAGE_MODEL.snapshot_dir,
+                **({"accent": ACCENT_MODEL.snapshot_dir} if accent is not None else {}),
+            },
         }
 
 
 __all__ = [
+    "ACCENT_LOCALES",
+    "LanguageDetectRequest",
     "LanguageInputError",
     "SpokenLanguageIdentifier",
+    "accent_locale",
     "decode_audio_16k_mono",
 ]

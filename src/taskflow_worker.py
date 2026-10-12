@@ -32,13 +32,14 @@ from .api.worker_common import ChildWorkerDied
 from .process_guard import hard_exit
 
 _LOGGER = logging.getLogger(__name__)
-TASK_TYPES = ("tts-synthesis", "voice-enhance", "nudity-detect")
+TASK_TYPES = ("tts-synthesis", "voice-enhance", "nudity-detect", "language-detect")
 
 # Task types whose payload carries no operation field: the task type implies
 # exactly one operation. Everything else (tts-synthesis) reads payload["operation"].
 _TYPE_OPERATIONS = {
     "voice-enhance": "voice-enhance",
     "nudity-detect": "detect-nudity",
+    "language-detect": "detect-language",
 }
 _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
 _CALLBACK_FLUSH_INTERVAL_SECONDS = 2.0
