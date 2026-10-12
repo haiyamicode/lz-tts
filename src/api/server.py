@@ -66,6 +66,7 @@ from .text_chunking import (
     expand_chunks,
     sparrow_batch_weights,
 )
+from .language_id import SpokenLanguageIdentifier
 from .nudity_detection import NudityDetectRequest, NudityDetector, NudityInputError
 from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
 from .voxcpm_runtime import VoxCPMRuntime
@@ -4622,7 +4623,11 @@ async def synthesize_mixed_batch(request: BatchSynthesizeRequest) -> BatchSynthe
 
 @dataclass(frozen=True)
 class InferenceResult:
-    """Transport-independent result returned by the preloaded inference session."""
+    """Transport-independent result returned by the preloaded inference session.
+
+    ``data`` is the payload of a json result; on an audio result it carries
+    extra fields reported alongside the audio (e.g. voice-enhance ``language``).
+    """
 
     kind: Literal["audio", "json"]
     content_type: str | None = None
@@ -5161,6 +5166,7 @@ class LzTtsInferenceSession:
             os.environ.get("VOICE_ENHANCE_TMP_DIR", "data/voice-enhance/tmp")
         )
         self.nudity_detector = NudityDetector()
+        self.language_identifier = SpokenLanguageIdentifier()
         self._started = False
 
     async def start(self) -> None:
@@ -5382,7 +5388,18 @@ class LzTtsInferenceSession:
             response = await client.get(request.reference_url)
             response.raise_for_status()
         audio = await asyncio.to_thread(self.voice_enhancer.enhance, response.content)
-        return InferenceResult(kind="audio", content_type="audio/mpeg", audio=audio)
+        try:
+            language = await asyncio.to_thread(self.language_identifier.identify, audio)
+        except Exception:
+            # The enhanced sample is the product; a missing language must not fail it.
+            _LOGGER.exception("Language identification failed id=%s", request.id)
+            language = None
+        return InferenceResult(
+            kind="audio",
+            content_type="audio/mpeg",
+            audio=audio,
+            data={"language": language},
+        )
 
     async def _detect_nudity(self, request_data: dict[str, Any]) -> InferenceResult:
         request = NudityDetectRequest.model_validate(request_data)
@@ -5429,6 +5446,7 @@ def _task_output_payload(result: InferenceResult) -> dict[str, Any]:
     if result.kind == "json":
         return {"status": "COMPLETED", "kind": "json", "data": result.data}
     return {
+        **(result.data or {}),
         "status": "COMPLETED",
         "kind": "audio",
         "contentType": result.content_type,

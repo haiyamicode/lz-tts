@@ -543,6 +543,7 @@ async def _finish_lease(
         await taskflow.upload(lease, artifact_id, audio)
         duration = await asyncio.to_thread(_measure_audio_duration, audio)
         completion: dict[str, Any] = {
+            **(result.data or {}),
             "kind": "artifact",
             "artifactId": artifact_id,
             "bytes": len(audio),
