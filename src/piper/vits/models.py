@@ -1162,6 +1162,50 @@ class SynthesizerTrn(nn.Module):
         max_len=None,
         bert_input: typing.Optional[typing.Dict[str, torch.Tensor]] = None,
     ):
+        x, m_p, logs_p, x_mask, g, w_ceil = self.predict_durations(
+            x,
+            x_lengths,
+            sid=sid,
+            length_scale=length_scale,
+            noise_scale_w=noise_scale_w,
+            sdp_ratio=sdp_ratio,
+            bert_input=bert_input,
+        )
+        y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+        y_mask = torch.unsqueeze(
+            commons.sequence_mask(y_lengths, y_lengths.max()), 1
+        ).type_as(x_mask)
+        attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+        attn = commons.generate_path(w_ceil, attn_mask)
+
+        m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(
+            1, 2
+        )  # [b, t', t], [b, t, d] -> [b, d, t']
+        logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(
+            1, 2
+        )  # [b, t', t], [b, t, d] -> [b, d, t']
+
+        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+        z = self.flow(z_p, y_mask, g=g, reverse=True)
+        o = self.dec((z * y_mask)[:, :, :max_len], g=g)
+
+        return o, attn, y_mask, (z, z_p, m_p, logs_p)
+
+    def predict_durations(
+        self,
+        x,
+        x_lengths,
+        sid=None,
+        length_scale=1,
+        noise_scale_w=0.8,
+        sdp_ratio: typing.Optional[float] = None,
+        bert_input: typing.Optional[typing.Dict[str, torch.Tensor]] = None,
+    ):
+        """Run the text encoder and duration predictor only.
+
+        Returns ``(x, m_p, logs_p, x_mask, g, w_ceil)`` where ``w_ceil`` is the
+        per-token frame count [b, 1, t] that ``infer`` expands into audio.
+        """
         if self.n_speakers > 1:
             assert sid is not None, "Missing speaker id"
             g = self._speaker_conditioning(sid)  # [b, h, 1]
@@ -1202,25 +1246,7 @@ class SynthesizerTrn(nn.Module):
             logw = self.dp(x, x_mask, g=g)
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
-        y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
-        y_mask = torch.unsqueeze(
-            commons.sequence_mask(y_lengths, y_lengths.max()), 1
-        ).type_as(x_mask)
-        attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
-        attn = commons.generate_path(w_ceil, attn_mask)
-
-        m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(
-            1, 2
-        )  # [b, t', t], [b, t, d] -> [b, d, t']
-        logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(
-            1, 2
-        )  # [b, t', t], [b, t, d] -> [b, d, t']
-
-        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
-        z = self.flow(z_p, y_mask, g=g, reverse=True)
-        o = self.dec((z * y_mask)[:, :, :max_len], g=g)
-
-        return o, attn, y_mask, (z, z_p, m_p, logs_p)
+        return x, m_p, logs_p, x_mask, g, w_ceil
 
     def voice_conversion(self, y, y_lengths, sid_src, sid_tgt):
         assert self.n_speakers > 1, "n_speakers have to be larger than 1."

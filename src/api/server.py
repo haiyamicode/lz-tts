@@ -1454,6 +1454,31 @@ class _SparrowInferenceProxy:
         self.sample_rate = int(data.get("sample_rate") or self.sample_rate)
         return data.get("audio")
 
+    def predict_ipa_override_timestamps(
+        self,
+        text: str,
+        overrides: Any,
+        *,
+        speaker: Any = None,
+        neural: bool = True,
+        voice_adapter: str | None = None,
+        **synth_kwargs: Any,
+    ) -> list[dict]:
+        response = _ensure_sparrow_worker().call(
+            "predict_ipa_override_timestamps",
+            {
+                "model": self.model,
+                "text": text,
+                "overrides": list(overrides),
+                "speaker": speaker,
+                "neural": neural,
+                "voice_adapter": voice_adapter,
+                "synth_kwargs": synth_kwargs,
+            },
+        )
+        data = response.get("data") or {}
+        return list(data.get("timestamps") or [])
+
 
 def _get_inference(model: str) -> PiperInference:
     """Get a Sparrow model, loading it on demand when necessary."""
@@ -3030,8 +3055,9 @@ async def _predict_ssml_ipa_chunk_durations(
 ) -> list[list[float]]:
     """Predict target durations per chunk with the shared Sparrow model.
 
-    Each chunk's plain twin is decoded once with its chunk-local overrides,
-    so no single duration-model decode exceeds the chunk token budget.
+    Each chunk's plain twin runs through Sparrow's text encoder and duration
+    predictor once with its chunk-local overrides (no flow/decoder), so no
+    single duration-model pass exceeds the chunk token budget.
     """
     await _await_engine_ready("pipertts")
     routes = [
@@ -3048,17 +3074,15 @@ async def _predict_ssml_ipa_chunk_durations(
         if not plan["twin_overrides"]:
             durations.append([])
             continue
-        _audio, timestamps = await asyncio.to_thread(
-            inference.synthesize_with_ipa_overrides,
+        timestamps = await asyncio.to_thread(
+            inference.predict_ipa_override_timestamps,
             plan["twin_text"],
             [tuple(item) for item in plan["twin_overrides"]],
             speaker=internal_speaker,
-            noise_scale=0.0,
             length_scale=1.0,
             noise_w=0.0,
             sdp_ratio=0.0,
             neural=False,
-            return_alignment=True,
         )
         twin_operations = tuple(
             PronunciationOperation(start=start, end=end, alphabet="ipa", phonemes=ipa)

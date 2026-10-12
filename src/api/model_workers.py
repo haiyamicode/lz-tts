@@ -371,6 +371,18 @@ def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
                 **dict(payload.get("synth_kwargs") or {}),
             )
             return {"ok": True, "data": {"audio": audio, "sample_rate": inference.sample_rate}}
+        if action == "predict_ipa_override_timestamps":
+            model_name = str(payload["model"])
+            inference = _get_or_load_model(model_name)
+            timestamps = inference.predict_ipa_override_timestamps(
+                str(payload.get("text") or ""),
+                [tuple(item) for item in (payload.get("overrides") or [])],
+                speaker=payload.get("speaker"),
+                neural=bool(payload.get("neural", True)),
+                voice_adapter=payload.get("voice_adapter"),
+                **dict(payload.get("synth_kwargs") or {}),
+            )
+            return {"ok": True, "data": {"timestamps": timestamps}}
         raise ValueError(f"unknown worker action: {action}")
 
     run_worker_loop("Sparrow", _with_gpu_cleanup(handler), request_queue, response_queue)
