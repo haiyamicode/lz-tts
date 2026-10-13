@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+_VENV_BIN = Path(sys.prefix) / "bin"
 
 from pydantic import BaseModel
 
@@ -47,7 +50,7 @@ class VoiceEnhancer:
             self._run(["ffmpeg", "-i", str(raw_path), "-t", "120", str(wav_path), "-y"])
             self._run(
                 [
-                    "ffmpeg-normalize",
+                    str(_VENV_BIN / "ffmpeg-normalize"),
                     str(wav_path),
                     "-o",
                     str(normalized_path),
