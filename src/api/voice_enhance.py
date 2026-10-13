@@ -47,9 +47,6 @@ class VoiceEnhancer:
             self._run(["ffmpeg", "-i", str(raw_path), "-t", "120", str(wav_path), "-y"])
             self._run(
                 [
-                    "uv",
-                    "tool",
-                    "run",
                     "ffmpeg-normalize",
                     str(wav_path),
                     "-o",
