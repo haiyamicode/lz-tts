@@ -984,8 +984,16 @@ def _routable_detected_language(language: str, main_lang: str) -> str:
 
 
 def _resolve_forced_language(locale: str) -> tuple[str, str, str]:
-    """Resolve a forced locale into speaker/model tuple and return normalized locale."""
+    """Resolve a forced locale into speaker/model tuple and return normalized locale.
+
+    A regional locale without its own Sparrow speaker (e.g. es-CL) falls back
+    to its base language's speaker; only unknown languages are rejected.
+    """
     normalized = _normalize_locale_with_region(locale)
+    if not _is_supported_sparrow_locale(normalized):
+        base_language = _get_base_language(normalized)
+        if _is_supported_sparrow_locale(base_language):
+            normalized = base_language
     speaker, model_name = _resolve_speaker_and_model(normalized, explicit=True)
     return normalized, speaker, model_name
 
@@ -2409,12 +2417,7 @@ def _resolve_sparrow_forced_language(language: str | None) -> str | None:
     if language is None:
         return None
 
-    forced_language = _normalize_locale_with_region(language)
-    if not _is_supported_sparrow_locale(forced_language):
-        base_language = _get_base_language(forced_language)
-        if _is_supported_sparrow_locale(base_language):
-            forced_language = base_language
-    _resolve_forced_language(forced_language)
+    forced_language, _speaker, _model = _resolve_forced_language(language)
     return forced_language
 
 
