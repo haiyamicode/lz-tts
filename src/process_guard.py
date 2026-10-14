@@ -6,8 +6,47 @@ import ctypes
 import logging
 import os
 import signal
+import sys
+import threading
+from collections.abc import Callable
+from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
+_SPAWN_LOCK = threading.Lock()
+
+
+def _run_child(target: Callable[..., Any], *args: Any) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
+    target(*args)
+
+
+def start_child(ctx: Any, target: Callable[..., Any], args: tuple[Any, ...] = (), **kwargs: Any) -> Any:
+    """Start a ``spawn`` child that imports only what ``target`` needs.
+
+    A spawned child re-runs the parent's ``__main__`` before unpickling its
+    target. For the ``lz-tts-worker`` console script that imports the whole
+    Taskflow worker and API server stack into every backend child, about
+    100 MB of RAM each for modules the child never uses. ``target`` is
+    pickled by reference to its own module, so hiding ``__main__``'s file and
+    spec while the child launches is enough.
+    """
+    process = ctx.Process(target=_run_child, args=(target, *args), **kwargs)
+    main = sys.modules["__main__"]
+    with _SPAWN_LOCK:
+        saved = {name: main.__dict__[name] for name in ("__file__", "__spec__") if name in main.__dict__}
+        main.__dict__.pop("__file__", None)
+        main.__spec__ = None
+        try:
+            process.start()
+        finally:
+            main.__dict__.update(saved)
+            if "__spec__" not in saved:
+                del main.__spec__
+    return process
 
 
 def exit_with_parent() -> None:

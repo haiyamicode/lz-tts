@@ -78,6 +78,18 @@ class VoxCPM2Runner(BaseModelRunner):
         finally:
             torch.set_default_dtype(self.dtype)
 
+    @torch.inference_mode()
+    def warmup_model(self):
+        super().warmup_model()
+        # Compile the VAE's snake kernels now instead of on the first live
+        # request. The kernel is shape-generic, but torch still specializes a
+        # size-1 batch, so decode is warmed at batch 1 and batch > 1.
+        with self.serving_state():
+            for batch_size in (1, 2):
+                z = torch.zeros(batch_size, self.feat_dim, 2 * self.patch_size, dtype=torch.float32, device="cuda")
+                self.vae.decode(z)
+            self.encode_latents(torch.zeros(1, self.vae.encoder_chunk_size * 4))
+
     def make_dummy_inputs(self, batch_size: int, length: int) -> dict[str, torch.Tensor]:
         return {
             "text_tokens": torch.zeros(batch_size * length, dtype=torch.int64),

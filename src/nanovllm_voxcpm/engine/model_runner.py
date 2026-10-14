@@ -76,6 +76,7 @@ import os
 import sys
 import pickle
 import tempfile
+from contextlib import contextmanager
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -247,6 +248,7 @@ class BaseModelRunner:
                 )
         torch.cuda.set_device(device_idx)
         default_dtype = torch.get_default_dtype()
+        self._serving_dtype = default_dtype
         torch.set_default_dtype(self.dtype)
         torch.set_default_device("cuda")
         self.init_model(self._config.model_config, self._config.model)
@@ -254,6 +256,7 @@ class BaseModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+        self._release_compile_workers()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -419,6 +422,40 @@ class BaseModelRunner:
             )
         slot_modules[slot_id] = list(payload.modules.keys())
 
+    @staticmethod
+    def _release_compile_workers() -> None:
+        """Shut down inductor's compile worker pool once warmup is done.
+
+        Warmup and CUDA graph capture compile every kernel the server runs;
+        torch would otherwise keep one compile subprocess per core (33 on a
+        56-core box, ~0.8 GB of RAM) alive for the life of the process. Any
+        later compile runs in-process instead of re-spawning the pool.
+        """
+        from torch._inductor import async_compile
+        from torch._inductor import config as inductor_config
+
+        async_compile.shutdown_compile_workers()
+        if async_compile.AsyncCompile.pool.cache_info().currsize:
+            async_compile.AsyncCompile.pool().shutdown(wait=False)
+            async_compile.AsyncCompile.pool.cache_clear()
+        inductor_config.compile_threads = 1
+
+    @contextmanager
+    def serving_state(self):
+        """Run warmup forwards under the default device/dtype live requests see.
+
+        torch.compile guards on the ambient default device, so kernels compiled
+        while __init__ has cuda as the default were discarded and recompiled on
+        the first live request. Inputs are still built under the init defaults.
+        """
+        torch.set_default_device("cpu")
+        torch.set_default_dtype(self._serving_dtype)
+        try:
+            yield
+        finally:
+            torch.set_default_dtype(self.dtype)
+            torch.set_default_device("cuda")
+
     @torch.inference_mode()
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -440,7 +477,8 @@ class BaseModelRunner:
         ]
         inputs = {"positions": self.prepare_prefill_context(seqs)}
         inputs.update(self.make_dummy_inputs(num_seqs, max_model_len))
-        _ = self.model(**inputs)
+        with self.serving_state():
+            _ = self.model(**inputs)
 
         # If LoRA is enabled, run additional warmup prefills with a fake
         # active slot so the Triton shrink/expand kernels JIT-compile and
@@ -488,7 +526,8 @@ class BaseModelRunner:
                 set_lora_context(lm_ctx, domain=LM_LORA_DOMAIN)
                 set_lora_context(proj_ctx, domain=PROJ_LORA_DOMAIN)
                 set_lora_context(dit_ctx, domain=DIT_LORA_DOMAIN)
-                _ = self.model(**warmup_inputs)
+                with self.serving_state():
+                    _ = self.model(**warmup_inputs)
 
         reset_all_contexts()
         torch.cuda.empty_cache()

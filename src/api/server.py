@@ -36,8 +36,9 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ..multilingual_splitter import MultilingualSplitter, SplitResult
 from ..piper import PiperInference
+from ..heap_trim import IdleHeapTrimmer
 from ..process_guard import hard_exit
-from ..ctc_forced_alignment import CtcAlignmentConfig, CtcForcedAligner, CtcLanguageSpan
+from ..ctc_forced_alignment import CtcLanguageSpan
 from ..aligned_pauses import ResolvedPause, insert_resolved_pauses
 from ..ssml import BreakOperation, PronunciationOperation, SSMLDocument, parse_ssml
 from ..ssml_postprocessing import (
@@ -52,7 +53,7 @@ from ..matcha_inference import MatchaBatcher as ProductionStarlingBatcher
 from .audio_utils import _audio_to_mp3_bytes, _audio_to_pcm16, _audio_to_wav_bytes, _resample_audio
 from .audio_adjustments import adjust_audio
 from .locale_utils import normalize_locale as _normalize_locale_with_region
-from .model_workers import seed_vc_worker_main, sparrow_worker_main, starling_worker_main
+from .model_workers import speech_worker_main, starling_worker_main
 from .seed_vc_backend import (
     SeedVCBackend as _SeedVCBackend,
     SeedVCBatchRequest,
@@ -70,7 +71,7 @@ from .language_id import LanguageDetectRequest, LanguageInputError, SpokenLangua
 from .nudity_detection import NudityDetectRequest, NudityDetector, NudityInputError
 from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
 from .voxcpm_runtime import VoxCPMRuntime
-from .worker_common import ChildWorkerDied, WorkerProcessClient
+from .worker_common import ChildWorkerDied, EngineClient, WorkerProcessClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -841,18 +842,18 @@ _splitter_languages: tuple[str, ...] | None = None
 _starling_backend: "ProductionStarlingBackend | None" = None
 _starling_batcher: "ProductionStarlingBatcher | None" = None
 _seed_vc_backend: "_SeedVCBackend | None" = None
-_sparrow_worker: WorkerProcessClient | None = None
+_speech_worker: WorkerProcessClient | None = None
+_sparrow_worker: EngineClient | None = None
 _sparrow_model_info: dict[str, dict[str, Any]] = {}
 _starling_worker: WorkerProcessClient | None = None
 _starling_info: dict[str, Any] = {}
-_seed_vc_worker: WorkerProcessClient | None = None
+_seed_vc_worker: EngineClient | None = None
 _seed_vc_info: dict[str, Any] = {}
 _voxcpm_runtime: VoxCPMRuntime | None = None
 _voxcpm_reference_download_cache: OrderedDict[str, tuple[bytes, str]] = OrderedDict()
 _voxcpm_reference_download_tasks: dict[str, asyncio.Task[tuple[bytes, str]]] = {}
 _voxcpm_reference_download_lock = asyncio.Lock()
 _startup_loader_task: asyncio.Task | None = None
-_ssml_aligner: CtcForcedAligner | None = None
 
 
 @dataclass
@@ -1175,14 +1176,22 @@ def _worker_settings_data() -> dict[str, Any]:
     return _server_config.model_dump(mode="json")
 
 
-def _ensure_sparrow_worker() -> WorkerProcessClient:
-    global _sparrow_worker
-    if _sparrow_worker is None:
-        _sparrow_worker = WorkerProcessClient(
-            name="sparrow",
-            target=sparrow_worker_main,
+def _ensure_speech_worker() -> WorkerProcessClient:
+    """The one GPU process hosting Sparrow, Seed-VC and the SSML aligner."""
+    global _speech_worker
+    if _speech_worker is None:
+        _speech_worker = WorkerProcessClient(
+            name="speech",
+            target=speech_worker_main,
             args=(_worker_settings_data(),),
         )
+    return _speech_worker
+
+
+def _ensure_sparrow_worker() -> EngineClient:
+    global _sparrow_worker
+    if _sparrow_worker is None:
+        _sparrow_worker = EngineClient(_ensure_speech_worker(), "sparrow")
     return _sparrow_worker
 
 
@@ -1197,27 +1206,25 @@ def _ensure_starling_worker() -> WorkerProcessClient:
     return _starling_worker
 
 
-def _ensure_seed_vc_worker() -> WorkerProcessClient:
+def _ensure_seed_vc_worker() -> EngineClient:
     global _seed_vc_worker
     if _seed_vc_worker is None:
-        _seed_vc_worker = WorkerProcessClient(
-            name="seed-vc",
-            target=seed_vc_worker_main,
-            args=(_worker_settings_data(),),
-        )
+        _seed_vc_worker = EngineClient(_ensure_speech_worker(), "seed_vc")
     return _seed_vc_worker
 
 
-def _worker_name_to_engine(name: str) -> str | None:
-    if name == "sparrow":
-        return "pipertts"
+def _ssml_aligner_client() -> EngineClient:
+    return EngineClient(_ensure_speech_worker(), "ctc")
+
+
+def _worker_name_to_engines(name: str) -> tuple[str, ...]:
+    if name == "speech":
+        return ("pipertts", "seed_vc")
     if name in {"starling", "matcha"}:
-        return "starling"
-    if name == "seed-vc":
-        return "seed_vc"
+        return ("starling",)
     if name == "voxcpm":
-        return "voxcpm"
-    return None
+        return ("voxcpm",)
+    return ()
 
 
 def _mark_engine_failed_from_child(worker_name: str, exc: BaseException) -> None:
@@ -1227,20 +1234,19 @@ def _mark_engine_failed_from_child(worker_name: str, exc: BaseException) -> None
     reloaded so the next lease gets a fresh process (with freshly allocated GPU
     memory) instead of a permanently broken backend.
     """
-    engine = _worker_name_to_engine(worker_name)
-    if engine is None or engine not in _engine_load_states:
-        return
-    if _engine_state(engine).status == "disabled":
-        return
-    _LOGGER.error("Backend %s worker died (%s); reloading %s backend", worker_name, exc, engine)
-    _schedule_engine_reload(engine)
+    for engine in _worker_name_to_engines(worker_name):
+        if engine not in _engine_load_states or _engine_state(engine).status == "disabled":
+            continue
+        _LOGGER.error("Backend %s worker died (%s); reloading %s backend", worker_name, exc, engine)
+        _schedule_engine_reload(engine)
 
 
 def _stop_model_workers() -> None:
-    global _sparrow_worker, _starling_worker, _seed_vc_worker
-    for worker in (_sparrow_worker, _starling_worker, _seed_vc_worker):
+    global _speech_worker, _sparrow_worker, _starling_worker, _seed_vc_worker
+    for worker in (_speech_worker, _starling_worker):
         if worker is not None:
             worker.stop()
+    _speech_worker = None
     _sparrow_worker = None
     _starling_worker = None
     _seed_vc_worker = None
@@ -2308,22 +2314,6 @@ def _decode_wav_bytes(audio_bytes: bytes) -> tuple[np.ndarray, int]:
     return audio.astype(np.float32, copy=False), int(sample_rate)
 
 
-def _get_ssml_aligner() -> CtcForcedAligner:
-    global _ssml_aligner
-    settings = _server_config.ssml
-    if not settings.enabled:
-        raise HTTPException(status_code=503, detail="SSML audio operations are disabled")
-    if _ssml_aligner is None:
-        _ssml_aligner = CtcForcedAligner(
-            CtcAlignmentConfig(
-                model=settings.ctc_model,
-                device=settings.ctc_device,
-                dtype=settings.ctc_dtype,
-            )
-        )
-    return _ssml_aligner
-
-
 def _ssml_language_plan(
     text: str,
     language_hint: str | None,
@@ -2373,14 +2363,20 @@ async def _align_ssml_audio(
         language_hint,
         forced_language,
     )
-    result = await asyncio.to_thread(
-        _get_ssml_aligner().align_words,
-        text,
-        audio,
-        sample_rate,
-        language=language,
-        language_spans=language_spans,
+    if not _server_config.ssml.enabled:
+        raise HTTPException(status_code=503, detail="SSML audio operations are disabled")
+    response = await asyncio.to_thread(
+        _ssml_aligner_client().call,
+        "align_words",
+        {
+            "text": text,
+            "audio": audio,
+            "sample_rate": sample_rate,
+            "language": language,
+            "language_spans": language_spans,
+        },
     )
+    result = response.get("data") or {}
     if not result.get("valid"):
         if result.get("reason") == "empty_transcript":
             # Nothing in the document tokenizes as a word (punctuation-only or
@@ -4678,14 +4674,32 @@ class InferenceOperationError(RuntimeError):
         super().__init__(str(detail))
 
 
+async def _load_speech_engine(engine: str, client: EngineClient) -> dict[str, Any]:
+    """Load one engine into the shared speech process and return its health data.
+
+    The process is shared, so a load must not restart it under the engines
+    already serving there. A dead process is respawned by ``call``. A failed
+    load restarts the process so the retry starts from a fresh CUDA context
+    (an in-process retry can inherit a broken one); the engines that were
+    serving from it are reloaded.
+    """
+    try:
+        response = await asyncio.to_thread(client.call, "load")
+    except Exception as exc:
+        if not isinstance(exc, ChildWorkerDied):
+            await asyncio.to_thread(client.worker.stop)
+        for sibling in _worker_name_to_engines(client.worker.name):
+            if sibling != engine and _engine_state(sibling).status == "ready":
+                _LOGGER.error("Speech worker restarted after %s failed to load; reloading %s", engine, sibling)
+                _schedule_engine_reload(sibling)
+        raise
+    return dict(response.get("data") or {})
+
+
 async def _load_sparrow_engine() -> None:
     global _sparrow_model_info
     with _logged_startup_step("sparrow_worker", preload_models=_preloaded_piper_models()):
-        worker = _ensure_sparrow_worker()
-        worker.stop()
-        worker.start()
-        response = await asyncio.to_thread(worker.call, "health")
-        data = response.get("data") or {}
+        data = await _load_speech_engine("pipertts", _ensure_sparrow_worker())
         _sparrow_model_info = dict(data.get("models") or {})
         _LOGGER.info("Sparrow worker loaded models=%s", list(_sparrow_model_info.keys()))
 
@@ -4742,11 +4756,7 @@ async def _load_seed_vc_engine() -> None:
         device=_server_config.seed_vc.device,
         root=_server_config.seed_vc.root,
     ):
-        worker = _ensure_seed_vc_worker()
-        worker.stop()
-        worker.start()
-        response = await asyncio.to_thread(worker.call, "health")
-        _seed_vc_info = dict(response.get("data") or {})
+        _seed_vc_info = await _load_speech_engine("seed_vc", _ensure_seed_vc_worker())
 
 
 _ENGINE_LOADERS: dict[str, Callable[[], Awaitable[None]]] = {
@@ -4822,7 +4832,7 @@ def _engine_reload_due(engine: str) -> bool:
 
 async def _start_inference_runtime(config: ServerConfig) -> None:
     """Initialize the process-wide model runtime without constructing an API app."""
-    global _server_config, _speaker_routes, _ssml_aligner
+    global _server_config, _speaker_routes
     global _lang_speaker_map, _splitter, _splitter_languages
     global _starling_backend, _starling_batcher, _seed_vc_backend
     global _voxcpm_runtime
@@ -4830,7 +4840,6 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
     global _startup_loader_task
 
     _server_config = config
-    _ssml_aligner = None
     startup_started = time.perf_counter()
     _LOGGER.info("Scheduling inference runtime startup config=%s", CONFIG_PATH)
     with _logged_startup_step("reset_runtime_state"):
@@ -4909,7 +4918,7 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
                 device=_server_config.ssml.ctc_device,
                 dtype=_server_config.ssml.ctc_dtype,
             ):
-                await asyncio.to_thread(_get_ssml_aligner().load)
+                await asyncio.to_thread(_ssml_aligner_client().call, "load")
         _LOGGER.info("Loaded inference runtime models elapsed=%.2fs", time.perf_counter() - load_started)
 
     if _engine_enabled("pipertts"):
@@ -4930,6 +4939,10 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
 
     _startup_loader_task = asyncio.create_task(load_models_background())
     await _startup_loader_task
+    # Startup state lives for the process; freeze it so the per-request
+    # gc.collect() in _maybe_cleanup_gpu() stops walking ~1M objects.
+    gc.collect()
+    gc.freeze()
     _LOGGER.info("Inference runtime startup complete elapsed=%.2fs", time.perf_counter() - startup_started)
 
 
@@ -5170,12 +5183,15 @@ class LzTtsInferenceSession:
         )
         self.nudity_detector = NudityDetector()
         self.language_identifier = SpokenLanguageIdentifier()
+        self._heap_trimmer = IdleHeapTrimmer()
         self._started = False
 
     async def start(self) -> None:
         if self._started:
             return
-        await _start_inference_runtime(self.config)
+        # Loading (checkpoints are staged on the CPU) leaves freed heap behind.
+        with self._heap_trimmer.busy():
+            await _start_inference_runtime(self.config)
         self._started = True
 
     async def close(self) -> None:
@@ -5192,6 +5208,13 @@ class LzTtsInferenceSession:
         operations: list[tuple[str, dict[str, Any]]],
     ) -> list[InferenceResult | BaseException]:
         """Plan compatible synthesis operations into real backend batches."""
+        with self._heap_trimmer.busy():
+            return await self._execute_many(operations)
+
+    async def _execute_many(
+        self,
+        operations: list[tuple[str, dict[str, Any]]],
+    ) -> list[InferenceResult | BaseException]:
         if not self._started:
             raise RuntimeError("Inference session has not been started")
 
@@ -5316,6 +5339,10 @@ class LzTtsInferenceSession:
         return [outcome for outcome in outcomes if outcome is not None]
 
     async def execute(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
+        with self._heap_trimmer.busy():
+            return await self._execute(operation, request_data)
+
+    async def _execute(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
         if not self._started:
             raise RuntimeError("Inference session has not been started")
         started = time.perf_counter()

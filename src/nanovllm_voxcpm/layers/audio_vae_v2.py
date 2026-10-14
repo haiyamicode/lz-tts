@@ -45,7 +45,11 @@ def WNCausalTransposeConv1d(*args, **kwargs):
     return weight_norm(CausalTransposeConv1d(*args, **kwargs))
 
 
-@torch.compile
+# One shape-generic kernel for every Snake1d in the VAE: each encoder/decoder
+# stage has its own channel count and every streaming step its own length, so
+# the default shape-specialized compile produced a new variant per stage on
+# live requests and hit the recompile limit (8), leaving the rest eager.
+@torch.compile(dynamic=True)
 def snake(x, alpha):
     shape = x.shape
     x = x.reshape(shape[0], shape[1], -1)
@@ -60,7 +64,10 @@ class Snake1d(nn.Module):
         self.alpha = nn.Parameter(torch.ones(1, channels, 1))
 
     def forward(self, x):
-        return snake(x, self.alpha)
+        # Contiguous input keeps the compiled kernel's stride guard stable, and
+        # a detached alpha keeps the channel dim dynamic: dynamo pins the shape
+        # of Parameter arguments, which compiled one variant per channel count.
+        return snake(x.contiguous(), self.alpha.detach())
 
 
 class CausalResidualUnit(nn.Module):

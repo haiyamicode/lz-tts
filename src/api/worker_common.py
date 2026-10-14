@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import queue
 import signal
 import sys
 import threading
@@ -16,8 +17,8 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from ..process_guard import exit_with_parent
-
+from ..heap_trim import IDLE_SECONDS, release_freed_heap
+from ..process_guard import exit_with_parent, start_child
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,8 +75,16 @@ def run_worker_loop(engine_name: str, handler: Callable[[str, Any], dict[str, An
     """Run a simple action/payload worker loop."""
     exit_with_parent()
     _LOGGER.info("%s worker ready pid=%s", engine_name, os.getpid())
+    # Model loading leaves freed checkpoint buffers behind: trim once idle.
+    trim_pending = True
     while True:
-        message = request_queue.get()
+        # After real work, return the freed heap once the queue stays empty.
+        try:
+            message = request_queue.get(timeout=IDLE_SECONDS) if trim_pending else request_queue.get()
+        except queue.Empty:
+            release_freed_heap()
+            trim_pending = False
+            continue
         if not isinstance(message, dict):
             response_queue.put({"ok": False, "status_code": 400, "detail": "invalid worker message", "request_id": None})
             continue
@@ -87,6 +96,7 @@ def run_worker_loop(engine_name: str, handler: Callable[[str, Any], dict[str, An
             _LOGGER.info("%s worker shutting down pid=%s", engine_name, os.getpid())
             return
 
+        trim_pending = trim_pending or str(action).rpartition(".")[2] != "health"
         try:
             response = handler(str(action), payload)
             if isinstance(response, dict):
@@ -96,6 +106,17 @@ def run_worker_loop(engine_name: str, handler: Callable[[str, Any], dict[str, An
         except Exception as exc:  # pylint: disable=broad-exception-caught
             _LOGGER.exception("%s worker action failed: %s", engine_name, action)
             response_queue.put({**error_response(exc), "request_id": request_id})
+
+
+class EngineClient:
+    """One engine hosted in a shared worker process (``<engine>.<action>``)."""
+
+    def __init__(self, worker: WorkerProcessClient, engine: str):
+        self.worker = worker
+        self.engine = engine
+
+    def call(self, action: str, payload: Any | None = None) -> dict[str, Any]:
+        return self.worker.call(f"{self.engine}.{action}", payload)
 
 
 class WorkerProcessClient:
@@ -126,23 +147,23 @@ class WorkerProcessClient:
             ctx = mp.get_context("spawn")
             self.requests = ctx.Queue()
             self.responses = ctx.Queue()
-            self.process = ctx.Process(
-                target=self.target,
-                args=(*self.args, self.requests, self.responses),
+            self.process = start_child(
+                ctx,
+                self.target,
+                (*self.args, self.requests, self.responses),
                 name=f"lz-tts-{self.name}-worker",
                 daemon=False,
             )
-            self.process.start()
 
     @staticmethod
     def _close_queues(*queues: Any) -> None:
         """Release queue pipes so reloading a worker does not leak fds/threads."""
-        for queue in queues:
-            if queue is None:
+        for worker_queue in queues:
+            if worker_queue is None:
                 continue
             try:
-                queue.cancel_join_thread()
-                queue.close()
+                worker_queue.cancel_join_thread()
+                worker_queue.close()
             except Exception:  # pylint: disable=broad-exception-caught
                 pass
 

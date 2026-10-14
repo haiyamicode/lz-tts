@@ -247,8 +247,11 @@ class VoxCPMRuntime:
             settings = self.settings["duration_budget"]
             config_path = settings.get("config_path")
             configured_device = str(settings["device"])
+            # "auto" means CPU: the DP is a small text encoder, and it is the
+            # only CUDA user in the API process, where a CUDA context costs
+            # ~0.6 GB of host RAM against ~0.1 GB for the model on CPU.
             duration_device = (
-                f"cuda:{int(self.settings['device'])}"
+                "cpu"
                 if configured_device.strip().lower() == "auto"
                 else configured_device
             )

@@ -16,6 +16,7 @@ from typing import Any, Optional
 import torch
 from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
 from ..matcha_inference import MatchaBatchRequest
+from ..ctc_forced_alignment import CtcAlignmentConfig, CtcForcedAligner
 from ..piper import PiperInference
 from .locale_utils import normalize_locale
 from .seed_vc_backend import (
@@ -44,12 +45,22 @@ def _cleanup_worker_gpu() -> None:
         torch.cuda.empty_cache()
 
 
+def _freeze_loaded_objects() -> None:
+    """Exclude a freshly loaded model's objects from future collections.
+
+    Models live for the process, yet every full ``gc.collect()`` walks their
+    ~1M Python objects (~300 ms per worker action). Frozen objects are skipped.
+    """
+    gc.collect()
+    gc.freeze()
+
+
 def _with_gpu_cleanup(handler: Callable[[str, Any], dict[str, Any]]) -> Callable[[str, Any], dict[str, Any]]:
     def wrapped(action: str, payload: Any) -> dict[str, Any]:
         try:
             return handler(action, payload)
         finally:
-            if action != "health":
+            if action.rpartition(".")[2] != "health":
                 _cleanup_worker_gpu()
 
     return wrapped
@@ -299,8 +310,11 @@ def _build_speaker_routes(model_priority: list[str]) -> dict[str, tuple[str, Opt
     return routes
 
 
-def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, response_queue: Any) -> None:
-    """Own all Sparrow/Piper model instances in a dedicated process."""
+Handler = Callable[[str, Any], dict[str, Any]]
+
+
+def _sparrow_engine(settings_data: dict[str, Any]) -> Handler:
+    """Load every Sparrow/Piper model instance and return the action handler."""
     global _server_config, _speaker_routes, _lang_speaker_map
 
     _server_config = _settings_data_to_config(settings_data)
@@ -385,13 +399,14 @@ def sparrow_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
             return {"ok": True, "data": {"timestamps": timestamps}}
         raise ValueError(f"unknown worker action: {action}")
 
-    run_worker_loop("Sparrow", _with_gpu_cleanup(handler), request_queue, response_queue)
+    return handler
 
 
 def starling_worker_main(settings_data: dict[str, Any], request_queue: Any, response_queue: Any) -> None:
     """Own the Starling model in a dedicated process."""
     config = _settings_data_to_config(settings_data)
     backend = ProductionStarlingBackend(config.starling)
+    _freeze_loaded_objects()
 
     def handler(action: str, payload: Any) -> dict[str, Any]:
         if action == "health":
@@ -430,8 +445,8 @@ def starling_worker_main(settings_data: dict[str, Any], request_queue: Any, resp
     run_worker_loop("Starling", _with_gpu_cleanup(handler), request_queue, response_queue)
 
 
-def seed_vc_worker_main(settings_data: dict[str, Any], request_queue: Any, response_queue: Any) -> None:
-    """Own the Seed-VC model in a dedicated process."""
+def _seed_vc_engine(settings_data: dict[str, Any]) -> Handler:
+    """Load the Seed-VC model and return the action handler."""
     config = _settings_data_to_config(settings_data)
     backend = SeedVCBackend(config.seed_vc)
 
@@ -508,4 +523,72 @@ def seed_vc_worker_main(settings_data: dict[str, Any], request_queue: Any, respo
             return {"ok": True, "data": {"items": data, "sample_rate": backend.sample_rate}}
         raise ValueError(f"unknown worker action: {action}")
 
-    run_worker_loop("Seed-VC", _with_gpu_cleanup(handler), request_queue, response_queue)
+    return handler
+
+
+def _ctc_engine(settings_data: dict[str, Any]) -> Handler:
+    """Load the SSML CTC forced aligner and return the action handler."""
+    settings = _settings_data_to_config(settings_data).ssml
+    aligner = CtcForcedAligner(
+        CtcAlignmentConfig(
+            model=settings.ctc_model,
+            device=settings.ctc_device,
+            dtype=settings.ctc_dtype,
+        )
+    )
+    aligner.load()
+
+    def handler(action: str, payload: Any) -> dict[str, Any]:
+        if action == "health":
+            return {"ok": True, "data": {"worker": "ok", "model": settings.ctc_model, "device": settings.ctc_device}}
+        if not isinstance(payload, dict):
+            raise ValueError("worker payload must be an object")
+        if action == "align_words":
+            result = aligner.align_words(
+                str(payload["text"]),
+                payload["audio"],
+                int(payload["sample_rate"]),
+                language=payload.get("language"),
+                language_spans=payload.get("language_spans"),
+            )
+            return {"ok": True, "data": result}
+        raise ValueError(f"unknown worker action: {action}")
+
+    return handler
+
+
+# engine -> (loader, cuDNN enabled). The CUDA driver keeps a host copy of every
+# cuDNN engine it loads (one per conv shape the heuristics pick), ~120-250 MB
+# of RAM per model, and torch's native convs are no slower for the Sparrow
+# decoder or the aligner. Seed-VC is ~25% slower without cuDNN, so it keeps it.
+SPEECH_ENGINES: dict[str, tuple[Callable[[dict[str, Any]], Handler], bool]] = {
+    "sparrow": (_sparrow_engine, False),
+    "seed_vc": (_seed_vc_engine, True),
+    "ctc": (_ctc_engine, False),
+}
+
+
+def speech_worker_main(settings_data: dict[str, Any], request_queue: Any, response_queue: Any) -> None:
+    """Host Sparrow, Seed-VC and the SSML CTC aligner in one GPU process.
+
+    They never run concurrently, and every GPU process pays ~1 GB of RAM for
+    its own CUDA context, torch import and driver copies of the kernels it
+    launches, most of which these models share. Actions are named
+    ``<engine>.<action>``; ``<engine>.load`` loads an engine (idempotent) and
+    any other action loads it on first use, so a respawned process recovers
+    an engine on its own.
+    """
+    handlers: dict[str, Handler] = {}
+
+    def handler(action: str, payload: Any) -> dict[str, Any]:
+        engine, _, engine_action = action.partition(".")
+        if engine not in SPEECH_ENGINES:
+            raise ValueError(f"unknown worker action: {action}")
+        loader, cudnn = SPEECH_ENGINES[engine]
+        torch.backends.cudnn.enabled = cudnn
+        if engine not in handlers:
+            handlers[engine] = loader(settings_data)
+            _freeze_loaded_objects()
+        return handlers[engine]("health" if engine_action == "load" else engine_action, payload)
+
+    run_worker_loop("Speech", _with_gpu_cleanup(handler), request_queue, response_queue)

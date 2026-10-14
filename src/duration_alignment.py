@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import logging
@@ -477,25 +478,49 @@ class DurationAlignmentValidator:
         if not batch_entries:
             return budgets
 
-        frame_tensor = torch.zeros(len(texts), dtype=torch.float32, device=self.device)
-        phoneme_counts = [0] * len(texts)
-        chunk_counts = [0] * len(texts)
-        for input_index, language, phoneme_ids, payload in batch_entries:
-            x = torch.tensor([phoneme_ids], dtype=torch.long, device=self.device)
+        if self._semantic_tokenizer is None:
+            # One padded forward for every chunk: VITS masks the padding, so
+            # the frames equal per-chunk forwards, and batch-1 calls are mostly
+            # per-op overhead on CPU.
+            x = torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(entry[2], dtype=torch.long) for entry in batch_entries],
+                batch_first=True,
+            ).to(self.device)
             x_lengths = torch.tensor(
-                [len(phoneme_ids)], dtype=torch.long, device=self.device
+                [len(entry[2]) for entry in batch_entries], dtype=torch.long, device=self.device
             )
             sid = torch.tensor(
-                [self._speaker_id_for_language(language)],
+                [self._speaker_id_for_language(entry[1]) for entry in batch_entries],
                 dtype=torch.long,
                 device=self.device,
             )
-            bert_input = self._bert_input(
-                [payload["phoneme_text"]],
-                phoneme_length=[payload["phoneme_length"]],
-                word_spans=[payload["word_spans"]],
-            )
-            token_frames = self._predict_token_frames(x, x_lengths, sid, bert_input)
+            batched_frames = self._predict_token_frames(x, x_lengths, sid, None)
+            chunk_frames = [batched_frames[i : i + 1] for i in range(len(batch_entries))]
+        else:
+            chunk_frames = []
+            for _input_index, language, phoneme_ids, payload in batch_entries:
+                x = torch.tensor([phoneme_ids], dtype=torch.long, device=self.device)
+                x_lengths = torch.tensor(
+                    [len(phoneme_ids)], dtype=torch.long, device=self.device
+                )
+                sid = torch.tensor(
+                    [self._speaker_id_for_language(language)],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                bert_input = self._bert_input(
+                    [payload["phoneme_text"]],
+                    phoneme_length=[payload["phoneme_length"]],
+                    word_spans=[payload["word_spans"]],
+                )
+                chunk_frames.append(self._predict_token_frames(x, x_lengths, sid, bert_input))
+
+        frame_tensor = torch.zeros(len(texts), dtype=torch.float32, device=self.device)
+        phoneme_counts = [0] * len(texts)
+        chunk_counts = [0] * len(texts)
+        for (input_index, _language, phoneme_ids, payload), token_frames in zip(
+            batch_entries, chunk_frames, strict=True
+        ):
             token_start = 0 if payload["keep_bos"] else 2
             token_end = (
                 len(phoneme_ids)
@@ -889,7 +914,13 @@ class DurationAlignmentValidator:
     ) -> torch.Tensor:
         assert self._model is not None
         model = self._model
-        with torch.device(self.device):
+        # The device context places VITS' device-less tensor factories on the
+        # model's device, but it intercepts every op in Python: on CPU, which is
+        # already the default device, it would cost ~70% of the forward.
+        device_context = (
+            contextlib.nullcontext() if self.device.type == "cpu" else torch.device(self.device)
+        )
+        with device_context:
             if model.n_speakers > 1:
                 g = model.emb_g(sid).unsqueeze(-1)
             else:

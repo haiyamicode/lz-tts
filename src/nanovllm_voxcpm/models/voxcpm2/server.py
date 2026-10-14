@@ -17,12 +17,13 @@ import torch.multiprocessing as mp
 from numpy.typing import NDArray
 from typing_extensions import Literal, TypedDict
 
+from src.heap_trim import IDLE_SECONDS, release_freed_heap
 from src.nanovllm_voxcpm.config import Config, resolve_model_dtype
 from src.nanovllm_voxcpm.layers.attention import flash_attn_supported
 from src.nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig, VoxCPM2Config
 from src.nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
 from src.nanovllm_voxcpm.models.voxcpm2.runner import VoxCPM2Runner
-from src.process_guard import exit_with_parent
+from src.process_guard import exit_with_parent, start_child
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -246,6 +247,9 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
 
     exit_with_parent()
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # The CUDA driver keeps a host copy of every cuDNN engine it loads, ~200 MB
+    # of RAM here; torch's native convs are just as fast for the audio VAE.
+    torch.backends.cudnn.enabled = False
     devices = kwargs.get("devices")
     if devices is None and len(args) > 8:
         devices = args[8]
@@ -288,8 +292,17 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
         except Exception:
             return {"type": "error", "id": opid, "error": traceback.format_exc()}
 
+    # Model loading leaves freed checkpoint buffers behind: trim once idle.
+    trim_pending = True
     while not states["is_stoped"]:
-        cmd = queue_in.get()
+        # After real work, return the freed heap once the queue stays empty.
+        try:
+            cmd = queue_in.get(timeout=IDLE_SECONDS) if trim_pending else queue_in.get()
+        except Empty:
+            release_freed_heap()
+            trim_pending = False
+            continue
+        trim_pending = trim_pending or cmd.get("type") != "health"
         queue_out.put(method_call(cmd))
 
         if coalesce_ms > 0:
@@ -319,6 +332,7 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
             # the process die, fails the in-flight sequences and reloads the
             # engine with a fresh process.
             output = srv.step()
+            trim_pending = True
             for seq in output:
                 latest_waveform = seq.custom_payload.generated_waveforms[-1]
                 queue_out.put({"type": "stream", "id": seq.seq_id, "data": latest_waveform})
@@ -356,9 +370,10 @@ class AsyncVoxCPM2Server:
         ctx = mp.get_context("spawn")
         self.queue_in = ctx.Queue()
         self.queue_out = ctx.Queue()
-        self.process = ctx.Process(
-            target=target or main_loop,
-            args=(
+        self.process = start_child(
+            ctx,
+            target or main_loop,
+            (
                 self.queue_in,
                 self.queue_out,
                 (
@@ -379,7 +394,6 @@ class AsyncVoxCPM2Server:
             ),
             daemon=True,
         )
-        self.process.start()
         loop = asyncio.get_running_loop()
         self._death: Optional[VoxCPMServerDied] = None
         self._stopping = False
