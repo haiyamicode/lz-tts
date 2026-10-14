@@ -556,6 +556,34 @@ class SynthesizeRequest(BaseModel):
     volume: float = Field(1.0, ge=0.0, description="Output volume multiplier")
 
 
+class VoiceDesignRequest(BaseModel):
+    """Request body for the ``voice-design`` operation (VoxCPM2 voice design).
+
+    Speaks ``text`` in a new voice generated from a natural-language
+    ``description`` alone, with no reference audio.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    description: str = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="Voice description, e.g. 'A young woman, gentle and sweet voice'",
+    )
+    text: str = Field(..., min_length=1, description="Text to speak in the designed voice")
+    language: Optional[str] = Field(
+        None,
+        description="Locale of the text; forced for text normalization and the locale LoRA when set",
+    )
+    seed: Optional[int] = Field(
+        None,
+        ge=0,
+        description="Sampling seed; a random one is chosen (and returned) when omitted",
+    )
+    format: Literal["wav", "mp3"] = Field("wav", description="Output audio format (wav or mp3)")
+
+
 class BatchSynthesizeInputItem(BaseModel):
     """One item in a /synthesize/batch request."""
 
@@ -4312,6 +4340,131 @@ async def _synthesize_voxcpm_items(
     )
 
 
+_VOICE_DESCRIPTION_BRACKETS_RE = re.compile(r"[()\[\]]")
+_VOICE_DESIGN_SEED_LIMIT = 2**31
+
+
+def _voice_design_description(description: str) -> str:
+    """Make a description safe to wrap in VoxCPM2's ``(description)`` prefix.
+
+    A bracket inside it would end the instruction early and leak the rest
+    into the spoken text.
+    """
+    cleaned = " ".join(_VOICE_DESCRIPTION_BRACKETS_RE.sub(" ", description).split())
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="description must contain words")
+    return cleaned
+
+
+async def synthesize_voice_designs(
+    requests: list[VoiceDesignRequest],
+) -> list[InferenceResult | BaseException]:
+    """Speak each request's text in a voice designed from its description.
+
+    Without a reference every generation invents a voice, so only the first
+    chunk of a long text is designed; the remaining chunks are cloned from
+    that chunk's audio so the whole text keeps one voice. All requests share
+    one VoxCPM batch per phase. Per-request input errors come back in place
+    of that request's result.
+    """
+    if not _engine_enabled("voxcpm"):
+        raise HTTPException(status_code=503, detail="VoxCPM backend is disabled")
+    await _await_engine_ready("voxcpm")
+    runtime = _get_voxcpm_runtime()
+
+    results: list[InferenceResult | BaseException | None] = [None] * len(requests)
+    valid: list[tuple[int, VoiceDesignRequest, str, str | None]] = []
+    for index, request in enumerate(requests):
+        try:
+            description = _voice_design_description(request.description)
+            text = request.text.strip()
+            if not text:
+                raise HTTPException(status_code=400, detail="text must not be empty")
+            lora_name = await runtime.resolve_lora_combination(
+                _effective_voxcpm_lora_names([], request.language, request.language is not None)
+            )
+        except HTTPException as exc:
+            results[index] = InferenceOperationError(exc.status_code, exc.detail)
+        except (OSError, ValueError) as exc:
+            results[index] = InferenceOperationError(400, f"Could not apply VoxCPM LoRAs: {exc}")
+        else:
+            valid.append((index, request, description, lora_name))
+    if not valid:
+        return [result for result in results if result is not None]
+
+    seeds = [
+        request.seed if request.seed is not None else secrets.randbelow(_VOICE_DESIGN_SEED_LIMIT)
+        for _, request, _, _ in valid
+    ]
+    chunk_texts, chunk_counts = _chunk_voxcpm_texts([request.text.strip() for _, request, _, _ in valid])
+    chunk_languages = expand_chunks([request.language for _, request, _, _ in valid], chunk_counts) or []
+    prepared = [
+        _prepare_voxcpm_input(text, language)
+        for text, language in zip(chunk_texts, chunk_languages, strict=True)
+    ]
+    starts = [sum(chunk_counts[:item]) for item in range(len(valid))]
+    started = time.perf_counter()
+
+    designed = await runtime.synthesize_batch(
+        [prepared[start][0] for start in starts],
+        languages=[prepared[start][1] for start in starts],
+        seeds=seeds,
+        lora_names=[lora_name for _, _, _, lora_name in valid],
+        voice_descriptions=[description for _, _, description, _ in valid],
+    )
+    chunk_audios: list[np.ndarray | None] = [None] * len(chunk_texts)
+    for start, audio in zip(starts, designed, strict=True):
+        chunk_audios[start] = audio
+
+    rest = [
+        (chunk_index, item)
+        for item, (start, count) in enumerate(zip(starts, chunk_counts, strict=True))
+        for chunk_index in range(start + 1, start + count)
+    ]
+    if rest:
+        references = {
+            item: _audio_to_wav_bytes(designed[item], runtime.sample_rate)
+            for item in {item for _, item in rest}
+        }
+        cloned = await runtime.synthesize_batch(
+            [prepared[chunk_index][0] for chunk_index, _ in rest],
+            languages=[prepared[chunk_index][1] for chunk_index, _ in rest],
+            seeds=[seeds[item] for _, item in rest],
+            reference_audios=[references[item] for _, item in rest],
+            reference_formats=["wav"] * len(rest),
+            lora_names=[valid[item][3] for _, item in rest],
+        )
+        for (chunk_index, _), audio in zip(rest, cloned, strict=True):
+            chunk_audios[chunk_index] = audio
+
+    audios = concat_chunk_audios([audio for audio in chunk_audios if audio is not None], chunk_counts)
+    sample_rate = runtime.sample_rate
+    for (index, request, description, _), audio, seed in zip(valid, audios, seeds, strict=True):
+        encoded = (
+            _audio_to_mp3_bytes(audio, sample_rate)
+            if request.format == "mp3"
+            else _audio_to_wav_bytes(audio, sample_rate)
+        )
+        results[index] = InferenceResult(
+            kind="audio",
+            content_type="audio/mpeg" if request.format == "mp3" else "audio/wav",
+            audio=encoded,
+            data={"seed": seed, "description": description},
+        )
+    audio_seconds_total = sum(len(audio) for audio in audios) / sample_rate if sample_rate else 0.0
+    wall_seconds = time.perf_counter() - started
+    _log_synthesize_batch_stage(
+        "voxcpm_voice_design_done",
+        model=_server_config.voxcpm.model_id,
+        item_count=len(valid),
+        chunk_count=len(chunk_texts),
+        wall_seconds=round(wall_seconds, 6),
+        audio_seconds=round(audio_seconds_total, 6),
+        rtf=round(wall_seconds / audio_seconds_total, 6) if audio_seconds_total else 0.0,
+    )
+    return [result for result in results if result is not None]
+
+
 def _batch_item_pipeline(item: BatchSynthesizeInputItem) -> str:
     resolved_model = _resolve_api_model(item.model)
     if _voice_request_routes_to_voxcpm(
@@ -5223,8 +5376,20 @@ class LzTtsInferenceSession:
         batch_requests: list[SynthesizeRequest] = []
         batch_operation_indices: list[int] = []
         singleton_indices: list[int] = []
+        voice_design_indices: list[int] = []
+        voice_design_requests: list[VoiceDesignRequest] = []
 
         for operation_index, (operation, request_data) in enumerate(operations):
+            if operation == "voice-design":
+                try:
+                    voice_design_requests.append(VoiceDesignRequest.model_validate(request_data))
+                except ValidationError as error:
+                    outcomes[operation_index] = InferenceOperationError(
+                        400, jsonable_encoder(error.errors())
+                    )
+                else:
+                    voice_design_indices.append(operation_index)
+                continue
             if operation != "synthesize":
                 singleton_indices.append(operation_index)
                 continue
@@ -5323,6 +5488,22 @@ class LzTtsInferenceSession:
                 for batch_item_index, _, _ in plan.records:
                     outcomes[batch_operation_indices[batch_item_index]] = error
 
+        if voice_design_requests:
+            try:
+                voice_designs = await synthesize_voice_designs(voice_design_requests)
+            except HTTPException as error:
+                voice_designs = [InferenceOperationError(error.status_code, error.detail)] * len(
+                    voice_design_requests
+                )
+            except ChildWorkerDied as error:
+                _mark_engine_failed_from_child(error.name, error)
+                raise
+            except Exception as error:
+                _LOGGER.exception("Voice design batch failed count=%d", len(voice_design_requests))
+                voice_designs = [error] * len(voice_design_requests)
+            for operation_index, outcome in zip(voice_design_indices, voice_designs, strict=True):
+                outcomes[operation_index] = outcome
+
         for operation_index in singleton_indices:
             operation, request_data = operations[operation_index]
             try:
@@ -5374,6 +5555,11 @@ class LzTtsInferenceSession:
                     pitch=request.pitch,
                     volume=request.volume,
                 )
+            elif operation == "voice-design":
+                outcome = (await synthesize_voice_designs([VoiceDesignRequest.model_validate(request_data)]))[0]
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                result = outcome
             elif operation == "voice-enhance":
                 result = await self._enhance(VoiceEnhanceRequest.model_validate(request_data))
             elif operation == "detect-nudity":
@@ -5473,7 +5659,7 @@ class SyncTaskInput(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    operation: Literal["synthesize", "voice-enhance", "detect-nudity", "detect-language"]
+    operation: Literal["synthesize", "voice-design", "voice-enhance", "detect-nudity", "detect-language"]
     request: dict[str, Any]
 
 

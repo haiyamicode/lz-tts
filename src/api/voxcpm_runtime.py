@@ -430,8 +430,14 @@ class VoxCPMRuntime:
         reference_audios: Sequence[bytes | None] | None = None,
         reference_formats: Sequence[str] | None = None,
         lora_names: Sequence[str | None] | None = None,
+        voice_descriptions: Sequence[str | None] | None = None,
     ) -> list[np.ndarray]:
-        """Submit every item concurrently so nano-vLLM can schedule a real batch."""
+        """Submit every item concurrently so nano-vLLM can schedule a real batch.
+
+        A voice description (VoxCPM2 voice design) is prefixed to its text as
+        ``(description)``; the model reads it as an instruction, not speech, so
+        the duration budget is predicted from the spoken text alone.
+        """
         if not texts:
             return []
         if languages is None:
@@ -461,6 +467,10 @@ class VoxCPMRuntime:
             reference_formats = [reference_format] * len(texts)
         if len(reference_formats) != len(texts):
             raise ValueError("reference_formats length must match texts length")
+        if voice_descriptions is None:
+            voice_descriptions = [None] * len(texts)
+        if len(voice_descriptions) != len(texts):
+            raise ValueError("voice_descriptions length must match texts length")
 
         duration_started = time.perf_counter()
         generation_limits, _budgets = await self._predict_generation_limits(
@@ -497,18 +507,19 @@ class VoxCPMRuntime:
             await asyncio.gather(
                 *(
                     self._synthesize_one(
-                        text,
+                        f"({description}){text}" if description else text,
                         max_generate_length=max_generate_length,
                         seed=seed,
                         ref_audio_latents=item_reference_latents,
                         lora_name=lora_name,
                     )
-                    for text, max_generate_length, seed, item_reference_latents, lora_name in zip(
+                    for text, max_generate_length, seed, item_reference_latents, lora_name, description in zip(
                         texts,
                         generation_limits,
                         seeds,
                         reference_latents,
                         lora_names,
+                        voice_descriptions,
                     )
                 )
             )
