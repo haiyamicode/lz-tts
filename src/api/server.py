@@ -554,6 +554,13 @@ class SynthesizeRequest(BaseModel):
     speed: float = Field(1.0, gt=0, description="Playback speed ratio")
     pitch: float = Field(1.0, gt=0, description="Pitch ratio without changing duration")
     volume: float = Field(1.0, ge=0.0, description="Output volume multiplier")
+    pause_before: float = Field(0.0, ge=0.0, description="Seconds of silence added before the speech")
+    pause_after: float = Field(0.0, ge=0.0, description="Seconds of silence added after the speech")
+
+
+# SynthesizeRequest fields applied to the finished audio (_apply_audio_adjustments),
+# not passed to the synthesis backends.
+_AUDIO_ADJUSTMENT_FIELDS = {"speed", "pitch", "volume", "pause_before", "pause_after"}
 
 
 class VoiceDesignRequest(BaseModel):
@@ -4789,12 +4796,16 @@ class InferenceResult:
 
 async def _apply_audio_adjustments(
     result: InferenceResult,
-    *,
-    speed: float,
-    pitch: float,
-    volume: float,
+    request: SynthesizeRequest,
 ) -> InferenceResult:
-    if result.kind != "audio" or (speed == 1.0 and pitch == 1.0 and volume == 1.0):
+    """Apply the request's speed/pitch/volume and its pauses to synthesized audio."""
+    if result.kind != "audio" or (
+        request.speed == 1.0
+        and request.pitch == 1.0
+        and request.volume == 1.0
+        and not request.pause_before
+        and not request.pause_after
+    ):
         return result
     if not result.audio:
         raise RuntimeError("cannot adjust an empty inference result")
@@ -4807,9 +4818,11 @@ async def _apply_audio_adjustments(
         result.audio,
         input_format=audio_format,
         output_format=audio_format,
-        speed=speed,
-        pitch=pitch,
-        volume=volume,
+        speed=request.speed,
+        pitch=request.pitch,
+        volume=request.volume,
+        pause_before=request.pause_before,
+        pause_after=request.pause_after,
     )
     return InferenceResult(
         kind="audio",
@@ -5401,7 +5414,7 @@ class LzTtsInferenceSession:
                 item = BatchSynthesizeInputItem.model_validate(
                     request.model_dump(
                         mode="python",
-                        exclude={"speed", "pitch", "volume"},
+                        exclude=_AUDIO_ADJUSTMENT_FIELDS,
                     )
                 )
                 _validate_batch_item(item, operation_index)
@@ -5460,12 +5473,7 @@ class LzTtsInferenceSession:
                         audio=base64.b64decode(response_item.audio_base64),
                     )
                     outcomes[batch_operation_indices[batch_item_index]] = (
-                        await _apply_audio_adjustments(
-                            result,
-                            speed=request.speed,
-                            pitch=request.pitch,
-                            volume=request.volume,
-                        )
+                        await _apply_audio_adjustments(result, request)
                     )
             except HTTPException as error:
                 outcome: BaseException = InferenceOperationError(
@@ -5538,6 +5546,8 @@ class LzTtsInferenceSession:
             "speed": request_data.get("speed", 1.0),
             "pitch": request_data.get("pitch", 1.0),
             "volume": request_data.get("volume", 1.0),
+            "pause_before": request_data.get("pause_before", 0.0),
+            "pause_after": request_data.get("pause_after", 0.0),
         }
         _LOGGER.info("Inference operation started: %s", json.dumps(context, default=str))
         try:
@@ -5549,12 +5559,7 @@ class LzTtsInferenceSession:
                     content_type=response.media_type,
                     audio=bytes(response.body),
                 )
-                result = await _apply_audio_adjustments(
-                    result,
-                    speed=request.speed,
-                    pitch=request.pitch,
-                    volume=request.volume,
-                )
+                result = await _apply_audio_adjustments(result, request)
             elif operation == "voice-design":
                 outcome = (await synthesize_voice_designs([VoiceDesignRequest.model_validate(request_data)]))[0]
                 if isinstance(outcome, BaseException):

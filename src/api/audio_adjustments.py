@@ -36,19 +36,34 @@ def adjust_audio(
     speed: float = 1.0,
     pitch: float = 1.0,
     volume: float = 1.0,
+    pause_before: float = 0.0,
+    pause_after: float = 0.0,
 ) -> bytes:
-    """Apply all requested adjustments in one SoX pass and preserve the encoding."""
-    if speed == 1.0 and pitch == 1.0 and volume == 1.0:
+    """Apply all requested adjustments in one SoX pass and preserve the encoding.
+
+    ``pause_before``/``pause_after`` add that many seconds of silence around
+    the speech, after the speed change so the silence keeps its length.
+    """
+    if (
+        speed == 1.0
+        and pitch == 1.0
+        and volume == 1.0
+        and not pause_before
+        and not pause_after
+    ):
         return audio
     if not audio:
         raise AudioAdjustmentError("cannot adjust empty audio")
 
     started = time.perf_counter()
     _LOGGER.info(
-        "Audio adjustment started speed=%.3f pitch=%.3f volume=%.3f input_bytes=%d",
+        "Audio adjustment started speed=%.3f pitch=%.3f volume=%.3f "
+        "pause_before=%.3f pause_after=%.3f input_bytes=%d",
         speed,
         pitch,
         volume,
+        pause_before,
+        pause_after,
         len(audio),
     )
 
@@ -86,6 +101,8 @@ def adjust_audio(
             cents = round(1200 * math.log2(pitch))
             if cents:
                 sox_command.extend(["pitch", str(cents)])
+        if pause_before or pause_after:
+            sox_command.extend(["pad", str(pause_before), str(pause_after)])
         sox_command.extend(["rate", "-v", "44100"])
         _run(sox_command, name="sox audio adjustment")
 
