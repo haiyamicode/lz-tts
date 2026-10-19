@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
-import json
 import logging
 import os
 import signal
@@ -43,7 +41,6 @@ _TYPE_OPERATIONS = {
     "language-detect": "detect-language",
 }
 _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
-_CALLBACK_FLUSH_INTERVAL_SECONDS = 2.0
 _CALLBACK_MAX_ATTEMPTS = 3
 
 
@@ -138,11 +135,16 @@ class TaskflowWorker:
             self.session_token = None
             await self._client.aclose()
 
-    async def _request(self, method: str, path: str, *, token: str, **kwargs: Any) -> httpx.Response:
+    async def _request(
+        self, method: str, path: str, *, token: str | None = None, **kwargs: Any
+    ) -> httpx.Response:
+        headers = kwargs.pop("headers", {})
+        if token:
+            headers = {"Authorization": f"Bearer {token}", **headers}
         response = await self._client.request(
             method,
             f"{self.base_url}{path}",
-            headers={"Authorization": f"Bearer {token}", **kwargs.pop("headers", {})},
+            headers=headers,
             **kwargs,
         )
         if response.is_error:
@@ -150,7 +152,7 @@ class TaskflowWorker:
                 f"Taskflow {method} {path} failed ({response.status_code}): {response.text[:500]}",
                 response.status_code,
                 _error_code(response),
-                scope="session" if path.startswith("/workers/") else "lease",
+                scope="session" if path.startswith("/workers/") else None,
             )
         return response
 
@@ -248,24 +250,35 @@ class TaskflowWorker:
             raise
         return response.json()["leases"]
 
-    async def complete(self, lease: dict[str, Any], result: dict[str, Any]) -> None:
-        await self._request(
-            "POST",
-            f"/leases/{lease['id']}/complete",
-            token=lease["leaseToken"],
-            json={"result": result},
-        )
+    async def settle(self, settlements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Complete or fail leases in one request; their results come back in order.
 
-    async def fail(self, lease: dict[str, Any], error: BaseException, *, retry: bool) -> None:
-        await self._request(
-            "POST",
-            f"/leases/{lease['id']}/fail",
-            token=lease["leaseToken"],
-            json={
-                "retry": retry,
-                "error": {"message": str(error), "data": {"type": type(error).__name__}},
-            },
-        )
+        Each item carries its own lease token, and a lease the server already
+        released is reported in its result instead of failing the request. So a
+        transient failure is safe to retry: a lease the lost attempt did settle
+        just comes back released.
+        """
+        attempt = 1
+        while True:
+            try:
+                response = await self._request(
+                    "POST", "/leases/settle", json={"leases": settlements}
+                )
+                return response.json()["results"]
+            except (httpx.TransportError, ProtocolError) as error:
+                transient = isinstance(error, httpx.TransportError) or (
+                    (error.status_code or 0) >= 500 and error.status_code != 501
+                )
+                if not transient or attempt >= _CALLBACK_MAX_ATTEMPTS:
+                    raise
+                _LOGGER.warning(
+                    "Taskflow lease settlement failed attempt=%d leases=%d: %s",
+                    attempt,
+                    len(settlements),
+                    error,
+                )
+            await asyncio.sleep(1.0 * attempt)
+            attempt += 1
 
     async def upload(self, lease: dict[str, Any], artifact_id: str, audio: bytes) -> None:
         artifact_base_url = self.base_url.removesuffix("/taskflow/v1") + "/tts-artifacts/v1"
@@ -309,6 +322,17 @@ class _LeaseWork:
     started_at: float
 
 
+@dataclass
+class _LeaseResult:
+    """A finished lease's outcome, uploaded and waiting on its ack."""
+
+    work: _LeaseWork
+    completion: dict[str, Any] | None = None
+    error: BaseException | None = None
+    retry: bool = False
+    ack: dict[str, Any] | None = None
+
+
 def _callback_token(lease: dict[str, Any]) -> str | None:
     """Extract the opaque completion token from a lease payload, if any."""
     payload = lease.get("payload")
@@ -319,21 +343,6 @@ def _callback_token(lease: dict[str, Any]) -> str | None:
         return None
     token = callback.get("token")
     return token if isinstance(token, str) and token else None
-
-
-def _token_project_id(token: str) -> str | None:
-    """Best-effort decode of the public projectId segment of a callback token.
-
-    Used purely to partition ack batches per project; verification happens
-    server-side.
-    """
-    body = token.split(".", 1)[0]
-    try:
-        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
-    except (ValueError, json.JSONDecodeError):
-        return None
-    project_id = claims.get("projectId") if isinstance(claims, dict) else None
-    return project_id if isinstance(project_id, str) and project_id else None
 
 
 def _measure_audio_duration(audio: bytes) -> float | None:
@@ -379,94 +388,78 @@ def _measure_audio_duration(audio: bytes) -> float | None:
             os.unlink(path)
 
 
-class SynthesisAckBatcher:
-    """Batches synthesis completion acks and flushes them per project.
+@dataclass
+class _AckFailure:
+    error: str
+    retry: bool
 
-    Acks are partitioned by projectId (one request per project per flush) so a
-    project's acks are applied strictly in order and never conflict with each
-    other. The API applies acks idempotently, so duplicate batches are safe.
-    A permanently dropped batch leaves the block pending; re-saving the
-    project re-submits it via the API's synthesis sync.
+
+class SynthesisAckClient:
+    """Acks a lease batch's synthesis outcomes to the API in one request.
+
+    The ack is what settles a block (attaching its audio, or recording a
+    terminal failure) and runs post-synthesis work such as charging, so a run
+    is only completed once its ack was accepted. The API applies acks
+    idempotently, so resending items from a partially applied request is safe.
     """
 
-    def __init__(
-        self,
-        client: httpx.AsyncClient,
-        endpoint: str,
-        *,
-        flush_interval: float = _CALLBACK_FLUSH_INTERVAL_SECONDS,
-    ) -> None:
+    def __init__(self, client: httpx.AsyncClient, endpoint: str) -> None:
         self._client = client
         self._endpoint = endpoint
-        self._flush_interval = flush_interval
-        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._flush_lock = asyncio.Lock()
-        self._task: asyncio.Task[None] | None = None
 
-    def start(self) -> None:
-        self._task = asyncio.create_task(self._run())
-
-    async def stop(self) -> None:
-        if self._task:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
-        await self.flush()
-
-    def enqueue(self, item: dict[str, Any]) -> None:
-        self._queue.put_nowait(item)
-
-    async def _run(self) -> None:
-        while True:
-            await asyncio.sleep(self._flush_interval)
-            await self.flush()
-
-    async def flush(self) -> None:
-        async with self._flush_lock:
-            items: list[dict[str, Any]] = []
-            while not self._queue.empty():
-                items.append(self._queue.get_nowait())
-            if not items:
-                return
-            groups: dict[str, list[dict[str, Any]]] = {}
-            for item in items:
-                token = item.get("token", "")
-                key = _token_project_id(token) if isinstance(token, str) else None
-                groups.setdefault(key or f"run:{item.get('runId')}", []).append(item)
-            results = await asyncio.gather(
-                *(self._post_group(key, group) for key, group in groups.items()),
-                return_exceptions=True,
-            )
-            for key, outcome in zip(groups, results, strict=True):
-                if isinstance(outcome, BaseException):
-                    _LOGGER.error(
-                        "Dropping %d synthesis acks for %s after retries: %s",
-                        len(groups[key]),
-                        key,
-                        outcome,
-                    )
-
-    async def _post_group(self, key: str, items: list[dict[str, Any]]) -> None:
+    async def send(self, items: list[dict[str, Any]]) -> dict[str, _AckFailure]:
+        """Ack ``items``; returns the ones the API did not accept, by runId."""
+        failures: dict[str, _AckFailure] = {}
+        pending = items
         for attempt in range(_CALLBACK_MAX_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(1.0 * attempt)
             try:
-                response = await self._client.post(self._endpoint, json={"items": items})
+                response = await self._client.post(self._endpoint, json={"items": pending})
                 if response.is_error:
                     raise ProtocolError(
                         f"Synthesis ack batch failed ({response.status_code}): "
                         f"{response.text[:500]}",
                         response.status_code,
                     )
-                _LOGGER.info(
-                    "Synthesis ack batch sent key=%s items=%d",
-                    key,
-                    len(items),
+                body = response.json()
+            except (httpx.HTTPError, ProtocolError, ValueError) as error:
+                _LOGGER.warning(
+                    "Synthesis ack request failed attempt=%d items=%d: %s",
+                    attempt + 1,
+                    len(pending),
+                    error,
                 )
-                return
-            except Exception:
-                if attempt == _CALLBACK_MAX_ATTEMPTS - 1:
-                    raise
-                await asyncio.sleep(1.0 * (attempt + 1))
+                for item in pending:
+                    failures[item["runId"]] = _AckFailure(str(error), retry=True)
+                continue
+            results = {result.get("runId"): result for result in body.get("results", [])}
+            rejected = {rejection.get("index"): rejection for rejection in body.get("rejected", [])}
+            retry_items: list[dict[str, Any]] = []
+            for index, item in enumerate(pending):
+                run_id = item["runId"]
+                result = results.get(run_id) or {}
+                if index in rejected:
+                    # The API can't verify this callback token; resending won't help.
+                    failures[run_id] = _AckFailure(
+                        f"Synthesis ack rejected: {rejected[index].get('error')}", retry=False
+                    )
+                elif result.get("ok") is True:
+                    failures.pop(run_id, None)
+                else:
+                    failures[run_id] = _AckFailure(
+                        f"Synthesis ack failed: {result.get('error', 'no result')}", retry=True
+                    )
+                    retry_items.append(item)
+            _LOGGER.info(
+                "Synthesis acks sent items=%d accepted=%d",
+                len(pending),
+                sum(1 for item in pending if item["runId"] not in failures),
+            )
+            pending = retry_items
+            if not pending:
+                break
+        return failures
 
 
 def _prepare_lease(taskflow: TaskflowWorker, lease: dict[str, Any]) -> _LeaseWork:
@@ -498,41 +491,75 @@ def _prepare_lease(taskflow: TaskflowWorker, lease: dict[str, Any]) -> _LeaseWor
     )
 
 
-async def _finish_lease(
+def _lease_released(taskflow: TaskflowWorker, work: _LeaseWork) -> bool:
+    lease_id = work.lease["id"]
+    if lease_id in taskflow.active_lease_ids:
+        return False
+    # The heartbeat already watched the server release this lease, which
+    # normally means the client cancelled or superseded the run.
+    _LOGGER.info(
+        "Discarding completed inference for released lease=%s run=%s reason=%s",
+        lease_id,
+        work.lease.get("runId"),
+        taskflow.dropped_lease_ids.get(lease_id, "unknown"),
+    )
+    return True
+
+
+def _completed_settlement(lease: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "leaseId": lease["id"],
+        "token": lease["leaseToken"],
+        "outcome": "completed",
+        "result": result,
+    }
+
+
+def _failed_settlement(
+    lease: dict[str, Any], error: BaseException, *, retry: bool
+) -> dict[str, Any]:
+    return {
+        "leaseId": lease["id"],
+        "token": lease["leaseToken"],
+        "outcome": "failed",
+        "retry": retry,
+        "error": {"message": str(error), "data": {"type": type(error).__name__}},
+    }
+
+
+def _log_dropped_result(work: _LeaseWork, error: object) -> None:
+    # Uploading or completing a result the server no longer wants is a
+    # routine race with a run that got cancelled while we were generating
+    # it. The lease is gone, not the session.
+    _LOGGER.warning(
+        "Dropped result for lease the server released lease=%s run=%s operation=%s: %s",
+        work.lease["id"],
+        work.lease.get("runId"),
+        work.operation,
+        error,
+    )
+
+
+async def _prepare_result(
     taskflow: TaskflowWorker,
     work: _LeaseWork,
     outcome: Any,
-    acks: SynthesisAckBatcher | None = None,
-) -> None:
+) -> _LeaseResult | None:
+    """Upload a lease's artifact and build its ack and Taskflow report.
+
+    Returns None when the server released the lease, leaving nothing to report.
+    """
     lease = work.lease
     lease_id = lease["id"]
     run_id = lease.get("runId")
+    if _lease_released(taskflow, work):
+        return None
     try:
-        if lease_id not in taskflow.active_lease_ids:
-            # The heartbeat already watched the server release this lease, which
-            # normally means the client cancelled or superseded the run.
-            _LOGGER.info(
-                "Discarding completed inference for released lease=%s run=%s reason=%s",
-                lease_id,
-                run_id,
-                taskflow.dropped_lease_ids.get(lease_id, "unknown"),
-            )
-            return
         if isinstance(outcome, BaseException):
             raise outcome
         result = outcome
         if result.kind == "json":
-            await taskflow.complete(lease, {"kind": "json", "data": result.data})
-            _LOGGER.info(
-                "LZ-TTS task completed type=%s lease=%s run=%s operation=%s kind=json "
-                "wall_seconds=%.3f",
-                work.task_type,
-                lease_id,
-                run_id,
-                work.operation,
-                time.monotonic() - work.started_at,
-            )
-            return
+            return _LeaseResult(work, completion={"kind": "json", "data": result.data})
 
         artifact_id = lease["payload"].get("artifactId")
         if not artifact_id:
@@ -553,28 +580,19 @@ async def _finish_lease(
         }
         if duration is not None:
             completion["duration"] = duration
-        await taskflow.complete(lease, completion)
         token = _callback_token(lease)
-        if token and acks is not None:
-            acks.enqueue(
-                {
-                    "token": token,
-                    "runId": run_id,
-                    "artifactId": artifact_id,
-                    "ok": True,
-                    **({"duration": duration} if duration is not None else {}),
-                }
-            )
-        _LOGGER.info(
-            "LZ-TTS task completed type=%s lease=%s run=%s operation=%s kind=artifact bytes=%d "
-            "wall_seconds=%.3f",
-            work.task_type,
-            lease_id,
-            run_id,
-            work.operation,
-            len(audio),
-            time.monotonic() - work.started_at,
+        ack = (
+            {
+                "token": token,
+                "runId": run_id,
+                "artifactId": artifact_id,
+                "ok": True,
+                **({"duration": duration} if duration is not None else {}),
+            }
+            if token
+            else None
         )
+        return _LeaseResult(work, completion=completion, ack=ack)
     except InferenceOperationError as error:
         retry = error.status_code >= 500 or error.status_code in {408, 429}
         _LOGGER.error(
@@ -590,38 +608,23 @@ async def _finish_lease(
         )
         token = _callback_token(lease)
         payload_artifact_id = lease.get("payload", {}).get("artifactId")
-        if (
-            token
-            and not retry
-            and acks is not None
-            and isinstance(payload_artifact_id, str)
-            and payload_artifact_id
-        ):
-            # Only terminal failures ack immediately; retriable failures get a
-            # fresh attempt (and eventually a terminal ack or a run.failed event).
-            acks.enqueue(
-                {
-                    "token": token,
-                    "runId": run_id,
-                    "artifactId": payload_artifact_id,
-                    "ok": False,
-                    "error": str(error)[:2000],
-                }
-            )
-        await _report_failure(taskflow, work, error, retry=retry)
+        ack = None
+        if token and not retry and isinstance(payload_artifact_id, str) and payload_artifact_id:
+            # Only terminal failures ack; retriable failures get a fresh attempt
+            # (and eventually a terminal ack or a run.failed event).
+            ack = {
+                "token": token,
+                "runId": run_id,
+                "artifactId": payload_artifact_id,
+                "ok": False,
+                "error": str(error)[:2000],
+            }
+        return _LeaseResult(work, error=error, retry=retry, ack=ack)
     except ProtocolError as error:
         if not error.loses_lease:
             raise
-        # Uploading or completing a result the server no longer wants is a
-        # routine race with a run that got cancelled while we were generating
-        # it. The lease is gone, not the session.
-        _LOGGER.warning(
-            "Dropped result for lease the server released lease=%s run=%s operation=%s: %s",
-            lease_id,
-            run_id,
-            work.operation,
-            error,
-        )
+        _log_dropped_result(work, error)
+        return None
     except Exception as error:
         _LOGGER.exception(
             "LZ-TTS task failed type=%s lease=%s run=%s operation=%s",
@@ -630,59 +633,104 @@ async def _finish_lease(
             run_id,
             work.operation,
         )
-        await _report_failure(taskflow, work, error, retry=True)
-    finally:
-        taskflow.active_lease_ids.discard(lease_id)
-        taskflow.dropped_lease_ids.pop(lease_id, None)
+        return _LeaseResult(work, error=error, retry=True)
 
 
-async def _report_failure(
+async def _settle_results(
     taskflow: TaskflowWorker,
-    work: _LeaseWork,
-    error: BaseException,
-    *,
-    retry: bool,
+    results: list[_LeaseResult],
+    ack_failures: dict[str, _AckFailure],
 ) -> None:
-    """Report a failed lease, tolerating one the server already released.
-
-    A released lease means the run was cancelled, expired or superseded while we
-    were working on it: the server has already reclaimed the work, so there is
-    nothing left to report and nothing worth reconnecting for.
-    """
-    lease = work.lease
-    try:
-        await taskflow.fail(lease, error, retry=retry)
-    except ProtocolError as report_error:
-        if not report_error.loses_lease:
-            _LOGGER.exception(
-                "Failed to report failed LZ-TTS task to Taskflow type=%s lease=%s run=%s",
+    """Complete or fail a batch's leases in one request, once the API settled their acks."""
+    settlements: list[dict[str, Any]] = []
+    for result in results:
+        work = result.work
+        lease = work.lease
+        ack_failure = ack_failures.get(result.ack["runId"]) if result.ack is not None else None
+        if result.error is not None:
+            # A terminal failure's ack is best effort: Taskflow's run.failed
+            # event settles the block as well.
+            settlements.append(_failed_settlement(lease, result.error, retry=result.retry))
+        elif ack_failure is not None:
+            _LOGGER.error(
+                "LZ-TTS task not acked type=%s lease=%s run=%s operation=%s retry=%s: %s",
                 work.task_type,
                 lease["id"],
                 lease.get("runId"),
+                work.operation,
+                ack_failure.retry,
+                ack_failure.error,
             )
-            raise
-        _LOGGER.warning(
-            "Taskflow already released lease=%s run=%s; dropped failure report",
-            lease["id"],
-            lease.get("runId"),
-        )
+            settlements.append(
+                _failed_settlement(
+                    lease, RuntimeError(ack_failure.error), retry=ack_failure.retry
+                )
+            )
+        else:
+            settlements.append(_completed_settlement(lease, result.completion or {}))
+    if not settlements:
+        return
+    try:
+        outcomes = await taskflow.settle(settlements)
     except Exception:
         _LOGGER.exception(
-            "Failed to report failed LZ-TTS task to Taskflow type=%s lease=%s run=%s",
-            work.task_type,
-            lease["id"],
-            lease.get("runId"),
+            "Failed to settle LZ-TTS leases with Taskflow leases=%s",
+            [settlement["leaseId"] for settlement in settlements],
         )
         raise
+
+    for result, settlement, outcome in zip(results, settlements, outcomes, strict=True):
+        work = result.work
+        lease = work.lease
+        error = outcome.get("error")
+        if isinstance(error, dict):
+            if error.get("code") in _LEASE_GONE_CODES:
+                # The run was cancelled, expired or superseded while we were
+                # working on it: the server already reclaimed the work.
+                _log_dropped_result(work, f"{error.get('code')}: {error.get('message')}")
+            else:
+                _LOGGER.error(
+                    "Taskflow rejected lease settlement lease=%s run=%s outcome=%s: %s",
+                    lease["id"],
+                    lease.get("runId"),
+                    settlement["outcome"],
+                    error,
+                )
+            continue
+        if settlement["outcome"] != "completed":
+            continue
+        completion = result.completion or {}
+        if completion.get("kind") == "json":
+            _LOGGER.info(
+                "LZ-TTS task completed type=%s lease=%s run=%s operation=%s kind=json "
+                "wall_seconds=%.3f",
+                work.task_type,
+                lease["id"],
+                lease.get("runId"),
+                work.operation,
+                time.monotonic() - work.started_at,
+            )
+        else:
+            _LOGGER.info(
+                "LZ-TTS task completed type=%s lease=%s run=%s operation=%s kind=artifact "
+                "bytes=%d wall_seconds=%.3f",
+                work.task_type,
+                lease["id"],
+                lease.get("runId"),
+                work.operation,
+                completion.get("bytes", 0),
+                time.monotonic() - work.started_at,
+            )
 
 
 async def _process_leases(
     taskflow: TaskflowWorker,
     inference: LzTtsInferenceSession,
     leases: list[dict[str, Any]],
-    acks: SynthesisAckBatcher | None = None,
+    acks: SynthesisAckClient | None = None,
 ) -> None:
     works: list[_LeaseWork] = []
+    invalid: list[tuple[dict[str, Any], BaseException]] = []
     for lease in leases:
         try:
             works.append(_prepare_lease(taskflow, lease))
@@ -692,14 +740,17 @@ async def _process_leases(
                 lease.get("id"),
                 lease.get("runId"),
             )
-            try:
-                await taskflow.fail(lease, error, retry=False)
-            except Exception:
-                _LOGGER.exception(
-                    "Failed to reject invalid LZ-TTS lease lease=%s run=%s",
-                    lease.get("id"),
-                    lease.get("runId"),
-                )
+            invalid.append((lease, error))
+    if invalid:
+        try:
+            await taskflow.settle(
+                [_failed_settlement(lease, error, retry=False) for lease, error in invalid]
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Failed to reject invalid LZ-TTS leases leases=%s",
+                [lease.get("id") for lease, _ in invalid],
+            )
 
     if not works:
         return
@@ -719,14 +770,29 @@ async def _process_leases(
     except Exception as error:
         _LOGGER.exception("LZ-TTS task batch planning or execution failed")
         outcomes = [error] * len(works)
-    results = await asyncio.gather(
-        *(
-            _finish_lease(taskflow, work, outcome, acks)
-            for work, outcome in zip(works, outcomes, strict=True)
-        ),
-        return_exceptions=True,
-    )
-    for result in results:
+    try:
+        prepared = await asyncio.gather(
+            *(
+                _prepare_result(taskflow, work, outcome)
+                for work, outcome in zip(works, outcomes, strict=True)
+            ),
+            return_exceptions=True,
+        )
+        results = [
+            result
+            for result in prepared
+            if isinstance(result, _LeaseResult) and not _lease_released(taskflow, result.work)
+        ]
+        # One ack request for the whole batch, then one settle request: a run
+        # must not finish until the API has settled its block.
+        ack_items = [result.ack for result in results if result.ack is not None]
+        ack_failures = await acks.send(ack_items) if ack_items and acks is not None else {}
+        await _settle_results(taskflow, results, ack_failures)
+    finally:
+        for work in works:
+            taskflow.active_lease_ids.discard(work.lease["id"])
+            taskflow.dropped_lease_ids.pop(work.lease["id"], None)
+    for result in prepared:
         if isinstance(result, BaseException):
             # Let every lease finish cleaning up before the serve loop drops the
             # session and reconnects (only inference-runtime failures get here).
@@ -737,7 +803,7 @@ async def _process_lease(
     taskflow: TaskflowWorker,
     inference: LzTtsInferenceSession,
     lease: dict[str, Any],
-    acks: SynthesisAckBatcher | None = None,
+    acks: SynthesisAckClient | None = None,
 ) -> None:
     await _process_leases(taskflow, inference, [lease], acks)
 
@@ -773,7 +839,7 @@ async def _serve_taskflow(
     taskflow: TaskflowWorker,
     inference: LzTtsInferenceSession,
     synthesis_capabilities: dict[str, Any],
-    acks: SynthesisAckBatcher | None = None,
+    acks: SynthesisAckClient | None = None,
 ) -> None:
     set_status("starting")
     while True:
@@ -900,11 +966,10 @@ async def run_worker() -> None:
     for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(shutdown_signal, _request_shutdown)
-    acks = SynthesisAckBatcher(
+    acks = SynthesisAckClient(
         taskflow._client,
         lazybird_url.rstrip("/") + "/internal/synthesis-events/v1/batch",
     )
-    acks.start()
     try:
         synthesis_capabilities = inference.synthesis_capabilities()
         await _serve_taskflow(taskflow, inference, synthesis_capabilities, acks)
@@ -916,7 +981,6 @@ async def run_worker() -> None:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await http_task
         set_status("starting")
-        await acks.stop()
         await taskflow.close()
         await inference.close()
 

@@ -51,7 +51,7 @@ from .api.server import (
 from .process_guard import hard_exit
 from .taskflow_worker import (
     _REQUEST_TIMEOUT,
-    SynthesisAckBatcher,
+    SynthesisAckClient,
     TaskflowWorker,
     _start_http_server,
     _serve_taskflow,
@@ -213,11 +213,10 @@ async def run_forwarder_worker() -> None:
     for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(shutdown_signal, _request_shutdown)
-    acks = SynthesisAckBatcher(
+    acks = SynthesisAckClient(
         taskflow._client,
         f"{os.environ.get('LZB_API', 'http://localhost:4001').rstrip('/')}/internal/synthesis-events/v1/batch",
     )
-    acks.start()
     try:
         synthesis_capabilities = inference.synthesis_capabilities()
         await _serve_taskflow(taskflow, inference, synthesis_capabilities, acks)
@@ -229,7 +228,6 @@ async def run_forwarder_worker() -> None:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await http_task
         set_status("starting")
-        await acks.stop()
         await taskflow.close()
         await inference.close()
 
