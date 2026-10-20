@@ -41,7 +41,13 @@ _TYPE_OPERATIONS = {
     "language-detect": "detect-language",
 }
 _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
+# Join, heartbeat, pull, settle and leave are small requests (pulls long-poll
+# for at most a second); a minute is plenty, and a hung heartbeat must not hold
+# up failure detection for the uploads' 15 minutes.
+_CONTROL_TIMEOUT = httpx.Timeout(connect=30.0, read=60.0, write=60.0, pool=30.0)
 _CALLBACK_MAX_ATTEMPTS = 3
+_RECONNECT_BASE_DELAY = 2.0
+_RECONNECT_MAX_DELAY = 60.0
 
 
 # Taskflow error codes. A lease that a cancelled, expired or superseded run no
@@ -119,6 +125,23 @@ class TaskflowWorker:
         self.base_url = self.base_url.rstrip("/")
         self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
 
+    @property
+    def client(self) -> httpx.AsyncClient:
+        return self._client
+
+    async def reset_client(self) -> None:
+        """Replace the HTTP client, discarding its whole connection pool.
+
+        httpcore can strand connections in the pool for good: through an HTTP
+        proxy, a tunnel whose CONNECT succeeded but whose TLS handshake timed
+        out stays neither closed, idle nor expired, so it is never evicted.
+        Once those fill the pool, every request fails with PoolTimeout even
+        after the network recovers. A fresh client is the only way out.
+        """
+        old_client, self._client = self._client, httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(old_client.aclose(), timeout=10)
+
     async def close(self) -> None:
         try:
             if self.session_id and self.session_token:
@@ -141,6 +164,7 @@ class TaskflowWorker:
         headers = kwargs.pop("headers", {})
         if token:
             headers = {"Authorization": f"Bearer {token}", **headers}
+        kwargs.setdefault("timeout", _CONTROL_TIMEOUT)
         response = await self._client.request(
             method,
             f"{self.base_url}{path}",
@@ -403,8 +427,9 @@ class SynthesisAckClient:
     idempotently, so resending items from a partially applied request is safe.
     """
 
-    def __init__(self, client: httpx.AsyncClient, endpoint: str) -> None:
-        self._client = client
+    def __init__(self, taskflow: TaskflowWorker, endpoint: str) -> None:
+        # Shares the worker's HTTP client, which a reconnect may replace.
+        self._taskflow = taskflow
         self._endpoint = endpoint
 
     async def send(self, items: list[dict[str, Any]]) -> dict[str, _AckFailure]:
@@ -415,7 +440,9 @@ class SynthesisAckClient:
             if attempt:
                 await asyncio.sleep(1.0 * attempt)
             try:
-                response = await self._client.post(self._endpoint, json={"items": pending})
+                response = await self._taskflow.client.post(
+                    self._endpoint, json={"items": pending}
+                )
                 if response.is_error:
                     raise ProtocolError(
                         f"Synthesis ack batch failed ({response.status_code}): "
@@ -835,6 +862,44 @@ async def _pull_task_batch(taskflow: TaskflowWorker) -> list[dict[str, Any]]:
     return leases
 
 
+class _DisconnectWatchdog:
+    """Hard-exit the worker once it has not been joined to Taskflow for too long.
+
+    The serve loop reconnects on its own, but a failure it does not know how to
+    recover from (a wedged HTTP client, a stuck event loop) would otherwise
+    leave the worker reconnecting forever. A pull worker can afford a restart:
+    after ``LZ_TTS_MAX_DISCONNECTED_SECONDS`` (default 600, 0 disables) without
+    an ``ok`` health status, kill the process tree and let pm2 start it clean.
+    Runs on a thread so a blocked event loop cannot keep it from firing.
+    """
+
+    def __init__(self) -> None:
+        self.limit = float(os.environ.get("LZ_TTS_MAX_DISCONNECTED_SECONDS", "600"))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="taskflow-disconnect-watchdog", daemon=True
+        )
+
+    def start(self) -> None:
+        if self.limit > 0:
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        last_ok = time.monotonic()
+        while not self._stop.wait(min(5.0, self.limit / 4)):
+            now = time.monotonic()
+            if get_health_status()["status"] == "ok":
+                last_ok = now
+            elif now - last_ok > self.limit:
+                hard_exit(
+                    f"not joined to Taskflow for {now - last_ok:.0f}s "
+                    f"(LZ_TTS_MAX_DISCONNECTED_SECONDS={self.limit:g})"
+                )
+
+
 async def _serve_taskflow(
     taskflow: TaskflowWorker,
     inference: LzTtsInferenceSession,
@@ -842,57 +907,79 @@ async def _serve_taskflow(
     acks: SynthesisAckClient | None = None,
 ) -> None:
     set_status("starting")
-    while True:
-        heartbeat_task: asyncio.Task[None] | None = None
-        was_ok = get_health_status()["status"] == "ok"
-        try:
-            if taskflow.session_token:
-                await taskflow.heartbeat()
-            else:
-                await taskflow.join({"service": "lz-tts", "synthesis": synthesis_capabilities})
-            connection_lost = asyncio.Event()
-            heartbeat_task = asyncio.create_task(taskflow.heartbeat_loop(connection_lost))
-            set_status("ok")
-            _LOGGER.info("LZ-TTS Taskflow worker ready id=%s", taskflow.worker_id)
-            while not connection_lost.is_set():
-                leases = await _pull_task_batch(taskflow)
-                if leases:
-                    try:
-                        await _process_leases(taskflow, inference, leases, acks)
-                    except Exception as error:
-                        # _process_leases only re-raises when the inference
-                        # runtime itself is broken (per-lease errors are
-                        # handled internally). Drop to ``error`` so the
-                        # orchestrator pulls traffic before reconnect storms.
-                        set_status("error", reason=f"inference runtime failed: {error}")
-                        raise
-        except ProtocolError as error:
-            if error.loses_lease:
-                # A lease-level rejection (cancelled run, expired lease) says
-                # nothing about the session, so keep it and keep pulling.
-                # Clearing it here would fence this session and release the
-                # leases of the worker's other in-flight tasks, making them run
-                # a second time.
-                _LOGGER.warning("Taskflow released a lease; keeping the session: %s", error)
-            else:
-                if error.loses_session:
-                    taskflow.session_id = None
-                    taskflow.session_token = None
-                _LOGGER.exception(
-                    "Taskflow connection lost; reconnecting without reloading models"
-                )
-        except Exception:
-            _LOGGER.exception("Taskflow connection lost; reconnecting without reloading models")
-        finally:
-            if was_ok:
-                set_status("error", reason="taskflow connection lost")
-            else:
-                set_status("starting")
-            if heartbeat_task:
-                heartbeat_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await heartbeat_task
-        await asyncio.sleep(2)
+    watchdog = _DisconnectWatchdog()
+    watchdog.start()
+    joined_once = False
+    failures = 0
+    try:
+        while True:
+            heartbeat_task: asyncio.Task[None] | None = None
+            reason = "taskflow connection lost"
+            reconnect = True
+            try:
+                if taskflow.session_token:
+                    await taskflow.heartbeat()
+                else:
+                    await taskflow.join({"service": "lz-tts", "synthesis": synthesis_capabilities})
+                connection_lost = asyncio.Event()
+                heartbeat_task = asyncio.create_task(taskflow.heartbeat_loop(connection_lost))
+                set_status("ok")
+                joined_once = True
+                failures = 0
+                _LOGGER.info("LZ-TTS Taskflow worker ready id=%s", taskflow.worker_id)
+                while not connection_lost.is_set():
+                    leases = await _pull_task_batch(taskflow)
+                    if leases:
+                        try:
+                            await _process_leases(taskflow, inference, leases, acks)
+                        except Exception as error:
+                            # _process_leases only re-raises when the inference
+                            # runtime itself is broken (per-lease errors are
+                            # handled internally). Drop to ``error`` so the
+                            # orchestrator pulls traffic before reconnect storms.
+                            reason = f"inference runtime failed: {error}"
+                            set_status("error", reason=reason)
+                            raise
+            except ProtocolError as error:
+                if error.loses_lease:
+                    # A lease-level rejection (cancelled run, expired lease) says
+                    # nothing about the session, so keep it and keep pulling.
+                    # Clearing it here would fence this session and release the
+                    # leases of the worker's other in-flight tasks, making them run
+                    # a second time.
+                    _LOGGER.warning("Taskflow released a lease; keeping the session: %s", error)
+                    reconnect = False
+                else:
+                    if error.loses_session:
+                        taskflow.session_id = None
+                        taskflow.session_token = None
+                    _LOGGER.exception(
+                        "Taskflow connection lost; reconnecting without reloading models"
+                    )
+            except Exception:
+                _LOGGER.exception("Taskflow connection lost; reconnecting without reloading models")
+            finally:
+                # Once joined, any disconnection is a failure worth surfacing;
+                # ``starting`` only means models are up but never joined yet.
+                if joined_once:
+                    set_status("error", reason=reason)
+                else:
+                    set_status("starting")
+                if heartbeat_task:
+                    heartbeat_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await heartbeat_task
+            if not reconnect:
+                await asyncio.sleep(_RECONNECT_BASE_DELAY)
+                continue
+            # Nothing else uses the client now (the batch is done and the
+            # heartbeat stopped), so drop its pool before trying again.
+            await taskflow.reset_client()
+            delay = min(_RECONNECT_MAX_DELAY, _RECONNECT_BASE_DELAY * 2 ** min(failures, 5))
+            failures += 1
+            await asyncio.sleep(delay)
+    finally:
+        watchdog.stop()
 
 
 def _start_http_server(inference: LzTtsInferenceSession) -> tuple[Any, asyncio.Task]:
@@ -967,7 +1054,7 @@ async def run_worker() -> None:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(shutdown_signal, _request_shutdown)
     acks = SynthesisAckClient(
-        taskflow._client,
+        taskflow,
         lazybird_url.rstrip("/") + "/internal/synthesis-events/v1/batch",
     )
     try:

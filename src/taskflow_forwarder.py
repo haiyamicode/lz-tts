@@ -214,7 +214,7 @@ async def run_forwarder_worker() -> None:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(shutdown_signal, _request_shutdown)
     acks = SynthesisAckClient(
-        taskflow._client,
+        taskflow,
         f"{os.environ.get('LZB_API', 'http://localhost:4001').rstrip('/')}/internal/synthesis-events/v1/batch",
     )
     try:
