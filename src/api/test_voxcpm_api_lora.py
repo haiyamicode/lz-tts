@@ -479,3 +479,19 @@ def test_voxcpm_speakable_bracket_groups():
     )
     assert "(" not in prepared and ")" not in prepared and "[" not in prepared
     assert "short prompt" in prepared
+
+
+def test_voxcpm_input_keeps_numbers_for_the_model():
+    """VoxCPM reads years and numbers itself; verbalizing them read every
+    number as a cardinal ("1949" -> "one thousand, nine hundred and ...")."""
+    from src.api.server import _prepare_voxcpm_input
+
+    for text, language in (
+        ("He was born in 1949.", "en-US"),
+        ("On May 4, 1949, it cost $3.2 billion.", "en-US"),
+        ("Er wurde 1949 geboren.", "de-DE"),
+        ("他1949年出生。", "zh-CN"),
+        ("2024年10月12日、1,487票でした。", "ja-JP"),
+    ):
+        assert _prepare_voxcpm_input(text, language) == (text, language)
+    assert _prepare_voxcpm_input("He was born in 1949.", None, "en-US")[0] == "He was born in 1949."

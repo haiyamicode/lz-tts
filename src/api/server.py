@@ -45,7 +45,6 @@ from ..ssml_postprocessing import (
     insert_ssml_breaks,
     resolve_ssml_breaks,
 )
-from ..text_norm import normalize_spoken_text
 from ..text_splitter import count_cl100k_tokens
 from ..voxcpm_ipa_adapter import approximate_ipa_spelling, resolve_ipa_control_schedules
 from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
@@ -2833,7 +2832,7 @@ def _prepare_voxcpm_ipa_text(
     for marker, operation in replacements:
         if marked_text.count(marker) != 1:
             raise ValueError(
-                "Spoken-text normalization did not preserve an SSML pronunciation span"
+                "VoxCPM text preparation did not preserve an SSML pronunciation span"
             )
         located_replacements.append((marked_text.index(marker), marker, operation))
     located_replacements.sort(key=lambda item: item[0])
@@ -4032,29 +4031,15 @@ def _prepare_voxcpm_input(
     language: str | None,
     fallback_language: str | None = None,
 ) -> tuple[str, str]:
+    # VoxCPM reads digits, dates and symbols itself. No spoken-text
+    # normalization: it verbalized every number as a cardinal, so years came
+    # out as "one thousand, nine hundred and forty-nine" and zh "二千零二十四年".
     text = _voxcpm_speakable_bracket_groups(text)
     if language is not None:
-        return normalize_spoken_text(text, language), language
+        return text, language
 
     result = _get_multilingual_splitter().split(text)
-    main_language = result.effective_main_language(fallback_language or "en-us")
-    prepared_segments = []
-    for segment in result.segments:
-        segment_text = segment.text.strip()
-        if not segment_text:
-            continue
-        segment_language = (
-            segment.language
-            if segment.language and segment.language != "und"
-            else main_language
-        )
-        prepared_segments.append(normalize_spoken_text(segment_text, segment_language))
-    prepared_text = (
-        " ".join(prepared_segments)
-        if prepared_segments
-        else normalize_spoken_text(text, main_language)
-    )
-    return prepared_text, main_language
+    return text, result.effective_main_language(fallback_language or "en-us")
 
 
 def _prepare_voxcpm_text(
