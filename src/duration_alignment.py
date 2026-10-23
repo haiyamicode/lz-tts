@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import threading
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -16,6 +17,14 @@ import numpy as np
 import torch
 
 _LOGGER = logging.getLogger(__name__)
+
+# piper_phonemize's error when eSpeak has no voice for the code.
+_UNSUPPORTED_ESPEAK_VOICE = "Failed to set eSpeak-ng voice"
+# Rough speech rates for a text-length budget: East Asian wide characters
+# (Han, kana, Hangul) and every other letter, digit or mark.
+_ROUGH_WIDE_CHARS_PER_SECOND = 2.5
+_ROUGH_CHARS_PER_SECOND = 11.0
+_ROUGH_BUDGET_MARGIN = 2.0
 
 _ALIGNMENT_TRIM_FRAME_MS = 20
 _ALIGNMENT_TRIM_HOP_MS = 10
@@ -455,7 +464,21 @@ class DurationAlignmentValidator:
         budgets = [self._empty_budget(language) for language in languages]
         batch_entries: list[tuple[int, str | None, list[int], dict[str, Any]]] = []
         for index, (text, language) in enumerate(zip(texts, languages)):
-            chunk_results = self._phonemize_budget_chunks(text, language)
+            try:
+                chunk_results = self._phonemize_budget_chunks(text, language)
+            except RuntimeError as exc:
+                # One unphonemizable item must not fail every request in the batch.
+                if _UNSUPPORTED_ESPEAK_VOICE not in str(exc):
+                    raise
+                budgets[index] = self._rough_budget(text, language)
+                _LOGGER.warning(
+                    "DP budget: no eSpeak voice for language=%r; rough text-length budget "
+                    "seconds=%.2f max_tokens=%d",
+                    language,
+                    budgets[index]["seconds"],
+                    budgets[index]["max_tokens"],
+                )
+                continue
             for chunk_index, phoneme_result in enumerate(chunk_results):
                 phoneme_ids = phoneme_result["phoneme_ids"]
                 if not phoneme_ids:
@@ -955,6 +978,40 @@ class DurationAlignmentValidator:
                 if hasattr(module, "attn"):
                     module.attn = None
             return token_frames
+
+    def _rough_budget(self, text: str, language: str | None) -> dict[str, Any]:
+        """Budget from character counts, for text eSpeak cannot phonemize.
+
+        The rates match the DP's median on LZQ-Bench texts in 25 languages, and
+        the 2x margin plus the usual extra tokens covers the DP's own max budget
+        on every one of them.
+        """
+        budget = self._empty_budget(language)
+        wide = sum(
+            unicodedata.east_asian_width(char) in "WF"
+            for char in text
+            if unicodedata.category(char)[0] in "LN"
+        )
+        other = sum(unicodedata.category(char)[0] in "LNM" for char in text) - wide
+        seconds = wide / _ROUGH_WIDE_CHARS_PER_SECOND + other / _ROUGH_CHARS_PER_SECOND
+        estimated_tokens = max(1, round(seconds * self.config.token_rate))
+        min_tokens = max(1, round(estimated_tokens * budget["min_margin"]) + budget["min_extra_tokens"])
+        max_tokens = max(
+            min_tokens,
+            round(estimated_tokens * _ROUGH_BUDGET_MARGIN) + budget["max_extra_tokens"],
+        )
+        budget.update(
+            mel_frames=math.ceil(seconds * 22050.0 / 256.0),
+            seconds=seconds,
+            estimated_tokens=estimated_tokens,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
+            max_margin=_ROUGH_BUDGET_MARGIN,
+            duration_chunks=0,
+            phoneme_language=self._phoneme_config(language)["language"]["code"],
+            rough_estimate=True,
+        )
+        return budget
 
     def _empty_budget(self, language: str | None = None) -> dict[str, Any]:
         profile_language, profile = self._budget_profile(language)

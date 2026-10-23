@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -99,3 +101,27 @@ def test_duration_budget_can_skip_unused_word_span_alignment() -> None:
     chunks = validator._phonemize_budget_chunks(text, "zh-CN")
     assert chunks
     assert all(chunk["word_spans"] is None for chunk in chunks)
+
+
+def test_duration_budget_survives_unsupported_espeak_voice() -> None:
+    validator = DurationAlignmentValidator(
+        DpBudgetConfig(
+            checkpoint=Path("data/lzspeech-sparrow/model.ckpt"),
+            config_path=Path("data/lzspeech-sparrow/config.json"),
+            token_rate=6.25,
+            include_word_spans=False,
+        )
+    )
+    filipino = "Nang sa wakas ay makarating kami sa istasyon, nakaalis na ang huling tren."
+    english = "The meeting has been moved to Thursday afternoon."
+
+    # "tl" is CLD2's code for Filipino, which eSpeak only knows through "fil".
+    supported = validator.predict_batch([filipino, english], ["tl", "en-us"])
+    mixed = validator.predict_batch([filipino, "Some text.", english], ["tl", "xx", "en-us"])
+
+    assert not supported[0].get("rough_estimate") and supported[0]["phoneme_count"] > 0
+    assert mixed[0] == supported[0]
+    assert mixed[2] == supported[1]
+    rough = mixed[1]
+    assert rough["rough_estimate"]
+    assert rough["max_tokens"] >= 2 * rough["estimated_tokens"] > 0

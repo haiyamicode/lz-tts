@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ..multilingual_splitter import MultilingualSplitter, SplitResult
+from ..multilingual_splitter.multilingual_splitter import CLD2_LANGUAGE_CODES
 from ..piper import PiperInference
 from ..heap_trim import IdleHeapTrimmer
 from ..process_guard import hard_exit
@@ -873,6 +874,7 @@ _speaker_routes: dict[str, tuple[str, Optional[int]]] = {}  # speaker -> (model,
 _lang_speaker_map: dict[str, str] = {}  # canonical locale -> speaker
 _splitter: MultilingualSplitter | None = None
 _splitter_languages: tuple[str, ...] | None = None
+_APPLICATION_LANGUAGE_CODES = {detector: application for application, detector in CLD2_LANGUAGE_CODES.items()}
 _starling_backend: "ProductionStarlingBackend | None" = None
 _starling_batcher: "ProductionStarlingBatcher | None" = None
 _seed_vc_backend: "_SeedVCBackend | None" = None
@@ -4039,7 +4041,10 @@ def _prepare_voxcpm_input(
         return text, language
 
     result = _get_multilingual_splitter().split(text)
-    return text, result.effective_main_language(fallback_language or "en-us")
+    language = result.effective_main_language(fallback_language or "en-us")
+    # Without Sparrow routes the splitter is unconstrained and passes CLD2's
+    # legacy codes through (Filipino as "tl"); the DP and LoRAs use "fil".
+    return text, _APPLICATION_LANGUAGE_CODES.get(language, language)
 
 
 def _prepare_voxcpm_text(

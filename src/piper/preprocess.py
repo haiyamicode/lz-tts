@@ -1012,8 +1012,15 @@ def _map_cld2_to_espeak(lang_code: str, primary_voice: str = "en-us") -> str:
     if base in ("zh", "cmn"):
         return "cmn-latn-pinyin"
 
-    if base in ("fil", "jv", "su"):
+    # tl/jw/iw/no are CLD2's legacy codes; eSpeak has no voice under them.
+    if base in ("fil", "tl", "jv", "jw", "su"):
         return "id"
+
+    if base == "iw":
+        return "he"
+
+    if base == "no":
+        return "nb"
 
     if base == "so":
         return "om"
