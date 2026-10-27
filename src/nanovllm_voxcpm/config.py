@@ -21,14 +21,12 @@ def resolve_torch_dtype(name: str) -> torch.dtype:
         ) from exc
 
 
-def resolve_model_dtype(name: str, device_index: int) -> str:
-    """Resolve automatic precision according to native CUDA dtype support."""
+def resolve_model_dtype(name: str) -> str:
+    """Resolve automatic precision: fp16 on every GPU, the precision the trainers use and production serves."""
     if name != "auto":
         resolve_torch_dtype(name)
         return name
-
-    major, _minor = torch.cuda.get_device_capability(device_index)
-    return "bfloat16" if major >= 8 else "float16"
+    return "float16"
 
 
 @dataclass

@@ -93,7 +93,7 @@ class VoxCPM2ServerImpl:
         self.model_path = model_path
         device_index = devices[0] if devices else 0
         devices = devices or [device_index]
-        self.dtype = resolve_model_dtype(dtype, device_index)
+        self.dtype = resolve_model_dtype(dtype)
         model_config.dtype = self.dtype
         # Prefix caching consumes the flash-attn prefill path; the SDPA
         # fallback used on unsupported archs cannot read prefix-cache block
