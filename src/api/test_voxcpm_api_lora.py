@@ -450,11 +450,12 @@ def test_non_english_voxcpm_ipa_keeps_native_visible_text_as_guide(
     assert controls[0]["target_ipa"] == document.pronunciations[0].phonemes
 
 
-def test_voxcpm_speakable_bracket_groups():
-    """VoxCPM2 truncates generation at an open paren; brackets must not
+def test_voxcpm_speakable_paren_groups():
+    """VoxCPM2 truncates generation at an open paren; parens must not
     reach the model — balanced groups become spoken clause punctuation,
-    empty/unbalanced leftovers vanish, and content always survives."""
-    from src.api.server import _prepare_voxcpm_input, _voxcpm_speakable_bracket_groups
+    empty/unbalanced leftovers vanish, and content always survives.
+    Square brackets (non-speech tags) pass through."""
+    from src.api.server import _prepare_voxcpm_input, _voxcpm_speakable_paren_groups
 
     cases = [
         (
@@ -466,19 +467,21 @@ def test_voxcpm_speakable_bracket_groups():
         ("Empty parens () here.", "Empty parens here."),
         ("Nested ((deep)) parens.", "Nested, deep, parens."),
         ("Unbalanced (open paren keeps content", "Unbalanced open paren keeps content"),
-        ("Brackets [Music] hello.", "Brackets, Music, hello."),
+        ("Brackets [laughter] hello.", "Brackets [laughter] hello."),
+        ("A tag (and an aside [breath]) here.", "A tag, and an aside [breath], here."),
+        ("Stray ] closer.", "Stray ] closer."),
         ("No brackets at all.", "No brackets at all."),
     ]
     for source, expected in cases:
-        assert _voxcpm_speakable_bracket_groups(source) == expected
+        assert _voxcpm_speakable_paren_groups(source) == expected
 
     # The transform runs inside the shared VoxCPM input preparation.
     prepared, detected = _prepare_voxcpm_input(
-        "Simple requests (short prompt) work correctly.",
+        "Simple requests (short prompt) work correctly [laughter].",
         "en-US",
     )
-    assert "(" not in prepared and ")" not in prepared and "[" not in prepared
-    assert "short prompt" in prepared
+    assert "(" not in prepared and ")" not in prepared
+    assert "short prompt" in prepared and "[laughter]" in prepared
 
 
 def test_voxcpm_input_keeps_numbers_for_the_model():

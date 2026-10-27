@@ -3981,35 +3981,31 @@ async def synthesize_multilingual_sparrow_batch(request: _SharedBatchSynthesizeR
     return response
 
 
-_VOXCPM_BRACKET_PAIR_RE = re.compile(r"[\(\[]\s*([^()\[\]]*?)\s*[\)\]]")
-
-
-def _voxcpm_speakable_bracket_groups(text: str) -> str:
-    """Demote bracketed groups to spoken punctuation for the VoxCPM route.
+def _voxcpm_speakable_paren_groups(text: str) -> str:
+    """Demote parenthesized groups to spoken punctuation for the VoxCPM route.
 
     VoxCPM2's LM was pretrained on spoken-style text: an open ``(`` in the
     token stream reliably truncates generation (premature EOS, mid-word —
     e.g. "Simple requests (short prompt...) work correctly." produced only
-    "Simple request"). Parentheses/square brackets never reach the model;
-    each balanced group becomes ``text, group, text`` (commas render
-    correctly and fully), empty groups vanish, and leftover unbalanced
-    brackets are dropped while keeping their content. Mixed or unmatched
-    closers close the innermost open bracket (the same lenient pairs the
-    previous iterative-regex version consumed); extra closers are dropped.
+    "Simple request"). Parentheses never reach the model; each balanced
+    group becomes ``text, group, text`` (commas render correctly and
+    fully), empty groups vanish, and leftover unbalanced parens are dropped
+    while keeping their content; extra closers are dropped. Square brackets
+    pass through untouched (non-speech tags such as ``[laughter]``).
     espeak/Sparrow reads these glyphs natively, so this is applied only on
     the VoxCPM path.
 
-    Single left-to-right pass with a bracket stack: O(n) in text length,
+    Single left-to-right pass with a paren stack: O(n) in text length,
     independent of nesting depth.
     """
 
     out: list[str] = []
-    stack: list[int] = []  # `out` indices where each open bracket's content starts
+    stack: list[int] = []  # `out` indices where each open paren's content starts
     for char in text:
-        if char in "([":
+        if char == "(":
             stack.append(len(out))
             continue
-        if char in ")]":
+        if char == ")":
             if not stack:
                 continue
             content_start = stack.pop()
@@ -4036,7 +4032,7 @@ def _prepare_voxcpm_input(
     # VoxCPM reads digits, dates and symbols itself. No spoken-text
     # normalization: it verbalized every number as a cardinal, so years came
     # out as "one thousand, nine hundred and forty-nine" and zh "二千零二十四年".
-    text = _voxcpm_speakable_bracket_groups(text)
+    text = _voxcpm_speakable_paren_groups(text)
     if language is not None:
         return text, language
 
