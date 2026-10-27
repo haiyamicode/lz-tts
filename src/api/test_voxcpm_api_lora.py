@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi import HTTPException
 
@@ -414,6 +416,47 @@ def test_sparrow_root_voice_adapter_must_match_its_base_model() -> None:
                     adapter="goran",
                 )
             },
+        )
+
+
+def test_sparrow_routes_ignore_a_seed(monkeypatch) -> None:
+    item = BatchSynthesizeInputItem(
+        text="Ovo je test.",
+        model="sparrow",
+        language="bs-BA",
+        language_override=True,
+        seed=7,
+    )
+
+    assert _validate_batch_item(item, 0) == "Ovo je test."
+    (plan,) = _plan_synthesis_batches([item, item.model_copy(update={"seed": 8})])
+    assert plan.pipeline == "sparrow_forced_language"
+    assert len(plan.records) == 2
+
+    root = RootVoiceConfig(voice_id="root", model="sparrow-root", speaker="bs-BA")
+    monkeypatch.setattr(
+        server,
+        "_configured_root_voice_for_voice_id",
+        lambda voice_id: root if voice_id == "root" else None,
+    )
+    monkeypatch.setattr(server, "_engine_enabled", lambda engine: True)
+
+    class EngineReached(Exception):
+        pass
+
+    async def reach_engine(engine: str) -> None:
+        raise EngineReached
+
+    monkeypatch.setattr(server, "_await_engine_ready", reach_engine)
+    with pytest.raises(EngineReached):
+        asyncio.run(
+            server.synthesize_configured_voice_batch(
+                server._SharedBatchSynthesizeRequest(
+                    texts=["Ovo je test."],
+                    seeds=[7],
+                    voice_id="root",
+                )
+            )
         )
 
 

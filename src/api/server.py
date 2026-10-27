@@ -547,7 +547,11 @@ class SynthesizeRequest(BaseModel):
         description="Whether language was explicitly selected rather than detected",
     )
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
-    seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
+    seed: Optional[int] = Field(
+        None,
+        ge=0,
+        description="Optional VoxCPM sampling seed; the other backends ignore it",
+    )
     voxcpm_loras: list[str] = Field(
         default_factory=list,
         description="Configured VoxCPM LoRA names to apply",
@@ -620,7 +624,11 @@ class BatchSynthesizeInputItem(BaseModel):
         description="Whether language was explicitly selected rather than detected",
     )
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
-    seed: Optional[int] = Field(None, ge=0, description="Optional VoxCPM sampling seed")
+    seed: Optional[int] = Field(
+        None,
+        ge=0,
+        description="Optional VoxCPM sampling seed; the other backends ignore it",
+    )
     voxcpm_loras: list[str] = Field(
         default_factory=list,
         description="Configured VoxCPM LoRA names to apply",
@@ -2026,8 +2034,6 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
 
     if not _engine_enabled("pipertts"):
         raise HTTPException(status_code=503, detail="PiperTTS backend is disabled")
-    if any(seed is not None for seed in request.seeds or []):
-        raise HTTPException(status_code=400, detail="'seed' is only supported by VoxCPM")
 
     texts = [text.strip() for text in request.texts]
     if any(not text for text in texts):
@@ -4587,8 +4593,6 @@ def _validate_batch_item(item: BatchSynthesizeInputItem, item_idx: int) -> str:
         model=resolved_model,
         reference_language=item.reference_language,
     )
-    if item.seed is not None and not routes_to_voxcpm:
-        raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'seed' requires model='voxcpm'")
     if item.voxcpm_loras and not routes_to_voxcpm:
         raise HTTPException(status_code=400, detail=f"items[{item_idx}]: 'voxcpm_loras' requires model='voxcpm'")
     if item.voxcpm_loras:
@@ -5252,8 +5256,6 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
         request.reference_language,
         len(request.text or ""),
     )
-    if request.seed is not None and not routes_to_voxcpm:
-        raise HTTPException(status_code=400, detail="'seed' requires model='voxcpm'")
     if request.voxcpm_loras and not routes_to_voxcpm:
         raise HTTPException(status_code=400, detail="'voxcpm_loras' requires model='voxcpm'")
     if request.voxcpm_loras:
