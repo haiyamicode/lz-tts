@@ -345,6 +345,10 @@ class VoxCPMConfig(BaseModel):
     temperature: float = Field(default=1.0, ge=0)
     cfg_value: float = Field(default=2.0, ge=0)
     reference_cache_size: int = Field(default=128, ge=1)
+    # Downloaded reference_url audio, kept on disk across restarts (LRU by mtime,
+    # shared by every worker process in this checkout).
+    reference_disk_cache_path: str = "cache/voxcpm-references"
+    reference_disk_cache_files: int = Field(default=500, ge=1)
     max_reference_seconds: float = Field(default=25.0, gt=0)
     supported_languages: list[str] = Field(default_factory=lambda: [
         "ar", "da", "de", "el", "en", "es", "fi", "fil", "fr", "he", "hi",
@@ -886,9 +890,7 @@ _starling_info: dict[str, Any] = {}
 _seed_vc_worker: EngineClient | None = None
 _seed_vc_info: dict[str, Any] = {}
 _voxcpm_runtime: VoxCPMRuntime | None = None
-_voxcpm_reference_download_cache: OrderedDict[str, tuple[bytes, str]] = OrderedDict()
 _voxcpm_reference_download_tasks: dict[str, asyncio.Task[tuple[bytes, str]]] = {}
-_voxcpm_reference_download_lock = asyncio.Lock()
 _startup_loader_task: asyncio.Task | None = None
 
 
@@ -4122,43 +4124,80 @@ async def _fetch_voxcpm_reference(reference_url: str) -> tuple[bytes, str]:
     audio = response.content
     if not audio:
         raise HTTPException(status_code=400, detail="reference_url returned an empty response")
-    suffix = Path(parsed.path).suffix.lower().lstrip(".")
-    return audio, suffix or "wav"
+    return audio, _voxcpm_reference_format(reference_url)
+
+
+def _voxcpm_reference_format(reference_url: str) -> str:
+    return Path(urlsplit(reference_url).path).suffix.lower().lstrip(".") or "wav"
+
+
+def _voxcpm_reference_cache_file(cache_dir: Path, reference_url: str) -> Path:
+    digest = hashlib.sha256(reference_url.encode("utf-8")).hexdigest()
+    return cache_dir / f"{digest}.{_voxcpm_reference_format(reference_url)}"
+
+
+def _read_cached_voxcpm_reference(path: Path) -> bytes | None:
+    try:
+        audio = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    # mtime is the LRU clock.
+    with contextlib.suppress(FileNotFoundError):
+        os.utime(path)
+    return audio or None
+
+
+def _store_cached_voxcpm_reference(path: Path, audio: bytes, max_files: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Other worker processes read this directory: publish whole files only.
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp_path.write_bytes(audio)
+    os.replace(temp_path, path)
+
+    entries: list[tuple[float, Path]] = []
+    for entry in path.parent.iterdir():
+        if entry.name.startswith("."):
+            continue
+        with contextlib.suppress(FileNotFoundError):
+            entries.append((entry.stat().st_mtime, entry))
+    entries.sort()
+    for _, entry in entries[: max(0, len(entries) - max_files)]:
+        entry.unlink(missing_ok=True)
+
+
+async def _load_voxcpm_reference(reference_url: str) -> tuple[bytes, str]:
+    settings = _server_config.voxcpm
+    cache_file = _voxcpm_reference_cache_file(
+        _resolve_project_path(settings.reference_disk_cache_path),
+        reference_url,
+    )
+    audio = await asyncio.to_thread(_read_cached_voxcpm_reference, cache_file)
+    if audio is not None:
+        return audio, _voxcpm_reference_format(reference_url)
+
+    audio, audio_format = await _fetch_voxcpm_reference(reference_url)
+    try:
+        await asyncio.to_thread(
+            _store_cached_voxcpm_reference,
+            cache_file,
+            audio,
+            settings.reference_disk_cache_files,
+        )
+    except OSError as exc:
+        _LOGGER.warning("Could not cache VoxCPM reference url=%s: %s", reference_url, exc)
+    return audio, audio_format
 
 
 async def _download_voxcpm_reference(
     reference_url: str,
 ) -> tuple[bytes, str]:
-    cache_key = reference_url
-    async with _voxcpm_reference_download_lock:
-        cached = _voxcpm_reference_download_cache.get(cache_key)
-        if cached is not None:
-            _voxcpm_reference_download_cache.move_to_end(cache_key)
-            return cached
-        task = _voxcpm_reference_download_tasks.get(cache_key)
-        if task is None:
-            task = asyncio.create_task(_fetch_voxcpm_reference(reference_url))
-            _voxcpm_reference_download_tasks[cache_key] = task
-
-    try:
-        loaded = await asyncio.shield(task)
-    except BaseException:
-        async with _voxcpm_reference_download_lock:
-            if _voxcpm_reference_download_tasks.get(cache_key) is task and task.done():
-                _voxcpm_reference_download_tasks.pop(cache_key, None)
-        raise
-
-    async with _voxcpm_reference_download_lock:
-        _voxcpm_reference_download_tasks.pop(cache_key, None)
-        cached = _voxcpm_reference_download_cache.get(cache_key)
-        if cached is not None:
-            _voxcpm_reference_download_cache.move_to_end(cache_key)
-            return cached
-        _voxcpm_reference_download_cache[cache_key] = loaded
-        cache_size = int(_server_config.voxcpm.reference_cache_size)
-        while len(_voxcpm_reference_download_cache) > cache_size:
-            _voxcpm_reference_download_cache.popitem(last=False)
-    return loaded
+    # Concurrent requests for one URL share a single disk read or fetch.
+    task = _voxcpm_reference_download_tasks.get(reference_url)
+    if task is None:
+        task = asyncio.create_task(_load_voxcpm_reference(reference_url))
+        _voxcpm_reference_download_tasks[reference_url] = task
+        task.add_done_callback(lambda _: _voxcpm_reference_download_tasks.pop(reference_url, None))
+    return await asyncio.shield(task)
 
 
 async def synthesize_voxcpm_batch(

@@ -498,3 +498,30 @@ def test_voxcpm_input_keeps_numbers_for_the_model():
     ):
         assert _prepare_voxcpm_input(text, language) == (text, language)
     assert _prepare_voxcpm_input("He was born in 1949.", None, "en-US")[0] == "He was born in 1949."
+
+
+def test_voxcpm_reference_disk_cache_evicts_least_recently_used(tmp_path):
+    import os
+
+    from src.api.server import (
+        _read_cached_voxcpm_reference,
+        _store_cached_voxcpm_reference,
+        _voxcpm_reference_cache_file,
+    )
+
+    old, used, new = (
+        _voxcpm_reference_cache_file(tmp_path, f"https://cdn.example.com/voices/{name}.mp3")
+        for name in ("old", "used", "new")
+    )
+    assert used.suffix == ".mp3" and old.name != used.name
+    _store_cached_voxcpm_reference(used, b"used", max_files=2)
+    _store_cached_voxcpm_reference(old, b"old", max_files=2)
+    os.utime(used, (1, 1))
+    os.utime(old, (2, 2))
+
+    # A hit refreshes the entry, so the unread one is evicted instead.
+    assert _read_cached_voxcpm_reference(used) == b"used"
+    _store_cached_voxcpm_reference(new, b"new", max_files=2)
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted([used.name, new.name])
+    assert _read_cached_voxcpm_reference(old) is None
