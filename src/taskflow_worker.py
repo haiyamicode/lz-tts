@@ -113,6 +113,9 @@ class TaskflowWorker:
     worker_token: str
     worker_id: str
     concurrency: int = 8
+    # Batch cap for negative-priority (background) work, so a long low-priority
+    # batch never keeps a normal job waiting behind it.
+    low_priority_batch_size: int = 3
     persistent: bool = False
     session_id: str | None = None
     session_token: str | None = None
@@ -250,20 +253,28 @@ class TaskflowWorker:
         *,
         max_tasks: int | None = None,
         wait_ms: int = 1000,
+        min_priority: int | None = None,
+        priority_bands: list[dict[str, int]] | None = None,
     ) -> list[dict[str, Any]]:
         if not self.session_token:
             raise ProtocolError("Worker has not joined Taskflow")
+        body: dict[str, Any] = {
+            "maxTasks": max_tasks or self.concurrency,
+            "waitMs": wait_ms,
+            "taskTypes": list(TASK_TYPES),
+        }
+        # A Taskflow server older than these pull filters ignores them.
+        if min_priority is not None:
+            body["minPriority"] = min_priority
+        if priority_bands:
+            body["priorityBands"] = priority_bands
         try:
             response = await self._request(
                 "POST",
                 f"/workers/{self.worker_id}/pull",
                 token=self.session_token,
                 headers=self._session_headers(),
-                json={
-                    "maxTasks": max_tasks or self.concurrency,
-                    "waitMs": wait_ms,
-                    "taskTypes": list(TASK_TYPES),
-                },
+                json=body,
             )
         except ProtocolError as error:
             # A server restart can leave the previous long-poll marker alive briefly in Redis.
@@ -836,8 +847,14 @@ async def _process_lease(
 
 
 async def _pull_task_batch(taskflow: TaskflowWorker) -> list[dict[str, Any]]:
-    leases = await taskflow.pull()
-    if not leases or len(leases) >= taskflow.concurrency:
+    # Taskflow's highest-priority ready task picks the band for the whole pull.
+    # Negative priority (background work) only runs when nothing >= 0 is ready,
+    # in a small batch that never waits to fill, so the next normal job waits
+    # at most one short batch; a >= 0 batch never carries background work.
+    leases = await taskflow.pull(
+        priority_bands=[{"below": 0, "maxTasks": taskflow.low_priority_batch_size}]
+    )
+    if not leases or len(leases) >= taskflow.concurrency or leases[0].get("priority", 0) < 0:
         return leases
 
     # Keep isolated request latency low. Once a burst is visible, give its
@@ -851,6 +868,7 @@ async def _pull_task_batch(taskflow: TaskflowWorker) -> list[dict[str, Any]]:
         more = await taskflow.pull(
             max_tasks=taskflow.concurrency - len(leases),
             wait_ms=max(1, min(100, round(remaining_seconds * 1000))),
+            min_priority=0,
         )
         if more:
             leases.extend(more)
@@ -1010,6 +1028,7 @@ async def run_worker() -> None:
         worker_token=worker_token,
         worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lz-tts-{socket.gethostname()}"),
         concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "8"))),
+        low_priority_batch_size=max(1, int(os.environ.get("TASKFLOW_LOW_PRIORITY_BATCH_SIZE", "3"))),
         persistent=_env_bool("TASKFLOW_WORKER_PERSISTENT", False),
     )
     inference = LzTtsInferenceSession()
