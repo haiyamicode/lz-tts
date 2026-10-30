@@ -103,6 +103,11 @@ LANGUAGE_ANCHORS = {
         "A native Delhi speaker with a standard Hindi accent",
         "आज सुबह मेरे बड़े भाई ने घर के पास वाले बाज़ार से ताज़ी सब्ज़ियाँ और मीठे फल ख़रीदे।",
     ),
+    # Urdu script, read raw (VoxCPM guesses unwritten vowels, so only words it reads right): ص/ش, aspirate تھ, چ, ع.
+    "ur": LanguageAnchor(
+        "A native Karachi speaker with a standard Urdu accent",
+        "آج صبح بارش کے بعد موسم بہت اچھا تھا، اس لیے ہم دوستوں کے ساتھ چائے پینے باہر چلے گئے۔",
+    ),
     # unstressed o (akanye), г (g, not ɣ), ч, palatalized consonants.
     "ru": LanguageAnchor(
         "A native Moscow speaker with a standard Russian accent",

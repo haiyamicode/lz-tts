@@ -354,7 +354,7 @@ class VoxCPMConfig(BaseModel):
     supported_languages: list[str] = Field(default_factory=lambda: [
         "ar", "da", "de", "el", "en", "es", "fi", "fil", "fr", "he", "hi",
         "id", "it", "ja", "km", "ko", "lo", "ms", "my", "nb", "nl", "pl",
-        "pt", "ru", "sv", "sw", "th", "tr", "vi", "wuu", "yue", "zh",
+        "pt", "ru", "sv", "sw", "th", "tr", "ur", "vi", "wuu", "yue", "zh",
     ])
     default_locales: list[str] = Field(default_factory=list)
     locale_loras: dict[str, str] = Field(default_factory=dict)
