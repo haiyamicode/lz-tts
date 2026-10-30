@@ -4233,6 +4233,15 @@ async def _download_voxcpm_reference(
     return await asyncio.shield(task)
 
 
+async def _download_voxcpm_anchor(anchor_url: str) -> tuple[bytes, str] | None:
+    # An anchor only holds the accent: if it can't be loaded, clone without it.
+    try:
+        return await _download_voxcpm_reference(anchor_url)
+    except Exception as exc:
+        _LOGGER.warning("VoxCPM anchor unavailable, cloning without it url=%s: %s", anchor_url, exc)
+        return None
+
+
 async def synthesize_voxcpm_batch(
     request: _SharedBatchSynthesizeRequest,
     *,
@@ -4263,8 +4272,9 @@ async def synthesize_voxcpm_batch(
     chunk_reference_audios = expand_chunks(reference_audios, chunk_counts)
     chunk_reference_formats = expand_chunks(reference_formats, chunk_counts)
     if request.anchor_url is not None and request.anchor_text is not None:
-        anchor_audio, anchor_format = await _download_voxcpm_reference(request.anchor_url)
-        anchors = [(anchor_audio, anchor_format, request.anchor_text)] * len(texts)
+        loaded_anchor = await _download_voxcpm_anchor(request.anchor_url)
+        if loaded_anchor is not None:
+            anchors = [(*loaded_anchor, request.anchor_text)] * len(texts)
     chunk_anchors = expand_chunks(anchors, chunk_counts)
     if len(chunk_texts) > len(texts):
         _log_synthesize_batch_stage(
@@ -4366,16 +4376,14 @@ async def _synthesize_voxcpm_items(
     records: list[tuple[int, BatchSynthesizeInputItem, str]],
 ) -> BatchSynthesizeResponse:
     reference_keys = [item.reference_url for _, item, _ in records]
-    anchor_keys = [item.anchor_url for _, item, _ in records]
-    unique_keys = list(dict.fromkeys(key for key in reference_keys + anchor_keys if key is not None))
-    loaded_references = await asyncio.gather(
-        *(
-            _download_voxcpm_reference(reference_url)
-            for reference_url in unique_keys
-            if reference_url is not None
-        )
+    unique_keys = list(dict.fromkeys(key for key in reference_keys if key is not None))
+    anchor_keys = list(dict.fromkeys(item.anchor_url for _, item, _ in records if item.anchor_url is not None))
+    loaded_references, loaded_anchors = await asyncio.gather(
+        asyncio.gather(*(_download_voxcpm_reference(reference_url) for reference_url in unique_keys)),
+        asyncio.gather(*(_download_voxcpm_anchor(anchor_url) for anchor_url in anchor_keys)),
     )
     loaded_by_key = dict(zip(unique_keys, loaded_references))
+    anchors_by_key = dict(zip(anchor_keys, loaded_anchors))
     reference_audios = [
         loaded_by_key[key][0] if key is not None else None
         for key in reference_keys
@@ -4385,8 +4393,8 @@ async def _synthesize_voxcpm_items(
         for key in reference_keys
     ]
     anchors = [
-        (*loaded_by_key[item.anchor_url], item.anchor_text)
-        if item.anchor_url is not None and item.anchor_text is not None
+        (*loaded_anchor, item.anchor_text)
+        if item.anchor_text is not None and (loaded_anchor := anchors_by_key.get(item.anchor_url)) is not None
         else None
         for _, item, _ in records
     ]
@@ -5685,8 +5693,8 @@ class LzTtsInferenceSession:
         language = anchor_language(request.language)
         anchor = LANGUAGE_ANCHORS.get(language)
         if anchor is None:
-            # 400 fails the task without retries; the API then synthesizes without an anchor.
-            raise HTTPException(status_code=400, detail=f"No language anchor for {request.language!r}")
+            # No anchor for this language: report none, and the API clones without one.
+            return InferenceResult(kind="json", data={"anchorLanguage": language, "anchorText": None})
         if not _engine_enabled("voxcpm"):
             raise HTTPException(status_code=503, detail="VoxCPM backend is disabled")
         await _await_engine_ready("voxcpm")
