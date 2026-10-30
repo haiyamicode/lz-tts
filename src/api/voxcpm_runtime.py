@@ -357,6 +357,8 @@ class VoxCPMRuntime:
         max_generate_length: int,
         seed: int | None = None,
         ref_audio_latents: bytes | None = None,
+        anchor_latents: bytes | None = None,
+        anchor_text: str = "",
         lora_name: str | None = None,
         ipa_controls: list[dict[str, Any]] | None = None,
         min_generate_length: int = 0,
@@ -369,6 +371,10 @@ class VoxCPMRuntime:
             "temperature": float(self.settings["temperature"]),
             "cfg_value": float(self.settings["cfg_value"]),
             "ref_audio_latents": ref_audio_latents,
+            # The anchor is a prompt continuation: the model hears the anchor
+            # audio after its text and continues with ``text`` in that accent.
+            "prompt_latents": anchor_latents,
+            "prompt_text": f"{anchor_text.rstrip()} " if anchor_latents is not None else "",
             "lora_name": lora_name,
             "ipa_controls": ipa_controls,
             "min_generate_length": min_generate_length,
@@ -431,12 +437,17 @@ class VoxCPMRuntime:
         reference_formats: Sequence[str] | None = None,
         lora_names: Sequence[str | None] | None = None,
         voice_descriptions: Sequence[str | None] | None = None,
+        anchors: Sequence[tuple[bytes, str, str] | None] | None = None,
     ) -> list[np.ndarray]:
         """Submit every item concurrently so nano-vLLM can schedule a real batch.
 
         A voice description (VoxCPM2 voice design) is prefixed to its text as
         ``(description)``; the model reads it as an instruction, not speech, so
         the duration budget is predicted from the spoken text alone.
+
+        An anchor ``(audio, format, text)`` is a short take of the voice in the
+        target language; each item continues from it, so every chunk keeps the
+        anchor's accent.
         """
         if not texts:
             return []
@@ -471,6 +482,10 @@ class VoxCPMRuntime:
             voice_descriptions = [None] * len(texts)
         if len(voice_descriptions) != len(texts):
             raise ValueError("voice_descriptions length must match texts length")
+        if anchors is None:
+            anchors = [None] * len(texts)
+        if len(anchors) != len(texts):
+            raise ValueError("anchors length must match texts length")
 
         duration_started = time.perf_counter()
         generation_limits, _budgets = await self._predict_generation_limits(
@@ -479,14 +494,22 @@ class VoxCPMRuntime:
         duration_wall_seconds = time.perf_counter() - duration_started
 
         unique_references: dict[tuple[str, str], tuple[bytes, str]] = {}
-        reference_keys: list[tuple[str, str] | None] = []
-        for audio, audio_format in zip(reference_audios, reference_formats):
+
+        def reference_key(audio: bytes | None, audio_format: str) -> tuple[str, str] | None:
             if audio is None:
-                reference_keys.append(None)
-                continue
+                return None
             key = (hashlib.sha256(audio).hexdigest(), audio_format)
             unique_references.setdefault(key, (audio, audio_format))
-            reference_keys.append(key)
+            return key
+
+        reference_keys = [
+            reference_key(audio, audio_format)
+            for audio, audio_format in zip(reference_audios, reference_formats)
+        ]
+        anchor_keys = [
+            reference_key(anchor[0], anchor[1]) if anchor else None
+            for anchor in anchors
+        ]
 
         reference_started = time.perf_counter()
         encoded_references = await asyncio.gather(
@@ -500,6 +523,10 @@ class VoxCPMRuntime:
             reference_latents_by_key[key] if key is not None else None
             for key in reference_keys
         ]
+        anchor_latents = [
+            reference_latents_by_key[key] if key is not None else None
+            for key in anchor_keys
+        ]
         reference_wall_seconds = time.perf_counter() - reference_started
 
         inference_started = time.perf_counter()
@@ -511,13 +538,17 @@ class VoxCPMRuntime:
                         max_generate_length=max_generate_length,
                         seed=seed,
                         ref_audio_latents=item_reference_latents,
+                        anchor_latents=item_anchor_latents,
+                        anchor_text=anchor[2] if anchor else "",
                         lora_name=lora_name,
                     )
-                    for text, max_generate_length, seed, item_reference_latents, lora_name, description in zip(
+                    for text, max_generate_length, seed, item_reference_latents, item_anchor_latents, anchor, lora_name, description in zip(
                         texts,
                         generation_limits,
                         seeds,
                         reference_latents,
+                        anchor_latents,
+                        anchors,
                         lora_names,
                         voice_descriptions,
                     )

@@ -69,6 +69,7 @@ from .text_chunking import (
 )
 from .language_id import LanguageDetectRequest, LanguageInputError, SpokenLanguageIdentifier
 from .nudity_detection import NudityDetectRequest, NudityDetector, NudityInputError
+from .voice_anchor import ANCHOR_SEED, LANGUAGE_ANCHORS, VoiceAnchorRequest, anchor_language
 from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
 from .voxcpm_runtime import VoxCPMRuntime
 from .worker_common import ChildWorkerDied, EngineClient, WorkerProcessClient
@@ -546,6 +547,12 @@ class SynthesizeRequest(BaseModel):
         False,
         description="Whether language was explicitly selected rather than detected",
     )
+    anchor_url: Optional[str] = Field(
+        None,
+        description="VoxCPM language anchor (a voice-anchor take); every chunk continues from it so the accent holds. "
+        "Other backends ignore it",
+    )
+    anchor_text: Optional[str] = Field(None, min_length=1, description="Text spoken in anchor_url")
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
     seed: Optional[int] = Field(
         None,
@@ -564,6 +571,12 @@ class SynthesizeRequest(BaseModel):
     volume: float = Field(1.0, ge=0.0, description="Output volume multiplier")
     pause_before: float = Field(0.0, ge=0.0, description="Seconds of silence added before the speech")
     pause_after: float = Field(0.0, ge=0.0, description="Seconds of silence added after the speech")
+
+    @model_validator(mode="after")
+    def validate_anchor(self) -> "SynthesizeRequest":
+        if (self.anchor_url is None) != (self.anchor_text is None):
+            raise ValueError("anchor_url and anchor_text go together")
+        return self
 
 
 # SynthesizeRequest fields applied to the finished audio (_apply_audio_adjustments),
@@ -623,6 +636,12 @@ class BatchSynthesizeInputItem(BaseModel):
         False,
         description="Whether language was explicitly selected rather than detected",
     )
+    anchor_url: Optional[str] = Field(
+        None,
+        description="VoxCPM language anchor (a voice-anchor take); every chunk continues from it so the accent holds. "
+        "Other backends ignore it",
+    )
+    anchor_text: Optional[str] = Field(None, min_length=1, description="Text spoken in anchor_url")
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
     seed: Optional[int] = Field(
         None,
@@ -636,6 +655,12 @@ class BatchSynthesizeInputItem(BaseModel):
     options: Optional[SparrowSynthesizeOptions] = Field(None, description="Sparrow/VITS-specific synthesis options")
     format: Literal["wav", "mp3"] = Field("wav", description="Output audio encoding")
     neural: bool = Field(True, description="Use neural heteronym disambiguation")
+
+    @model_validator(mode="after")
+    def validate_anchor(self) -> "BatchSynthesizeInputItem":
+        if (self.anchor_url is None) != (self.anchor_text is None):
+            raise ValueError("anchor_url and anchor_text go together")
+        return self
 
 
 class BatchSynthesizeRequest(BaseModel):
@@ -656,6 +681,8 @@ class _SharedBatchSynthesizeRequest:
     language: str | None = None
     language_override: bool = False
     languages: list[str | None] | None = None
+    anchor_url: str | None = None
+    anchor_text: str | None = None
     model: str | None = None
     voxcpm_loras: tuple[str, ...] = ()
     options: SparrowSynthesizeOptions | None = None
@@ -4213,6 +4240,7 @@ async def synthesize_voxcpm_batch(
     reference_format: str | None = None,
     reference_audios: list[bytes | None] | None = None,
     reference_formats: list[str] | None = None,
+    anchors: list[tuple[bytes, str, str] | None] | None = None,
 ) -> BatchSynthesizeResponse:
     """Synthesize one compatible request group with optimized nano-vLLM."""
     if not _engine_enabled("voxcpm"):
@@ -4234,6 +4262,10 @@ async def synthesize_voxcpm_batch(
     chunk_seeds = expand_chunks(request.seeds, chunk_counts)
     chunk_reference_audios = expand_chunks(reference_audios, chunk_counts)
     chunk_reference_formats = expand_chunks(reference_formats, chunk_counts)
+    if request.anchor_url is not None and request.anchor_text is not None:
+        anchor_audio, anchor_format = await _download_voxcpm_reference(request.anchor_url)
+        anchors = [(anchor_audio, anchor_format, request.anchor_text)] * len(texts)
+    chunk_anchors = expand_chunks(anchors, chunk_counts)
     if len(chunk_texts) > len(texts):
         _log_synthesize_batch_stage(
             "text_chunking",
@@ -4282,6 +4314,7 @@ async def synthesize_voxcpm_batch(
         reference_audios=chunk_reference_audios,
         reference_formats=chunk_reference_formats,
         lora_names=[lora_name] * len(prepared_texts),
+        anchors=chunk_anchors,
     )
     audios = concat_chunk_audios(chunk_audios, chunk_counts)
     generation_wall_seconds = time.perf_counter() - started
@@ -4333,7 +4366,8 @@ async def _synthesize_voxcpm_items(
     records: list[tuple[int, BatchSynthesizeInputItem, str]],
 ) -> BatchSynthesizeResponse:
     reference_keys = [item.reference_url for _, item, _ in records]
-    unique_keys = list(dict.fromkeys(key for key in reference_keys if key is not None))
+    anchor_keys = [item.anchor_url for _, item, _ in records]
+    unique_keys = list(dict.fromkeys(key for key in reference_keys + anchor_keys if key is not None))
     loaded_references = await asyncio.gather(
         *(
             _download_voxcpm_reference(reference_url)
@@ -4349,6 +4383,12 @@ async def _synthesize_voxcpm_items(
     reference_formats = [
         loaded_by_key[key][1] if key is not None else "wav"
         for key in reference_keys
+    ]
+    anchors = [
+        (*loaded_by_key[item.anchor_url], item.anchor_text)
+        if item.anchor_url is not None and item.anchor_text is not None
+        else None
+        for _, item, _ in records
     ]
     first = records[0][1]
     routing_languages = [
@@ -4375,6 +4415,7 @@ async def _synthesize_voxcpm_items(
         ),
         reference_audios=reference_audios,
         reference_formats=reference_formats,
+        anchors=anchors,
     )
 
 
@@ -4524,7 +4565,7 @@ def _batch_item_pipeline(item: BatchSynthesizeInputItem) -> str:
     return "sparrow"
 
 
-_BATCH_PER_ITEM_FIELDS = frozenset({"text", "ssml", "seed", "language_override"})
+_BATCH_PER_ITEM_FIELDS = frozenset({"text", "ssml", "seed", "language_override", "anchor_url", "anchor_text"})
 _BATCH_PIPELINE_PER_ITEM_FIELDS = {
     "voxcpm": frozenset({"reference_url", "reference_language", "language", "voice_id"}),
 }
@@ -5272,6 +5313,8 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
                 language=request.language,
                 language_override=request.language_override,
                 languages=[forced_language],
+                anchor_url=request.anchor_url,
+                anchor_text=request.anchor_text,
                 model=_server_config.voxcpm.model_id,
                 voxcpm_loras=tuple(request.voxcpm_loras),
                 options=request.options,
@@ -5594,6 +5637,8 @@ class LzTtsInferenceSession:
                 result = outcome
             elif operation == "voice-enhance":
                 result = await self._enhance(VoiceEnhanceRequest.model_validate(request_data))
+            elif operation == "voice-anchor":
+                result = await self._voice_anchor(VoiceAnchorRequest.model_validate(request_data))
             elif operation == "detect-nudity":
                 try:
                     result = await self._detect_nudity(request_data)
@@ -5635,6 +5680,43 @@ class LzTtsInferenceSession:
             time.perf_counter() - started,
         )
         return result
+
+    async def _voice_anchor(self, request: VoiceAnchorRequest) -> InferenceResult:
+        language = anchor_language(request.language)
+        anchor = LANGUAGE_ANCHORS.get(language)
+        if anchor is None:
+            # 400 fails the task without retries; the API then synthesizes without an anchor.
+            raise HTTPException(status_code=400, detail=f"No language anchor for {request.language!r}")
+        if not _engine_enabled("voxcpm"):
+            raise HTTPException(status_code=503, detail="VoxCPM backend is disabled")
+        await _await_engine_ready("voxcpm")
+        runtime = _get_voxcpm_runtime()
+        reference_audio, reference_format = await _download_voxcpm_reference(request.reference_url)
+        text, dp_language = _prepare_voxcpm_input(anchor.text, language)
+        # One short chunk: the reference gives the timbre, the instruction the accent.
+        [audio] = await runtime.synthesize_batch(
+            [text],
+            languages=[dp_language],
+            seeds=[ANCHOR_SEED],
+            reference_audio=reference_audio,
+            reference_format=reference_format,
+            voice_descriptions=[anchor.instruction],
+        )
+        return InferenceResult(
+            kind="audio",
+            content_type="audio/mpeg" if request.format == "mp3" else "audio/wav",
+            audio=(
+                _audio_to_mp3_bytes(audio, runtime.sample_rate)
+                if request.format == "mp3"
+                else _audio_to_wav_bytes(audio, runtime.sample_rate)
+            ),
+            data={
+                "anchorText": anchor.text,
+                "anchorLanguage": language,
+                "instruction": anchor.instruction,
+                "seed": ANCHOR_SEED,
+            },
+        )
 
     async def _enhance(self, request: VoiceEnhanceRequest) -> InferenceResult:
         async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -5691,7 +5773,7 @@ class SyncTaskInput(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    operation: Literal["synthesize", "voice-design", "voice-enhance", "detect-nudity", "detect-language"]
+    operation: Literal["synthesize", "voice-design", "voice-enhance", "voice-anchor", "detect-nudity", "detect-language"]
     request: dict[str, Any]
 
 
