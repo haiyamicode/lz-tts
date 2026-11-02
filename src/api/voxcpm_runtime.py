@@ -357,8 +357,8 @@ class VoxCPMRuntime:
         max_generate_length: int,
         seed: int | None = None,
         ref_audio_latents: bytes | None = None,
-        anchor_latents: bytes | None = None,
-        anchor_text: str = "",
+        continuation_latents: bytes | None = None,
+        continuation_text: str = "",
         lora_name: str | None = None,
         ipa_controls: list[dict[str, Any]] | None = None,
         min_generate_length: int = 0,
@@ -371,10 +371,10 @@ class VoxCPMRuntime:
             "temperature": float(self.settings["temperature"]),
             "cfg_value": float(self.settings["cfg_value"]),
             "ref_audio_latents": ref_audio_latents,
-            # The anchor is a prompt continuation: the model hears the anchor
-            # audio after its text and continues with ``text`` in that accent.
-            "prompt_latents": anchor_latents,
-            "prompt_text": f"{anchor_text.rstrip()} " if anchor_latents is not None else "",
+            # Prompt continuation: the model hears the continuation audio after
+            # its text and continues with ``text`` in that voice and delivery.
+            "prompt_latents": continuation_latents,
+            "prompt_text": f"{continuation_text.rstrip()} " if continuation_latents is not None else "",
             "lora_name": lora_name,
             "ipa_controls": ipa_controls,
             "min_generate_length": min_generate_length,
@@ -437,7 +437,7 @@ class VoxCPMRuntime:
         reference_formats: Sequence[str] | None = None,
         lora_names: Sequence[str | None] | None = None,
         voice_descriptions: Sequence[str | None] | None = None,
-        anchors: Sequence[tuple[bytes, str, str] | None] | None = None,
+        continuations: Sequence[tuple[bytes, str, str] | None] | None = None,
     ) -> list[np.ndarray]:
         """Submit every item concurrently so nano-vLLM can schedule a real batch.
 
@@ -445,9 +445,9 @@ class VoxCPMRuntime:
         ``(description)``; the model reads it as an instruction, not speech, so
         the duration budget is predicted from the spoken text alone.
 
-        An anchor ``(audio, format, text)`` is a short take of the voice in the
-        target language; each item continues from it, so every chunk keeps the
-        anchor's accent.
+        A continuation ``(audio, format, text)`` is a take the item continues
+        from (prompt continuation): a language anchor holds the accent this way,
+        a caller's take carries over its delivery (VoxCPM2 ultimate cloning).
         """
         if not texts:
             return []
@@ -482,10 +482,10 @@ class VoxCPMRuntime:
             voice_descriptions = [None] * len(texts)
         if len(voice_descriptions) != len(texts):
             raise ValueError("voice_descriptions length must match texts length")
-        if anchors is None:
-            anchors = [None] * len(texts)
-        if len(anchors) != len(texts):
-            raise ValueError("anchors length must match texts length")
+        if continuations is None:
+            continuations = [None] * len(texts)
+        if len(continuations) != len(texts):
+            raise ValueError("continuations length must match texts length")
 
         duration_started = time.perf_counter()
         generation_limits, _budgets = await self._predict_generation_limits(
@@ -506,9 +506,9 @@ class VoxCPMRuntime:
             reference_key(audio, audio_format)
             for audio, audio_format in zip(reference_audios, reference_formats)
         ]
-        anchor_keys = [
-            reference_key(anchor[0], anchor[1]) if anchor else None
-            for anchor in anchors
+        continuation_keys = [
+            reference_key(continuation[0], continuation[1]) if continuation else None
+            for continuation in continuations
         ]
 
         reference_started = time.perf_counter()
@@ -523,9 +523,9 @@ class VoxCPMRuntime:
             reference_latents_by_key[key] if key is not None else None
             for key in reference_keys
         ]
-        anchor_latents = [
+        continuation_latents = [
             reference_latents_by_key[key] if key is not None else None
-            for key in anchor_keys
+            for key in continuation_keys
         ]
         reference_wall_seconds = time.perf_counter() - reference_started
 
@@ -538,17 +538,17 @@ class VoxCPMRuntime:
                         max_generate_length=max_generate_length,
                         seed=seed,
                         ref_audio_latents=item_reference_latents,
-                        anchor_latents=item_anchor_latents,
-                        anchor_text=anchor[2] if anchor else "",
+                        continuation_latents=item_continuation_latents,
+                        continuation_text=continuation[2] if continuation else "",
                         lora_name=lora_name,
                     )
-                    for text, max_generate_length, seed, item_reference_latents, item_anchor_latents, anchor, lora_name, description in zip(
+                    for text, max_generate_length, seed, item_reference_latents, item_continuation_latents, continuation, lora_name, description in zip(
                         texts,
                         generation_limits,
                         seeds,
                         reference_latents,
-                        anchor_latents,
-                        anchors,
+                        continuation_latents,
+                        continuations,
                         lora_names,
                         voice_descriptions,
                     )

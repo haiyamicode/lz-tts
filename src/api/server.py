@@ -529,6 +529,30 @@ class SparrowSynthesizeOptions(BaseModel):
     )
 
 
+_VOXCPM_INSTRUCTION_BRACKETS_RE = re.compile(r"[()\[\]]")
+
+
+def _voxcpm_instruction(text: str) -> str:
+    """Make a voice description or acting instruction safe to wrap in VoxCPM2's
+    ``(instruction)`` prefix: a bracket inside it would end the instruction early
+    and leak the rest into the spoken text. Empty when no words are left.
+    """
+    return " ".join(_VOXCPM_INSTRUCTION_BRACKETS_RE.sub(" ", text).split())
+
+
+def _validate_voxcpm_prompts(request: "SynthesizeRequest | BatchSynthesizeInputItem") -> None:
+    if (request.anchor_url is None) != (request.anchor_text is None):
+        raise ValueError("anchor_url and anchor_text go together")
+    if (request.continuation_url is None) != (request.continuation_text is None):
+        raise ValueError("continuation_url and continuation_text go together")
+    if request.continuation and request.continuation_url is None:
+        raise ValueError("continuation needs continuation_url and continuation_text")
+    if request.instruction is not None:
+        request.instruction = _voxcpm_instruction(request.instruction)
+        if not request.instruction:
+            raise ValueError("instruction must contain words")
+
+
 class SynthesizeRequest(BaseModel):
     """Request body for text synthesis."""
 
@@ -559,6 +583,21 @@ class SynthesizeRequest(BaseModel):
         "Other backends ignore it",
     )
     anchor_text: Optional[str] = Field(None, min_length=1, description="Text spoken in anchor_url")
+    instruction: Optional[str] = Field(
+        None,
+        description="VoxCPM acting instruction, e.g. 'whispering, nervous' (VoxCPM2 '(instruction)text'); "
+        "applies to every chunk and is never spoken. Other backends ignore it",
+    )
+    continuation: bool = Field(
+        False,
+        description="VoxCPM ultimate cloning: every chunk continues from continuation_url (prompt continuation), "
+        "so its voice and delivery carry over; replaces the anchor. Other backends ignore it",
+    )
+    continuation_url: Optional[str] = Field(
+        None,
+        description="Audio to continue from when continuation is on; only its first max_reference_seconds are used",
+    )
+    continuation_text: Optional[str] = Field(None, min_length=1, description="Text spoken in continuation_url")
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
     seed: Optional[int] = Field(
         None,
@@ -583,9 +622,8 @@ class SynthesizeRequest(BaseModel):
     )
 
     @model_validator(mode="after")
-    def validate_anchor(self) -> "SynthesizeRequest":
-        if (self.anchor_url is None) != (self.anchor_text is None):
-            raise ValueError("anchor_url and anchor_text go together")
+    def validate_voxcpm_prompts(self) -> "SynthesizeRequest":
+        _validate_voxcpm_prompts(self)
         return self
 
 
@@ -652,6 +690,21 @@ class BatchSynthesizeInputItem(BaseModel):
         "Other backends ignore it",
     )
     anchor_text: Optional[str] = Field(None, min_length=1, description="Text spoken in anchor_url")
+    instruction: Optional[str] = Field(
+        None,
+        description="VoxCPM acting instruction, e.g. 'whispering, nervous' (VoxCPM2 '(instruction)text'); "
+        "applies to every chunk and is never spoken. Other backends ignore it",
+    )
+    continuation: bool = Field(
+        False,
+        description="VoxCPM ultimate cloning: every chunk continues from continuation_url (prompt continuation), "
+        "so its voice and delivery carry over; replaces the anchor. Other backends ignore it",
+    )
+    continuation_url: Optional[str] = Field(
+        None,
+        description="Audio to continue from when continuation is on; only its first max_reference_seconds are used",
+    )
+    continuation_text: Optional[str] = Field(None, min_length=1, description="Text spoken in continuation_url")
     model: Optional[str] = Field(None, description="Public model family, e.g. sparrow or voxcpm")
     seed: Optional[int] = Field(
         None,
@@ -667,9 +720,8 @@ class BatchSynthesizeInputItem(BaseModel):
     neural: bool = Field(True, description="Use neural heteronym disambiguation")
 
     @model_validator(mode="after")
-    def validate_anchor(self) -> "BatchSynthesizeInputItem":
-        if (self.anchor_url is None) != (self.anchor_text is None):
-            raise ValueError("anchor_url and anchor_text go together")
+    def validate_voxcpm_prompts(self) -> "BatchSynthesizeInputItem":
+        _validate_voxcpm_prompts(self)
         return self
 
 
@@ -693,6 +745,10 @@ class _SharedBatchSynthesizeRequest:
     languages: list[str | None] | None = None
     anchor_url: str | None = None
     anchor_text: str | None = None
+    instruction: str | None = None
+    continuation: bool = False
+    continuation_url: str | None = None
+    continuation_text: str | None = None
     model: str | None = None
     voxcpm_loras: tuple[str, ...] = ()
     options: SparrowSynthesizeOptions | None = None
@@ -4257,7 +4313,8 @@ async def synthesize_voxcpm_batch(
     reference_format: str | None = None,
     reference_audios: list[bytes | None] | None = None,
     reference_formats: list[str] | None = None,
-    anchors: list[tuple[bytes, str, str] | None] | None = None,
+    continuations: list[tuple[bytes, str, str] | None] | None = None,
+    instructions: list[str | None] | None = None,
 ) -> BatchSynthesizeResponse:
     """Synthesize one compatible request group with optimized nano-vLLM."""
     if not _engine_enabled("voxcpm"):
@@ -4279,11 +4336,17 @@ async def synthesize_voxcpm_batch(
     chunk_seeds = expand_chunks(request.seeds, chunk_counts)
     chunk_reference_audios = expand_chunks(reference_audios, chunk_counts)
     chunk_reference_formats = expand_chunks(reference_formats, chunk_counts)
-    if request.anchor_url is not None and request.anchor_text is not None:
+    if request.continuation:
+        continuation_audio = await _download_voxcpm_reference(request.continuation_url)
+        continuations = [(*continuation_audio, request.continuation_text)] * len(texts)
+    elif request.anchor_url is not None and request.anchor_text is not None:
         loaded_anchor = await _download_voxcpm_anchor(request.anchor_url)
         if loaded_anchor is not None:
-            anchors = [(*loaded_anchor, request.anchor_text)] * len(texts)
-    chunk_anchors = expand_chunks(anchors, chunk_counts)
+            continuations = [(*loaded_anchor, request.anchor_text)] * len(texts)
+    if request.instruction is not None:
+        instructions = [request.instruction] * len(texts)
+    chunk_continuations = expand_chunks(continuations, chunk_counts)
+    chunk_instructions = expand_chunks(instructions, chunk_counts)
     if len(chunk_texts) > len(texts):
         _log_synthesize_batch_stage(
             "text_chunking",
@@ -4332,7 +4395,8 @@ async def synthesize_voxcpm_batch(
         reference_audios=chunk_reference_audios,
         reference_formats=chunk_reference_formats,
         lora_names=[lora_name] * len(prepared_texts),
-        anchors=chunk_anchors,
+        voice_descriptions=chunk_instructions,
+        continuations=chunk_continuations,
     )
     audios = concat_chunk_audios(chunk_audios, chunk_counts)
     generation_wall_seconds = time.perf_counter() - started
@@ -4385,12 +4449,17 @@ async def _synthesize_voxcpm_items(
 ) -> BatchSynthesizeResponse:
     reference_keys = [item.reference_url for _, item, _ in records]
     unique_keys = list(dict.fromkeys(key for key in reference_keys if key is not None))
-    anchor_keys = list(dict.fromkeys(item.anchor_url for _, item, _ in records if item.anchor_url is not None))
-    loaded_references, loaded_anchors = await asyncio.gather(
+    continuation_keys = list(dict.fromkeys(item.continuation_url for _, item, _ in records if item.continuation))
+    anchor_keys = list(dict.fromkeys(
+        item.anchor_url for _, item, _ in records if item.anchor_url is not None and not item.continuation
+    ))
+    loaded_references, loaded_continuations, loaded_anchors = await asyncio.gather(
         asyncio.gather(*(_download_voxcpm_reference(reference_url) for reference_url in unique_keys)),
+        asyncio.gather(*(_download_voxcpm_reference(url) for url in continuation_keys)),
         asyncio.gather(*(_download_voxcpm_anchor(anchor_url) for anchor_url in anchor_keys)),
     )
     loaded_by_key = dict(zip(unique_keys, loaded_references))
+    continuations_by_key = dict(zip(continuation_keys, loaded_continuations))
     anchors_by_key = dict(zip(anchor_keys, loaded_anchors))
     reference_audios = [
         loaded_by_key[key][0] if key is not None else None
@@ -4400,8 +4469,10 @@ async def _synthesize_voxcpm_items(
         loaded_by_key[key][1] if key is not None else "wav"
         for key in reference_keys
     ]
-    anchors = [
-        (*loaded_anchor, item.anchor_text)
+    continuations = [
+        (*continuations_by_key[item.continuation_url], item.continuation_text)
+        if item.continuation
+        else (*loaded_anchor, item.anchor_text)
         if item.anchor_text is not None and (loaded_anchor := anchors_by_key.get(item.anchor_url)) is not None
         else None
         for _, item, _ in records
@@ -4431,21 +4502,16 @@ async def _synthesize_voxcpm_items(
         ),
         reference_audios=reference_audios,
         reference_formats=reference_formats,
-        anchors=anchors,
+        continuations=continuations,
+        instructions=[item.instruction for _, item, _ in records],
     )
 
 
-_VOICE_DESCRIPTION_BRACKETS_RE = re.compile(r"[()\[\]]")
 _VOICE_DESIGN_SEED_LIMIT = 2**31
 
 
 def _voice_design_description(description: str) -> str:
-    """Make a description safe to wrap in VoxCPM2's ``(description)`` prefix.
-
-    A bracket inside it would end the instruction early and leak the rest
-    into the spoken text.
-    """
-    cleaned = " ".join(_VOICE_DESCRIPTION_BRACKETS_RE.sub(" ", description).split())
+    cleaned = _voxcpm_instruction(description)
     if not cleaned:
         raise HTTPException(status_code=400, detail="description must contain words")
     return cleaned
@@ -4581,7 +4647,18 @@ def _batch_item_pipeline(item: BatchSynthesizeInputItem) -> str:
     return "sparrow"
 
 
-_BATCH_PER_ITEM_FIELDS = frozenset({"text", "ssml", "seed", "language_override", "anchor_url", "anchor_text"})
+_BATCH_PER_ITEM_FIELDS = frozenset({
+    "text",
+    "ssml",
+    "seed",
+    "language_override",
+    "anchor_url",
+    "anchor_text",
+    "instruction",
+    "continuation",
+    "continuation_url",
+    "continuation_text",
+})
 _BATCH_PIPELINE_PER_ITEM_FIELDS = {
     "voxcpm": frozenset({"reference_url", "reference_language", "language", "voice_id"}),
 }
@@ -5372,6 +5449,10 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
                 languages=[forced_language],
                 anchor_url=request.anchor_url,
                 anchor_text=request.anchor_text,
+                instruction=request.instruction,
+                continuation=request.continuation,
+                continuation_url=request.continuation_url,
+                continuation_text=request.continuation_text,
                 model=_server_config.voxcpm.model_id,
                 voxcpm_loras=tuple(request.voxcpm_loras),
                 options=request.options,

@@ -568,3 +568,26 @@ def test_voxcpm_reference_disk_cache_evicts_least_recently_used(tmp_path):
 
     assert sorted(path.name for path in tmp_path.iterdir()) == sorted([used.name, new.name])
     assert _read_cached_voxcpm_reference(old) is None
+
+
+def test_voxcpm_prompt_fields_validate_and_stay_per_item() -> None:
+    base = {"text": "Hello.", "voice_id": "v", "reference_url": "https://x/ref.wav", "model": "voxcpm"}
+    instructed = BatchSynthesizeInputItem(**base, instruction=" (whispering)  [nervous] ")
+    assert instructed.instruction == "whispering nervous"
+    assert server.SynthesizeRequest(**base, instruction="(angry)").instruction == "angry"
+    for invalid in (
+        {"instruction": "( )"},
+        {"continuation": True},
+        {"continuation_url": "https://x/take.wav"},
+        {"continuation": True, "continuation_text": "Hi."},
+    ):
+        with pytest.raises(ValueError):
+            BatchSynthesizeInputItem(**base, **invalid)
+        with pytest.raises(ValueError):
+            server.SynthesizeRequest(**base, **invalid)
+    continued = BatchSynthesizeInputItem(
+        **base, continuation=True, continuation_url="https://x/take.wav", continuation_text="Hi there."
+    )
+    plain = BatchSynthesizeInputItem(**base)
+    assert _batch_item_compatibility_key(instructed) == _batch_item_compatibility_key(plain)
+    assert _batch_item_compatibility_key(continued) == _batch_item_compatibility_key(plain)
