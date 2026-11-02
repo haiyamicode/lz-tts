@@ -527,20 +527,20 @@ def _seed_vc_engine(settings_data: dict[str, Any]) -> Handler:
 
 
 def _ctc_engine(settings_data: dict[str, Any]) -> Handler:
-    """Load the SSML CTC forced aligner and return the action handler."""
-    settings = _settings_data_to_config(settings_data).ssml
+    """Load the CTC forced aligner and return the action handler."""
+    settings = _settings_data_to_config(settings_data).aligner
     aligner = CtcForcedAligner(
         CtcAlignmentConfig(
-            model=settings.ctc_model,
-            device=settings.ctc_device,
-            dtype=settings.ctc_dtype,
+            model=settings.model,
+            device=settings.device,
+            dtype=settings.dtype,
         )
     )
     aligner.load()
 
     def handler(action: str, payload: Any) -> dict[str, Any]:
         if action == "health":
-            return {"ok": True, "data": {"worker": "ok", "model": settings.ctc_model, "device": settings.ctc_device}}
+            return {"ok": True, "data": {"worker": "ok", "model": settings.model, "device": settings.device}}
         if not isinstance(payload, dict):
             raise ValueError("worker payload must be an object")
         if action == "align_words":
@@ -569,7 +569,7 @@ SPEECH_ENGINES: dict[str, tuple[Callable[[dict[str, Any]], Handler], bool]] = {
 
 
 def speech_worker_main(settings_data: dict[str, Any], request_queue: Any, response_queue: Any) -> None:
-    """Host Sparrow, Seed-VC and the SSML CTC aligner in one GPU process.
+    """Host Sparrow, Seed-VC and the CTC aligner in one GPU process.
 
     They never run concurrently, and every GPU process pays ~1 GB of RAM for
     its own CUDA context, torch import and driver copies of the kernels it

@@ -481,13 +481,18 @@ class SynthesisChunkingConfig(BaseModel):
         return self
 
 
+class AlignerConfig(BaseModel):
+    """CTC forced aligner: word timings on synthesized audio (SSML operations, synthesize timestamps)."""
+
+    model: str = "MahmoudAshraf/mms-300m-1130-forced-aligner"
+    device: str = Field(default_factory=lambda: os.environ.get("ALIGNER_DEVICE", "cuda:0"))
+    dtype: str = Field(default_factory=lambda: os.environ.get("ALIGNER_DTYPE", "float16"))
+
+
 class SSMLConfig(BaseModel):
-    """Settings for SSML operations that require audio alignment."""
+    """Settings for SSML operations (breaks, IPA pronunciations)."""
 
     enabled: bool = True
-    ctc_model: str = "MahmoudAshraf/mms-300m-1130-forced-aligner"
-    ctc_device: str = Field(default_factory=lambda: os.environ.get("SSML_CTC_DEVICE", "cuda:0"))
-    ctc_dtype: str = Field(default_factory=lambda: os.environ.get("SSML_CTC_DTYPE", "float16"))
     voxcpm_ipa_stop_cushion_patches: int = Field(default=1, ge=0)
     voxcpm_ipa_max_length_cushion_patches: int = Field(default=12, ge=1)
     voxcpm_ipa_alignment_tolerance_patches: int = Field(default=2, ge=0)
@@ -505,6 +510,7 @@ class ServerConfig(BaseModel):
     matcha: MatchaConfig = Field(default_factory=MatchaConfig)
     seed_vc: SeedVCConfig = Field(default_factory=SeedVCConfig)
     ssml: SSMLConfig = Field(default_factory=SSMLConfig)
+    aligner: AlignerConfig = Field(default_factory=AlignerConfig)
 
 
 class SparrowSynthesizeOptions(BaseModel):
@@ -571,6 +577,10 @@ class SynthesizeRequest(BaseModel):
     volume: float = Field(1.0, ge=0.0, description="Output volume multiplier")
     pause_before: float = Field(0.0, ge=0.0, description="Seconds of silence added before the speech")
     pause_after: float = Field(0.0, ge=0.0, description="Seconds of silence added after the speech")
+    timestamps: bool = Field(
+        False,
+        description="Also return word timestamps, force-aligned (CTC) on the finished audio",
+    )
 
     @model_validator(mode="after")
     def validate_anchor(self) -> "SynthesizeRequest":
@@ -579,9 +589,9 @@ class SynthesizeRequest(BaseModel):
         return self
 
 
-# SynthesizeRequest fields applied to the finished audio (_apply_audio_adjustments),
-# not passed to the synthesis backends.
-_AUDIO_ADJUSTMENT_FIELDS = {"speed", "pitch", "volume", "pause_before", "pause_after"}
+# SynthesizeRequest fields applied to the finished audio (_apply_audio_adjustments,
+# _add_word_timestamps), not passed to the synthesis backends.
+_FINISHED_AUDIO_FIELDS = {"speed", "pitch", "volume", "pause_before", "pause_after", "timestamps"}
 
 
 class VoiceDesignRequest(BaseModel):
@@ -1250,7 +1260,7 @@ def _worker_settings_data() -> dict[str, Any]:
 
 
 def _ensure_speech_worker() -> WorkerProcessClient:
-    """The one GPU process hosting Sparrow, Seed-VC and the SSML aligner."""
+    """The one GPU process hosting Sparrow, Seed-VC and the CTC aligner."""
     global _speech_worker
     if _speech_worker is None:
         _speech_worker = WorkerProcessClient(
@@ -1286,7 +1296,7 @@ def _ensure_seed_vc_worker() -> EngineClient:
     return _seed_vc_worker
 
 
-def _ssml_aligner_client() -> EngineClient:
+def _aligner_client() -> EngineClient:
     return EngineClient(_ensure_speech_worker(), "ctc")
 
 
@@ -2422,7 +2432,7 @@ def _ssml_language_plan(
     return main_language, spans
 
 
-async def _align_ssml_audio(
+async def _align_words(
     text: str,
     audio: np.ndarray,
     sample_rate: int,
@@ -2434,10 +2444,8 @@ async def _align_ssml_audio(
         language_hint,
         forced_language,
     )
-    if not _server_config.ssml.enabled:
-        raise HTTPException(status_code=503, detail="SSML audio operations are disabled")
     response = await asyncio.to_thread(
-        _ssml_aligner_client().call,
+        _aligner_client().call,
         "align_words",
         {
             "text": text,
@@ -2450,16 +2458,16 @@ async def _align_ssml_audio(
     result = response.get("data") or {}
     if not result.get("valid"):
         if result.get("reason") == "empty_transcript":
-            # Nothing in the document tokenizes as a word (punctuation-only or
-            # symbol-only SSML), so there is no word anchor to align to. The
-            # audio was still synthesized: let the caller place the pauses on
-            # the audio boundaries instead of failing the whole task.
+            # Nothing in the text tokenizes as a word (punctuation-only or
+            # symbol-only), so there is no word to align. The audio was still
+            # synthesized: there are no word timings (SSML pauses go on the
+            # audio boundaries) instead of failing the whole task.
             return []
         raise ValueError(
-            f"Could not force-align SSML audio: {result.get('reason') or 'unknown error'}"
+            f"Could not force-align audio: {result.get('reason') or 'unknown error'}"
         )
     if not result.get("word_timestamps"):
-        raise ValueError("Could not force-align SSML audio: no word timestamps")
+        raise ValueError("Could not force-align audio: no word timestamps")
     return list(result["word_timestamps"])
 
 
@@ -3208,7 +3216,7 @@ async def _synthesize_voxcpm_ipa_ssml(
         raise ValueError(
             "VoxCPM baseline audio does not contain an integral number of output patches"
         )
-    baseline_timestamps = await _align_ssml_audio(
+    baseline_timestamps = await _align_words(
         document.text,
         baseline_audio,
         baseline_sample_rate,
@@ -3340,7 +3348,7 @@ async def _synthesize_voxcpm_ipa_ssml(
         async def align_controlled(
             audio: np.ndarray,
         ) -> tuple[list[dict[str, Any]], list[dict[str, float]]]:
-            timestamps = await _align_ssml_audio(
+            timestamps = await _align_words(
                 chunk_text,
                 audio,
                 runtime.sample_rate,
@@ -3432,7 +3440,7 @@ async def _synthesize_voxcpm_ipa_ssml(
     )
 
     if document.breaks:
-        timestamps = await _align_ssml_audio(
+        timestamps = await _align_words(
             controlled_text,
             audio,
             runtime.sample_rate,
@@ -3480,7 +3488,7 @@ async def _postprocess_ssml_response(
                 resolved_breaks,
             )
         else:
-            timestamps = await _align_ssml_audio(
+            timestamps = await _align_words(
                 document.text,
                 audio,
                 sample_rate,
@@ -4909,6 +4917,46 @@ async def _apply_audio_adjustments(
     )
 
 
+def _word_timestamp(text: str, word: dict[str, Any]) -> dict[str, Any]:
+    # An aligned unit runs up to the next word: report the word itself, without the whitespace.
+    start, end = int(word["source_start"]), int(word["source_end"])
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return {
+        "text": text[start:end],
+        "start": round(float(word["start_seconds"]), 3),
+        "end": round(float(word["end_seconds"]), 3),
+        "charStart": start,
+        "charEnd": end,
+    }
+
+
+async def _add_word_timestamps(
+    result: InferenceResult,
+    request: SynthesizeRequest,
+) -> InferenceResult:
+    """Force-align the finished audio to the spoken text when the request asks for timestamps."""
+    if not request.timestamps or result.kind != "audio" or not result.audio:
+        return result
+    text = parse_ssml(request.ssml).text if request.ssml is not None else request.text or ""
+    audio, sample_rate = await asyncio.to_thread(_decode_wav_bytes, result.audio)
+    words = await _align_words(
+        text,
+        audio,
+        sample_rate,
+        request.language,
+        _explicit_language(request.language, request.language_override),
+    )
+    return InferenceResult(
+        kind="audio",
+        content_type=result.content_type,
+        audio=result.audio,
+        data={**(result.data or {}), "timestamps": [_word_timestamp(text, word) for word in words]},
+    )
+
+
 class InferenceOperationError(RuntimeError):
     """An inference failure with retry semantics independent of HTTP."""
 
@@ -5155,14 +5203,13 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
             )
             raise RuntimeError(f"Configured inference engines failed to load: {details}")
 
-        if _server_config.ssml.enabled:
-            with _logged_startup_step(
-                "ssml_ctc_aligner",
-                model=_server_config.ssml.ctc_model,
-                device=_server_config.ssml.ctc_device,
-                dtype=_server_config.ssml.ctc_dtype,
-            ):
-                await asyncio.to_thread(_ssml_aligner_client().call, "load")
+        with _logged_startup_step(
+            "ctc_aligner",
+            model=_server_config.aligner.model,
+            device=_server_config.aligner.device,
+            dtype=_server_config.aligner.dtype,
+        ):
+            await asyncio.to_thread(_aligner_client().call, "load")
         _LOGGER.info("Loaded inference runtime models elapsed=%.2fs", time.perf_counter() - load_started)
 
     if _engine_enabled("pipertts"):
@@ -5228,6 +5275,8 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
             document = parse_ssml(request.ssml)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if document.operations and not _server_config.ssml.enabled:
+            raise HTTPException(status_code=503, detail="SSML audio operations are disabled")
         if document.pronunciations and not _request_routes_to_voxcpm(request, model):
             try:
                 audio, sample_rate = await _synthesize_sparrow_ipa_ssml(
@@ -5236,7 +5285,7 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
                     model,
                 )
                 if document.breaks:
-                    timestamps = await _align_ssml_audio(
+                    timestamps = await _align_words(
                         document.text,
                         audio,
                         sample_rate,
@@ -5492,7 +5541,7 @@ class LzTtsInferenceSession:
                 item = BatchSynthesizeInputItem.model_validate(
                     request.model_dump(
                         mode="python",
-                        exclude=_AUDIO_ADJUSTMENT_FIELDS,
+                        exclude=_FINISHED_AUDIO_FIELDS,
                     )
                 )
                 _validate_batch_item(item, operation_index)
@@ -5550,8 +5599,9 @@ class LzTtsInferenceSession:
                         ),
                         audio=base64.b64decode(response_item.audio_base64),
                     )
+                    result = await _apply_audio_adjustments(result, request)
                     outcomes[batch_operation_indices[batch_item_index]] = (
-                        await _apply_audio_adjustments(result, request)
+                        await _add_word_timestamps(result, request)
                     )
             except HTTPException as error:
                 outcome: BaseException = InferenceOperationError(
@@ -5638,6 +5688,7 @@ class LzTtsInferenceSession:
                     audio=bytes(response.body),
                 )
                 result = await _apply_audio_adjustments(result, request)
+                result = await _add_word_timestamps(result, request)
             elif operation == "voice-design":
                 outcome = (await synthesize_voice_designs([VoiceDesignRequest.model_validate(request_data)]))[0]
                 if isinstance(outcome, BaseException):
