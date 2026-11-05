@@ -52,10 +52,10 @@ def test_ssml_with_postprocessing_is_not_prepared_for_batching() -> None:
     assert request is None
 
 
-def test_voxcpm_release_defaults_use_original_model_and_three_slots() -> None:
+def test_voxcpm_release_defaults_use_falcon_v1_and_three_slots() -> None:
     config = VoxCPMConfig()
 
-    assert config.model_path == "data/voxcpm2-original"
+    assert config.model_path == "data/lzspeech-falcon-v1"
     assert config.default_locales == []
     assert config.locale_loras == {}
     assert config.max_concurrent_loras == 3
