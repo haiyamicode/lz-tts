@@ -60,6 +60,16 @@ def test_parse_ssml_tolerates_characters_xml_rejects() -> None:
         ("<speak><phoneme alphabet='x-sampa' ph='x'>word</phoneme></speak>", "alphabet='ipa'"),
         ("<speak><phoneme alphabet='ipa' ph=''>word</phoneme></speak>", "non-empty 'ph'"),
         ("<speak><phoneme alphabet='ipa' ph='wɜːd' ignored='x'>word</phoneme></speak>", "Unsupported SSML <phoneme> attribute"),
+        ("<speak><sub>word</sub></speak>", "non-empty 'alias'"),
+        ("<speak><sub alias=' '>word</sub></speak>", "non-empty 'alias'"),
+        ("<speak><sub alias='x' lang='en'>word</sub></speak>", "Unsupported SSML <sub> attribute"),
+        ("<speak><sub alias='x'> </sub></speak>", "non-empty display text"),
+        ("<speak><sub alias='x'/></speak>", "non-empty display text"),
+        ("<speak><sub alias='x'>a<break/>b</sub></speak>", "only text"),
+        ("<speak><sub alias='x'>a<sub alias='y'>b</sub></sub></speak>", "only text"),
+        ("<speak><sub alias='x'>word</speak>", "only text"),
+        ("<speak><phoneme alphabet='ipa' ph='x'><sub alias='y'>z</sub></phoneme></speak>", "inside <phoneme>"),
+        ("<speak>word</sub></speak>", "no matching <sub>"),
         ("<speak><prosody rate='slow'>hello</prosody></speak>", "Unsupported SSML element"),
         ("<voice>hello</voice>", "root element"),
         ("oops <speak>hello</speak>", "root element"),
@@ -186,3 +196,24 @@ def test_xml_escapes_are_decoded_in_phoneme_text_and_attribute() -> None:
     )
     assert document.text == "Say A&B."
     assert document.pronunciations == (PronunciationOperation(4, 7, "ipa", 'a&b"c'),)
+
+
+def test_sub_says_its_alias_in_place_of_the_written_text() -> None:
+    document = parse_ssml('<speak>Welcome to <sub alias="lazy bird">Lazybird</sub>.</speak>')
+    assert document.text == "Welcome to lazy bird."
+    assert document.operations == ()
+
+
+def test_sub_keeps_the_space_around_its_words_and_spans_after_it() -> None:
+    document = parse_ssml(
+        '<speak>Read<sub alias="  World Health Organization "> WHO </sub>news,'
+        '<break time="500ms"/>then <phoneme alphabet="ipa" ph="təˈmɑːtəʊ">tomato</phoneme>.</speak>'
+    )
+    assert document.text == "Read World Health Organization news, then tomato."
+    assert document.breaks == (BreakOperation(36, 0.5),)
+    assert document.pronunciations == (PronunciationOperation(42, 48, "ipa", "təˈmɑːtəʊ"),)
+
+
+def test_xml_escapes_are_decoded_in_sub_alias() -> None:
+    document = parse_ssml('<speak><sub alias="Tom &amp; Jerry">T&amp;J</sub> again</speak>')
+    assert document.text == "Tom & Jerry again"

@@ -3,10 +3,11 @@
 Documents are parsed with the standard library HTML parser, so plain text
 that an XML parser would reject (bare ``&``, unescaped ``<``) passes through
 unchanged.  The tag set stays strict: a single ``<speak>`` root containing
-text, ``<break>`` and ``<phoneme>`` elements is accepted, and the parser
-produces the plain text sent to the normal TTS route plus source-character
-spans for the two operations we currently implement: timed breaks and IPA
-pronunciation overrides.
+text, ``<break>``, ``<phoneme>`` and ``<sub>`` elements is accepted, and the
+parser produces the plain text sent to the normal TTS route plus
+source-character spans for the two operations we currently implement: timed
+breaks and IPA pronunciation overrides.  A ``<sub>`` needs no operation: its
+``alias`` is what the text says in place of the written words.
 """
 
 from __future__ import annotations
@@ -221,6 +222,8 @@ class _SSMLParser(HTMLParser):
         self._root_open = False
         self._root_closed = False
         self._phonemes: list[tuple[int, str]] = []
+        # The open <sub>'s alias and the written text gathered so far.
+        self._sub: tuple[str, list[str]] | None = None
 
     def _require_root(self, tag: str) -> None:
         if self._root_open:
@@ -233,6 +236,8 @@ class _SSMLParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self._require_root(tag)
+        if self._sub is not None:
+            raise ValueError("SSML <sub> can contain only text")
         if tag == "speak":
             return
         if tag == "break":
@@ -251,6 +256,19 @@ class _SSMLParser(HTMLParser):
             start = self.builder.open_phoneme(values.get("alphabet"), values.get("ph"))
             self._phonemes.append((start, values.get("ph") or ""))
             return
+        if tag == "sub":
+            unsupported = {name for name, _ in attrs} - {"alias"}
+            if unsupported:
+                names = ", ".join(sorted(unsupported))
+                raise ValueError(f"Unsupported SSML <sub> attribute(s): {names}")
+            alias = dict(attrs).get("alias")
+            if alias is None or not alias.strip():
+                raise ValueError("SSML <sub> requires a non-empty 'alias' attribute")
+            # An alias in a <phoneme> would be read with the phoneme's IPA anyway.
+            if self._phonemes:
+                raise ValueError("SSML <sub> cannot be inside <phoneme>")
+            self._sub = (alias.strip(), [])
+            return
         raise ValueError(f"Unsupported SSML element <{tag}>")
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -258,6 +276,8 @@ class _SSMLParser(HTMLParser):
         self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
+        if self._sub is not None and tag != "sub":
+            raise ValueError("SSML <sub> can contain only text")
         if tag == "speak":
             if not self._root_open:
                 raise ValueError("SSML root element must be <speak>")
@@ -274,12 +294,28 @@ class _SSMLParser(HTMLParser):
             start, phonemes = self._phonemes.pop()
             self.builder.close_phoneme(start, phonemes)
             return
+        if tag == "sub":
+            if self._sub is None:
+                raise ValueError("SSML </sub> has no matching <sub> start tag")
+            alias, parts = self._sub
+            self._sub = None
+            written = "".join(parts)
+            if not written.strip():
+                raise ValueError("SSML <sub> requires non-empty display text")
+            # The alias is said in place of the words, keeping the space around them.
+            lead = written[: len(written) - len(written.lstrip())]
+            trail = written[len(written.rstrip()) :]
+            self.builder.append_text(lead + alias + trail)
+            return
         raise ValueError(f"Unsupported SSML element <{tag}>")
 
     def handle_data(self, data: str) -> None:
         if not self._root_open:
             if data.strip():
                 raise ValueError("SSML root element must be <speak>")
+            return
+        if self._sub is not None:
+            self._sub[1].append(data)
             return
         self.builder.append_text(data)
 
