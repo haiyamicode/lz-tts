@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import re
+
+from num2words import num2words
+
 from .base import SpokenLocale, make_number_words
 
 _NUMBER_WORDS = make_number_words('de')
@@ -12,6 +16,44 @@ def _clock_words(hour: int, minute: int | None, meridiem: str | None) -> str:
     if minute not in (None, 0):
         result += f" {_NUMBER_WORDS(minute)}"
     return result
+
+
+_MONTHS = frozenset({
+    'januar', 'jänner', 'februar', 'märz', 'april', 'mai', 'juni', 'juli',
+    'august', 'september', 'oktober', 'november', 'dezember',
+})
+_NOMINATIVE_ARTICLES = frozenset({
+    'der', 'die', 'das', 'jede', 'jeder', 'jedes', 'diese', 'dieser', 'dieses',
+})
+_DATIVE_ARTICLES = frozenset({
+    'am', 'im', 'vom', 'zum', 'zur', 'beim', 'den', 'dem', 'des', 'einem',
+    'einen', 'eines', 'jeden', 'jedem', 'diesen', 'diesem',
+})
+_DATIVE_PREPOSITIONS = frozenset({
+    'in', 'an', 'auf', 'aus', 'bei', 'mit', 'nach', 'von', 'zu', 'vor', 'seit',
+})
+
+
+def _year_words(value: int) -> str:
+    return num2words(value, lang='de', to='year')
+
+
+def _ordinal_words(value: int, before: str, after: str) -> str:
+    stem = num2words(value, lang='de', to='ordinal')
+    words = re.findall(r'\w+', before.lower())[-2:]
+    previous = words[-1] if words else ''
+    if previous == 'der' and len(words) == 2 and words[0] in _DATIVE_PREPOSITIONS:
+        return f'{stem}n'
+    if previous in _NOMINATIVE_ARTICLES:
+        return stem
+    if previous in _DATIVE_ARTICLES:
+        return f'{stem}n'
+    if previous == 'ein':
+        return f'{stem}r'
+    following = re.match(r'\W*(\w+)', after)
+    if following and following.group(1).lower() in _MONTHS:
+        return f'{stem}r'
+    return stem
 
 
 LOCALE = SpokenLocale(
@@ -95,4 +137,8 @@ LOCALE = SpokenLocale(
         'Minuten': 'min',
         'Tage': 'd',
     },
+    year_words=_year_words,
+    ordinal_words=_ordinal_words,
+    ordinal_period=True,
+    degree_words=('Grad', 'Grad'),
 )

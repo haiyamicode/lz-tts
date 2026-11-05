@@ -1,5 +1,5 @@
 """Spoken-text normalization profile."""
 
-from .engine import verbalize_spoken_text
+from .engine import NUMBER_MODES, NumberModes, verbalize_spoken_text
 
-__all__ = ["verbalize_spoken_text"]
+__all__ = ["NUMBER_MODES", "NumberModes", "verbalize_spoken_text"]

@@ -80,4 +80,6 @@ LOCALE = SpokenLocale(
         'd': '一日',
     },
     rate_denominator_aliases={},
+    digit_group_separator='、',
+    degree_words=('度', '度'),
 )

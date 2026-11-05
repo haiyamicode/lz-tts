@@ -126,3 +126,19 @@ def test_edge_star_frequency_has_only_outer_wildcards() -> None:
 
     assert prepared.tokens == ["<star>", "o n e", "t w o", "<star>"]
     assert prepared.starred_text == ["<star>", "One ", "two.", "<star>"]
+
+
+def test_numeral_characters_are_aligned_as_their_syllables() -> None:
+    prepared = _prepare_ctc_transcript("会议在三月十五日开始，地点是三零二房间。", "zh-CN", star_frequency="segment")
+
+    assert [(unit.text, unit.token) for unit in prepared.units][2:11] == [
+        ("三月", "s a n y u e"),
+        ("十五", "s h i w u"),
+        ("日", "r i"),
+        ("开始，", "k a i s h i"),
+        ("地点", "d e d i a n"),
+        ("是", "s h i"),
+        ("三", "s a n"),
+        ("零", "l i n g"),
+        ("二", "e r"),
+    ]

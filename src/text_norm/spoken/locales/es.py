@@ -2,16 +2,43 @@
 
 from __future__ import annotations
 
+import re
+
+from num2words import num2words
+
 from .base import SpokenLocale, make_number_words
 
 _NUMBER_WORDS = make_number_words('es')
 
 
 def _clock_words(hour: int, minute: int | None, meridiem: str | None) -> str:
-    result = f"{_NUMBER_WORDS(hour)} horas"
-    if minute not in (None, 0):
-        result += f" y {_NUMBER_WORDS(minute)} minutos"
+    # Hora is feminine (una hora, veintiuna horas), minuto masculine before
+    # the noun (un minuto, veintiún minutos).
+    if hour == 1:
+        result = 'una hora'
+    else:
+        result = re.sub(r'uno$', 'una', _NUMBER_WORDS(hour)) + ' horas'
+    if minute == 1:
+        result += ' y un minuto'
+    elif minute:
+        words = re.sub(r'veintiuno$', 'veintiún', _NUMBER_WORDS(minute))
+        result += f" y {re.sub(r'uno$', 'un', words)} minutos"
     return result
+
+
+def _sign_ordinal_words(value: int, before: str, after: str) -> str:
+    words = num2words(value, lang='es', to='ordinal')
+    # Primero and tercero drop the -o before a noun: el 1º piso, el 3º puesto.
+    if words.endswith(('primero', 'tercero')) and re.match(
+        r'\s*(?!(?:de|del|y|o)\b)[^\W\d_]', after, re.IGNORECASE
+    ):
+        words = words[:-1]
+    return words
+
+
+def _ordinal_words(value: int, before: str, after: str) -> str:
+    # Only the first day of a month is an ordinal; the rest read as cardinals.
+    return 'primero' if value == 1 else _NUMBER_WORDS(value)
 
 
 LOCALE = SpokenLocale(
@@ -113,4 +140,9 @@ LOCALE = SpokenLocale(
         'minutos': 'min',
         'días': 'd',
     },
+    ordinal_words=_ordinal_words,
+    decimal_fraction_number=True,
+    bare_hour_clock=True,
+    degree_words=('grado', 'grados'),
+    sign_ordinal_words=_sign_ordinal_words,
 )

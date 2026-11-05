@@ -1,0 +1,813 @@
+# Hand-written training samples for the number mode classifier (piper.number_modes).
+# One sample per line: <language>\t<text>. Every digit run inside ⟦...:X⟧ gets label X:
+#   C cardinal (1982 apples), Y year (in 1982), O ordinal (May 3, der 3. Platz),
+#   D digit by digit (PIN 4821, phone numbers, codes, IDs).
+# A day of the month is O; in all-numeric dates the day and month are C (de: O) and the
+# year is Y. A bare number is C. French phone pairs are C (zéro six, douze, ...).
+# English reads numbered things of 3-4 digits in pairs, which is the year reading
+# (Boeing 747, room 1205, flight 1549, 2024 Maple Street): Y. Emergency numbers are D
+# in en/de/es/vi/ko/zh/yue (nine one one) and C in fr/it/pt/ja (le dix-huit, 百十九番).
+# Chinese room numbers are D (三零二房间); bus routes are C (三百零二路).
+# Korean rooms (호) and 3-digit bus routes (번) are C (팔백오 호, 백사십육 번). A number before
+# a bare degree sign is C (30°), except a Romance ordinal written with it (al 2° piano): O.
+en	Say ⟦1:C⟧.
+en	Say ⟦2:C⟧.
+en	Now say ⟦3:C⟧, then ⟦4:C⟧.
+en	⟦7:C⟧
+en	⟦8:C⟧.
+en	⟦42:C⟧
+en	⟦100:C⟧
+en	⟦1982:C⟧
+en	⟦2024:C⟧.
+en	Count from ⟦1:C⟧ to ⟦10:C⟧.
+en	Press ⟦1:C⟧ for English, press ⟦2:C⟧ for Spanish.
+en	Pick a number between ⟦1:C⟧ and ⟦50:C⟧.
+en	The answer is ⟦12:C⟧.
+en	Option ⟦4:C⟧ is the best one.
+en	Step ⟦3:C⟧: mix the flour and the eggs.
+en	We are on level ⟦12:C⟧ now.
+en	Read chapter ⟦7:C⟧ before Friday.
+en	Turn to page ⟦245:C⟧.
+en	Season ⟦2:C⟧, episode ⟦9:C⟧ is the best one.
+en	Lesson ⟦15:C⟧ covers fractions.
+en	Track ⟦9:C⟧ on the album is a ballad.
+en	Question ⟦18:C⟧ was the hardest.
+en	Rule number ⟦1:C⟧: never give up.
+en	Your gate is ⟦23:C⟧, boarding starts soon.
+en	The train leaves from platform ⟦9:C⟧.
+en	Take bus ⟦47:C⟧ downtown.
+en	Get off at exit ⟦12:C⟧.
+en	We booked room ⟦214:Y⟧ for two nights.
+en	Table ⟦6:C⟧ is ready.
+en	I'm in row ⟦22:C⟧, seat ⟦14:C⟧.
+en	Apollo ⟦11:C⟧ landed on the moon.
+en	I just updated to Windows ⟦11:C⟧.
+en	She bought an iPhone ⟦15:C⟧ Pro.
+en	He plays on a PS⟦5:C⟧ every night.
+en	The COVID-⟦19:C⟧ pandemic changed everything.
+en	It's a real Catch-⟦22:C⟧.
+en	They say aliens are kept at Area ⟦51:C⟧.
+en	Formula ⟦1:C⟧ races are fast.
+en	Get your kicks on Route ⟦66:C⟧.
+en	I have ⟦3:C⟧ kids and ⟦2:C⟧ dogs.
+en	We sold ⟦1982:C⟧ copies in the first week.
+en	There were ⟦2000:C⟧ people at the concert.
+en	He scored ⟦2024:C⟧ points this season.
+en	The company has about ⟦1300:C⟧ employees.
+en	She won by over ⟦1800:C⟧ votes.
+en	A fleet of ⟦1200:C⟧ trucks crossed the border.
+en	All ⟦1600:C⟧ students passed the exam.
+en	The hospital reported ⟦1950:C⟧ new cases.
+en	There are ⟦1776:C⟧ steps to the top.
+en	It took ⟦1500:C⟧ hours to finish.
+en	The bridge is ⟦2010:C⟧ meters long.
+en	I counted ⟦1999:C⟧ sheep and still couldn't sleep.
+en	We need ⟦2048:C⟧ more samples.
+en	The stadium holds ⟦1900:C⟧ fans.
+en	Only ⟦12:C⟧ of the ⟦30:C⟧ players showed up.
+en	She is ⟦7:C⟧ years old.
+en	The recipe needs ⟦4:C⟧ cups of sugar.
+en	That's ⟦3:C⟧ times in a row.
+en	There are ⟦365:C⟧ days in a year.
+en	The ⟦3:C⟧ of us went hiking.
+en	Top ⟦10:C⟧ songs of the week.
+en	It costs ⟦1500:C⟧ dollars.
+en	He ran ⟦26:C⟧ miles.
+en	The score was ⟦3:C⟧ to ⟦1:C⟧.
+en	In ⟦1982:Y⟧, we had ⟦1982:C⟧ apples.
+en	In ⟦1982:Y⟧ the company moved to Boston.
+en	She was born in ⟦1990:Y⟧.
+en	We have lived here since ⟦2001:Y⟧.
+en	The contract runs until ⟦2030:Y⟧.
+en	By ⟦2050:Y⟧, half the cars will be electric.
+en	The ⟦1984:Y⟧ Olympics were held in Los Angeles.
+en	He graduated with the class of ⟦2010:Y⟧.
+en	The Matrix (⟦1999:Y⟧) is still a classic.
+en	From ⟦1990:Y⟧ to ⟦1995:Y⟧ she lived in Paris.
+en	The war lasted from ⟦1939-1945:Y⟧.
+en	Prices rose sharply between ⟦2010:Y⟧ and ⟦2015:Y⟧.
+en	In early ⟦2020:Y⟧ everything shut down.
+en	We met in the summer of ⟦2019:Y⟧.
+en	The ⟦2019:Y⟧ season was a disaster.
+en	Revenue grew in Q3 ⟦2024:Y⟧.
+en	The store opened in May ⟦2024:Y⟧.
+en	Results for fiscal ⟦2023:Y⟧ are in.
+en	Copyright ⟦2022:Y⟧ Lazybird. All rights reserved.
+en	He restored a ⟦1967:Y⟧ Mustang.
+en	I drive a ⟦2015:Y⟧ Honda Civic.
+en	The World Cup ⟦2026:Y⟧ will be in North America.
+en	Everyone was scared of the year ⟦2000:Y⟧ bug.
+en	The Normans invaded England in ⟦1066:Y⟧.
+en	In ⟦1492:Y⟧, Columbus sailed the ocean blue.
+en	The crisis of ⟦2008:Y⟧ hit everyone.
+en	The bakery was founded in ⟦1923:Y⟧.
+en	Established ⟦1887:Y⟧.
+en	This is a ⟦1998:Y⟧ vintage.
+en	⟦1999:Y⟧ was a wild year.
+en	Back in ⟦2012:Y⟧ I had no idea.
+en	⟦2020:Y⟧ was the year everything changed.
+en	The ⟦2016:Y⟧ election surprised many people.
+en	The report covers ⟦2018-2022:Y⟧.
+en	In the late ⟦1800:Y⟧s, railroads spread west.
+en	Elvis died in ⟦1977:Y⟧ at the age of ⟦42:C⟧.
+en	The meeting is on May ⟦3:O⟧.
+en	The deadline is March ⟦21:O⟧, ⟦2024:Y⟧.
+en	School starts on September ⟦1:O⟧.
+en	Christmas falls on December ⟦25:O⟧.
+en	We celebrate on Jan ⟦1:O⟧.
+en	The attacks happened on Sept. ⟦11:O⟧, ⟦2001:Y⟧.
+en	The declaration was signed on July ⟦4:O⟧, ⟦1776:Y⟧.
+en	I arrived on ⟦3:O⟧ May ⟦2023:Y⟧.
+en	Her birthday is the ⟦21:O⟧ of June.
+en	Leap day is Feb ⟦29:O⟧.
+en	The concert is on Monday, October ⟦7:O⟧.
+en	Polls close on Nov. ⟦5:O⟧.
+en	Taxes are due April ⟦15:O⟧.
+en	The offer ends August ⟦31:O⟧.
+en	It happened on Friday the ⟦13:O⟧.
+en	See you on the ⟦2:O⟧ of January.
+en	The festival runs from June ⟦10:O⟧ to June ⟦14:O⟧.
+en	Your PIN is ⟦4821:D⟧.
+en	The code is ⟦739104:D⟧.
+en	Your verification code is ⟦552901:D⟧.
+en	Enter the one-time password ⟦884213:D⟧ to continue.
+en	Call me at ⟦555-123-4567:D⟧.
+en	You can reach the office at (⟦212:D⟧) ⟦555-0199:D⟧.
+en	Our number is +⟦1 415 555 2671:D⟧.
+en	In an emergency, dial ⟦911:D⟧.
+en	My zip code is ⟦90210:D⟧.
+en	Ship it to New York, NY ⟦10001:D⟧.
+en	Flight ⟦302:Y⟧ to Chicago is delayed.
+en	Please board United flight UA ⟦857:Y⟧.
+en	Your order number is ⟦1029384:D⟧.
+en	Order #⟦48213:D⟧ has shipped.
+en	The account number is ⟦1234567890:D⟧.
+en	Pay with the card ending in ⟦4242:D⟧.
+en	Your tracking number is ⟦9400111899223:D⟧.
+en	She flew a Boeing ⟦737:Y⟧ for ten years.
+en	The Airbus A⟦320:Y⟧ is a narrow-body jet.
+en	Call extension ⟦4410:D⟧ for support.
+en	His badge number is ⟦4471:D⟧.
+en	Ticket ⟦88231:D⟧, please come to the counter.
+en	The serial number is ⟦55210984:D⟧.
+en	Employee ID ⟦39417:D⟧ has been locked.
+en	The license plate was ⟦7:D⟧ABC⟦123:D⟧.
+en	Room ⟦1205:Y⟧ is on the twelfth floor.
+en	Case number ⟦2024-1187:D⟧ was closed.
+en	The password is ⟦1982:D⟧, don't tell anyone.
+en	Use the coupon code SAVE⟦2024:Y⟧ at checkout.
+en	The wifi password is ⟦88446622:D⟧.
+en	Area code ⟦212:D⟧ is Manhattan.
+en	He just bought an RTX ⟦4090:Y⟧.
+en	Your confirmation number is ⟦7731:D⟧.
+en	Invoice ⟦20231105:D⟧ is overdue.
+en	The form is dated ⟦12:C⟧/⟦05:C⟧/⟦1990:Y⟧.
+en	Date of birth: ⟦03:C⟧/⟦14:C⟧/⟦1985:Y⟧.
+en	Expires ⟦08:C⟧/⟦27:Y⟧.
+en	On May ⟦3:O⟧, ⟦1982:Y⟧, ⟦1982:C⟧ people called ⟦555-0199:D⟧.
+en	In ⟦2015:Y⟧ she ran ⟦3:C⟧ marathons and placed ⟦2:C⟧ times in the top ⟦10:C⟧.
+en	Call ⟦800-555-0123:D⟧ before June ⟦30:O⟧ to get ⟦2:C⟧ free months.
+en	The ⟦1990:Y⟧ census counted ⟦1990:C⟧ residents in the village.
+en	Group ⟦4:C⟧ meets in room ⟦101:Y⟧ on March ⟦8:O⟧.
+en	Since ⟦2010:Y⟧, the club has won ⟦12:C⟧ titles.
+en	Text ⟦4:C⟧ words to ⟦55512:D⟧.
+en	It was ⟦2000:C⟧ degrees inside the furnace.
+en	My grandfather was born in ⟦1931:Y⟧ and lived to ⟦94:C⟧.
+en	She sang ⟦12:C⟧ songs at the ⟦2018:Y⟧ festival.
+de	Sag ⟦1:C⟧.
+de	⟦7:C⟧
+de	⟦1982:C⟧
+de	Zähl von ⟦1:C⟧ bis ⟦10:C⟧.
+de	Im Jahr ⟦1982:Y⟧ kamen ⟦1982:C⟧ Besucher.
+de	Am ⟦4:O⟧. Mai ⟦1982:Y⟧ kamen ⟦4:C⟧ Leute.
+de	Der ⟦3:O⟧. Platz geht an Berlin.
+de	Zum ⟦2:O⟧. Mal in Folge gewinnt sie.
+de	Wir wohnen im ⟦5:O⟧. Stock.
+de	Die Messe läuft vom ⟦3:O⟧. bis ⟦5:O⟧. März.
+de	Am ⟦1:O⟧. Januar ⟦2024:Y⟧ tritt das Gesetz in Kraft.
+de	Er wurde am ⟦17:O⟧. Juli geboren.
+de	Heute ist der ⟦24:O⟧. Dezember.
+de	Treffen wir uns am ⟦4:O⟧.Mai?
+de	Sie belegte Platz ⟦3:C⟧.
+de	Lies Kapitel ⟦4:C⟧, Seite ⟦17:C⟧.
+de	Der Zug fährt von Gleis ⟦9:C⟧.
+de	Nimm die Linie ⟦52:C⟧ bis zum Bahnhof.
+de	Folge ⟦12:C⟧ ist die beste.
+de	Wir haben ⟦3:C⟧ Kinder.
+de	Das kostet ⟦2000:C⟧ Euro.
+de	Es kamen über ⟦1500:C⟧ Menschen.
+de	Die Firma hat ⟦1990:C⟧ Mitarbeiter.
+de	Seit ⟦1990:Y⟧ lebe ich in Hamburg.
+de	Von ⟦1990:Y⟧ bis ⟦1995:Y⟧ war er in Wien.
+de	Der Krieg dauerte von ⟦1939-1945:Y⟧.
+de	Das Auto ist Baujahr ⟦2015:Y⟧.
+de	Die Mauer fiel ⟦1989:Y⟧.
+de	Die WM ⟦2006:Y⟧ war ein Sommermärchen.
+de	Er ist ⟦1965:Y⟧ geboren.
+de	Bis ⟦2030:Y⟧ soll alles fertig sein.
+de	Die Saison ⟦2023:Y⟧/⟦24:Y⟧ war spannend.
+de	Die ⟦90:C⟧er Jahre waren bunt.
+de	Das ist ⟦3:C⟧fach so teuer.
+de	Ruf mich an: Tel. ⟦030 1234 5678:D⟧.
+de	Meine Handynummer ist ⟦0171 2345678:D⟧.
+de	Deine PIN lautet ⟦4821:D⟧.
+de	Der Bestätigungscode ist ⟦552901:D⟧.
+de	Die Postleitzahl ist ⟦10115:D⟧.
+de	Ihre Bestellnummer: ⟦4471029:D⟧.
+de	Flug LH ⟦400:D⟧ nach New York ist verspätet.
+de	Die Kundennummer lautet ⟦88231:D⟧.
+de	Geboren am ⟦12:O⟧.⟦05:O⟧.⟦1990:Y⟧ in München.
+de	Der Termin ist am ⟦03:O⟧.⟦11:O⟧.⟦2024:Y⟧.
+de	Gültig bis ⟦31:O⟧.⟦12:O⟧.⟦2025:Y⟧.
+de	Am ⟦3:O⟧. Oktober ⟦1990:Y⟧ feierten ⟦1990:C⟧ Gäste.
+de	Er wurde ⟦80:C⟧ Jahre alt.
+de	Wir treffen uns in Raum ⟦214:C⟧.
+de	Der Porsche ⟦911:C⟧ ist ein Klassiker.
+fr	Dis ⟦1:C⟧.
+fr	⟦7:C⟧
+fr	⟦1982:C⟧
+fr	Compte de ⟦1:C⟧ à ⟦10:C⟧.
+fr	Le ⟦1:O⟧ mai ⟦1982:Y⟧, il faisait beau.
+fr	La fête nationale est le ⟦14:O⟧ juillet.
+fr	Rendez-vous le ⟦3:O⟧ mars.
+fr	Le ⟦1:O⟧ janvier ⟦2024:Y⟧, tout change.
+fr	Elle est née le ⟦25:O⟧ décembre ⟦1990:Y⟧.
+fr	En ⟦1982:Y⟧, nous avons déménagé.
+fr	Il y avait ⟦1982:C⟧ personnes dans la salle.
+fr	Nous habitons ici depuis ⟦2001:Y⟧.
+fr	De ⟦1990:Y⟧ à ⟦1995:Y⟧, il a vécu à Lyon.
+fr	La guerre a duré de ⟦1939-1945:Y⟧.
+fr	La Révolution a commencé en ⟦1789:Y⟧.
+fr	La Coupe du monde ⟦1998:Y⟧ reste inoubliable.
+fr	D'ici ⟦2030:Y⟧, tout sera électrique.
+fr	J'ai ⟦3:C⟧ enfants.
+fr	Ça coûte ⟦2000:C⟧ euros.
+fr	Plus de ⟦1500:C⟧ manifestants étaient présents.
+fr	Lisez le chapitre ⟦3:C⟧, page ⟦12:C⟧.
+fr	Le train part du quai ⟦9:C⟧.
+fr	Prenez le bus ⟦52:C⟧.
+fr	Il a fini à la place ⟦3:C⟧.
+fr	Appelez-moi au ⟦06 12 34 56 78:C⟧.
+fr	Le numéro du standard est le ⟦01 45 67 89 10:C⟧.
+fr	Votre code est ⟦4821:D⟧.
+fr	Le code de vérification est ⟦552901:D⟧.
+fr	Le code postal est ⟦75001:D⟧.
+fr	Votre numéro de commande est ⟦4471029:D⟧.
+fr	Né le ⟦12:C⟧/⟦05:C⟧/⟦1990:Y⟧ à Paris.
+fr	Le ⟦3:O⟧ mai ⟦2015:Y⟧, ⟦2015:C⟧ coureurs ont pris le départ.
+fr	Elle a ⟦40:C⟧ ans.
+es	Di ⟦1:C⟧.
+es	⟦7:C⟧
+es	⟦1982:C⟧
+es	Cuenta del ⟦1:C⟧ al ⟦10:C⟧.
+es	El ⟦1:O⟧ de mayo de ⟦1982:Y⟧ llovió mucho.
+es	Nos vemos el ⟦15:O⟧ de agosto.
+es	La fiesta es el ⟦24:O⟧ de diciembre.
+es	Nació el ⟦3:O⟧ de marzo de ⟦1990:Y⟧.
+es	En ⟦1982:Y⟧ nos mudamos a Madrid.
+es	Había ⟦1982:C⟧ personas en el estadio.
+es	Vivimos aquí desde ⟦2001:Y⟧.
+es	De ⟦1990:Y⟧ a ⟦1995:Y⟧ trabajó en Lima.
+es	La guerra civil duró de ⟦1936-1939:Y⟧.
+es	Colón llegó a América en ⟦1492:Y⟧.
+es	El Mundial ⟦2010:Y⟧ lo ganó España.
+es	Para ⟦2030:Y⟧ todo será distinto.
+es	Tengo ⟦3:C⟧ hijos.
+es	Cuesta ⟦2000:C⟧ euros.
+es	Más de ⟦1500:C⟧ personas firmaron.
+es	Lee el capítulo ⟦3:C⟧, página ⟦12:C⟧.
+es	El tren sale del andén ⟦9:C⟧.
+es	Toma el autobús ⟦52:C⟧.
+es	Llámame al ⟦612 345 678:D⟧.
+es	Mi número es el ⟦55 1234 5678:D⟧.
+es	Tu código es ⟦4821:D⟧.
+es	El código de verificación es ⟦552901:D⟧.
+es	El código postal es ⟦28013:D⟧.
+es	Tu número de pedido es ⟦4471029:D⟧.
+es	Nacido el ⟦12:C⟧/⟦05:C⟧/⟦1990:Y⟧ en Sevilla.
+es	El ⟦3:O⟧ de mayo de ⟦2015:Y⟧ corrieron ⟦2015:C⟧ atletas.
+es	Tiene ⟦40:C⟧ años.
+it	Di' ⟦1:C⟧.
+it	⟦7:C⟧
+it	⟦1982:C⟧
+it	Conta da ⟦1:C⟧ a ⟦10:C⟧.
+it	Il ⟦1:O⟧ maggio ⟦1982:Y⟧ pioveva.
+it	Ci vediamo il ⟦15:O⟧ agosto.
+it	Natale è il ⟦25:O⟧ dicembre.
+it	È nata il ⟦3:O⟧ marzo ⟦1990:Y⟧.
+it	Nel ⟦1982:Y⟧ ci siamo trasferiti a Roma.
+it	C'erano ⟦1982:C⟧ persone allo stadio.
+it	Abitiamo qui dal ⟦2001:Y⟧.
+it	Dal ⟦1990:Y⟧ al ⟦1995:Y⟧ ha vissuto a Milano.
+it	La guerra durò dal ⟦1940-1945:Y⟧.
+it	L'Italia vinse i Mondiali del ⟦2006:Y⟧.
+it	Entro il ⟦2030:Y⟧ cambierà tutto.
+it	Ho ⟦3:C⟧ figli.
+it	Costa ⟦2000:C⟧ euro.
+it	Più di ⟦1500:C⟧ persone hanno firmato.
+it	Leggi il capitolo ⟦3:C⟧, pagina ⟦12:C⟧.
+it	Il treno parte dal binario ⟦9:C⟧.
+it	Prendi l'autobus ⟦52:C⟧.
+it	Chiamami al ⟦333 123 4567:D⟧.
+it	Il tuo codice è ⟦4821:D⟧.
+it	Il codice di verifica è ⟦552901:D⟧.
+it	Il CAP è ⟦00184:D⟧.
+it	Il numero d'ordine è ⟦4471029:D⟧.
+it	Nato il ⟦12:C⟧/⟦05:C⟧/⟦1990:Y⟧ a Napoli.
+it	Il ⟦3:O⟧ maggio ⟦2015:Y⟧ sono partiti ⟦2015:C⟧ corridori.
+it	Ha ⟦40:C⟧ anni.
+pt	Diga ⟦1:C⟧.
+pt	⟦7:C⟧
+pt	⟦1982:C⟧
+pt	Conte de ⟦1:C⟧ a ⟦10:C⟧.
+pt	No dia ⟦1:O⟧ de maio de ⟦1982:Y⟧ choveu muito.
+pt	A gente se vê no dia ⟦15:O⟧ de agosto.
+pt	O Natal é em ⟦25:O⟧ de dezembro.
+pt	Ela nasceu em ⟦3:O⟧ de março de ⟦1990:Y⟧.
+pt	Em ⟦1982:Y⟧ nós nos mudamos para Lisboa.
+pt	Havia ⟦1982:C⟧ pessoas no estádio.
+pt	Moramos aqui desde ⟦2001:Y⟧.
+pt	De ⟦1990:Y⟧ a ⟦1995:Y⟧ ele morou no Rio.
+pt	O Brasil foi descoberto em ⟦1500:Y⟧.
+pt	A Copa de ⟦2014:Y⟧ foi no Brasil.
+pt	Até ⟦2030:Y⟧ tudo vai mudar.
+pt	Tenho ⟦3:C⟧ filhos.
+pt	Custa ⟦2000:C⟧ reais.
+pt	Mais de ⟦1500:C⟧ pessoas assinaram.
+pt	Leia o capítulo ⟦3:C⟧, página ⟦12:C⟧.
+pt	Pegue o ônibus ⟦52:C⟧.
+pt	Ligue para (⟦11:C⟧) ⟦98765-4321:D⟧.
+pt	Meu número é ⟦912 345 678:D⟧.
+pt	Seu código é ⟦4821:D⟧.
+pt	O código de verificação é ⟦552901:D⟧.
+pt	O CEP é ⟦01310-100:D⟧.
+pt	O número do pedido é ⟦4471029:D⟧.
+pt	Nascido em ⟦12:C⟧/⟦05:C⟧/⟦1990:Y⟧ em Recife.
+pt	Em ⟦3:O⟧ de maio de ⟦2015:Y⟧ correram ⟦2015:C⟧ atletas.
+pt	Ele tem ⟦40:C⟧ anos.
+vi	Nói ⟦1:C⟧.
+vi	⟦7:C⟧
+vi	⟦1982:C⟧
+vi	Đếm từ ⟦1:C⟧ đến ⟦10:C⟧.
+vi	Thứ ⟦2:O⟧ tuần sau mình gặp nhau nhé.
+vi	Hôm nay là thứ ⟦4:O⟧.
+vi	Cửa hàng mở cửa từ thứ ⟦2:O⟧ đến thứ ⟦7:O⟧.
+vi	Đội tuyển giành hạng ⟦1:O⟧.
+vi	Em được giải ⟦1:O⟧ cuộc thi vẽ.
+vi	Đây là lần thứ ⟦3:O⟧ anh ấy đến Hà Nội.
+vi	Cô ấy đứng thứ ⟦4:O⟧ trong lớp.
+vi	Năm ⟦1982:Y⟧ gia đình tôi chuyển vào Sài Gòn.
+vi	Năm ⟦2024:Y⟧ có ⟦2024:C⟧ người tham gia.
+vi	Anh ấy sinh năm ⟦1990:Y⟧.
+vi	Từ năm ⟦1990:Y⟧ đến năm ⟦1995:Y⟧ ông sống ở Huế.
+vi	Giai đoạn ⟦2016-2020:Y⟧ kinh tế tăng trưởng mạnh.
+vi	Chiến tranh kết thúc vào năm ⟦1975:Y⟧.
+vi	Đến năm ⟦2030:Y⟧ mọi thứ sẽ khác.
+vi	Ngày ⟦4:O⟧ tháng ⟦5:C⟧ chúng ta khai giảng.
+vi	Sinh nhật em vào ngày ⟦20:O⟧ tháng ⟦10:C⟧.
+vi	Ngày ⟦2:O⟧ tháng ⟦9:C⟧ năm ⟦1945:Y⟧ là Quốc khánh.
+vi	Tháng ⟦4:C⟧ này trời nóng lắm.
+vi	Tôi có ⟦3:C⟧ đứa con.
+vi	Chiếc xe này giá ⟦500:C⟧ triệu.
+vi	Có hơn ⟦1500:C⟧ người đến dự.
+vi	Công ty có ⟦1982:C⟧ nhân viên.
+vi	Đọc chương ⟦3:C⟧, trang ⟦12:C⟧.
+vi	Em học lớp ⟦5:C⟧.
+vi	Văn phòng ở tầng ⟦4:C⟧.
+vi	Đi xe buýt số ⟦52:C⟧.
+vi	Phòng ⟦305:C⟧ còn trống.
+vi	Gọi cho tôi theo số ⟦0912 345 678:D⟧.
+vi	Số điện thoại của cửa hàng là ⟦028 3822 1234:D⟧.
+vi	Mã xác nhận của bạn là ⟦552901:D⟧.
+vi	Mật khẩu là ⟦4821:D⟧.
+vi	Mã đơn hàng ⟦4471029:D⟧ đã được giao.
+vi	Số tài khoản ⟦1903 5566 7788:D⟧ ngân hàng Techcombank.
+vi	Chuyến bay VN ⟦254:D⟧ bị hoãn.
+vi	Ông ấy năm nay ⟦80:C⟧ tuổi.
+vi	Thứ ⟦6:O⟧ ngày ⟦13:O⟧ tháng ⟦9:C⟧ năm ⟦2024:Y⟧ có ⟦13:C⟧ người vắng mặt.
+vi	iPhone ⟦15:C⟧ vừa ra mắt.
+zh	说⟦1:C⟧。
+zh	⟦7:C⟧
+zh	⟦1982:C⟧
+zh	从⟦1:C⟧数到⟦10:C⟧。
+zh	⟦1982:Y⟧年，我们搬到了上海。
+zh	他⟦1990:Y⟧年出生。
+zh	从⟦1990:Y⟧年到⟦1995:Y⟧年，她一直在北京。
+zh	⟦1990-1995:Y⟧年间经济快速增长。
+zh	⟦2008:Y⟧年北京奥运会非常成功。
+zh	⟦2023:Y⟧赛季已经结束了。
+zh	到⟦2030:Y⟧年一切都会改变。
+zh	⟦2024:Y⟧年⟦5:C⟧月⟦3:O⟧日下午见。
+zh	⟦12:C⟧月⟦25:O⟧日是圣诞节。
+zh	我的生日是⟦10:C⟧月⟦1:O⟧日。
+zh	我有⟦2:C⟧个苹果。
+zh	他买了⟦3:C⟧本书。
+zh	这件衣服⟦2000:C⟧元。
+zh	共有⟦1982:C⟧人参加了比赛。
+zh	现场来了⟦1500:C⟧多名观众。
+zh	公司有⟦2024:C⟧名员工。
+zh	他得了第⟦2:O⟧名。
+zh	第⟦18:O⟧届运动会开幕了。
+zh	这是我第⟦3:O⟧次来中国。
+zh	请翻到第⟦12:C⟧页。
+zh	我们坐⟦52:C⟧路公交车。
+zh	她今年⟦2:C⟧年级。
+zh	下午⟦2:C⟧点见。
+zh	我的电话是⟦13812345678:D⟧。
+zh	请拨打⟦010-6552-1234:D⟧。
+zh	验证码是⟦552901:D⟧。
+zh	密码是⟦4821:D⟧。
+zh	邮编⟦100080:D⟧。
+zh	航班CA⟦1234:D⟧延误了。
+zh	请到⟦1205:D⟧房间。
+zh	订单号⟦4471029:D⟧已发货。
+zh	iPhone⟦15:C⟧刚刚发布。
+zh	他今年⟦80:C⟧岁了。
+zh	⟦1982:Y⟧年有⟦1982:C⟧名学生毕业。
+yue	我⟦1982:Y⟧年出世。
+yue	我有⟦2:C⟧個仔。
+yue	呢件衫⟦2000:C⟧蚊。
+yue	佢攞咗第⟦3:O⟧名。
+yue	打電話畀我，⟦9876 5432:D⟧。
+yue	驗證碼係⟦552901:D⟧。
+yue	⟦1997:Y⟧年香港回歸。
+yue	我哋⟦3:C⟧點見。
+ja	⟦1:C⟧と言ってください。
+ja	⟦7:C⟧
+ja	⟦1982:C⟧
+ja	⟦1:C⟧から⟦10:C⟧まで数えて。
+ja	⟦2024:Y⟧年に引っ越しました。
+ja	彼は⟦1990:Y⟧年生まれです。
+ja	⟦1990-1995:Y⟧年は東京にいました。
+ja	⟦1964:Y⟧年の東京オリンピック。
+ja	⟦5:C⟧月⟦3:O⟧日に会いましょう。
+ja	⟦12:C⟧月⟦25:O⟧日はクリスマスです。
+ja	子供が⟦3:C⟧人います。
+ja	参加者は⟦1982:C⟧人でした。
+ja	この服は⟦2000:C⟧円です。
+ja	第⟦2:O⟧回の会議です。
+ja	⟦3:O⟧番目の駅で降りてください。
+ja	⟦12:C⟧ページを開いてください。
+ja	電話番号は⟦03-1234-5678:D⟧です。
+ja	携帯は⟦090-1234-5678:D⟧です。
+ja	暗証番号は⟦4821:D⟧です。
+ja	確認コードは⟦552901:D⟧です。
+ja	郵便番号は⟦100-0001:D⟧です。
+ja	注文番号⟦4471029:D⟧を発送しました。
+ja	iPhone⟦15:C⟧を買いました。
+ja	祖父は⟦80:C⟧歳です。
+ko	⟦1:C⟧ 해 봐.
+ko	⟦7:C⟧
+ko	⟦1982:C⟧
+ko	⟦1:C⟧부터 ⟦10:C⟧까지 세어 봐.
+ko	사과 ⟦3:C⟧개 주세요.
+ko	학생 ⟦20:C⟧명이 왔어요.
+ko	저는 ⟦21:C⟧살이에요.
+ko	⟦2024:Y⟧년에 이사했어요.
+ko	그는 ⟦1990:Y⟧년에 태어났다.
+ko	⟦1990-1995:Y⟧년에 서울에 살았다.
+ko	⟦1988:Y⟧년 서울 올림픽.
+ko	⟦5:C⟧월 ⟦3:O⟧일에 만나요.
+ko	⟦6:C⟧월 ⟦25:O⟧일은 기념일이다.
+ko	⟦10:C⟧월 ⟦9:O⟧일은 한글날이다.
+ko	⟦3:O⟧번째 줄에 앉으세요.
+ko	제⟦3:O⟧회 대회가 열렸다.
+ko	⟦3:C⟧개월 동안 준비했다.
+ko	참가자는 ⟦1982:C⟧명이었다.
+ko	이 옷은 ⟦2000:C⟧원이에요.
+ko	⟦12:C⟧쪽을 펴세요.
+ko	⟦52:C⟧번 버스를 타세요.
+ko	전화번호는 ⟦010-1234-5678:D⟧입니다.
+ko	사무실 번호는 ⟦02-555-1234:D⟧입니다.
+ko	비밀번호는 ⟦4821:D⟧입니다.
+ko	인증번호는 ⟦552901:D⟧입니다.
+ko	주문번호 ⟦4471029:D⟧가 발송되었습니다.
+ko	할아버지는 ⟦80:C⟧세이시다.
+ko	⟦2018:Y⟧년에 ⟦2018:C⟧명이 참가했다.
+# Year pairs with words between them, against counts in the same frame.
+en	Between ⟦1861:Y⟧ and ⟦1865:Y⟧ the country was at war.
+en	Between ⟦2004:Y⟧ and ⟦2009:Y⟧ she worked in Tokyo.
+en	Between ⟦1500:C⟧ and ⟦2000:C⟧ people are expected.
+en	Between ⟦1200:C⟧ and ⟦1400:C⟧ calories a day is too little.
+en	From ⟦1975:Y⟧ until ⟦1979:Y⟧ the regime ruled by terror.
+en	From ⟦2012:Y⟧ through ⟦2016:Y⟧ he coached the team.
+en	From ⟦1000:C⟧ to ⟦5000:C⟧ followers in a month.
+en	Unemployment fell between ⟦1993:Y⟧ and ⟦2000:Y⟧, then rose.
+en	Prices went from ⟦1800:C⟧ to ⟦2400:C⟧ dollars.
+en	It was popular between ⟦1920:Y⟧ and ⟦1940:Y⟧ in Europe.
+en	He was mayor from ⟦1998:Y⟧ to ⟦2006:Y⟧.
+en	The ⟦1918:Y⟧ flu killed millions.
+en	The ⟦2011:Y⟧ earthquake shook the whole coast.
+en	Her ⟦1995:Y⟧ debut is still her best record.
+en	A ⟦1962:Y⟧ Ferrari sold at auction.
+en	Like the ⟦1929:Y⟧ crash, it came without warning.
+de	Zwischen ⟦1949:Y⟧ und ⟦1990:Y⟧ war das Land geteilt.
+de	Von ⟦2005:Y⟧ bis ⟦2021:Y⟧ regierte sie das Land.
+de	Zwischen ⟦1500:C⟧ und ⟦2000:C⟧ Gäste werden erwartet.
+de	Der Winter ⟦1946:Y⟧ war besonders kalt.
+fr	Entre ⟦1940:Y⟧ et ⟦1944:Y⟧, Paris était occupé.
+fr	De ⟦2007:Y⟧ jusqu'en ⟦2012:Y⟧, il a été président.
+fr	Entre ⟦1500:C⟧ et ⟦2000:C⟧ personnes sont attendues.
+es	Entre ⟦1939:Y⟧ y ⟦1975:Y⟧ gobernó Franco.
+es	Desde ⟦2004:Y⟧ hasta ⟦2011:Y⟧ vivió en Chile.
+es	Entre ⟦1500:C⟧ y ⟦2000:C⟧ personas asistirán.
+it	Tra il ⟦1861:Y⟧ e il ⟦1870:Y⟧ l'Italia fu unificata.
+it	Dal ⟦2001:Y⟧ fino al ⟦2008:Y⟧ ha lavorato a Torino.
+it	Tra ⟦1500:C⟧ e ⟦2000:C⟧ persone sono attese.
+pt	Entre ⟦1964:Y⟧ e ⟦1985:Y⟧ o país viveu uma ditadura.
+pt	De ⟦2003:Y⟧ até ⟦2010:Y⟧ ele morou em Porto Alegre.
+pt	Entre ⟦1500:C⟧ e ⟦2000:C⟧ pessoas são esperadas.
+vi	Từ ⟦1945:Y⟧ đến ⟦1954:Y⟧ là thời kỳ kháng chiến.
+vi	Từ năm ⟦2010:Y⟧ tới năm ⟦2015:Y⟧ anh ấy làm ở Đà Nẵng.
+vi	Từ ⟦1500:C⟧ đến ⟦2000:C⟧ người sẽ tham dự.
+zh	⟦1937:Y⟧年到⟦1945:Y⟧年是抗战时期。
+zh	从⟦2010:Y⟧年至⟦2015:Y⟧年他在深圳工作。
+zh	⟦1500:C⟧人到⟦2000:C⟧人会参加。
+ja	⟦1941:Y⟧年から⟦1945:Y⟧年まで戦争が続いた。
+ja	⟦1500:C⟧人から⟦2000:C⟧人が参加する予定だ。
+ko	⟦1950:Y⟧년부터 ⟦1953:Y⟧년까지 전쟁이 있었다.
+ko	⟦1500:C⟧명에서 ⟦2000:C⟧명이 올 예정이다.
+# Short counters next to codes and IDs.
+en	Flight ⟦4417:Y⟧ now departs from gate ⟦31:C⟧.
+en	Your train ⟦9324:D⟧ leaves from platform ⟦4:C⟧.
+en	Order ⟦66721:D⟧ contains ⟦3:C⟧ items.
+en	Ticket ⟦55190:D⟧ is valid for ⟦2:C⟧ adults.
+en	Code ⟦8812:D⟧ unlocks door ⟦6:C⟧.
+en	Reservation ⟦448210:D⟧, table for ⟦4:C⟧.
+de	Flug ⟦2231:D⟧ startet heute von Gate ⟦7:C⟧.
+fr	Le train ⟦6612:D⟧ part de la voie ⟦3:C⟧.
+es	El vuelo ⟦3317:D⟧ sale por la puerta ⟦21:C⟧.
+vi	Chuyến bay VJ ⟦133:D⟧ khởi hành từ cổng ⟦8:C⟧.
+zh	航班MU⟦5137:D⟧在⟦9:C⟧号登机口登机。
+zh	K⟦1234:D⟧次列车在⟦3:C⟧号站台。
+ja	⟦3:C⟧番線から新幹線のぞみ⟦21:C⟧号が発車します。
+ko	⟦12:C⟧번 게이트에서 ⟦7702:D⟧편이 출발합니다.
+# PINs, codes and emergency numbers of every shape.
+en	My PIN is ⟦1234:D⟧, which is a bad idea.
+en	The PIN is ⟦0000:D⟧ by default.
+en	Set your passcode to ⟦2580:D⟧.
+en	The door code is ⟦1990:D⟧.
+en	The lock combination is ⟦3:C⟧-⟦17:C⟧-⟦29:C⟧.
+en	Call ⟦911:D⟧ right now!
+en	For an ambulance call ⟦999:D⟧ in the UK.
+en	Dial ⟦112:D⟧ anywhere in Europe.
+en	Text STOP to ⟦78750:D⟧ to unsubscribe.
+en	Your login code: ⟦2048:D⟧.
+de	Ruf sofort die ⟦112:D⟧ an!
+de	Die PIN ist ⟦1234:D⟧.
+fr	Appelez le ⟦15:C⟧ pour le SAMU.
+fr	Le code de la porte est ⟦2580:D⟧.
+es	Llama al ⟦112:D⟧ en caso de emergencia.
+es	El PIN es ⟦1234:D⟧.
+pt	Ligue ⟦190:C⟧ para a polícia.
+vi	Gọi ⟦113:D⟧ khi có trộm.
+vi	Mã PIN là ⟦1234:D⟧.
+zh	遇到火灾请拨打⟦119:D⟧。
+zh	密码是⟦1234:D⟧。
+ja	事故の時は⟦110:C⟧番に電話してください。
+ko	불이 나면 ⟦119:D⟧에 전화하세요.
+# House, plot, lot and unit numbers are cardinals.
+en	They live at ⟦2024:Y⟧ Maple Street.
+en	Lot ⟦18:C⟧ sold for ⟦900:C⟧ dollars.
+en	Apartment ⟦4:C⟧B is on the left.
+en	Plot ⟦2025:Y⟧ backs onto the river.
+# Four-digit counts with counters.
+vi	Có ⟦2005:C⟧ học sinh đăng ký.
+vi	Năm ⟦2019:Y⟧ có ⟦2019:C⟧ ca mắc mới.
+vi	Đã bán được ⟦1987:C⟧ chiếc xe.
+ko	⟦2005:C⟧명의 학생이 등록했다.
+ko	⟦2019:Y⟧년에 ⟦2019:C⟧건의 사고가 있었다.
+ko	차가 ⟦1987:C⟧대 팔렸다.
+zh	卖出了⟦1987:C⟧辆车。
+zh	⟦2019:Y⟧年有⟦2019:C⟧起事故。
+ja	車が⟦1987:C⟧台売れた。
+# Day before the month name.
+en	The ceremony is on ⟦9:O⟧ June ⟦2026:Y⟧.
+en	She was born on ⟦30:O⟧ November ⟦1974:Y⟧ in Cork.
+en	We fly out on ⟦14:O⟧ July.
+en	Applications close on ⟦1:O⟧ March.
+en	He died on ⟦2:O⟧ October ⟦1869:Y⟧.
+en	See you on Tuesday ⟦18:O⟧ April.
+# Roads, lockers, seats and other numbered places are cardinals.
+en	Take Interstate ⟦95:C⟧ north.
+en	Highway ⟦101:Y⟧ is closed near the bridge.
+en	Traffic is bad on the M⟦25:C⟧ again.
+en	Head south on Route ⟦128:Y⟧.
+en	Your locker is ⟦38:C⟧.
+en	Sit in seat ⟦17:C⟧.
+en	Visit booth ⟦212:Y⟧ at the fair.
+en	Go to counter ⟦5:C⟧.
+en	Line ⟦7:C⟧ runs every ten minutes.
+en	The patient in bed ⟦9:C⟧ needs water.
+zh	请到⟦7:C⟧号窗口办理。
+zh	他住在⟦302:D⟧号房间。
+zh	坐⟦18:C⟧号座位。
+ja	⟦5:C⟧番窓口へどうぞ。
+ko	⟦7:C⟧번 창구로 오세요.
+# Four-digit counts with many nouns and verbs.
+en	They planted ⟦1883:C⟧ trees last spring.
+en	The library lent out ⟦1745:C⟧ books.
+en	About ⟦1911:C⟧ fans signed the petition.
+en	The jar holds ⟦1066:C⟧ jelly beans.
+en	We received ⟦2005:C⟧ applications.
+de	Wir haben ⟦1883:C⟧ Bäume gepflanzt.
+de	Die Bibliothek verlieh ⟦1745:C⟧ Bücher.
+de	Es wurden ⟦1911:C⟧ Unterschriften gesammelt.
+fr	Nous avons planté ⟦1883:C⟧ arbres.
+fr	La bibliothèque a prêté ⟦1745:C⟧ livres.
+fr	On a reçu ⟦2005:C⟧ candidatures.
+es	Plantamos ⟦1883:C⟧ árboles.
+es	La biblioteca prestó ⟦1745:C⟧ libros.
+es	Recibimos ⟦2005:C⟧ solicitudes.
+es	Se vendieron ⟦1911:C⟧ boletos.
+it	Abbiamo piantato ⟦1883:C⟧ alberi.
+it	La biblioteca ha prestato ⟦1745:C⟧ libri.
+it	Sono arrivate ⟦2005:C⟧ domande.
+pt	Plantamos ⟦1883:C⟧ árvores.
+pt	A biblioteca emprestou ⟦1745:C⟧ livros.
+pt	Recebemos ⟦2005:C⟧ inscrições.
+vi	Chúng tôi trồng được ⟦1883:C⟧ cây.
+vi	Thư viện cho mượn ⟦1745:C⟧ cuốn sách.
+vi	Nhận được ⟦2005:C⟧ hồ sơ.
+zh	我们种了⟦1883:C⟧棵树。
+zh	图书馆借出了⟦1745:C⟧本书。
+ja	⟦1883:C⟧本の木を植えました。
+ja	図書館は⟦1745:C⟧冊の本を貸し出した。
+ko	나무를 ⟦1883:C⟧그루 심었다.
+ko	도서관에서 책 ⟦1745:C⟧권을 빌려주었다.
+# Years with verbs, against counts with the same verbs.
+es	En ⟦1969:Y⟧ el hombre llegó a la Luna.
+es	Llegaron ⟦1969:C⟧ turistas ayer.
+it	Nel ⟦1969:Y⟧ l'uomo arrivò sulla Luna.
+it	Sono arrivati ⟦1969:C⟧ turisti ieri.
+pt	Em ⟦1969:Y⟧ o homem chegou à Lua.
+pt	Chegaram ⟦1969:C⟧ turistas ontem.
+fr	En ⟦1969:Y⟧, l'homme a marché sur la Lune.
+fr	⟦1969:C⟧ touristes sont arrivés hier.
+de	⟦1969:Y⟧ landete der Mensch auf dem Mond.
+de	Gestern kamen ⟦1969:C⟧ Touristen an.
+vi	Năm ⟦1969:Y⟧ con người lên Mặt Trăng.
+vi	Hôm qua có ⟦1969:C⟧ du khách đến.
+# Codes and short service numbers in CJK.
+ko	쿠폰 코드는 ⟦7741:D⟧이에요.
+ko	보안 코드 ⟦205:D⟧를 입력하세요.
+ko	문 비밀번호가 ⟦1004:D⟧로 바뀌었어.
+ko	경찰은 ⟦112:D⟧번입니다.
+ja	クーポンコード⟦7741:D⟧を入力してください。
+ja	セキュリティコードは⟦205:D⟧です。
+zh	请拨打⟦114:D⟧查号。
+zh	有事打⟦12345:D⟧热线。
+zh	优惠码是⟦7741:D⟧。
+zh	安全码是⟦205:D⟧。
+yue	有事打⟦999:D⟧報警。
+
+# English numbered things read in pairs, against counts in the same frames.
+en	Take bus ⟦302:Y⟧ to the station.
+en	The bus carried ⟦302:C⟧ passengers yesterday.
+en	Our office is in suite ⟦410:Y⟧.
+en	The suite costs ⟦410:C⟧ dollars a night.
+en	Check in to room ⟦1123:Y⟧ after three.
+en	The hotel has ⟦1123:C⟧ rooms.
+en	US Airways flight ⟦1549:Y⟧ landed on the Hudson.
+en	The airline flew ⟦1549:C⟧ passengers that week.
+en	The Boeing ⟦777:Y⟧ has two engines.
+en	She upgraded to an RTX ⟦3080:Y⟧.
+en	Take Interstate ⟦405:Y⟧ to the airport.
+en	We drove ⟦405:C⟧ miles today.
+en	The museum is at ⟦1200:Y⟧ Pine Street.
+en	Pine Street has ⟦1200:C⟧ residents.
+en	Mail it to ⟦4417:Y⟧ Oak Avenue.
+en	Apartment ⟦305:Y⟧ has a balcony.
+en	He drives a Peugeot ⟦308:Y⟧.
+en	About ⟦1984:C⟧ runners finished the race.
+en	We sold ⟦2010:C⟧ tickets on the first day.
+en	Exactly ⟦1999:C⟧ people voted yes.
+en	The library owns ⟦1776:C⟧ maps.
+en	By ⟦2015:Y⟧, ⟦2015:C⟧ families had moved in.
+en	The safe opens with ⟦12:C⟧-⟦34:C⟧-⟦56:C⟧.
+en	Take the A⟦1:C⟧ north to Edinburgh.
+en	Junction ⟦15:C⟧ of the M⟦4:C⟧ is closed.
+en	Agent ⟦47:C⟧ never misses.
+en	Copyright ⟦2019:Y⟧ Acme Inc.
+en	© ⟦2023:Y⟧ All rights reserved.
+de	Copyright ⟦2021:Y⟧, alle Rechte vorbehalten.
+
+# A day after the month name and the bare "the 13".
+en	Friday the ⟦13:O⟧ is unlucky for some.
+en	The sale runs from March ⟦3:O⟧ to March ⟦9:O⟧.
+en	Classes start September ⟦2:O⟧.
+en	Join us Saturday, July ⟦19:O⟧, at noon.
+en	The deadline moved to April ⟦30:O⟧.
+en	I was born on December ⟦25:O⟧.
+
+# Emergency and service numbers in every language.
+en	If someone collapses, call ⟦911:D⟧ immediately.
+en	Dial ⟦999:D⟧ and ask for the fire brigade.
+de	Rufen Sie die Polizei unter ⟦110:D⟧ an.
+de	Die Feuerwehr erreichen Sie unter ⟦112:D⟧.
+es	Para emergencias, marca el ⟦112:D⟧.
+fr	Pour les pompiers, faites le ⟦18:C⟧.
+fr	Le ⟦112:C⟧ fonctionne partout en Europe.
+fr	Composez le ⟦17:C⟧ pour joindre la police.
+it	Chiama il ⟦118:C⟧ per un'ambulanza.
+it	Il numero unico di emergenza è il ⟦112:C⟧.
+it	In caso di incendio chiamate il ⟦115:C⟧.
+pt	Ligue ⟦192:C⟧ para chamar o SAMU.
+pt	Em caso de incêndio, ligue ⟦193:C⟧.
+pt	Disque ⟦180:C⟧ para denunciar.
+ja	火事の時は⟦119:C⟧番に電話してください。
+ja	事件ですか、事故ですか。こちら⟦110:C⟧番です。
+ja	救急車を呼ぶなら⟦119:C⟧番です。
+vi	Gọi ⟦115:D⟧ để cấp cứu.
+vi	Báo cháy thì gọi ⟦114:D⟧.
+vi	Tổng đài ⟦1900 1234:D⟧ hỗ trợ khách hàng.
+vi	Năm ⟦1900:Y⟧ dân số còn ít.
+ko	구급차는 ⟦119:D⟧로 부르세요.
+ko	범죄 신고는 ⟦112:D⟧입니다.
+zh	急救电话是⟦120:D⟧。
+zh	报警请拨⟦110:D⟧。
+zh	查号台是⟦114:D⟧。
+yue	緊急事故請打⟦999:D⟧。
+
+# Rooms in Chinese are read digit by digit; bus routes and floors are cardinals.
+zh	我住在⟦508:D⟧房间。
+zh	请到⟦3:C⟧楼⟦302:D⟧室办理。
+zh	会议在⟦1601:D⟧会议室举行。
+zh	坐⟦302:C⟧路公交车到火车站。
+yue	我住⟦1203:D⟧室。
+
+# French phone numbers are read in pairs.
+fr	Mon portable, c'est le ⟦06 12 34 56 78:C⟧.
+fr	Appelez le service client au ⟦01 23 45 67 89:C⟧.
+fr	Le cabinet médical : ⟦04 78 12 90 33:C⟧.
+
+# Vietnamese prizes against "solve N", and account numbers that look like years.
+vi	Lớp em được giải ⟦4:O⟧ văn nghệ.
+vi	Anh ấy giải ⟦4:C⟧ câu đố liền.
+vi	Cô ấy giải ⟦1:C⟧ bài toán khó trong ⟦5:C⟧ phút.
+vi	Đội bóng giành giải ⟦1:O⟧ năm nay.
+vi	Chuyển khoản vào số ⟦2004 1188 6677:D⟧ giúp em.
+vi	Số tài khoản của tôi là ⟦1987 2233 4455:D⟧.
+de	Wir treffen uns um ⟦18:C⟧ Uhr am Bahnhof.
+de	Der Film beginnt um ⟦21:C⟧ Uhr.
+de	Am ⟦5:O⟧. Mai um ⟦9:C⟧ Uhr fängt der Kurs an.
+de	Das Büro ist im ⟦4:O⟧. Stock, Raum ⟦417:C⟧.
+de	Bitte kommen Sie in Zimmer ⟦108:C⟧.
+de	Er wohnt in der Hauptstraße ⟦27:C⟧.
+de	Der Zug fährt von Gleis ⟦11:C⟧ ab.
+de	Sie belegte den ⟦2:O⟧. Platz von ⟦40:C⟧ Teilnehmern.
+de	Nehmen Sie den Bus ⟦142:C⟧ bis zur Endhaltestelle.
+de	Rufen Sie uns unter ⟦030 1234 5678:D⟧ an.
+de	Meine Handynummer ist ⟦0171 2345678:D⟧.
+de	Seit dem ⟦1:O⟧. Januar gilt die neue Regel.
+de	Die Bestellnummer lautet ⟦4471093:D⟧.
+de	Heute sind es ⟦25:C⟧° im Schatten.
+de	Der Winkel beträgt ⟦45:C⟧°.
+it	Abito al ⟦3:O⟧° piano.
+it	È arrivato ⟦2:O⟧° nella gara di ieri.
+it	La squadra è al ⟦5:O⟧° posto in classifica.
+it	Il ⟦1:O⟧° maggio è festa.
+it	Oggi ci sono ⟦30:C⟧° all'ombra.
+it	Stanotte la temperatura è scesa a ⟦2:C⟧°.
+it	Gira il volante di ⟦90:C⟧°.
+it	Chiamami al ⟦347 123 4567:D⟧.
+it	Il numero dell'ufficio è ⟦06 4567 8910:D⟧.
+it	Abito in via Roma ⟦15:C⟧.
+it	La camera ⟦108:C⟧ è libera.
+es	Vivo en el ⟦3:O⟧° piso.
+es	Quedó en ⟦2:O⟧° lugar en la carrera.
+es	Hoy hace ⟦35:C⟧° a la sombra.
+es	El ángulo mide ⟦60:C⟧°.
+es	Mi móvil es el ⟦612 345 678:D⟧.
+es	Llámame al ⟦600 12 34 56:D⟧.
+es	El teléfono de la oficina es el ⟦93 412 56 78:D⟧.
+es	La habitación ⟦305:C⟧ está en la tercera planta.
+pt	Meu celular é ⟦21 99876 5432:D⟧.
+pt	Ligue para ⟦(11) 3456-7890:D⟧.
+pt	O telefone da loja é ⟦31 3222 1100:D⟧.
+pt	Moro no apartamento ⟦1204:C⟧.
+pt	A sala ⟦305:C⟧ fica no terceiro andar.
+pt	O quarto ⟦12:C⟧ está livre.
+pt	Ele chegou em ⟦2:O⟧° lugar.
+pt	Moro no ⟦4:O⟧° andar.
+pt	Hoje faz ⟦32:C⟧° no Rio.
+pt	O ângulo tem ⟦90:C⟧°.
+ko	⟦1203:C⟧호로 오세요.
+ko	저는 ⟦302:C⟧호에 살아요.
+ko	⟦101:C⟧동 ⟦1504:C⟧호입니다.
+ko	회의실은 ⟦5:C⟧층 ⟦507:C⟧호예요.
+ko	⟦305:C⟧호 강의실에서 수업이 있어요.
+ko	⟦741:C⟧번 버스가 곧 도착합니다.
+ko	⟦273:C⟧번 버스는 시청에 가요.
+ko	⟦15:C⟧번 출구로 나가세요.
+ko	계좌번호는 ⟦110-234-567890:D⟧입니다.
+ko	⟦010 9876 5432:D⟧로 문자 주세요.
+ko	오늘 기온이 ⟦30:C⟧°까지 올라요.
+ja	⟦080 2345 6789:D⟧までご連絡ください。
+ja	今日は⟦35:C⟧°まで上がります。
+fr	Il fait ⟦25:C⟧° dehors.
+fr	Tourne de ⟦90:C⟧° à gauche.
+en	It's ⟦75:C⟧° outside.
+en	Turn ⟦90:C⟧° to the left.
+vi	Trời nóng tới ⟦38:C⟧°.
+zh	今天最高气温⟦30:C⟧°。

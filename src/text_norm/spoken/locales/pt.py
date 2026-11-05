@@ -2,16 +2,34 @@
 
 from __future__ import annotations
 
+import re
+
+from num2words import num2words
+
 from .base import SpokenLocale, make_number_words
 
 _NUMBER_WORDS = make_number_words('pt')
 
 
 def _clock_words(hour: int, minute: int | None, meridiem: str | None) -> str:
-    result = f"{_NUMBER_WORDS(hour)} horas"
+    # Hora is feminine: uma hora, duas horas, vinte e duas horas.
+    if hour == 1:
+        result = 'uma hora'
+    else:
+        words = re.sub(r'\bum$', 'uma', _NUMBER_WORDS(hour))
+        result = re.sub(r'\bdois$', 'duas', words) + ' horas'
     if minute not in (None, 0):
         result += f" e {_NUMBER_WORDS(minute)} minutos"
     return result
+
+
+def _sign_ordinal_words(value: int, before: str, after: str) -> str:
+    return num2words(value, lang='pt', to='ordinal')
+
+
+def _ordinal_words(value: int, before: str, after: str) -> str:
+    # Only the first day of a month is an ordinal; the rest read as cardinals.
+    return 'primeiro' if value == 1 else _NUMBER_WORDS(value)
 
 
 LOCALE = SpokenLocale(
@@ -114,4 +132,9 @@ LOCALE = SpokenLocale(
         'minutos': 'min',
         'dias': 'd',
     },
+    ordinal_words=_ordinal_words,
+    decimal_fraction_number=True,
+    bare_hour_clock=True,
+    degree_words=('grau', 'graus'),
+    sign_ordinal_words=_sign_ordinal_words,
 )

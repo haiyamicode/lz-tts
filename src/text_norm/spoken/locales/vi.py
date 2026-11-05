@@ -2,10 +2,40 @@
 
 from __future__ import annotations
 
+import re
+
 from ...vietnamese import vietnamese_number_words
 from .base import SpokenLocale
 
-_NUMBER_WORDS = vietnamese_number_words
+
+_SCALES = ('', ' nghìn', ' triệu', ' tỷ')
+
+
+def _number_words(value: int) -> str:
+    # num2words reads an inner group below 100 as "lẻ hai mươi tư" (2024);
+    # Vietnamese says "hai nghìn không trăm hai mươi tư".
+    if value < 1000 or value >= 10**12:
+        return vietnamese_number_words(value)
+    groups = []
+    while value:
+        value, group = divmod(value, 1000)
+        groups.append(group)
+    words = []
+    for index in range(len(groups) - 1, -1, -1):
+        group = groups[index]
+        if not group:
+            continue
+        if index == len(groups) - 1 or group >= 100:
+            spoken = vietnamese_number_words(group)
+        elif group >= 10:
+            spoken = f'không trăm {vietnamese_number_words(group)}'
+        else:
+            spoken = f'không trăm lẻ {vietnamese_number_words(group)}'
+        words.append(spoken + _SCALES[index])
+    return ' '.join(words)
+
+
+_NUMBER_WORDS = _number_words
 
 
 def _clock_words(hour: int, minute: int | None, meridiem: str | None) -> str:
@@ -13,6 +43,30 @@ def _clock_words(hour: int, minute: int | None, meridiem: str | None) -> str:
     if minute not in (None, 0):
         result += f" {_NUMBER_WORDS(minute)}"
     return result
+
+
+_ORDER_WORDS = {1: 'nhất', 4: 'tư'}  # "thứ nhất", "thứ hai", "thứ tư"
+_PRIZE_WORDS = {1: 'nhất', 2: 'nhì', 4: 'tư'}  # "giải nhì", "hạng nhì"
+
+
+def _cardinal_words(value: int, before: str, after: str) -> str:
+    # The fourth month is "tháng tư"; "thứ 4" is "thứ tư", "hạng 1" is
+    # "hạng nhất" and a prize won ("đạt giải 1") is "giải nhất" in any context.
+    if value == 4 and re.search(r'tháng\s*$', before, re.IGNORECASE):
+        return 'tư'
+    if re.search(r'thứ\s*$', before, re.IGNORECASE):
+        return _ORDER_WORDS.get(value) or _number_words(value)
+    if re.search(r'(?:hạng|(?:đạt|giành|đoạt|được|nhận)\s+giải)\s*$', before, re.IGNORECASE):
+        return _PRIZE_WORDS.get(value) or _number_words(value)
+    return _number_words(value)
+
+
+def _ordinal_words(value: int, before: str, after: str) -> str:
+    # "giải 1" is "giải nhất" as a prize but "giải một bài toán" (solve) as a
+    # count; other ordinals are cardinals.
+    if re.search(r'giải\s*$', before, re.IGNORECASE):
+        return _PRIZE_WORDS.get(value) or _number_words(value)
+    return _cardinal_words(value, before, after)
 
 
 LOCALE = SpokenLocale(
@@ -87,4 +141,9 @@ LOCALE = SpokenLocale(
         'd': 'ngày',
     },
     rate_denominator_aliases={},
+    ordinal_words=_ordinal_words,
+    cardinal_words=_cardinal_words,
+    decimal_fraction_number=True,
+    bare_hour_clock=True,
+    degree_words=('độ', 'độ'),
 )

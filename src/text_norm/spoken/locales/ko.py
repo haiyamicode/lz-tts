@@ -5,13 +5,46 @@ from __future__ import annotations
 from .base import SpokenLocale, make_number_words
 
 _NUMBER_WORDS = make_number_words('ko')
+_NATIVE_UNITS = ('', '한', '두', '세', '네', '다섯', '여섯', '일곱', '여덟', '아홉')
+_NATIVE_TENS = ('', '열', '스물', '서른', '마흔', '쉰', '예순', '일흔', '여든', '아흔')
+# Counters that take native numbers (세 개, 다섯 명). 번 is left out: 세 번
+# (three times) but 삼 번 (number three).
+_NATIVE_COUNTERS = (
+    '개', '명', '사람', '시', '살', '마리', '잔', '권', '장', '대', '병', '그릇',
+    '달', '군데', '가지', '벌', '켤레', '송이', '그루', '채', '척', '통', '줄',
+    '쌍', '곳',
+)
+# Sino-Korean words that start like a native counter (삼 개월, 오 대학).
+_SINO_COUNTER_WORDS = ('개월', '시즌', '대학', '대회', '장면', '줄기')
+
+
+def _native_words(value: int) -> str:
+    tens, units = divmod(value, 10)
+    if tens == 2 and units == 0:
+        return '스무'
+    return _NATIVE_TENS[tens] + _NATIVE_UNITS[units]
 
 
 def _clock_words(hour: int, minute: int | None, meridiem: str | None) -> str:
-    result = f"{_NUMBER_WORDS(hour)}시"
+    result = f"{_native_words(hour) if hour else _NUMBER_WORDS(hour)}시"
     if minute not in (None, 0):
         result += f" {_NUMBER_WORDS(minute)}분"
     return result
+
+
+def _cardinal_words(value: int, before: str, after: str) -> str:
+    following = after.lstrip()
+    if following.startswith('번째') and 0 < value < 100:
+        return '첫' if value == 1 else _native_words(value)
+    if following.startswith('월') and value in (6, 10):
+        return '유' if value == 6 else '시'
+    if (
+        0 < value < 100
+        and following.startswith(_NATIVE_COUNTERS)
+        and not following.startswith(_SINO_COUNTER_WORDS)
+    ):
+        return _native_words(value)
+    return _NUMBER_WORDS(value)
 
 
 LOCALE = SpokenLocale(
@@ -31,7 +64,8 @@ LOCALE = SpokenLocale(
     clock_consumes_meridiem=False,
     carbon_dioxide='씨오투',
     tech_letter_words={'K': '케이', 'D': '디', 'G': '지'},
-    range_template='{start}부터 {end}까지',
+    # 에서 also reads before a counter: 천구백구십에서 천구백구십오 년.
+    range_template='{start}에서 {end}',
     decimal_word='점',
     percent_word='퍼센트',
     currency_magnitudes={},
@@ -80,4 +114,7 @@ LOCALE = SpokenLocale(
         'd': '하루',
     },
     rate_denominator_aliases={},
+    cardinal_words=_cardinal_words,
+    code_zero_word='공',
+    degree_words=('도', '도'),
 )

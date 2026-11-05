@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import re
+
+from num2words import num2words
+
 from .base import SpokenLocale, make_number_words
 
 _NUMBER_WORDS = make_number_words('en')
@@ -22,6 +26,26 @@ def _clock_words(hour: int, minute: int | None, meridiem: str | None) -> str:
     if normalized_meridiem:
         result += ' a.m.' if normalized_meridiem == 'am' else ' p.m.'
     return result
+
+
+def _year_words(value: int) -> str:
+    return num2words(value, lang='en', to='year')
+
+
+_MONTH_AFTER_RE = re.compile(
+    r'\s+(?:January|February|March|April|May|June|July|August|September|October|November'
+    r'|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)\.?(?!\w)'
+)
+
+
+def _ordinal_words(value: int, before: str, after: str) -> str:
+    words = num2words(value, lang='en', to='ordinal')
+    # A day before its month: "6 January" is "the sixth of January".
+    if _MONTH_AFTER_RE.match(after):
+        if not re.search(r'\bthe\s*$', before, re.IGNORECASE):
+            words = f'the {words}'
+        words += ' of'
+    return words
 
 
 LOCALE = SpokenLocale(
@@ -137,4 +161,7 @@ LOCALE = SpokenLocale(
         'minutes': 'min',
         'days': 'd',
     },
+    year_words=_year_words,
+    ordinal_words=_ordinal_words,
+    degree_words=('degree', 'degrees'),
 )

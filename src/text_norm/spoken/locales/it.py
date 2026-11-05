@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from num2words import num2words
+
 from .base import SpokenLocale, make_number_words
 
-_NUMBER_WORDS = make_number_words('it')
+_NUM2WORDS = make_number_words('it')
+
+
+def _NUMBER_WORDS(value: int) -> str:
+    # num2words elides "cento" + "diciotto" (118, 2118, 118000) to "centodicotto".
+    return _NUM2WORDS(value).replace('dicott', 'diciott')
 
 
 def _clock_words(hour: int, minute: int | None, meridiem: str | None) -> str:
@@ -12,6 +19,16 @@ def _clock_words(hour: int, minute: int | None, meridiem: str | None) -> str:
     if minute not in (None, 0):
         result += f" e {_NUMBER_WORDS(minute)}"
     return result
+
+
+def _sign_ordinal_words(value: int, before: str, after: str) -> str:
+    # num2words: 118º "centodicottesimo".
+    return num2words(value, lang='it', to='ordinal').replace('dicott', 'diciott')
+
+
+def _ordinal_words(value: int, before: str, after: str) -> str:
+    # Only the first day of a month is an ordinal; the rest read as cardinals.
+    return 'primo' if value == 1 else _NUMBER_WORDS(value)
 
 
 LOCALE = SpokenLocale(
@@ -114,4 +131,8 @@ LOCALE = SpokenLocale(
         'minuti': 'min',
         'giorni': 'd',
     },
+    ordinal_words=_ordinal_words,
+    decimal_fraction_number=True,
+    degree_words=('grado', 'gradi'),
+    sign_ordinal_words=_sign_ordinal_words,
 )

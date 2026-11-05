@@ -33,6 +33,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError, model_validator
+from rapidfuzz.distance import Levenshtein
 
 from ..multilingual_splitter import MultilingualSplitter, SplitResult
 from ..multilingual_splitter.multilingual_splitter import CLD2_LANGUAGE_CODES
@@ -337,6 +338,10 @@ class VoxCPMConfig(BaseModel):
     # True: one conditional DiT pass per step, no CFG, cfg_value ignored (what a model with CFG folded into its DiT,
     # Falcon v1.2, needs). False: the two-pass CFG solver. None: the model's config.json `guidance_folded`.
     guidance_folded: bool | None = None
+    # Spell every number out before VoxCPM reads it (it reads written digits
+    # unreliably), in the reading the data/number-modes classifier picks from
+    # its context. Languages without spoken rules keep their digits.
+    verbalize_numbers: bool = True
     max_num_batched_tokens: int = Field(default=8192, ge=1)
     max_num_seqs: int = Field(default=8, ge=1)
     max_model_len: int = Field(default=4096, ge=1)
@@ -1319,7 +1324,7 @@ def _worker_settings_data() -> dict[str, Any]:
 
 
 def _ensure_speech_worker() -> WorkerProcessClient:
-    """The one GPU process hosting Sparrow, Seed-VC and the CTC aligner."""
+    """The one GPU process hosting Sparrow, Seed-VC, the CTC aligner and the number classifier."""
     global _speech_worker
     if _speech_worker is None:
         _speech_worker = WorkerProcessClient(
@@ -1357,6 +1362,10 @@ def _ensure_seed_vc_worker() -> EngineClient:
 
 def _aligner_client() -> EngineClient:
     return EngineClient(_ensure_speech_worker(), "ctc")
+
+
+def _number_modes_client() -> EngineClient:
+    return EngineClient(_ensure_speech_worker(), "numbers")
 
 
 def _worker_name_to_engines(name: str) -> tuple[str, ...]:
@@ -2913,6 +2922,7 @@ def _prepare_voxcpm_ipa_text(
     language_hint: str | None,
     forced_language: str | None,
     fallback_language: str | None = None,
+    verbalize_numbers: bool = False,
 ) -> tuple[str, str, list[dict[str, Any]]]:
     operations = sorted(document.pronunciations, key=lambda item: item.start)
     cursor = 0
@@ -2932,6 +2942,8 @@ def _prepare_voxcpm_ipa_text(
     marked_text, detected_language = _prepare_voxcpm_input(
         "".join(marked_parts), forced_language, fallback_language
     )
+    if verbalize_numbers:
+        marked_text = _verbalize_voxcpm_numbers([marked_text], [detected_language])[0]
     located_replacements: list[tuple[int, str, PronunciationOperation]] = []
     for marker, operation in replacements:
         if marked_text.count(marker) != 1:
@@ -3262,11 +3274,14 @@ async def _synthesize_voxcpm_ipa_ssml(
         request.language,
         request.language_override,
     )
-    controlled_text, language, controls = _prepare_voxcpm_ipa_text(
+    # The baseline read its numbers as words; the regenerated chunks must too.
+    controlled_text, language, controls = await asyncio.to_thread(
+        _prepare_voxcpm_ipa_text,
         document,
         request.language,
         forced_language,
         _configured_voice_language(request.voice_id, request.language),
+        True,
     )
     patch_samples = runtime.output_patch_samples
     patch_seconds = patch_samples / runtime.sample_rate
@@ -4131,18 +4146,88 @@ def _prepare_voxcpm_input(
     language: str | None,
     fallback_language: str | None = None,
 ) -> tuple[str, str]:
-    # VoxCPM reads digits, dates and symbols itself. No spoken-text
-    # normalization: it verbalized every number as a cardinal, so years came
-    # out as "one thousand, nine hundred and forty-nine" and zh "二千零二十四年".
+    # Numbers were spelled out before chunking (_verbalize_voxcpm_numbers).
     text = _voxcpm_speakable_paren_groups(text)
     if language is not None:
         return text, language
+    return text, _voxcpm_main_language(text, fallback_language)
 
-    result = _get_multilingual_splitter().split(text)
-    language = result.effective_main_language(fallback_language or "en-us")
-    # Without Sparrow routes the splitter is unconstrained and passes CLD2's
-    # legacy codes through (Filipino as "tl"); the DP and LoRAs use "fil".
-    return text, _APPLICATION_LANGUAGE_CODES.get(language, language)
+
+def _voxcpm_main_language(text: str, fallback_language: str | None = None) -> str:
+    runs = _voxcpm_language_runs(text, fallback_language)
+    return max(runs, key=lambda run: len(run[0]))[1] if runs else fallback_language or "en-us"
+
+
+def _voxcpm_language_runs(text: str, fallback_language: str | None = None) -> list[tuple[str, str]]:
+    """Split text into runs of one script, each in the language covering most of it.
+
+    The request locale is the splitter's main language: detection alone reads
+    short texts as English ("Dimmi 7.", "Le train part le 14 juillet à
+    9 h 30."), while text clearly in another language keeps its own. Runs break
+    only where the script changes ("My mom said 我们3点见面"): within one script
+    the splitter's word guesses even cut numbers ("2." | "750 ingressos." as
+    Catalan). Text with no detectable language (bare numbers) takes the locale.
+    """
+    base = _get_base_language(fallback_language) if fallback_language else None
+    hint = CLD2_LANGUAGE_CODES.get(base, base) if base else None
+    runs: list[tuple[list[str], dict[str, int]]] = []
+    run_script: str | None = None
+    for segment in _get_multilingual_splitter().split(text, main_lang=hint).segments:
+        undetected = segment.language == "und" or segment.script in ("Common", "Inherited")
+        if not runs or not (undetected or run_script in (None, segment.script)):
+            runs.append(([], {}))
+            run_script = None
+        parts, languages = runs[-1]
+        parts.append(segment.text)
+        if not undetected:
+            run_script = segment.script
+            # Without Sparrow routes the splitter is unconstrained and passes CLD2's
+            # legacy codes through (Filipino as "tl"); the DP and LoRAs use "fil".
+            language = _APPLICATION_LANGUAGE_CODES.get(segment.language, segment.language)
+            languages[language] = languages.get(language, 0) + len(segment.text)
+    return [
+        ("".join(parts), max(languages, key=languages.__getitem__) if languages else fallback_language or "en-us")
+        for parts, languages in runs
+    ]
+
+
+_DIGIT_RE = re.compile(r"\d")
+
+
+def _verbalize_voxcpm_numbers(
+    texts: list[str],
+    languages: list[str | None],
+    fallback_language: str | None = None,
+) -> list[str]:
+    """Spell out every number in the reading its context picks (blocking).
+
+    VoxCPM reads written digits unreliably (Falcon v1.2 read 56% of number
+    texts right as digits, 98% as words). The classifier picks cardinal, year,
+    ordinal or digit by digit for each number from the whole text, and the
+    language's spoken rules read it: "in 1982" is "in nineteen eighty-two",
+    "1982 apples" "one thousand, nine hundred and eighty-two apples". Whole
+    texts go in before chunking, so the chunk budget counts the words. Without
+    an explicit language each language run is read in its own language.
+    """
+    if not (_engine_enabled("voxcpm") and _server_config.voxcpm.verbalize_numbers):
+        return list(texts)
+    runs = [
+        (index, run_text, run_language)
+        for index, (text, language) in enumerate(zip(texts, languages, strict=True))
+        if _DIGIT_RE.search(text)
+        for run_text, run_language in (
+            [(text, language)] if language else _voxcpm_language_runs(text, fallback_language)
+        )
+    ]
+    if not runs:
+        return list(texts)
+    response = _number_modes_client().call(
+        "verbalize", {"items": [[run_text, run_language] for _, run_text, run_language in runs]}
+    )
+    spoken: dict[int, str] = {}
+    for (index, _, _), text in zip(runs, response["data"]["texts"], strict=True):
+        spoken[index] = spoken.get(index, "") + text
+    return [spoken.get(index, text) for index, text in enumerate(texts)]
 
 
 def _prepare_voxcpm_text(
@@ -4334,7 +4419,9 @@ async def synthesize_voxcpm_batch(
     if len(languages) != len(texts):
         raise HTTPException(status_code=400, detail="VoxCPM languages length must match texts length")
 
-    chunk_texts, chunk_counts = _chunk_voxcpm_texts(texts)
+    fallback_language = _configured_voice_language(request.voice_id, request.language)
+    spoken_texts = await asyncio.to_thread(_verbalize_voxcpm_numbers, texts, languages, fallback_language)
+    chunk_texts, chunk_counts = _chunk_voxcpm_texts(spoken_texts)
     chunk_languages = expand_chunks(languages, chunk_counts) or []
     chunk_seeds = expand_chunks(request.seeds, chunk_counts)
     chunk_reference_audios = expand_chunks(reference_audios, chunk_counts)
@@ -4371,7 +4458,6 @@ async def synthesize_voxcpm_batch(
         lora_name = await runtime.resolve_lora_combination(requested_loras)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Could not apply VoxCPM LoRAs: {exc}") from exc
-    fallback_language = _configured_voice_language(request.voice_id, request.language)
     prepared_inputs = [
         _prepare_voxcpm_input(text, language, fallback_language)
         for text, language in zip(chunk_texts, chunk_languages)
@@ -4560,7 +4646,12 @@ async def synthesize_voice_designs(
         request.seed if request.seed is not None else secrets.randbelow(_VOICE_DESIGN_SEED_LIMIT)
         for _, request, _, _ in valid
     ]
-    chunk_texts, chunk_counts = _chunk_voxcpm_texts([request.text.strip() for _, request, _, _ in valid])
+    spoken_texts = await asyncio.to_thread(
+        _verbalize_voxcpm_numbers,
+        [request.text.strip() for _, request, _, _ in valid],
+        [request.language for _, request, _, _ in valid],
+    )
+    chunk_texts, chunk_counts = _chunk_voxcpm_texts(spoken_texts)
     chunk_languages = expand_chunks([request.language for _, request, _, _ in valid], chunk_counts) or []
     prepared = [
         _prepare_voxcpm_input(text, language)
@@ -5013,6 +5104,87 @@ def _word_timestamp(text: str, word: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# A CJK character is a token of its own; other tokens run between spaces.
+_TIMESTAMP_TOKEN_RE = re.compile(
+    r"[぀-ヿ㐀-鿿豈-﫿]|[^\s぀-ヿ㐀-鿿豈-﫿]+"
+)
+
+
+def _source_word_timestamps(
+    text: str,
+    spoken: str,
+    words: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Move words aligned on the spoken text onto the text it was spoken from.
+
+    The tokens of the two texts are matched by edit script; a run of changed
+    tokens (1987 -> nineteen eighty-seven) maps every spoken word onto the
+    whole written run, and words that land on the same written span become
+    one timestamp.
+    """
+    source = [match.span() for match in _TIMESTAMP_TOKEN_RE.finditer(text)]
+    target = [match.span() for match in _TIMESTAMP_TOKEN_RE.finditer(spoken)]
+    origins: list[tuple[int, int] | None] = [None] * len(target)
+    opcodes = [
+        tuple(opcode)
+        for opcode in Levenshtein.opcodes(
+            [text[start:end] for start, end in source],
+            [spoken[start:end] for start, end in target],
+        )
+    ]
+    index = 0
+    while index < len(opcodes):
+        tag, i1, i2, j1, j2 = opcodes[index]
+        if tag == "equal":
+            for offset in range(j2 - j1):
+                origins[j1 + offset] = source[i1 + offset]
+            index += 1
+            continue
+        while index + 1 < len(opcodes) and opcodes[index + 1][0] != "equal":
+            index += 1
+            _, _, i2, _, j2 = opcodes[index]
+        for position in range(j1, j2):
+            origins[position] = (source[i1][0], source[i2 - 1][1]) if i2 > i1 else None
+        index += 1
+
+    mapped: list[dict[str, Any]] = []
+    pending_start: float | None = None
+    token = 0
+    for word in words:
+        start, end = int(word["source_start"]), int(word["source_end"])
+        while token < len(target) and target[token][1] <= start:
+            token += 1
+        spans = []
+        for (token_start, _), origin in zip(target[token:], origins[token:]):
+            if token_start >= end:
+                break
+            if origin is not None:
+                spans.append(origin)
+        if not spans:
+            # Spoken words with nothing written under them join a neighbour.
+            if mapped:
+                mapped[-1]["end_seconds"] = word["end_seconds"]
+            elif pending_start is None:
+                pending_start = word["start_seconds"]
+            continue
+        source_start = min(span[0] for span in spans)
+        source_end = max(span[1] for span in spans)
+        if mapped and source_start < mapped[-1]["source_end"]:
+            mapped[-1]["source_end"] = max(mapped[-1]["source_end"], source_end)
+            mapped[-1]["end_seconds"] = word["end_seconds"]
+            continue
+        mapped.append(
+            {
+                **word,
+                "start_seconds": word["start_seconds"] if pending_start is None else pending_start,
+                "source_start": source_start,
+                "source_end": source_end,
+            }
+        )
+        pending_start = None
+    return mapped
+
+
 async def _add_word_timestamps(
     result: InferenceResult,
     request: SynthesizeRequest,
@@ -5021,14 +5193,26 @@ async def _add_word_timestamps(
     if not request.timestamps or result.kind != "audio" or not result.audio:
         return result
     text = parse_ssml(request.ssml).text if request.ssml is not None else request.text or ""
+    explicit_language = _explicit_language(request.language, request.language_override)
+    # The aligner can't read digits: align the words the numbers were spoken as.
+    spoken = (
+        await asyncio.to_thread(
+            _verbalize_voxcpm_numbers,
+            [text],
+            [explicit_language],
+            _configured_voice_language(request.voice_id, request.language),
+        )
+    )[0]
     audio, sample_rate = await asyncio.to_thread(_decode_wav_bytes, result.audio)
     words = await _align_words(
-        text,
+        spoken,
         audio,
         sample_rate,
         request.language,
-        _explicit_language(request.language, request.language_override),
+        explicit_language,
     )
+    if spoken != text:
+        words = _source_word_timestamps(text, spoken, words)
     return InferenceResult(
         kind="audio",
         content_type=result.content_type,
@@ -5290,6 +5474,12 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
             dtype=_server_config.aligner.dtype,
         ):
             await asyncio.to_thread(_aligner_client().call, "load")
+        if _engine_enabled("voxcpm") and _server_config.voxcpm.verbalize_numbers:
+            with _logged_startup_step(
+                "number_modes",
+                device=_server_config.pipertts.text_preprocessor_device,
+            ):
+                await asyncio.to_thread(_number_modes_client().call, "load")
         _LOGGER.info("Loaded inference runtime models elapsed=%.2fs", time.perf_counter() - load_started)
 
     if _engine_enabled("pipertts"):

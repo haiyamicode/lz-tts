@@ -225,7 +225,7 @@ class TestTextNorm(unittest.TestCase):
             ),
             (
                 "Mở mười bốn giờ ba mươi, tải hai mươi ba ki lô gam, "
-                "pin ba mươi phần trăm, giá mười hai phẩy năm không đô la."
+                "pin ba mươi phần trăm, giá mười hai phẩy năm mươi đô la."
             ),
         )
         self.assertEqual(
@@ -240,8 +240,8 @@ class TestTextNorm(unittest.TestCase):
             "fr": "Meet at deux heures trente p.m.",
             "it": "Meet at due e trenta p.m.",
             "ja": "Meet at 二時三十分 p.m.",
-            "ko": "Meet at 이시 삼십분 p.m.",
-            "pt": "Meet at dois horas e trinta minutos p.m.",
+            "ko": "Meet at 두시 삼십분 p.m.",
+            "pt": "Meet at duas horas e trinta minutos p.m.",
             "vi": "Meet at hai giờ ba mươi p.m.",
         }
         for language, spoken in expected.items():
@@ -466,7 +466,7 @@ class TestTextNorm(unittest.TestCase):
         )
         self.assertEqual(
             normalize_spoken_text("Ngày 12/06/2026.", "vi-VN"),
-            "Ngày mười hai tháng sáu năm hai nghìn lẻ hai mươi sáu.",
+            "Ngày mười hai tháng sáu năm hai nghìn không trăm hai mươi sáu.",
         )
         self.assertEqual(
             normalize_spoken_text("Ngày 29/02/2025.", "vi-VN"),
@@ -576,11 +576,25 @@ class TestTextNorm(unittest.TestCase):
                 )
 
     def test_spoken_normalization_preserves_ambiguous_hour_only_tokens(self):
-        for language in ("de", "en", "es", "fr", "it", "ja", "ko", "pt", "vi"):
+        for language in ("de", "en", "it", "ja", "ko"):
             with self.subTest(language=language):
                 self.assertEqual(
                     normalize_spoken_text("Work for 10h.", language),
                     "Work for 10h.",
+                )
+
+    def test_spoken_normalization_reads_hour_only_tokens_whose_word_is_a_duration(self):
+        expected = {
+            "es": "Work for diez horas, una hora.",
+            "fr": "Work for dix heures, une heure.",
+            "pt": "Work for dez horas, uma hora.",
+            "vi": "Work for mười giờ, một giờ.",
+        }
+        for language, spoken in expected.items():
+            with self.subTest(language=language):
+                self.assertEqual(
+                    normalize_spoken_text("Work for 10h, 1h.", language),
+                    spoken,
                 )
 
     def test_shared_preparation_accepts_spoken_profile(self):

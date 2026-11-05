@@ -54,9 +54,15 @@ def _iso_639_3(language: str, fallback: str) -> str:
 
 
 def _romanized_edges(text: str, language: str) -> list[Any]:
-    """Romanize a complete language span while retaining its source offsets."""
+    """Romanize a complete language span while retaining its source offsets.
+
+    Numeral characters (三, 十, 零) keep their syllables instead of the number
+    uroman prefers: the CTC vocabulary has no digits, so 三月 would otherwise
+    align as 月 alone.
+    """
     from ctc_forced_aligner.text_utils import uroman_instance
     from uroman import RomFormat
+    from uroman.uroman import NumEdge
 
     result = uroman_instance.romanize_string(
         text,
@@ -65,7 +71,27 @@ def _romanized_edges(text: str, language: str) -> list[Any]:
     )
     if isinstance(result, str):
         raise TypeError("Uroman did not return offset edges")
-    return result
+    if not any(isinstance(edge, NumEdge) for edge in result):
+        return result
+    syllables = {
+        int(edge.start): edge
+        for edge in uroman_instance.romanize_string(
+            text,
+            lcode=language,
+            rom_format=RomFormat.LATTICE,
+        )
+        if not isinstance(edge, NumEdge)
+        and int(edge.end) == int(edge.start) + 1
+        and _edge_has_ctc_text(edge)
+    }
+    edges: list[Any] = []
+    for edge in result:
+        spelled = [syllables.get(position) for position in range(int(edge.start), int(edge.end))]
+        if isinstance(edge, NumEdge) and all(spelled):
+            edges.extend(spelled)
+        else:
+            edges.append(edge)
+    return edges
 
 
 def _edge_has_ctc_text(edge: Any) -> bool:

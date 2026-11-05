@@ -528,8 +528,8 @@ def test_voxcpm_speakable_paren_groups():
 
 
 def test_voxcpm_input_keeps_numbers_for_the_model():
-    """VoxCPM reads years and numbers itself; verbalizing them read every
-    number as a cardinal ("1949" -> "one thousand, nine hundred and ...")."""
+    """Numbers are spelled out once, on whole texts before chunking
+    (_verbalize_voxcpm_numbers); chunk preparation leaves them alone."""
     from src.api.server import _prepare_voxcpm_input
 
     for text, language in (

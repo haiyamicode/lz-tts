@@ -95,10 +95,15 @@ class _Match:
 
 
 class ContextReplacerClassifier(nn.Module):
-    """Binary classifier: approve (1) or reject (0) a text replacement in context."""
+    """Classifies a target span in context.
 
-    def __init__(self, context_hidden_size: int = _DEFAULT_CONTEXT_HIDDEN):
+    With one label it approves (1) or rejects (0) a text replacement; with more it
+    picks one of ``num_labels`` classes (number reading modes, ``piper.number_modes``).
+    """
+
+    def __init__(self, context_hidden_size: int = _DEFAULT_CONTEXT_HIDDEN, num_labels: int = 1):
         super().__init__()
+        self.num_labels = num_labels
 
         self.target_proj = nn.Sequential(
             nn.Linear(context_hidden_size, _EMBED_DIM),
@@ -129,7 +134,7 @@ class ContextReplacerClassifier(nn.Module):
             nn.Linear(_EMBED_DIM, _EMBED_DIM // 2),
             nn.GELU(),
             nn.Dropout(_DROPOUT),
-            nn.Linear(_EMBED_DIM // 2, 1),
+            nn.Linear(_EMBED_DIM // 2, num_labels),
         )
 
     def forward(
@@ -156,7 +161,8 @@ class ContextReplacerClassifier(nn.Module):
             [target, attended, target * attended, target - attended],
             dim=-1,
         )
-        return self.classifier(features).squeeze(-1)
+        logits = self.classifier(features)
+        return logits.squeeze(-1) if self.num_labels == 1 else logits
 
     @staticmethod
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

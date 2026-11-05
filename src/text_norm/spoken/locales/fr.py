@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import re
+
 from .base import SpokenLocale, make_number_words
 
 _NUMBER_WORDS = make_number_words('fr')
 
 
 def _clock_words(hour: int, minute: int | None, meridiem: str | None) -> str:
-    result = f"{_NUMBER_WORDS(hour)} heures"
+    # Heure is feminine: une heure, vingt et une heures.
+    if hour == 1:
+        result = 'une heure'
+    else:
+        result = re.sub(r'\bun$', 'une', _NUMBER_WORDS(hour)) + ' heures'
     if minute not in (None, 0):
         result += f" {_NUMBER_WORDS(minute)}"
     return result
+
+
+def _ordinal_words(value: int, before: str, after: str) -> str:
+    # Only the first day of a month is an ordinal; the rest read as cardinals.
+    return 'premier' if value == 1 else _NUMBER_WORDS(value)
 
 
 LOCALE = SpokenLocale(
@@ -114,4 +125,8 @@ LOCALE = SpokenLocale(
         'minutes': 'min',
         'jours': 'd',
     },
+    ordinal_words=_ordinal_words,
+    decimal_fraction_number=True,
+    bare_hour_clock=True,
+    degree_words=('degré', 'degrés'),
 )

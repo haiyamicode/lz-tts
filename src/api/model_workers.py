@@ -557,6 +557,31 @@ def _ctc_engine(settings_data: dict[str, Any]) -> Handler:
     return handler
 
 
+def _number_modes_engine(settings_data: dict[str, Any]) -> Handler:
+    """Load the number reading-mode classifier and return the action handler."""
+    from ..piper.number_modes import get_number_modes
+    from ..text_norm.spoken import verbalize_spoken_text
+
+    device = str(_settings_data_to_config(settings_data).pipertts.text_preprocessor_device)
+    number_modes = get_number_modes(device=device)
+    number_modes.load()
+
+    def handler(action: str, payload: Any) -> dict[str, Any]:
+        if action == "health":
+            return {"ok": True, "data": {"worker": "ok", "device": device}}
+        if not isinstance(payload, dict):
+            raise ValueError("worker payload must be an object")
+        if action == "verbalize":
+            texts = [
+                verbalize_spoken_text(str(text), str(language), number_modes)
+                for text, language in payload["items"]
+            ]
+            return {"ok": True, "data": {"texts": texts}}
+        raise ValueError(f"unknown worker action: {action}")
+
+    return handler
+
+
 # engine -> (loader, cuDNN enabled). The CUDA driver keeps a host copy of every
 # cuDNN engine it loads (one per conv shape the heuristics pick), ~120-250 MB
 # of RAM per model, and torch's native convs are no slower for the Sparrow
@@ -565,11 +590,12 @@ SPEECH_ENGINES: dict[str, tuple[Callable[[dict[str, Any]], Handler], bool]] = {
     "sparrow": (_sparrow_engine, False),
     "seed_vc": (_seed_vc_engine, True),
     "ctc": (_ctc_engine, False),
+    "numbers": (_number_modes_engine, False),
 }
 
 
 def speech_worker_main(settings_data: dict[str, Any], request_queue: Any, response_queue: Any) -> None:
-    """Host Sparrow, Seed-VC and the CTC aligner in one GPU process.
+    """Host Sparrow, Seed-VC, the CTC aligner and the number classifier in one GPU process.
 
     They never run concurrently, and every GPU process pays ~1 GB of RAM for
     its own CUDA context, torch import and driver copies of the kernels it

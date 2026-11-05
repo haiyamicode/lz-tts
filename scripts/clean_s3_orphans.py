@@ -51,6 +51,7 @@ SERVING_FILES = {
     "lzspeech-sparrow-lfl/model.ckpt",
     "lzspeech-starling/config.json",
     "lzspeech-starling/model.ckpt",
+    "number-modes/best.pt",
     "nsfw-detection/manifest.json",
     "nsfw-detection/marqo-nsfw-image-detection-384/README.md",
     "nsfw-detection/marqo-nsfw-image-detection-384/config.json",

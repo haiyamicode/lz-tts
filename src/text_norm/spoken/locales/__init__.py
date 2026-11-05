@@ -25,6 +25,10 @@ BASE_LANGUAGE_ALIASES = {
     "kr": "ko",
     "vie": "vi",
     "sp": "es",
+    # Cantonese and Wu read numbers with the same characters as Mandarin.
+    "cmn": "zh",
+    "yue": "zh",
+    "wuu": "zh",
 }
 
 CURRENCY_MAGNITUDES = {

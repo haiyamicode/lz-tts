@@ -71,7 +71,7 @@ def _date_words(match: re.Match[str], context: RuleContext) -> str:
     prefix = "Ngày" if label and label[0].isupper() else "ngày"
     return (
         f"{prefix} {context.spoken_number(str(day))} "
-        f"tháng {context.spoken_number(str(month))} "
+        f"tháng {'tư' if month == 4 else context.spoken_number(str(month))} "
         f"năm {context.spoken_number(str(year))}"
     )
 

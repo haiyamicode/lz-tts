@@ -92,6 +92,21 @@ def test_voxcpm_input_falls_back_to_request_language_for_undetectable_text() -> 
     assert explicit_language == "de-DE"
 
 
+def test_voxcpm_language_runs_keep_short_texts_in_the_request_language() -> None:
+    # CLD2 alone reads all three as English, so their numbers were read in English.
+    assert server._voxcpm_language_runs("Dimmi 7.", "it-IT") == [("Dimmi 7.", "it")]
+    assert server._voxcpm_language_runs("Dime 3.", "es-ES") == [("Dime 3.", "es")]
+    assert server._voxcpm_main_language("Le train part le 14 juillet à 9 h 30.", "fr-FR") == "fr"
+    # Text in another language than the request keeps its own.
+    assert server._voxcpm_main_language("Hello world, call 5.", "fr-FR") == "en"
+    assert server._voxcpm_language_runs("My mom said 我们3点见面 and left at 5.", "en-US") == [
+        ("My mom said ", "en"),
+        ("我们3点见面", "zh"),
+        (" and left at 5.", "en"),
+    ]
+    assert server._voxcpm_language_runs("1 / 2 / 3", "fr-FR") == [("1 / 2 / 3", "fr-FR")]
+
+
 def test_configured_voice_language_prefers_request_language(monkeypatch) -> None:
     voice = server.RootVoiceConfig(voice_id="v1", model="m", languages=["fr-FR"])
     monkeypatch.setattr(

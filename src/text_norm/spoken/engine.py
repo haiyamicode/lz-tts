@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from typing import Callable
 
 from .rules import RuleContext, apply_language_rules
 
@@ -92,6 +93,10 @@ def _clock_pattern(language: str) -> re.Pattern[str]:
 _CLOCK_RES = {
     language: _clock_pattern(language) for language in _SUPPORTED_LANGUAGES
 }
+_BARE_HOUR_RE = re.compile(
+    rf"{_TOKEN_LEFT_BOUNDARY}(?P<hour>\d{{1,3}})\s*h{_TOKEN_RIGHT_BOUNDARY}",
+    re.IGNORECASE,
+)
 _NUMERIC_TOKEN = r"[-−]?\d+(?:(?:[.,])\d+)*"
 _COMMON_MEASUREMENT_UNIT_ALIASES = {
     "km": "km",
@@ -240,12 +245,24 @@ _MACHINE_NUMERIC_RE = re.compile(
     rf"{_TOKEN_RIGHT_BOUNDARY}",
     re.IGNORECASE,
 )
+# Only digits and number signs are folded to ASCII when numbers are read by
+# mode: the text's own punctuation (，。！) stays for the model.
+_FULLWIDTH_NUMERIC_RE = re.compile(r"[\uff04\uff05\uff0b\uff0d\uff0e\uff0f\uff10-\uff19]")
+_PLACEHOLDER_RE = re.compile("\ue000[A-Z]+\ue001")
+_DIGIT_RUN_RE = re.compile(r"\d+")
+_DASH_RE = re.compile(r"\s*[-‐‑‒–—]\s*")
+_ORDINAL_PERIOD_RE = re.compile(r"\.(?P<space>\s*)(?=\w)")
+_UNSPACED_LANGUAGES = frozenset({"ja", "zh"})
+
+NUMBER_MODES = ("cardinal", "year", "ordinal", "digits")
+# (text, number spans) -> one of NUMBER_MODES per span.
+NumberModes = Callable[[str, list[tuple[int, int]]], list[str]]
 _AMBIGUOUS_NUMERIC_RE = re.compile(
     rf"{_TOKEN_LEFT_BOUNDARY}\d+(?:\.\d+){{2,}}{_TOKEN_RIGHT_BOUNDARY}"
     rf"|{_TOKEN_LEFT_BOUNDARY}\d{{1,4}}[/-]\d{{1,2}}"
     rf"[/-]\d{{1,4}}{_TOKEN_RIGHT_BOUNDARY}"
     rf"|{_TOKEN_LEFT_BOUNDARY}\+?\(?\d{{1,4}}\)?"
-    rf"(?:[\t \-‐‑‒–—]\d{{2,4}}){{2,}}{_TOKEN_RIGHT_BOUNDARY}"
+    rf"(?:[\t \-‐‑‒–—]\d{{2,5}}){{2,}}{_TOKEN_RIGHT_BOUNDARY}"
     rf"|{_TOKEN_LEFT_BOUNDARY}\d{{2,}}"
     rf"(?:[\-‐‑‒–—]\d{{2,}})+{_TOKEN_RIGHT_BOUNDARY}",
     re.IGNORECASE,
@@ -261,9 +278,29 @@ def _number_words(value: int, language: str) -> str:
     return _LOCALES[language].number_words(value)
 
 
-def _digit_words(digits: str, language: str) -> str:
-    words = [_number_words(int(digit), language) for digit in digits]
-    return _LOCALES[language].digit_separator.join(words)
+def _digit_words(digits: str, language: str, *, fraction: bool = False) -> str:
+    locale = _LOCALES[language]
+    zero = locale.code_zero_word if not fraction else None
+    words = [
+        zero if digit == "0" and zero else _number_words(int(digit), language)
+        for digit in digits
+    ]
+    return locale.digit_separator.join(words)
+
+
+def _fraction_words(fraction: str, language: str) -> str:
+    rest = fraction.lstrip("0")
+    if (
+        not _LOCALES[language].decimal_fraction_number
+        or len(fraction) > 3
+        or not rest
+    ):
+        return _digit_words(fraction, language, fraction=True)
+    words = _number_words(int(rest), language)
+    if rest == fraction:
+        return words
+    zeros = _digit_words(fraction[: len(fraction) - len(rest)], language, fraction=True)
+    return f"{zeros}{_LOCALES[language].digit_separator}{words}"
 
 
 def _parse_number(raw: str, language: str) -> tuple[int, str | None] | None:
@@ -333,7 +370,7 @@ def _spoken_number(raw: str, language: str) -> str:
         result = _LOCALES[language].decimal_template.format(
             integer=integer_words,
             decimal=_DECIMAL_WORDS[language],
-            fraction=_digit_words(fraction, language),
+            fraction=_fraction_words(fraction, language),
         )
         return (
             _LOCALES[language].negative_template.format(number=result)
@@ -614,20 +651,259 @@ def _protect_spans(
     return pattern.sub(replace, text)
 
 
+def _mark_new_spans(
+    protected: dict[str, str],
+    deferred: dict[str, str],
+    start: int,
+    kind: str,
+) -> None:
+    for index in range(start, len(protected)):
+        deferred.setdefault(_placeholder_name(index), kind)
+
+
+def _mode_words(
+    value: int,
+    mode: str,
+    language: str,
+    before: str,
+    after: str,
+) -> str:
+    locale = _LOCALES[language]
+    if mode == "year" and locale.year_words is not None and value < 10000:
+        return locale.year_words(value)
+    if mode == "ordinal" and locale.ordinal_words is not None:
+        return locale.ordinal_words(value, before, after)
+    if locale.cardinal_words is not None:
+        return locale.cardinal_words(value, before, after)
+    return locale.number_words(value)
+
+
+def _number_mode_words(
+    digits: str,
+    mode: str,
+    language: str,
+    before: str,
+    after: str,
+) -> str:
+    if mode == "digits":
+        return _digit_words(digits, language)
+    rest = digits.lstrip("0")
+    if mode == "cardinal" and digits.startswith("0") and len(digits) > 1:
+        # Zeros are spoken before a cardinal: 06 → zéro six (French phone pairs).
+        zeros = _digit_words(digits[: len(digits) - len(rest)], language)
+        if not rest:
+            return zeros
+        joiner = "" if language in _UNSPACED_LANGUAGES else " "
+        return zeros + joiner + _mode_words(int(rest), mode, language, before, after)
+    return _mode_words(int(digits), mode, language, before, after)
+
+
+def _group_span_words(
+    span: str,
+    modes: list[str],
+    language: str,
+    before: str,
+    after: str,
+) -> str:
+    """Read a range, date, phone number or other digit groups by mode."""
+    groups = list(_DIGIT_RUN_RE.finditer(span))
+    unspaced = language in _UNSPACED_LANGUAGES
+    words = [
+        _number_mode_words(group.group(0), mode, language, before, after)
+        for group, mode in zip(groups, modes)
+    ]
+    separators = [
+        span[left.end() : right.start()] for left, right in zip(groups, groups[1:])
+    ]
+    if (
+        len(groups) == 2
+        and modes[0] != "digits"
+        and _DASH_RE.fullmatch(separators[0])
+        and not span[: groups[0].start()].strip()
+    ):
+        end = _number_mode_words(groups[1].group(0), modes[0], language, before, after)
+        return _RANGE_WORDS[language].format(start=words[0], end=end)
+
+    # 1.2.3 reads with the decimal word; 12.05.2024 is a date.
+    dotted = all(separator == "." for separator in separators) and (
+        len(groups[-1].group(0)) != 4
+    )
+    result = words[0]
+    for index in range(1, len(words)):
+        if dotted:
+            joiner = (
+                _DECIMAL_WORDS[language]
+                if unspaced
+                else f" {_DECIMAL_WORDS[language]} "
+            )
+        elif modes[index - 1] == "digits" and modes[index] == "digits":
+            joiner = _LOCALES[language].digit_group_separator
+        else:
+            joiner = " "
+        result += joiner + words[index]
+    if span.lstrip().startswith("+"):
+        result = f"+{result}" if unspaced else f"+ {result}"
+    return result
+
+
+def _verbalize_numbers(
+    text: str,
+    language: str,
+    protected: dict[str, str],
+    deferred: dict[str, str],
+    number_modes: NumberModes,
+) -> str:
+    """Read every number left in the text in the mode the classifier picks."""
+    pieces: list[str] = []
+    # (start, end, kind) of restored spans in the display text: "frozen" spans
+    # (URLs, versions) stay as written, "range"/"ambiguous" spans read by group.
+    regions: list[tuple[int, int, str]] = []
+    cursor = 0
+    length = 0
+    for match in _PLACEHOLDER_RE.finditer(text):
+        pieces.append(text[cursor : match.start()])
+        length += match.start() - cursor
+        original = protected[match.group(0)]
+        kind = deferred.get(match.group(0), "frozen")
+        if kind != "plain":
+            regions.append((length, length + len(original), kind))
+        pieces.append(original)
+        length += len(original)
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    display = "".join(pieces)
+
+    def overlaps(start: int, end: int, spans) -> bool:
+        return any(start < right and left < end for left, right, *_ in spans)
+
+    # (start, end, kind): "number" and "glued" runs are classified; "spoken"
+    # numbers (signed, grouped, decimal, zero-led) read as before.
+    items: list[tuple[int, int, str]] = []
+    for match in _NUMBER_RE.finditer(display):
+        if overlaps(match.start(), match.end(), regions):
+            continue
+        kind = "number" if re.fullmatch(r"[1-9]\d*", match.group(0)) else "spoken"
+        items.append((match.start(), match.end(), kind))
+    for match in _DIGIT_RUN_RE.finditer(display):
+        if not overlaps(match.start(), match.end(), regions) and not overlaps(
+            match.start(), match.end(), items
+        ):
+            items.append((match.start(), match.end(), "glued"))
+    items.sort()
+    grouped = [region for region in regions if region[2] != "frozen"]
+
+    spans = [(start, end) for start, end, kind in items if kind != "spoken"]
+    for left, right, _ in grouped:
+        spans.extend(
+            match.span() for match in _DIGIT_RUN_RE.finditer(display, left, right)
+        )
+    modes = iter(number_modes(display, spans) if spans else [])
+
+    locale = _LOCALES[language]
+    replacements: list[tuple[int, int, str]] = []
+    for start, end, kind in items:
+        raw = display[start:end]
+        before, after = display[:start], display[end:]
+        mode = None if kind == "spoken" else next(modes)
+        if after.startswith("°") and locale.degree_words is not None:
+            # 30° is degrees; 2° piano an ordinal where the sign stands for º.
+            try:
+                if mode == "ordinal" and locale.sign_ordinal_words is not None:
+                    words = locale.sign_ordinal_words(int(raw), before, after[1:])
+                else:
+                    singular, plural = locale.degree_words
+                    words = _join_quantity_unit(
+                        _quantity_words(raw, language),
+                        singular if _is_one(raw, language) else plural,
+                        language,
+                    )
+            except (ArithmeticError, KeyError, NotImplementedError, OverflowError, ValueError):
+                continue
+            replacements.append((start, end + 1, words))
+            continue
+        if kind == "spoken":
+            replacements.append((start, end, _spoken_number(raw, language)))
+            continue
+        period = _ORDINAL_PERIOD_RE.match(after) if locale.ordinal_period else None
+        if mode == "ordinal" and locale.ordinal_period and not period:
+            # German ordinals are written with a period: um 20 Uhr is a cardinal.
+            mode = "cardinal"
+        try:
+            words = _number_mode_words(raw, mode, language, before, after)
+        except (ArithmeticError, KeyError, NotImplementedError, OverflowError, ValueError):
+            continue
+        if mode == "ordinal" and period:
+            end += 1
+            if not period.group("space"):
+                words += " "
+        if kind == "glued" and language not in _UNSPACED_LANGUAGES:
+            if start and display[start - 1].isalpha():
+                words = " " + words
+            following = display[end : end + 1]
+            # German glues a suffix to the number: 90er, 3fach.
+            if following.isalpha() and not (language == "de" and following.islower()):
+                words += " "
+        replacements.append((start, end, words))
+    for left, right, _ in grouped:
+        span = display[left:right]
+        span_modes = [next(modes) for _ in _DIGIT_RUN_RE.finditer(span)]
+        # Digit groups are one number: a code read digit by digit anywhere is
+        # read that way throughout (11 98765 4321).
+        if "digits" in span_modes:
+            span_modes = ["digits"] * len(span_modes)
+        try:
+            words = _group_span_words(
+                span, span_modes, language, display[:left], display[right:]
+            )
+        except (ArithmeticError, KeyError, NotImplementedError, OverflowError, ValueError):
+            continue
+        replacements.append((left, right, words))
+
+    replacements.sort()
+    output = []
+    cursor = 0
+    for start, end, words in replacements:
+        output.append(display[cursor:start])
+        output.append(words)
+        cursor = end
+    output.append(display[cursor:])
+    return "".join(output)
+
+
 def _restore_spans(text: str, protected: dict[str, str]) -> str:
     for placeholder, original in protected.items():
         text = text.replace(placeholder, original)
     return text
 
 
-def verbalize_spoken_text(text: str, language: str) -> str:
-    """Expand unambiguous written forms for a TTS frontend without a TN stage."""
+def verbalize_spoken_text(
+    text: str,
+    language: str,
+    number_modes: NumberModes | None = None,
+) -> str:
+    """Expand unambiguous written forms for a TTS frontend without a TN stage.
+
+    With ``number_modes``, every number left after the fixed forms (clocks,
+    currency, units, ...) is read in the mode it picks from the context:
+    cardinal, year, ordinal or digit by digit, including ranges, dates, phone
+    numbers and digits glued to words. Without it, bare numbers read as
+    cardinals and ambiguous spans stay as written.
+    """
     base = _base_language(language)
     if base not in _SUPPORTED_LANGUAGES:
         return text
 
-    normalized = unicodedata.normalize("NFKC", text)
+    if number_modes is None:
+        normalized = unicodedata.normalize("NFKC", text)
+    else:
+        normalized = _FULLWIDTH_NUMERIC_RE.sub(
+            lambda match: unicodedata.normalize("NFKC", match.group(0)),
+            text,
+        )
     protected: dict[str, str] = {}
+    # Placeholder -> "range" | "ambiguous" | "plain" for spans read by mode at
+    # the end; any other protected span stays as written.
+    deferred: dict[str, str] = {}
     normalized = _protect_spans(normalized, _OPAQUE_SPAN_RE, protected)
     normalized = _protect_spans(
         normalized,
@@ -657,11 +933,13 @@ def verbalize_spoken_text(text: str, language: str) -> str:
             ),
         ),
     )
+    first = len(protected)
     normalized = _protect_spans(
         normalized,
         _AMBIGUOUS_NUMERIC_RE,
         protected,
     )
+    _mark_new_spans(protected, deferred, first, "ambiguous")
     normalized = _CARBON_DIOXIDE_RE.sub(_CARBON_DIOXIDE_WORDS[base], normalized)
     normalized = _COMPACT_TECH_RE.sub(
         lambda match: _compact_tech_words(
@@ -671,6 +949,7 @@ def verbalize_spoken_text(text: str, language: str) -> str:
         ),
         normalized,
     )
+    first = len(protected)
     normalized = _RANGE_RE.sub(
         lambda match: _protect_if_unchanged(
             match,
@@ -681,17 +960,27 @@ def verbalize_spoken_text(text: str, language: str) -> str:
             if (
                 len(match.group("start").lstrip("-−"))
                 == len(match.group("end").lstrip("-−"))
+                if number_modes is None
+                # Signed ranges read as cardinals; the rest read by mode.
+                else re.match(r"[-−]", match.group(0))
             )
             else match.group(0),
             protected,
         ),
         normalized,
     )
+    _mark_new_spans(protected, deferred, first, "range")
 
     normalized = _CLOCK_RES[base].sub(
         lambda match: _clock_match_words(match, base),
         normalized,
     )
+    if _LOCALES[base].bare_hour_clock:
+        normalized = _BARE_HOUR_RE.sub(
+            lambda match: _clock_words(int(match.group("hour")), None, None, base),
+            normalized,
+        )
+    first = len(protected)
     normalized = _RATE_UNIT_RE.sub(
         lambda match: _protect_if_unchanged(
             match,
@@ -724,6 +1013,11 @@ def verbalize_spoken_text(text: str, language: str) -> str:
         ),
         normalized,
     )
+    if number_modes is not None:
+        _mark_new_spans(protected, deferred, first, "plain")
+        return _verbalize_numbers(
+            normalized, base, protected, deferred, number_modes
+        )
     normalized = _NUMBER_RE.sub(
         lambda match: _spoken_number(match.group(0), base),
         normalized,
@@ -731,4 +1025,4 @@ def verbalize_spoken_text(text: str, language: str) -> str:
     return _restore_spans(normalized, protected)
 
 
-__all__ = ["verbalize_spoken_text"]
+__all__ = ["NUMBER_MODES", "NumberModes", "verbalize_spoken_text"]

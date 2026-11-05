@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import cn2an
 
 from .base import SpokenLocale
@@ -12,10 +14,49 @@ def _number_words(value: int) -> str:
 
 
 def _clock_words(hour: int, minute: int | None, meridiem: str | None) -> str:
-    result = f"{_number_words(hour)}点"
+    result = "两点" if hour == 2 else f"{_number_words(hour)}点"
     if minute not in (None, 0):
         result += f"{_number_words(minute)}分"
     return result
+
+
+_DIGITS = "零一二三四五六七八九"
+# Measure words and magnitudes that take 两 instead of 二.
+_LIANG_FOLLOWERS = (
+    "个", "本", "只", "天", "次", "位", "件", "张", "条", "种", "部", "辆", "杯",
+    "家", "份", "点", "岁", "年", "周", "倍", "万", "千", "百", "亿", "斤",
+    "公斤", "公里", "米", "小时", "分钟", "秒钟", "星期", "礼拜", "台", "双",
+    "对", "块", "片", "间", "所", "座", "棵", "头", "匹", "支", "首", "篇",
+    "门", "节", "层", "趟", "遍", "口", "名", "颗", "瓶", "碗", "根", "套",
+    # Traditional script (Cantonese and Taiwan text).
+    "個", "隻", "張", "條", "種", "輛", "歲", "週", "萬", "億", "點", "雙",
+    "對", "塊", "間", "頭", "門", "節", "層", "顆", "架", "碟", "分鐘", "秒鐘",
+    "小時", "禮拜", "臺",
+)
+
+
+def _year_words(value: int) -> str:
+    # Years are read digit by digit: 一九八二年, 二零二四年.
+    digits = str(value)
+    if len(digits) < 4:
+        return _number_words(value)
+    return "".join(_DIGITS[int(digit)] for digit in digits)
+
+
+def _cardinal_words(value: int, before: str, after: str) -> str:
+    words = _number_words(value)
+    if before.endswith("第"):
+        return words
+    following = after.lstrip()
+    if (
+        value == 2
+        and following.startswith(_LIANG_FOLLOWERS)
+        and not following.startswith(("年级", "年級"))
+    ):
+        return "两"
+    if re.match(r"二[千万亿]", words):
+        return "两" + words[1:]
+    return words
 
 
 LOCALE = SpokenLocale(
@@ -88,4 +129,8 @@ LOCALE = SpokenLocale(
         "d": "天",
     },
     rate_denominator_aliases={},
+    year_words=_year_words,
+    cardinal_words=_cardinal_words,
+    digit_group_separator='，',
+    degree_words=('度', '度'),
 )

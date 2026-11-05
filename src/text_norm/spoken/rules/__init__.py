@@ -6,12 +6,16 @@ from collections.abc import Callable
 
 from . import en, fr, vi, zh
 from .base import RuleContext
+from .romance import ordinal_indicator_rule
 
 LanguageRule = Callable[[str, RuleContext], str]
 
 LANGUAGE_RULES: dict[str, LanguageRule] = {
     "en": en.apply,
+    "es": ordinal_indicator_rule("es"),
     "fr": fr.apply,
+    "it": ordinal_indicator_rule("it"),
+    "pt": ordinal_indicator_rule("pt"),
     "vi": vi.apply,
     "zh": zh.apply,
 }
