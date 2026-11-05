@@ -135,6 +135,7 @@ class VoxCPMRuntime:
             dtype=dtype,
             devices=[int(self.settings["device"])],
             inference_timesteps=int(self.settings["inference_timesteps"]),
+            guidance_folded=self.settings.get("guidance_folded"),
             max_num_batched_tokens=int(self.settings["max_num_batched_tokens"]),
             max_num_seqs=int(self.settings["max_num_seqs"]),
             max_model_len=int(self.settings["max_model_len"]),
@@ -162,12 +163,14 @@ class VoxCPMRuntime:
         if duration_settings["enabled"] and duration_settings["preload"]:
             await asyncio.to_thread(self._get_duration_budget)
         _LOGGER.info(
-            "VoxCPM nano-vLLM ready model=%s device=%s dtype=%s sample_rate=%d "
+            "VoxCPM nano-vLLM ready model=%s device=%s dtype=%s sample_rate=%d steps=%d guidance_folded=%s "
             "kv_blocks=%d max_num_seqs=%d loras=%s",
             self.settings["model_path"],
             self.settings["device"],
             self.dtype,
             self.sample_rate,
+            model_info["inference_timesteps"],
+            model_info["guidance_folded"],
             num_kvcache_blocks,
             self.settings["max_num_seqs"],
             sorted(self._available_loras),

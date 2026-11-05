@@ -415,12 +415,14 @@ class UnifiedCFM(nn.Module):
         cfm_params: CfmConfig,
         estimator: VoxCPM2LocDiT,
         mean_mode: bool = False,
+        guidance_folded: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.patch_size = patch_size
         self.inference_timesteps = inference_timesteps
         self.mean_mode = mean_mode
+        self.guidance_folded = guidance_folded
         self.estimator = estimator
 
     def forward(
@@ -453,7 +455,9 @@ class UnifiedCFM(nn.Module):
         cfg_value: torch.Tensor,
     ):
         inputs = EulerSolverInputs(x=x, t_span=t_span, mu=mu, cond=cond, cfg_value=cfg_value)
-        config = EulerSolverConfig(in_channels=self.in_channels, mean_mode=self.mean_mode)
+        config = EulerSolverConfig(
+            in_channels=self.in_channels, mean_mode=self.mean_mode, guidance_folded=self.guidance_folded
+        )
         return solve_euler(inputs, config, self)
 
 
@@ -539,6 +543,7 @@ class VoxCPM2Model(nn.Module):
             cfm_params=config.dit_config.cfm_config,
             estimator=VoxCPM2LocDiT(decoder_config, in_channels=config.feat_dim, lora_config=lora_config),
             mean_mode=config.dit_mean_mode,
+            guidance_folded=config.guidance_folded,
         )
 
         self.fsq_layer = ScalarQuantizationLayer(

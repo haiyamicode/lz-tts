@@ -17,6 +17,7 @@ class EulerSolverInputs:
 class EulerSolverConfig:
     in_channels: int
     mean_mode: bool
+    guidance_folded: bool = False
 
 
 class EulerEstimator(Protocol):
@@ -58,14 +59,24 @@ def solve_euler(inputs: EulerSolverInputs, config: EulerSolverConfig, ops: Euler
     t, dt = t_span[0], t_span[0] - t_span[1]
     zero_init_steps = compute_zero_init_steps(len(t_span))
     bsz = x.size(0)
-    x_in = torch.empty([2 * bsz, config.in_channels, x.size(2)], device=x.device, dtype=x.dtype)
-    mu_in = torch.empty([2 * bsz, inputs.mu.size(1)], device=x.device, dtype=x.dtype)
-    t_in = torch.empty([2 * bsz], device=x.device, dtype=x.dtype)
-    dt_in = torch.empty([2 * bsz], device=x.device, dtype=x.dtype)
-    cond_in = torch.empty([2 * bsz, config.in_channels, x.size(2)], device=x.device, dtype=x.dtype)
+    if config.guidance_folded:
+        # One conditional pass per step: the DiT already predicts the guided velocity.
+        t_in = torch.empty([bsz], device=x.device, dtype=x.dtype)
+        dt_in = torch.zeros([bsz], device=x.device, dtype=x.dtype)
+    else:
+        x_in = torch.empty([2 * bsz, config.in_channels, x.size(2)], device=x.device, dtype=x.dtype)
+        mu_in = torch.empty([2 * bsz, inputs.mu.size(1)], device=x.device, dtype=x.dtype)
+        t_in = torch.empty([2 * bsz], device=x.device, dtype=x.dtype)
+        dt_in = torch.empty([2 * bsz], device=x.device, dtype=x.dtype)
+        cond_in = torch.empty([2 * bsz, config.in_channels, x.size(2)], device=x.device, dtype=x.dtype)
     for step in range(1, len(t_span)):
         if step <= zero_init_steps:
             dphi_dt = 0.0
+        elif config.guidance_folded:
+            t_in[:] = t
+            if config.mean_mode:
+                dt_in[:] = dt
+            dphi_dt = ops.estimator(x, inputs.mu, t_in, inputs.cond, dt_in)
         else:
             x_in[:bsz], x_in[bsz:] = x, x
             mu_in[:bsz] = inputs.mu

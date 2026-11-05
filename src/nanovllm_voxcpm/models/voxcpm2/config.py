@@ -116,5 +116,8 @@ class VoxCPM2Config(BaseModel):
     device: str = "cuda"
     dtype: str = "bfloat16"
     dit_mean_mode: bool = Field(default=False)
+    # The DiT predicts the guided velocity in one conditional pass (CFG folded in by distillation): the solver skips
+    # the unconditional half and ignores cfg_value.
+    guidance_folded: bool = Field(default=False)
 
     inference_timesteps: int = 10

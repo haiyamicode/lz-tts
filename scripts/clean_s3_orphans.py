@@ -94,6 +94,16 @@ SERVING_FILES = {
     "lzspeech-falcon-v1/tokenization_voxcpm2.py",
     "lzspeech-falcon-v1/tokenizer.json",
     "lzspeech-falcon-v1/tokenizer_config.json",
+    "lzspeech-falcon-v1.2/.gitattributes",
+    "lzspeech-falcon-v1.2/README.md",
+    "lzspeech-falcon-v1.2/audiovae.pth",
+    "lzspeech-falcon-v1.2/bake_metadata.json",
+    "lzspeech-falcon-v1.2/config.json",
+    "lzspeech-falcon-v1.2/model.safetensors",
+    "lzspeech-falcon-v1.2/special_tokens_map.json",
+    "lzspeech-falcon-v1.2/tokenization_voxcpm2.py",
+    "lzspeech-falcon-v1.2/tokenizer.json",
+    "lzspeech-falcon-v1.2/tokenizer_config.json",
 }
 
 

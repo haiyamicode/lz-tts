@@ -53,6 +53,8 @@ class ModelInfoResponse(TypedDict):
     output_patch_samples: int
     ipa_fade_out_ratio: float | None
     model_path: str
+    inference_timesteps: int
+    guidance_folded: bool
 
 
 class LoRAInfo(TypedDict):
@@ -86,9 +88,13 @@ class VoxCPM2ServerImpl:
         lora_config: Optional[LoRAConfig] = None,
         ipa_adapter_path: str | None = None,
         dtype: str = "auto",
+        guidance_folded: bool | None = None,
     ):
         model_config = VoxCPM2Config.model_validate_json(open(os.path.join(model_path, "config.json")).read())
         model_config.inference_timesteps = inference_timesteps
+        if guidance_folded is not None:  # None keeps the model's config.json
+            model_config.guidance_folded = guidance_folded
+        self.model_config = model_config
         self.lora_config = lora_config
         self.model_path = model_path
         device_index = devices[0] if devices else 0
@@ -138,6 +144,8 @@ class VoxCPM2ServerImpl:
             output_patch_samples=self.output_patch_samples,
             ipa_fade_out_ratio=self.ipa_fade_out_ratio,
             model_path=str(self.model_path),
+            inference_timesteps=int(self.model_config.inference_timesteps),
+            guidance_folded=bool(self.model_config.guidance_folded),
         )
 
     def encode_latents(
@@ -362,6 +370,7 @@ class AsyncVoxCPM2Server:
         lora_config: Optional[LoRAConfig] = None,
         ipa_adapter_path: str | None = None,
         dtype: str = "auto",
+        guidance_folded: bool | None = None,
         target: Optional[Callable[..., None]] = None,
         **kwargs,
     ) -> None:
@@ -389,6 +398,7 @@ class AsyncVoxCPM2Server:
                     lora_config,
                     ipa_adapter_path,
                     dtype,
+                    guidance_folded,
                 ),
                 {},
             ),
@@ -634,6 +644,7 @@ class AsyncVoxCPM2ServerPool:
         lora_config: Optional[LoRAConfig] = None,
         ipa_adapter_path: str | None = None,
         dtype: str = "auto",
+        guidance_folded: bool | None = None,
         **kwargs,
     ):
         if len(kwargs) > 0:
@@ -652,6 +663,7 @@ class AsyncVoxCPM2ServerPool:
                 lora_config=lora_config,
                 ipa_adapter_path=ipa_adapter_path,
                 dtype=dtype,
+                guidance_folded=guidance_folded,
             )
             for device_idx in devices
         ]
@@ -792,6 +804,7 @@ class SyncVoxCPM2ServerPool:
         lora_config: Optional[LoRAConfig] = None,
         ipa_adapter_path: str | None = None,
         dtype: str = "auto",
+        guidance_folded: bool | None = None,
         **kwargs,
     ):
         async def init_async_server_pool():
@@ -808,6 +821,7 @@ class SyncVoxCPM2ServerPool:
                 lora_config=lora_config,
                 ipa_adapter_path=ipa_adapter_path,
                 dtype=dtype,
+                guidance_folded=guidance_folded,
                 **kwargs,
             )
 

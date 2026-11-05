@@ -334,6 +334,9 @@ class VoxCPMConfig(BaseModel):
         default_factory=lambda: os.environ.get("VOXCPM_DTYPE", "auto")
     )
     inference_timesteps: int = Field(default=10, ge=1)
+    # True: one conditional DiT pass per step, no CFG, cfg_value ignored (what a model with CFG folded into its DiT,
+    # Falcon v1.2, needs). False: the two-pass CFG solver. None: the model's config.json `guidance_folded`.
+    guidance_folded: bool | None = None
     max_num_batched_tokens: int = Field(default=8192, ge=1)
     max_num_seqs: int = Field(default=8, ge=1)
     max_model_len: int = Field(default=4096, ge=1)
