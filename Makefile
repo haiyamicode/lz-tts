@@ -1,6 +1,6 @@
-IMAGE ?= docker.lazybird.app/lztts
+IMAGE ?= docker.lazybird.app/lzai
 TAG ?= latest
-CONTAINER ?= lz-tts
+CONTAINER ?= lzai
 
 FULL_IMAGE := $(IMAGE):$(TAG)
 
@@ -24,10 +24,10 @@ run:
 		--restart unless-stopped \
 		--stop-timeout 30 \
 		-e CUDA_VISIBLE_DEVICES=$${CUDA_VISIBLE_DEVICES:-2} \
-		-e LZ_TTS_SKIP_DATA_DOWNLOAD=$${LZ_TTS_SKIP_DATA_DOWNLOAD:-0} \
-		-v lz-tts-data:/app/data \
-		-v lz-tts-venv:/app/.venv \
-		-v lz-tts-cache:/app/cache \
+		-e LZAI_SKIP_DATA_DOWNLOAD=$${LZAI_SKIP_DATA_DOWNLOAD:-0} \
+		-v lzai-data:/app/data \
+		-v lzai-venv:/app/.venv \
+		-v lzai-cache:/app/cache \
 		$(FULL_IMAGE)
 
 ## stop: remove the container (volumes are kept)
@@ -51,4 +51,4 @@ size:
 ## clean: remove container and named volumes (deletes synced venv + downloaded models)
 clean:
 	docker rm -f $(CONTAINER) || true
-	docker volume rm lz-tts-data lz-tts-venv lz-tts-cache || true
+	docker volume rm lzai-data lzai-venv lzai-cache || true

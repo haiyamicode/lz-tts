@@ -67,7 +67,7 @@ def adjust_audio(
         len(audio),
     )
 
-    with tempfile.TemporaryDirectory(prefix="lz-tts-adjust-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="lzai-adjust-") as temp_dir:
         root = Path(temp_dir)
         encoded_input = root / f"encoded-input.{input_format}"
         decoded_input = root / "decoded-input.wav"

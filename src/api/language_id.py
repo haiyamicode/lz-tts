@@ -208,7 +208,7 @@ class SpokenLanguageIdentifier:
                 _LOGGER.info("Language identifier loading model=%s", spec.snapshot_dir)
                 # SpeechBrain links every checkpoint into ``savedir``; keep
                 # those links out of the baked data directory.
-                savedir = Path(tempfile.gettempdir()) / "lz-tts-language-id" / spec.snapshot_dir
+                savedir = Path(tempfile.gettempdir()) / "lzai-language-id" / spec.snapshot_dir
                 model = EncoderClassifier.from_hparams(
                     source=source,
                     savedir=str(savedir),

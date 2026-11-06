@@ -28,7 +28,7 @@ def start_child(ctx: Any, target: Callable[..., Any], args: tuple[Any, ...] = ()
     """Start a ``spawn`` child that imports only what ``target`` needs.
 
     A spawned child re-runs the parent's ``__main__`` before unpickling its
-    target. For the ``lz-tts-worker`` console script that imports the whole
+    target. For the ``lzai-worker`` console script that imports the whole
     Taskflow worker and API server stack into every backend child, about
     100 MB of RAM each for modules the child never uses. ``target`` is
     pickled by reference to its own module, so hiding ``__main__``'s file and

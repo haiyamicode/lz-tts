@@ -108,7 +108,7 @@ def _binary_response(content: bytes, media_type: str, headers: dict[str, str] | 
 
 # Default paths
 DATA_DIR = Path("data")
-CONFIG_PATH = Path(os.environ.get("LZ_TTS_SERVER_CONFIG", "local/server.json"))
+CONFIG_PATH = Path(os.environ.get("LZAI_SERVER_CONFIG", "local/server.json"))
 DEFAULT_MODEL = "lzspeech-sparrow"
 PUBLIC_SPARROW_MODEL = "sparrow"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -5333,7 +5333,7 @@ def _max_engine_reload_failures() -> int:
     the dotenv file is only loaded once the worker starts.
     """
     try:
-        return max(1, int(os.environ.get("LZ_TTS_MAX_ENGINE_RELOAD_FAILURES", "3")))
+        return max(1, int(os.environ.get("LZAI_MAX_ENGINE_RELOAD_FAILURES", "3")))
     except ValueError:
         return 3
 
@@ -6165,7 +6165,7 @@ def create_app(config: ServerConfig | None = None, session: LzTtsInferenceSessio
             await session.close()
 
     app = FastAPI(
-        title="LZ-TTS synchronous task adapter",
+        title="LZAI synchronous task adapter",
         version="0.1.0",
         docs_url=None,
         redoc_url=None,

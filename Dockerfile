@@ -1,4 +1,4 @@
-# LZ-TTS production image — minimal: runtime base + source only (<1GB).
+# LZAI production image — minimal: runtime base + source only (<1GB).
 #
 # NOT baked in (provisioned at bootstrap by docker/entrypoint.sh):
 #   - Python deps (uv sync --frozen): torch 2.9.1+cu128 pulls the full CUDA 12.8
@@ -71,5 +71,5 @@ RUN chmod +x /usr/local/bin/entrypoint.sh \
 ENV PATH="/app/.venv/bin:${PATH}"
 
 ENTRYPOINT ["entrypoint.sh"]
-# Mirrors pm2 (local/ecosystem.config.js): .venv/bin/lz-tts-worker
-CMD ["lz-tts-worker"]
+# Mirrors pm2 (local/ecosystem.config.js): .venv/bin/lzai-worker
+CMD ["lzai-worker"]

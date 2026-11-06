@@ -1,4 +1,4 @@
-"""Headless Taskflow worker for durable LZ-TTS synthesis jobs."""
+"""Headless Taskflow worker for durable LZAI synthesis jobs."""
 
 from __future__ import annotations
 
@@ -509,7 +509,7 @@ def _prepare_lease(taskflow: TaskflowWorker, lease: dict[str, Any]) -> _LeaseWor
     request = payload["request"]
     taskflow.active_lease_ids.add(lease_id)
     _LOGGER.info(
-        "LZ-TTS task started type=%s lease=%s run=%s operation=%s artifact=%s "
+        "LZAI task started type=%s lease=%s run=%s operation=%s artifact=%s "
         "model=%s voice=%s locale=%s",
         task_type,
         lease_id,
@@ -606,7 +606,7 @@ async def _prepare_result(
             )
         audio = result.audio or b""
         if not audio:
-            raise RuntimeError("LZ-TTS returned an empty audio artifact")
+            raise RuntimeError("LZAI returned an empty audio artifact")
         await taskflow.upload(lease, artifact_id, audio)
         duration = await asyncio.to_thread(_measure_audio_duration, audio)
         completion: dict[str, Any] = {
@@ -634,7 +634,7 @@ async def _prepare_result(
     except InferenceOperationError as error:
         retry = error.status_code >= 500 or error.status_code in {408, 429}
         _LOGGER.error(
-            "LZ-TTS task rejected type=%s lease=%s run=%s operation=%s status=%d retry=%s "
+            "LZAI task rejected type=%s lease=%s run=%s operation=%s status=%d retry=%s "
             "detail=%s",
             work.task_type,
             lease_id,
@@ -665,7 +665,7 @@ async def _prepare_result(
         return None
     except Exception as error:
         _LOGGER.exception(
-            "LZ-TTS task failed type=%s lease=%s run=%s operation=%s",
+            "LZAI task failed type=%s lease=%s run=%s operation=%s",
             work.task_type,
             lease_id,
             run_id,
@@ -691,7 +691,7 @@ async def _settle_results(
             settlements.append(_failed_settlement(lease, result.error, retry=result.retry))
         elif ack_failure is not None:
             _LOGGER.error(
-                "LZ-TTS task not acked type=%s lease=%s run=%s operation=%s retry=%s: %s",
+                "LZAI task not acked type=%s lease=%s run=%s operation=%s retry=%s: %s",
                 work.task_type,
                 lease["id"],
                 lease.get("runId"),
@@ -712,7 +712,7 @@ async def _settle_results(
         outcomes = await taskflow.settle(settlements)
     except Exception:
         _LOGGER.exception(
-            "Failed to settle LZ-TTS leases with Taskflow leases=%s",
+            "Failed to settle LZAI leases with Taskflow leases=%s",
             [settlement["leaseId"] for settlement in settlements],
         )
         raise
@@ -740,7 +740,7 @@ async def _settle_results(
         completion = result.completion or {}
         if completion.get("kind") == "json":
             _LOGGER.info(
-                "LZ-TTS task completed type=%s lease=%s run=%s operation=%s kind=json "
+                "LZAI task completed type=%s lease=%s run=%s operation=%s kind=json "
                 "wall_seconds=%.3f",
                 work.task_type,
                 lease["id"],
@@ -750,7 +750,7 @@ async def _settle_results(
             )
         else:
             _LOGGER.info(
-                "LZ-TTS task completed type=%s lease=%s run=%s operation=%s kind=artifact "
+                "LZAI task completed type=%s lease=%s run=%s operation=%s kind=artifact "
                 "bytes=%d wall_seconds=%.3f",
                 work.task_type,
                 lease["id"],
@@ -774,7 +774,7 @@ async def _process_leases(
             works.append(_prepare_lease(taskflow, lease))
         except Exception as error:
             _LOGGER.exception(
-                "Invalid LZ-TTS lease payload lease=%s run=%s",
+                "Invalid LZAI lease payload lease=%s run=%s",
                 lease.get("id"),
                 lease.get("runId"),
             )
@@ -786,7 +786,7 @@ async def _process_leases(
             )
         except Exception:
             _LOGGER.exception(
-                "Failed to reject invalid LZ-TTS leases leases=%s",
+                "Failed to reject invalid LZAI leases leases=%s",
                 [lease.get("id") for lease, _ in invalid],
             )
 
@@ -806,7 +806,7 @@ async def _process_leases(
         # ``error`` on /health so the orchestrator pulls traffic.
         raise
     except Exception as error:
-        _LOGGER.exception("LZ-TTS task batch planning or execution failed")
+        _LOGGER.exception("LZAI task batch planning or execution failed")
         outcomes = [error] * len(works)
     try:
         prepared = await asyncio.gather(
@@ -886,13 +886,13 @@ class _DisconnectWatchdog:
     The serve loop reconnects on its own, but a failure it does not know how to
     recover from (a wedged HTTP client, a stuck event loop) would otherwise
     leave the worker reconnecting forever. A pull worker can afford a restart:
-    after ``LZ_TTS_MAX_DISCONNECTED_SECONDS`` (default 600, 0 disables) without
+    after ``LZAI_MAX_DISCONNECTED_SECONDS`` (default 600, 0 disables) without
     an ``ok`` health status, kill the process tree and let pm2 start it clean.
     Runs on a thread so a blocked event loop cannot keep it from firing.
     """
 
     def __init__(self) -> None:
-        self.limit = float(os.environ.get("LZ_TTS_MAX_DISCONNECTED_SECONDS", "600"))
+        self.limit = float(os.environ.get("LZAI_MAX_DISCONNECTED_SECONDS", "600"))
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="taskflow-disconnect-watchdog", daemon=True
@@ -914,7 +914,7 @@ class _DisconnectWatchdog:
             elif now - last_ok > self.limit:
                 hard_exit(
                     f"not joined to Taskflow for {now - last_ok:.0f}s "
-                    f"(LZ_TTS_MAX_DISCONNECTED_SECONDS={self.limit:g})"
+                    f"(LZAI_MAX_DISCONNECTED_SECONDS={self.limit:g})"
                 )
 
 
@@ -938,13 +938,13 @@ async def _serve_taskflow(
                 if taskflow.session_token:
                     await taskflow.heartbeat()
                 else:
-                    await taskflow.join({"service": "lz-tts", "synthesis": synthesis_capabilities})
+                    await taskflow.join({"service": "lzai", "synthesis": synthesis_capabilities})
                 connection_lost = asyncio.Event()
                 heartbeat_task = asyncio.create_task(taskflow.heartbeat_loop(connection_lost))
                 set_status("ok")
                 joined_once = True
                 failures = 0
-                _LOGGER.info("LZ-TTS Taskflow worker ready id=%s", taskflow.worker_id)
+                _LOGGER.info("LZAI Taskflow worker ready id=%s", taskflow.worker_id)
                 while not connection_lost.is_set():
                     leases = await _pull_task_batch(taskflow)
                     if leases:
@@ -1026,7 +1026,7 @@ async def run_worker() -> None:
     taskflow = TaskflowWorker(
         base_url=f"{lazybird_url}/internal/taskflow/v1",
         worker_token=worker_token,
-        worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lz-tts-{socket.gethostname()}"),
+        worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lzai-{socket.gethostname()}"),
         concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "8"))),
         low_priority_batch_size=max(1, int(os.environ.get("TASKFLOW_LOW_PRIORITY_BATCH_SIZE", "3"))),
         persistent=_env_bool("TASKFLOW_WORKER_PERSISTENT", False),
@@ -1051,7 +1051,7 @@ async def run_worker() -> None:
     # CUDA call, a thread that will not join), don't wait for pm2 to SIGKILL us
     # at kill_timeout. Tear the whole tree down ourselves so the GPU is free
     # before the supervisor restarts the worker.
-    shutdown_grace = max(1.0, float(os.environ.get("LZ_TTS_SHUTDOWN_GRACE_SECONDS", "20")))
+    shutdown_grace = max(1.0, float(os.environ.get("LZAI_SHUTDOWN_GRACE_SECONDS", "20")))
     shutdown_watchdog = threading.Timer(
         shutdown_grace,
         hard_exit,
@@ -1080,7 +1080,7 @@ async def run_worker() -> None:
         synthesis_capabilities = inference.synthesis_capabilities()
         await _serve_taskflow(taskflow, inference, synthesis_capabilities, acks)
     except asyncio.CancelledError:
-        _LOGGER.info("LZ-TTS worker shutdown requested")
+        _LOGGER.info("LZAI worker shutdown requested")
     finally:
         shutdown_watchdog.cancel()
         http_server.should_exit = True
@@ -1100,5 +1100,5 @@ def run() -> None:
         # Anything that escapes the worker loop means we cannot guarantee the
         # backend children are still healthy. Never leave them holding GPU
         # memory: kill the tree and let the supervisor start us clean.
-        _LOGGER.exception("LZ-TTS worker failed; killing the whole process tree")
+        _LOGGER.exception("LZAI worker failed; killing the whole process tree")
         hard_exit("unhandled worker error")

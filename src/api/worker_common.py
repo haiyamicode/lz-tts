@@ -151,7 +151,7 @@ class WorkerProcessClient:
                 ctx,
                 self.target,
                 (*self.args, self.requests, self.responses),
-                name=f"lz-tts-{self.name}-worker",
+                name=f"lzai-{self.name}-worker",
                 daemon=False,
             )
 

@@ -1,6 +1,6 @@
-# LZ-TTS API Documentation for LLMs
+# LZAI API Documentation for LLMs
 
-This is a text-to-speech API that converts text to audio using the configured LZ-TTS synthesis pipeline.
+This is a text-to-speech API that converts text to audio using the configured LZAI synthesis pipeline.
 
 ## Base URL
 {{BASE_URL}}

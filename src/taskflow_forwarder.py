@@ -1,10 +1,10 @@
-"""Forwarding Taskflow worker for LZ-TTS — dev helper.
+"""Forwarding Taskflow worker for LZAI — dev helper.
 
 Protocol-identical to :mod:`src.taskflow_worker` (join / heartbeat / pull /
 lease fencing / artifact upload / synthesis-event acks are all reused
 verbatim), but instead of a local model runtime each task operation is
-forwarded over HTTP to a real LZ-TTS service's ``/task/sync`` endpoint (the
-in-process HTTP adapter that every lz-tts worker exposes on ``PORT``).
+forwarded over HTTP to a real LZAI service's ``/task/sync`` endpoint (the
+in-process HTTP adapter that every lzai worker exposes on ``PORT``).
 
 This lets a small dev machine serve a Lazybird dev API's ``tts-synthesis``
 and ``voice-enhance`` queues without loading the multi-GB model runtime:
@@ -13,9 +13,9 @@ the forwards execute on the production worker box over the LAN/Tailscale.
 Env:
   LZB_API                    taskflow base url (default http://localhost:4001)
   TASKFLOW_WORKER_TOKEN      worker auth token (required)
-  TASKFLOW_WORKER_ID         worker id (default lz-tts-forwarder-<host>)
+  TASKFLOW_WORKER_ID         worker id (default lzai-forwarder-<host>)
   TASKFLOW_WORKER_CONCURRENCY  lease batch size (default 4)
-  LZTTS_FORWARD_URL          base url of the remote lz-tts HTTP adapter
+  LZAI_FORWARD_URL           base url of the remote lzai HTTP adapter
                              (default http://home.vnet.local:8000)
   API_KEY                    api key for the remote adapter (required)
   PORT                       this worker's own HTTP adapter port (default 8010)
@@ -67,7 +67,7 @@ class ForwardingInferenceSession:
 
     Same four-method surface the Taskflow worker expects (start / close /
     synthesis_capabilities / execute_many), but every operation executes on a
-    remote lz-tts HTTP adapter and comes back as an ``InferenceResult``.
+    remote lzai HTTP adapter and comes back as an ``InferenceResult``.
     Error mapping mirrors the real worker contract: HTTP >= 500 and 408/429
     are retriable (``InferenceOperationError`` with that status), other 4xx
     are terminal.
@@ -91,9 +91,9 @@ class ForwardingInferenceSession:
 
     async def start(self) -> None:
         if not self._api_key:
-            raise RuntimeError("API_KEY is required to forward to the remote lz-tts service")
+            raise RuntimeError("API_KEY is required to forward to the remote lzai service")
         if not self._base_url:
-            raise RuntimeError("LZTTS_FORWARD_URL is required for the forwarding worker")
+            raise RuntimeError("LZAI_FORWARD_URL is required for the forwarding worker")
         self._started = True
 
     async def close(self) -> None:
@@ -124,7 +124,7 @@ class ForwardingInferenceSession:
                 headers={"X-Api-Key": self._api_key},
             )
         except httpx.HTTPError as error:
-            _LOGGER.error("Forward to remote lz-tts failed (transport) url=%s: %s", url, error)
+            _LOGGER.error("Forward to remote lzai failed (transport) url=%s: %s", url, error)
             return InferenceOperationError(503, f"forward transport failure: {error}")
 
         try:
@@ -173,13 +173,13 @@ async def run_forwarder_worker() -> None:
     worker_token = os.environ.get("TASKFLOW_WORKER_TOKEN", "").strip()
     if not worker_token:
         raise RuntimeError("TASKFLOW_WORKER_TOKEN is required to authenticate with Lazybird Taskflow")
-    forward_url = os.environ.get("LZTTS_FORWARD_URL", "http://home.vnet.local:8000").strip()
+    forward_url = os.environ.get("LZAI_FORWARD_URL", "http://home.vnet.local:8000").strip()
     api_key = os.environ.get("API_KEY", "").strip()
 
     taskflow = TaskflowWorker(
         base_url=f"{os.environ.get('LZB_API', 'http://localhost:4001').rstrip('/')}/internal/taskflow/v1",
         worker_token=worker_token,
-        worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lz-tts-forwarder-{socket.gethostname()}"),
+        worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lzai-forwarder-{socket.gethostname()}"),
         concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "8"))),
         persistent=_env_bool("TASKFLOW_WORKER_PERSISTENT", False),
     )
@@ -193,7 +193,7 @@ async def run_forwarder_worker() -> None:
     await asyncio.sleep(0)
     main_task = asyncio.current_task()
     loop = asyncio.get_running_loop()
-    shutdown_grace = max(1.0, float(os.environ.get("LZ_TTS_SHUTDOWN_GRACE_SECONDS", "20")))
+    shutdown_grace = max(1.0, float(os.environ.get("LZAI_SHUTDOWN_GRACE_SECONDS", "20")))
     shutdown_watchdog = threading.Timer(
         shutdown_grace,
         hard_exit,
@@ -221,7 +221,7 @@ async def run_forwarder_worker() -> None:
         synthesis_capabilities = inference.synthesis_capabilities()
         await _serve_taskflow(taskflow, inference, synthesis_capabilities, acks)
     except asyncio.CancelledError:
-        _LOGGER.info("LZ-TTS forwarding worker shutdown requested")
+        _LOGGER.info("LZAI forwarding worker shutdown requested")
     finally:
         shutdown_watchdog.cancel()
         http_server.should_exit = True
@@ -238,7 +238,7 @@ def run() -> None:
     try:
         asyncio.run(run_forwarder_worker())
     except BaseException:  # pylint: disable=broad-exception-caught
-        _LOGGER.exception("LZ-TTS forwarding worker failed; exiting")
+        _LOGGER.exception("LZAI forwarding worker failed; exiting")
         raise
 
 
