@@ -38,6 +38,7 @@ from rapidfuzz.distance import Levenshtein
 from ..multilingual_splitter import MultilingualSplitter, SplitResult
 from ..multilingual_splitter.multilingual_splitter import CLD2_LANGUAGE_CODES
 from ..piper import PiperInference
+from ..piper.ipa_symbols import sparrow_ipa_symbols
 from ..heap_trim import IdleHeapTrimmer
 from ..process_guard import hard_exit
 from ..ctc_forced_alignment import CtcLanguageSpan
@@ -349,6 +350,9 @@ class VoxCPMConfig(BaseModel):
     num_kvcache_blocks: int = Field(default=192, ge=1)
     enforce_eager: bool = False
     ipa_adapter_path: str | None = None
+    # An applicable_loras name: SSML <phoneme> spans are written into the text as /ipa/ and read by this LoRA in
+    # one pass (no baseline, no IPA adapter). None keeps the adapter path.
+    ipa_text_lora: str | None = None
     fallback_max_generate_length: int = Field(default=4096, ge=1)
     duration_budget: VoxCPMDurationBudgetConfig = Field(default_factory=VoxCPMDurationBudgetConfig)
     temperature: float = Field(default=1.0, ge=0)
@@ -385,6 +389,8 @@ class VoxCPMConfig(BaseModel):
         unknown_loras = sorted(set(self.locale_loras.values()) - set(self.applicable_loras))
         if unknown_loras:
             raise ValueError(f"VoxCPM locale policy contains unknown LoRAs: {unknown_loras}")
+        if self.ipa_text_lora is not None and self.ipa_text_lora not in self.applicable_loras:
+            raise ValueError(f"VoxCPM ipa_text_lora {self.ipa_text_lora!r} is not in applicable_loras")
         return self
 
 
@@ -2911,6 +2917,13 @@ def _voxcpm_ipa_guide_text(
     forced_language: str | None,
 ) -> str:
     """Return the visible LM guide; the adapter receives exact IPA separately."""
+    if _server_config.voxcpm.ipa_text_lora:
+        # The IPA-text LoRA reads the IPA itself, between slashes, in espeak's symbols (as Sparrow's map holds
+        # them) and without syllable dots, as it was trained.
+        ipa = " ".join(re.sub(r"[/.]", "", "".join(sparrow_ipa_symbols(operation.phonemes))).split())
+        if not ipa:
+            raise ValueError("SSML <phoneme> needs a non-empty ph")
+        return f"/{ipa}/"
     language = _language_at_source_position(
         document.text,
         operation.start,
@@ -3264,6 +3277,51 @@ async def _load_voxcpm_ssml_reference(
     if request.reference_url is not None:
         return await _download_voxcpm_reference(request.reference_url)
     return None, "wav"
+
+
+async def _synthesize_voxcpm_ipa_text_ssml(
+    request: SynthesizeRequest,
+    document: SSMLDocument,
+) -> tuple[np.ndarray, int]:
+    """SSML <phoneme> on VoxCPM with the IPA written into the text: each span reads "/ipa/" and the
+    configured IPA-text LoRA (stacked on the request's own) speaks it, in one pass like a plain request."""
+    await _await_engine_ready("voxcpm")
+    runtime = _get_voxcpm_runtime()
+    forced_language = _explicit_language(request.language, request.language_override)
+    controlled_text, language, _controls = await asyncio.to_thread(
+        _prepare_voxcpm_ipa_text,
+        document,
+        request.language,
+        forced_language,
+        _configured_voice_language(request.voice_id, request.language),
+        True,
+    )
+    chunks = _chunk_voxcpm_texts([controlled_text])[0]
+    requested_loras = _effective_voxcpm_lora_names(
+        list(dict.fromkeys([*request.voxcpm_loras, _server_config.voxcpm.ipa_text_lora])),
+        request.language,
+        request.language_override,
+    )
+    try:
+        lora_name = await runtime.resolve_lora_combination(requested_loras)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Could not apply VoxCPM LoRAs: {exc}") from exc
+    reference_audio, reference_format = await _load_voxcpm_ssml_reference(request)
+    chunk_audios = await runtime.synthesize_batch(
+        chunks,
+        languages=[language] * len(chunks),
+        seeds=[request.seed] * len(chunks),
+        reference_audio=reference_audio,
+        reference_format=reference_format,
+        lora_names=[lora_name] * len(chunks),
+    )
+    _LOGGER.info(
+        "VoxCPM IPA-text SSML generated chunks=%d spans=%d loras=%s",
+        len(chunks),
+        len(document.pronunciations),
+        list(requested_loras),
+    )
+    return np.concatenate(chunk_audios), runtime.sample_rate
 
 
 async def _synthesize_voxcpm_ipa_ssml(
@@ -5561,13 +5619,17 @@ async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> R
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if document.operations and not _server_config.ssml.enabled:
             raise HTTPException(status_code=503, detail="SSML audio operations are disabled")
-        if document.pronunciations and not _request_routes_to_voxcpm(request, model):
+        routes_to_voxcpm = _request_routes_to_voxcpm(request, model)
+        if document.pronunciations and (not routes_to_voxcpm or _server_config.voxcpm.ipa_text_lora):
             try:
-                audio, sample_rate = await _synthesize_sparrow_ipa_ssml(
-                    request,
-                    document,
-                    model,
-                )
+                if routes_to_voxcpm:
+                    audio, sample_rate = await _synthesize_voxcpm_ipa_text_ssml(request, document)
+                else:
+                    audio, sample_rate = await _synthesize_sparrow_ipa_ssml(
+                        request,
+                        document,
+                        model,
+                    )
                 if document.breaks:
                     timestamps = await _align_words(
                         document.text,

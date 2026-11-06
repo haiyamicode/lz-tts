@@ -493,6 +493,24 @@ def test_non_english_voxcpm_ipa_keeps_native_visible_text_as_guide(
     assert controls[0]["target_ipa"] == document.pronunciations[0].phonemes
 
 
+def test_ipa_text_lora_writes_the_ipa_into_the_text(monkeypatch) -> None:
+    monkeypatch.setattr(server._server_config.voxcpm, "applicable_loras", {"ipa-text": "unused"})
+    monkeypatch.setattr(server._server_config.voxcpm, "ipa_text_lora", "ipa-text")
+    document = parse_ssml(
+        '<speak>Ela é <phoneme alphabet="ipa" ph="ˈmã.j̃ɐ̃">mãe</phoneme> de '
+        '<phoneme alphabet="ipa" ph="/ˈme.xi.ko/">México</phoneme>.</speak>'
+    )
+
+    controlled_text, _, controls = _prepare_voxcpm_ipa_text(document, "pt-BR", "pt-BR")
+
+    # Sparrow's (espeak's) symbols: the nasal vowel decomposed, no syllable dots, the user's slashes dropped.
+    assert controlled_text == "Ela é /ˈma\u0303j̃ɐ̃/ de /ˈmexiko/."
+    assert [controlled_text[c["controlled_start"] : c["controlled_end"]] for c in controls] == [
+        "/ˈma\u0303j̃ɐ̃/",
+        "/ˈmexiko/",
+    ]
+
+
 def test_voxcpm_speakable_paren_groups():
     """VoxCPM2 truncates generation at an open paren; parens must not
     reach the model — balanced groups become spoken clause punctuation,
