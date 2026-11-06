@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,9 @@ import numpy as np
 from ..nanovllm_voxcpm.models.voxcpm2.server import VoxCPMServerDied
 from .voxcpm_lora import compose_voxcpm_loras
 from .worker_common import ChildWorkerDied
+
+# Gets a generation's audio as it is made, then None once it is complete.
+AudioSink = Callable[[np.ndarray | None], Awaitable[None]]
 
 _LOGGER = logging.getLogger(__name__)
 _KV_BLOCKS_ENV = "NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"
@@ -365,6 +368,7 @@ class VoxCPMRuntime:
         lora_name: str | None = None,
         ipa_controls: list[dict[str, Any]] | None = None,
         min_generate_length: int = 0,
+        on_audio: AudioSink | None = None,
     ) -> np.ndarray:
         if self.server is None:
             raise RuntimeError("VoxCPM runtime is not started")
@@ -384,13 +388,16 @@ class VoxCPMRuntime:
         }
         if seed is not None:
             generation_kwargs["seed"] = seed
+        chunks: list[np.ndarray] = []
         try:
-            chunks = [
-                np.asarray(chunk, dtype=np.float32)
-                async for chunk in self.server.generate(**generation_kwargs)
-            ]
+            async for chunk in self.server.generate(**generation_kwargs):
+                chunks.append(np.asarray(chunk, dtype=np.float32))
+                if on_audio is not None:
+                    await on_audio(chunks[-1])
         except VoxCPMServerDied as exc:
             raise _as_child_death(exc) from exc
+        if on_audio is not None:
+            await on_audio(None)
         if not chunks:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(chunks).astype(np.float32, copy=False)
@@ -441,6 +448,7 @@ class VoxCPMRuntime:
         lora_names: Sequence[str | None] | None = None,
         voice_descriptions: Sequence[str | None] | None = None,
         continuations: Sequence[tuple[bytes, str, str] | None] | None = None,
+        on_audio: Sequence[AudioSink | None] | None = None,
     ) -> list[np.ndarray]:
         """Submit every item concurrently so nano-vLLM can schedule a real batch.
 
@@ -489,6 +497,10 @@ class VoxCPMRuntime:
             continuations = [None] * len(texts)
         if len(continuations) != len(texts):
             raise ValueError("continuations length must match texts length")
+        if on_audio is None:
+            on_audio = [None] * len(texts)
+        if len(on_audio) != len(texts):
+            raise ValueError("on_audio length must match texts length")
 
         duration_started = time.perf_counter()
         generation_limits, _budgets = await self._predict_generation_limits(
@@ -544,8 +556,9 @@ class VoxCPMRuntime:
                         continuation_latents=item_continuation_latents,
                         continuation_text=continuation[2] if continuation else "",
                         lora_name=lora_name,
+                        on_audio=item_on_audio,
                     )
-                    for text, max_generate_length, seed, item_reference_latents, item_continuation_latents, continuation, lora_name, description in zip(
+                    for text, max_generate_length, seed, item_reference_latents, item_continuation_latents, continuation, lora_name, description, item_on_audio in zip(
                         texts,
                         generation_limits,
                         seeds,
@@ -554,6 +567,7 @@ class VoxCPMRuntime:
                         continuations,
                         lora_names,
                         voice_descriptions,
+                        on_audio,
                     )
                 )
             )
@@ -570,4 +584,4 @@ class VoxCPMRuntime:
         return outputs
 
 
-__all__ = ["VoxCPMRuntime"]
+__all__ = ["AudioSink", "VoxCPMRuntime"]

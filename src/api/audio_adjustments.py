@@ -97,6 +97,57 @@ def _run(command: list[str], *, name: str) -> None:
     )
 
 
+def needs_adjustment(
+    *,
+    speed: float = 1.0,
+    pitch: float = 1.0,
+    volume: float = 1.0,
+    pause_before: float = 0.0,
+    pause_after: float = 0.0,
+    effect: AudioEffect | None = None,
+) -> bool:
+    return (
+        speed != 1.0
+        or pitch != 1.0
+        or volume != 1.0
+        or bool(pause_before)
+        or bool(pause_after)
+        or effect is not None
+    )
+
+
+def decode_filter(effect: AudioEffect | None) -> str | None:
+    """The ffmpeg filter ``effect`` runs on the speech before SoX, if any."""
+    return _EFFECTS[effect].decode_filter if effect else None
+
+
+def sox_adjustment_effects(
+    *,
+    speed: float = 1.0,
+    pitch: float = 1.0,
+    volume: float = 1.0,
+    pause_before: float = 0.0,
+    pause_after: float = 0.0,
+    effect: AudioEffect | None = None,
+) -> list[str]:
+    """The SoX effects chain of an adjustment, ending at 44.1 kHz."""
+    effects: list[str] = []
+    if speed != 1.0:
+        effects.extend(["tempo", "-s", str(speed)])
+    if pitch != 1.0:
+        cents = round(1200 * math.log2(pitch))
+        if cents:
+            effects.extend(["pitch", str(cents)])
+    if effect:
+        effects.extend(_EFFECTS[effect].sox)
+    if volume != 1.0:
+        effects.extend(["vol", str(volume)])
+    if pause_before or pause_after:
+        effects.extend(["pad", str(pause_before), str(pause_after)])
+    effects.extend(["rate", "-v", "44100"])
+    return effects
+
+
 def adjust_audio(
     audio: bytes,
     *,
@@ -116,13 +167,13 @@ def adjust_audio(
     that many seconds of silence around the speech, after the speed change so
     the silence keeps its length.
     """
-    if (
-        speed == 1.0
-        and pitch == 1.0
-        and volume == 1.0
-        and not pause_before
-        and not pause_after
-        and effect is None
+    if not needs_adjustment(
+        speed=speed,
+        pitch=pitch,
+        volume=volume,
+        pause_before=pause_before,
+        pause_after=pause_after,
+        effect=effect,
     ):
         return audio
     if not audio:
@@ -140,7 +191,7 @@ def adjust_audio(
         effect,
         len(audio),
     )
-    effect_steps = _EFFECTS[effect] if effect else _Effect()
+    filter_steps = decode_filter(effect)
 
     with tempfile.TemporaryDirectory(prefix="lzai-adjust-") as temp_dir:
         root = Path(temp_dir)
@@ -160,7 +211,7 @@ def adjust_audio(
                 "-i",
                 str(encoded_input),
                 "-vn",
-                *(["-af", effect_steps.decode_filter] if effect_steps.decode_filter else []),
+                *(["-af", filter_steps] if filter_steps else []),
                 "-acodec",
                 "pcm_s16le",
                 str(decoded_input),
@@ -168,19 +219,19 @@ def adjust_audio(
             name="ffmpeg audio decode",
         )
 
-        sox_command = ["sox", str(decoded_input), str(adjusted_output)]
-        if speed != 1.0:
-            sox_command.extend(["tempo", "-s", str(speed)])
-        if pitch != 1.0:
-            cents = round(1200 * math.log2(pitch))
-            if cents:
-                sox_command.extend(["pitch", str(cents)])
-        sox_command.extend(effect_steps.sox)
-        if volume != 1.0:
-            sox_command.extend(["vol", str(volume)])
-        if pause_before or pause_after:
-            sox_command.extend(["pad", str(pause_before), str(pause_after)])
-        sox_command.extend(["rate", "-v", "44100"])
+        sox_command = [
+            "sox",
+            str(decoded_input),
+            str(adjusted_output),
+            *sox_adjustment_effects(
+                speed=speed,
+                pitch=pitch,
+                volume=volume,
+                pause_before=pause_before,
+                pause_after=pause_after,
+                effect=effect,
+            ),
+        ]
         _run(sox_command, name="sox audio adjustment")
 
         if output_format == "mp3":

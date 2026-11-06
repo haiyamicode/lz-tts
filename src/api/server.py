@@ -54,6 +54,7 @@ from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
 from ..matcha_inference import MatchaBatcher as ProductionStarlingBatcher
 from .audio_utils import _audio_to_mp3_bytes, _audio_to_pcm16, _audio_to_wav_bytes, _resample_audio
 from .audio_adjustments import AudioEffect, adjust_audio
+from .take_stream import OrderedChunkAudio, StreamingMp3Encoder
 from .locale_utils import normalize_locale as _normalize_locale_with_region
 from .model_workers import speech_worker_main, starling_worker_main
 from .seed_vc_backend import (
@@ -4478,8 +4479,13 @@ async def synthesize_voxcpm_batch(
     reference_formats: list[str] | None = None,
     continuations: list[tuple[bytes, str, str] | None] | None = None,
     instructions: list[str | None] | None = None,
+    line_encoders: list[StreamingMp3Encoder | None] | None = None,
 ) -> BatchSynthesizeResponse:
-    """Synthesize one compatible request group with optimized nano-vLLM."""
+    """Synthesize one compatible request group with optimized nano-vLLM.
+
+    A line with an encoder in ``line_encoders`` is encoded as it is generated,
+    and its item carries that encoder's MP3.
+    """
     if not _engine_enabled("voxcpm"):
         raise HTTPException(status_code=503, detail="VoxCPM backend is disabled")
     if request.options is not None:
@@ -4549,6 +4555,15 @@ async def synthesize_voxcpm_batch(
             request.reference_url,
         )
 
+    chunk_sinks = None
+    if line_encoders is not None and any(line_encoders):
+        chunk_sinks = []
+        for encoder, chunk_count in zip(line_encoders, chunk_counts, strict=True):
+            if encoder is None:
+                chunk_sinks.extend([None] * chunk_count)
+            else:
+                chunk_sinks.extend(OrderedChunkAudio(encoder.write, chunk_count).sinks())
+
     started = time.perf_counter()
     chunk_audios = await runtime.synthesize_batch(
         prepared_texts,
@@ -4561,16 +4576,19 @@ async def synthesize_voxcpm_batch(
         lora_names=[lora_name] * len(prepared_texts),
         voice_descriptions=chunk_instructions,
         continuations=chunk_continuations,
+        on_audio=chunk_sinks,
     )
     audios = concat_chunk_audios(chunk_audios, chunk_counts)
     generation_wall_seconds = time.perf_counter() - started
     sample_rate = runtime.sample_rate
 
     items = []
-    for text, audio in zip(texts, audios):
+    for text, audio, encoder in zip(texts, audios, line_encoders or [None] * len(texts)):
         audio_seconds = float(len(audio)) / sample_rate if sample_rate else 0.0
         encoded = (
-            _audio_to_mp3_bytes(audio, sample_rate)
+            await encoder.finish()
+            if encoder is not None
+            else _audio_to_mp3_bytes(audio, sample_rate)
             if request.format == "mp3"
             else _audio_to_wav_bytes(audio, sample_rate)
         )
@@ -4610,6 +4628,7 @@ async def synthesize_voxcpm_batch(
 
 async def _synthesize_voxcpm_items(
     records: list[tuple[int, BatchSynthesizeInputItem, str]],
+    line_encoders: list[StreamingMp3Encoder | None] | None = None,
 ) -> BatchSynthesizeResponse:
     reference_keys = [item.reference_url for _, item, _ in records]
     unique_keys = list(dict.fromkeys(key for key in reference_keys if key is not None))
@@ -4668,6 +4687,7 @@ async def _synthesize_voxcpm_items(
         reference_formats=reference_formats,
         continuations=continuations,
         instructions=[item.instruction for _, item, _ in records],
+        line_encoders=line_encoders,
     )
 
 
@@ -4985,11 +5005,12 @@ def _plan_synthesis_batches(
 
 async def _execute_synthesis_batch_plan(
     plan: _SynthesisBatchPlan,
+    line_encoders: list[StreamingMp3Encoder | None] | None = None,
 ) -> BatchSynthesizeResponse:
     records = plan.records
     shared_request = _shared_batch_from_items(records)
     if plan.pipeline == "voxcpm":
-        return await _synthesize_voxcpm_items(records)
+        return await _synthesize_voxcpm_items(records, line_encoders)
     if _configured_root_voice_for_voice_id(shared_request.voice_id) is not None:
         return await synthesize_configured_voice_batch(shared_request)
     forced_language = (shared_request.languages or [None])[0]
@@ -5821,6 +5842,31 @@ def _prepare_batchable_synthesis_request(
     return request.model_copy(update={"text": document.text, "ssml": None})
 
 
+def _streaming_encoder(
+    request: SynthesizeRequest,
+    on_mp3: Callable[[bytes], None] | None,
+) -> StreamingMp3Encoder | None:
+    if on_mp3 is None:
+        return None
+    return StreamingMp3Encoder(
+        _get_voxcpm_runtime().sample_rate,
+        on_mp3=on_mp3,
+        speed=request.speed,
+        pitch=request.pitch,
+        volume=request.volume,
+        pause_before=request.pause_before,
+        pause_after=request.pause_after,
+        effect=request.effect,
+    )
+
+
+async def _abort_encoders(encoders: list[StreamingMp3Encoder | None] | None) -> None:
+    await asyncio.gather(
+        *(encoder.abort() for encoder in encoders or [] if encoder is not None),
+        return_exceptions=True,
+    )
+
+
 class LzTtsInferenceSession:
     """One preloaded runtime with direct task-operation dispatch."""
 
@@ -5854,14 +5900,21 @@ class LzTtsInferenceSession:
     async def execute_many(
         self,
         operations: list[tuple[str, dict[str, Any]]],
+        mp3_sinks: list[Callable[[bytes], None] | None] | None = None,
     ) -> list[InferenceResult | BaseException]:
-        """Plan compatible synthesis operations into real backend batches."""
+        """Plan compatible synthesis operations into real backend batches.
+
+        An operation with a sink in ``mp3_sinks`` hands it its MP3 as it is
+        encoded, when its backend generates live (VoxCPM); the sink gets
+        nothing from other operations, whose result is complete at once.
+        """
         with self._heap_trimmer.busy():
-            return await self._execute_many(operations)
+            return await self._execute_many(operations, mp3_sinks)
 
     async def _execute_many(
         self,
         operations: list[tuple[str, dict[str, Any]]],
+        mp3_sinks: list[Callable[[bytes], None] | None] | None = None,
     ) -> list[InferenceResult | BaseException]:
         if not self._started:
             raise RuntimeError("Inference session has not been started")
@@ -5937,14 +5990,28 @@ class LzTtsInferenceSession:
         )
 
         for plan in plans:
+            line_encoders: list[StreamingMp3Encoder | None] | None = None
+            if plan.pipeline == "voxcpm" and mp3_sinks is not None:
+                line_encoders = [
+                    _streaming_encoder(
+                        batch_requests[batch_item_index],
+                        mp3_sinks[batch_operation_indices[batch_item_index]],
+                    )
+                    if item.format == "mp3"
+                    else None
+                    for batch_item_index, item, _ in plan.records
+                ]
             try:
-                response = await _execute_synthesis_batch_plan(plan)
+                response = await _execute_synthesis_batch_plan(plan, line_encoders)
                 if len(response.items) != len(plan.records):
                     raise RuntimeError(
                         "backend batch returned a different number of results"
                     )
-                for (batch_item_index, item, _), response_item in zip(
-                    plan.records, response.items, strict=True
+                for (batch_item_index, item, _), response_item, encoder in zip(
+                    plan.records,
+                    response.items,
+                    line_encoders or [None] * len(plan.records),
+                    strict=True,
                 ):
                     request = batch_requests[batch_item_index]
                     result = InferenceResult(
@@ -5954,23 +6021,28 @@ class LzTtsInferenceSession:
                         ),
                         audio=base64.b64decode(response_item.audio_base64),
                     )
-                    result = await _apply_audio_adjustments(result, request)
+                    if encoder is None:
+                        # A streamed take was adjusted as it was encoded.
+                        result = await _apply_audio_adjustments(result, request)
                     outcomes[batch_operation_indices[batch_item_index]] = (
                         await _add_word_timestamps(result, request)
                     )
             except HTTPException as error:
+                await _abort_encoders(line_encoders)
                 outcome: BaseException = InferenceOperationError(
                     error.status_code, error.detail
                 )
                 for batch_item_index, _, _ in plan.records:
                     outcomes[batch_operation_indices[batch_item_index]] = outcome
             except ChildWorkerDied as error:
+                await _abort_encoders(line_encoders)
                 # A backend subprocess is gone (OOM, crash). Don't retry the
                 # leases in this batch — escalate to the worker so it surfaces
                 # ``error`` and stops pulling new leases.
                 _mark_engine_failed_from_child(error.name, error)
                 raise
             except Exception as error:
+                await _abort_encoders(line_encoders)
                 _LOGGER.exception(
                     "Inference task batch failed pipeline=%s count=%d",
                     plan.pipeline,
