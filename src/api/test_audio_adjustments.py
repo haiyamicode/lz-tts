@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from typing import get_args
 
 import numpy as np
 
-from .audio_adjustments import adjust_audio
+from .audio_adjustments import AudioEffect, adjust_audio
 
 SAMPLE_RATE = 16000
 
 
-def _tone_mp3(seconds: float) -> bytes:
+def _tone_mp3(seconds: float, frequency: int = 440) -> bytes:
     return subprocess.run(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+            "-f", "lavfi", "-i", f"sine=frequency={frequency}:duration={seconds}",
             "-codec:a", "libmp3lame", "-b:a", "128k", "-f", "mp3", "-",
         ],
         capture_output=True,
@@ -41,6 +42,10 @@ def _seconds(samples: np.ndarray) -> float:
 
 def _peak(samples: np.ndarray, start: float, end: float) -> float:
     return float(np.abs(samples[int(start * SAMPLE_RATE) : int(end * SAMPLE_RATE)]).max())
+
+
+def _level_db(samples: np.ndarray) -> float:
+    return float(20 * np.log10(np.sqrt(np.mean(samples**2))))
 
 
 class PauseTests(unittest.TestCase):
@@ -78,6 +83,44 @@ class PauseTests(unittest.TestCase):
         self.assertIs(
             adjust_audio(audio, input_format="mp3", output_format="mp3"), audio
         )
+
+
+class EffectTests(unittest.TestCase):
+    def test_every_effect_keeps_the_length_and_level(self) -> None:
+        tone = _tone_mp3(1.0)
+        plain = _decode(tone)
+        for effect in get_args(AudioEffect):
+            with self.subTest(effect=effect):
+                samples = _decode(
+                    adjust_audio(tone, input_format="mp3", output_format="mp3", effect=effect)
+                )
+                self.assertGreaterEqual(_seconds(samples), _seconds(plain) - 0.01)
+                self.assertAlmostEqual(
+                    _level_db(samples[: len(plain)]), _level_db(plain), delta=4
+                )
+
+    def test_phone_cuts_what_a_phone_line_cannot_carry(self) -> None:
+        tone = _tone_mp3(1.0, frequency=5000)
+        samples = _decode(
+            adjust_audio(tone, input_format="mp3", output_format="mp3", effect="phone")
+        )
+        self.assertLess(_level_db(samples), _level_db(_decode(tone)) - 30)
+
+    def test_echo_rings_on_after_the_speech(self) -> None:
+        samples = _decode(
+            adjust_audio(_tone_mp3(1.0), input_format="mp3", output_format="mp3", effect="echo")
+        )
+        self.assertGreater(_peak(samples, 1.2, 1.6), 0.01)
+
+    def test_volume_applies_on_top_of_an_effect(self) -> None:
+        tone = _tone_mp3(1.0)
+        full = _decode(adjust_audio(tone, input_format="mp3", output_format="mp3", effect="deep"))
+        half = _decode(
+            adjust_audio(
+                tone, input_format="mp3", output_format="mp3", effect="deep", volume=0.5
+            )
+        )
+        self.assertAlmostEqual(_level_db(full) - _level_db(half), 6.02, delta=0.3)
 
 
 if __name__ == "__main__":

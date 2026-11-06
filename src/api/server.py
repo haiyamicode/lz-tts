@@ -52,7 +52,7 @@ from ..voxcpm_ipa_adapter import approximate_ipa_spelling, resolve_ipa_control_s
 from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
 from ..matcha_inference import MatchaBatcher as ProductionStarlingBatcher
 from .audio_utils import _audio_to_mp3_bytes, _audio_to_pcm16, _audio_to_wav_bytes, _resample_audio
-from .audio_adjustments import adjust_audio
+from .audio_adjustments import AudioEffect, adjust_audio
 from .locale_utils import normalize_locale as _normalize_locale_with_region
 from .model_workers import speech_worker_main, starling_worker_main
 from .seed_vc_backend import (
@@ -624,6 +624,10 @@ class SynthesizeRequest(BaseModel):
     volume: float = Field(1.0, ge=0.0, description="Output volume multiplier")
     pause_before: float = Field(0.0, ge=0.0, description="Seconds of silence added before the speech")
     pause_after: float = Field(0.0, ge=0.0, description="Seconds of silence added after the speech")
+    effect: Optional[AudioEffect] = Field(
+        None,
+        description="Sound effect on the finished speech: robot, deep, monster, echo, radio or phone",
+    )
     timestamps: bool = Field(
         False,
         description="Also return word timestamps, force-aligned (CTC) on the finished audio",
@@ -637,7 +641,15 @@ class SynthesizeRequest(BaseModel):
 
 # SynthesizeRequest fields applied to the finished audio (_apply_audio_adjustments,
 # _add_word_timestamps), not passed to the synthesis backends.
-_FINISHED_AUDIO_FIELDS = {"speed", "pitch", "volume", "pause_before", "pause_after", "timestamps"}
+_FINISHED_AUDIO_FIELDS = {
+    "speed",
+    "pitch",
+    "volume",
+    "pause_before",
+    "pause_after",
+    "effect",
+    "timestamps",
+}
 
 
 class VoiceDesignRequest(BaseModel):
@@ -5055,13 +5067,14 @@ async def _apply_audio_adjustments(
     result: InferenceResult,
     request: SynthesizeRequest,
 ) -> InferenceResult:
-    """Apply the request's speed/pitch/volume and its pauses to synthesized audio."""
+    """Apply the request's speed/pitch/volume, effect and pauses to synthesized audio."""
     if result.kind != "audio" or (
         request.speed == 1.0
         and request.pitch == 1.0
         and request.volume == 1.0
         and not request.pause_before
         and not request.pause_after
+        and request.effect is None
     ):
         return result
     if not result.audio:
@@ -5080,6 +5093,7 @@ async def _apply_audio_adjustments(
         volume=request.volume,
         pause_before=request.pause_before,
         pause_after=request.pause_after,
+        effect=request.effect,
     )
     return InferenceResult(
         kind="audio",
@@ -5950,6 +5964,7 @@ class LzTtsInferenceSession:
             "volume": request_data.get("volume", 1.0),
             "pause_before": request_data.get("pause_before", 0.0),
             "pause_after": request_data.get("pause_after", 0.0),
+            "effect": request_data.get("effect"),
         }
         _LOGGER.info("Inference operation started: %s", json.dumps(context, default=str))
         try:
