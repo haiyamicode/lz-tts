@@ -532,6 +532,17 @@ def test_voxcpm_speakable_paren_groups():
         ("A tag (and an aside [breath]) here.", "A tag, and an aside [breath], here."),
         ("Stray ] closer.", "Stray ] closer."),
         ("No brackets at all.", "No brackets at all."),
+        # A group right before punctuation leaves no ", ." (VoxCPM2 rambles past the period).
+        (
+            "Hiển thị các giọng nói đã sử dụng gần đây (nếu có, nếu có thì bỏ qua).",
+            "Hiển thị các giọng nói đã sử dụng gần đây, nếu có, nếu có thì bỏ qua.",
+        ),
+        ("Wow (really)!", "Wow, really!"),
+        ("Is it (maybe)?", "Is it, maybe?"),
+        ("Note (a): next.", "Note, a: next."),
+        ("Wait (what)...", "Wait, what..."),
+        ("他说(真的)。", "他说, 真的。"),
+        ("Languages: C#, .NET (mostly), Java.", "Languages: C#, .NET, mostly, Java."),
     ]
     for source, expected in cases:
         assert _voxcpm_speakable_paren_groups(source) == expected

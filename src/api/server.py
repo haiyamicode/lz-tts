@@ -4177,7 +4177,10 @@ def _voxcpm_speakable_paren_groups(text: str) -> str:
     "Simple request"). Parentheses never reach the model; each balanced
     group becomes ``text, group, text`` (commas render correctly and
     fully), empty groups vanish, and leftover unbalanced parens are dropped
-    while keeping their content; extra closers are dropped. Square brackets
+    while keeping their content; extra closers are dropped. No comma is left
+    right before other punctuation: VoxCPM2 reads ``x, .`` as more to come
+    and makes up words after the sentence ("... (if any)." rambled past the
+    final period on every take). Square brackets
     pass through untouched (non-speech tags such as ``[laughter]``).
     espeak/Sparrow reads these glyphs natively, so this is applied only on
     the VoxCPM path.
@@ -4207,6 +4210,8 @@ def _voxcpm_speakable_paren_groups(text: str) -> str:
     text = "".join(out)
     text = re.sub(r"(?:\s*,\s*){2,}", ", ", text)
     text = re.sub(r"\s+,", ",", text)
+    # Punctuation that starts a word (".NET") is not a clause end and keeps the comma.
+    text = re.sub(r",\s*([.!?;:…。！？；：])(?![^\W_])", r"\1", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text.strip(", ")
 
