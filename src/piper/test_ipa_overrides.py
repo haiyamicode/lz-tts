@@ -256,3 +256,32 @@ def test_ipa_override_boundaries_survive_chinese_normalization() -> None:
         text.index("番茄") + len("番茄"),
         normalized,
     ) == (8, 10)
+
+
+def test_sparrow_ipa_symbols_match_the_phoneme_map() -> None:
+    """Dictionaries write nasal vowels precomposed and ``ç`` either way; Sparrow's
+    map holds the tilde as a combining mark but ``ç`` precomposed."""
+    from .ipa_symbols import sparrow_ipa_symbols
+
+    assert sparrow_ipa_symbols("si\u00e3\u028a\u0303") == ["s", "i", "a", "\u0303", "\u028a", "\u0303"]
+    assert sparrow_ipa_symbols("\u026ac\u0327") == ["\u026a", "\u00e7"]
+    assert sparrow_ipa_symbols("\u02a7\u025d") == ["t", "\u0283", "\u025c", "\u02de"]
+    assert sparrow_ipa_symbols("t\u0361s") == ["t", "s"]
+
+
+def test_apply_ipa_overrides_takes_precomposed_nasal_vowels() -> None:
+    spans = [
+        {
+            "text": "as maos",
+            "source_text": "as m\u00e3os",
+            "voice": "pt-br",
+            "source_start": 0,
+            "source_end": 7,
+            "phonemes": list("as maws"),
+            "word_spans": [[0, 2, 0, 2], [3, 7, 3, 7]],
+            "speaker_id": 0,
+        }
+    ]
+    result = apply_ipa_overrides(spans, [(3, 7, "m\u02c8\u00e3ws")])
+
+    assert result[0]["phonemes"] == ["a", "s", " ", "m", "\u02c8", "a", "\u0303", "w", "s"]

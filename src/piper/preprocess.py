@@ -20,6 +20,7 @@ from piper_phonemize import (
 )
 
 from ..multilingual_splitter import MultilingualSplitter
+from .ipa_symbols import sparrow_ipa_symbols
 from ..text_norm import normalize_text as _normalize_written_text
 from .heteronym import get_resolver as _get_heteronym_resolver
 from .language_frontends import get_language_frontend, has_language_frontend
@@ -1921,7 +1922,7 @@ def apply_ipa_overrides(
             first, last = mappings[first_index], mappings[last_index]
             replacement_start = local_start
             replacement_end = local_end
-            replacement = list(ipa)
+            replacement = sparrow_ipa_symbols(ipa)
             if first[0] < local_start or last[1] > local_end:
                 if partial_word_phonemizer is None:
                     raise ValueError(

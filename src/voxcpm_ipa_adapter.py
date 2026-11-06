@@ -216,10 +216,16 @@ def replace_span_with_ipa_spelling(
     ipa: str,
     language: str = "en-US",
 ) -> tuple[str, str]:
-    """Replace exactly one source span with its approximate IPA spelling."""
+    """Replace exactly one source span with its approximate IPA spelling.
+
+    Only English has a respelling; other languages keep the written word as the
+    visible guide, as the server does, and the IPA reaches only the adapter.
+    """
 
     if not 0 <= start < end <= len(text):
         raise ValueError(f"Invalid IPA source span [{start}, {end}) for {text!r}")
+    if language.replace("_", "-").lower().split("-")[0] != "en":
+        return text, text[start:end]
     spelling = approximate_ipa_spelling(ipa, language)
     # Nothing speakable in the IPA: keep the original text for this span.
     spelling = spelling or text[start:end]
@@ -355,11 +361,13 @@ def sparrow_phoneme_ids(ipa: str) -> list[int]:
 
     from piper_phonemize import phoneme_ids_espeak
 
-    normalized = unicodedata.normalize("NFD", ipa.strip())
-    if not normalized:
+    from src.piper.ipa_symbols import sparrow_ipa_symbols
+
+    symbols = sparrow_ipa_symbols(ipa.strip())
+    if not symbols:
         raise ValueError("IPA pronunciation must not be empty")
     missing: dict[str, int] = {}
-    ids = list(phoneme_ids_espeak(list(normalized), missing_phonemes=missing))
+    ids = list(phoneme_ids_espeak(symbols, missing_phonemes=missing))
     if missing:
         symbols = ", ".join(repr(symbol) for symbol in sorted(missing))
         raise ValueError(f"IPA contains symbols unsupported by Sparrow: {symbols}")
