@@ -26,6 +26,7 @@ from .api.server import (
     get_health_status,
     set_status,
 )
+from .api.take_stream import Mp3Segment, Mp3Segmenter
 from .api.worker_common import ChildWorkerDied
 from .process_guard import hard_exit
 
@@ -47,6 +48,11 @@ _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.
 _CONTROL_TIMEOUT = httpx.Timeout(connect=30.0, read=60.0, write=60.0, pool=30.0)
 _CALLBACK_MAX_ATTEMPTS = 3
 _RECONNECT_BASE_DELAY = 2.0
+# The priority the API gives a block someone pressed Play on, above any bulk
+# work; the worker keeps its boost slots for it.
+_PLAY_PRIORITY = 100
+# Length of the segments a streamed take is uploaded in.
+_SEGMENT_SECONDS = 1.0
 _RECONNECT_MAX_DELAY = 60.0
 
 
@@ -116,6 +122,9 @@ class TaskflowWorker:
     # Batch cap for negative-priority (background) work, so a long low-priority
     # batch never keeps a normal job waiting behind it.
     low_priority_batch_size: int = 3
+    # Slots on top of ``concurrency`` that only take Play-boosted leases, so a
+    # line someone is waiting on starts even while the worker is full.
+    boost_slots: int = 3
     persistent: bool = False
     session_id: str | None = None
     session_token: str | None = None
@@ -192,7 +201,10 @@ class TaskflowWorker:
                 "workerId": self.worker_id,
                 "ephemeral": not self.persistent,
                 "metadata": metadata,
-                "capabilities": {"taskTypes": list(TASK_TYPES), "concurrency": self.concurrency},
+                "capabilities": {
+                    "taskTypes": list(TASK_TYPES),
+                    "concurrency": self.concurrency + self.boost_slots,
+                },
             },
         )
         body = response.json()
@@ -315,8 +327,43 @@ class TaskflowWorker:
             await asyncio.sleep(1.0 * attempt)
             attempt += 1
 
+    @property
+    def artifact_base_url(self) -> str:
+        return self.base_url.removesuffix("/taskflow/v1") + "/tts-artifacts/v1"
+
+    async def upload_segment(
+        self,
+        lease: dict[str, Any],
+        artifact_id: str,
+        index: int,
+        segment: Mp3Segment,
+        *,
+        last: bool,
+    ) -> None:
+        """Upload one segment of a streamed take; the last one completes the artifact."""
+        params = {"duration": f"{segment.seconds:.6f}"}
+        if last:
+            params["last"] = "1"
+        response = await self._client.put(
+            f"{self.artifact_base_url}/leases/{lease['id']}/{artifact_id}/segments/{index}",
+            params=params,
+            content=segment.data,
+            headers={
+                "Authorization": f"Bearer {lease['leaseToken']}",
+                "Content-Type": "application/octet-stream",
+            },
+            timeout=_CONTROL_TIMEOUT,
+        )
+        if response.is_error:
+            raise ProtocolError(
+                f"Segment upload failed ({response.status_code}): {response.text[:500]}",
+                response.status_code,
+                _error_code(response),
+                scope="lease",
+            )
+
     async def upload(self, lease: dict[str, Any], artifact_id: str, audio: bytes) -> None:
-        artifact_base_url = self.base_url.removesuffix("/taskflow/v1") + "/tts-artifacts/v1"
+        artifact_base_url = self.artifact_base_url
         started_at = time.monotonic()
         _LOGGER.info(
             "Artifact upload started lease=%s artifact=%s bytes=%d",
@@ -366,6 +413,88 @@ class _LeaseResult:
     error: BaseException | None = None
     retry: bool = False
     ack: dict[str, Any] | None = None
+
+
+class _SegmentUploads:
+    """Uploads a take in ~1 s segments as its MP3 is encoded, so it can play live.
+
+    Segments go up one at a time, in order. A take that wasn't encoded live is
+    segmented once it is complete. If a segment upload fails, the take is
+    uploaded whole instead: it can't play live, but it is still kept.
+    """
+
+    def __init__(self, taskflow: TaskflowWorker, lease: dict[str, Any], artifact_id: str):
+        self._taskflow = taskflow
+        self._lease = lease
+        self._artifact_id = artifact_id
+        self._segmenter = Mp3Segmenter(_SEGMENT_SECONDS)
+        self._received = 0
+        self._count = 0
+        self._chain: asyncio.Task[None] | None = None
+        self._error: BaseException | None = None
+
+    def write(self, mp3: bytes) -> None:
+        self._received += len(mp3)
+        for segment in self._segmenter.feed(mp3):
+            self._send(segment, last=False)
+
+    def _send(self, segment: Mp3Segment, *, last: bool) -> None:
+        self._chain = asyncio.create_task(
+            self._upload_after(self._chain, self._count, segment, last)
+        )
+        self._count += 1
+
+    async def _upload_after(
+        self,
+        previous: asyncio.Task[None] | None,
+        index: int,
+        segment: Mp3Segment,
+        last: bool,
+    ) -> None:
+        if previous is not None:
+            await previous
+        if self._error is not None:
+            return
+        try:
+            await self._taskflow.upload_segment(
+                self._lease, self._artifact_id, index, segment, last=last
+            )
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            self._error = error
+
+    async def finish(self, audio: bytes) -> None:
+        """Send the rest of ``audio`` (the whole take) and complete the artifact."""
+        for segment in self._segmenter.feed(audio[self._received :]):
+            self._send(segment, last=False)
+        last = self._segmenter.finish()
+        if last is not None:
+            self._send(last, last=True)
+        if self._chain is not None:
+            await self._chain
+        if self._error is None:
+            return
+        if isinstance(self._error, ProtocolError) and self._error.loses_lease:
+            raise self._error
+        _LOGGER.warning(
+            "Segment upload failed; uploading the take whole lease=%s artifact=%s: %s",
+            self._lease["id"],
+            self._artifact_id,
+            self._error,
+        )
+        await self._taskflow.upload(self._lease, self._artifact_id, audio)
+
+    def cancel(self) -> None:
+        if self._chain is not None:
+            self._chain.cancel()
+
+
+def _segment_uploads(taskflow: TaskflowWorker, work: _LeaseWork) -> _SegmentUploads | None:
+    """Uploads for a lease whose API takes its artifact in segments."""
+    payload = work.lease["payload"]
+    artifact_id = payload.get("artifactId")
+    if payload.get("segments") is not True or not isinstance(artifact_id, str) or not artifact_id:
+        return None
+    return _SegmentUploads(taskflow, work.lease, artifact_id)
 
 
 def _callback_token(lease: dict[str, Any]) -> str | None:
@@ -582,6 +711,7 @@ async def _prepare_result(
     taskflow: TaskflowWorker,
     work: _LeaseWork,
     outcome: Any,
+    segments: _SegmentUploads | None = None,
 ) -> _LeaseResult | None:
     """Upload a lease's artifact and build its ack and Taskflow report.
 
@@ -590,6 +720,10 @@ async def _prepare_result(
     lease = work.lease
     lease_id = lease["id"]
     run_id = lease.get("runId")
+    if segments is not None and (
+        isinstance(outcome, BaseException) or _lease_released(taskflow, work)
+    ):
+        segments.cancel()
     if _lease_released(taskflow, work):
         return None
     try:
@@ -607,7 +741,10 @@ async def _prepare_result(
         audio = result.audio or b""
         if not audio:
             raise RuntimeError("LZAI returned an empty audio artifact")
-        await taskflow.upload(lease, artifact_id, audio)
+        if segments is not None:
+            await segments.finish(audio)
+        else:
+            await taskflow.upload(lease, artifact_id, audio)
         duration = await asyncio.to_thread(_measure_audio_duration, audio)
         completion: dict[str, Any] = {
             **(result.data or {}),
@@ -792,9 +929,11 @@ async def _process_leases(
 
     if not works:
         return
+    uploads = [_segment_uploads(taskflow, work) for work in works]
     try:
         outcomes = await inference.execute_many(
-            [(work.operation, work.request) for work in works]
+            [(work.operation, work.request) for work in works],
+            mp3_sinks=[upload.write if upload is not None else None for upload in uploads],
         )
         if len(outcomes) != len(works):
             raise RuntimeError(
@@ -804,6 +943,9 @@ async def _process_leases(
         # A backend subprocess died. Don't waste retries on these leases; let
         # the worker's serve loop drop the Taskflow session and surface
         # ``error`` on /health so the orchestrator pulls traffic.
+        for upload in uploads:
+            if upload is not None:
+                upload.cancel()
         raise
     except Exception as error:
         _LOGGER.exception("LZAI task batch planning or execution failed")
@@ -811,8 +953,8 @@ async def _process_leases(
     try:
         prepared = await asyncio.gather(
             *(
-                _prepare_result(taskflow, work, outcome)
-                for work, outcome in zip(works, outcomes, strict=True)
+                _prepare_result(taskflow, work, outcome, upload)
+                for work, outcome, upload in zip(works, outcomes, uploads, strict=True)
             ),
             return_exceptions=True,
         )
@@ -846,38 +988,30 @@ async def _process_lease(
     await _process_leases(taskflow, inference, [lease], acks)
 
 
-async def _pull_task_batch(taskflow: TaskflowWorker) -> list[dict[str, Any]]:
-    # Taskflow's highest-priority ready task picks the band for the whole pull.
-    # Negative priority (background work) only runs when nothing >= 0 is ready,
-    # in a small batch that never waits to fill, so the next normal job waits
-    # at most one short batch; a >= 0 batch never carries background work.
-    leases = await taskflow.pull(
-        priority_bands=[{"below": 0, "maxTasks": taskflow.low_priority_batch_size}]
-    )
-    if not leases or len(leases) >= taskflow.concurrency or leases[0].get("priority", 0) < 0:
-        return leases
+async def _pull_leases(
+    taskflow: TaskflowWorker, busy: int, background: int
+) -> list[dict[str, Any]]:
+    """Pull what fits beside the ``busy`` leases in flight (``background`` of them
+    negative-priority).
 
-    # Keep isolated request latency low. Once a burst is visible, give its
-    # remaining submissions time to reach Taskflow and fill the model batch.
-    burst = len(leases) > 1
-    deadline = time.monotonic() + (1.0 if burst else 0.1)
-    while len(leases) < taskflow.concurrency:
-        remaining_seconds = deadline - time.monotonic()
-        if remaining_seconds <= 0:
-            break
-        more = await taskflow.pull(
-            max_tasks=taskflow.concurrency - len(leases),
-            wait_ms=max(1, min(100, round(remaining_seconds * 1000))),
-            min_priority=0,
+    Taskflow's highest-priority ready task picks the band for the whole pull.
+    Negative priority (background work) only runs when nothing >= 0 is ready,
+    and never more than ``low_priority_batch_size`` at once. Once the worker is
+    full, only Play-boosted leases come in, into its boost slots.
+    """
+    free = taskflow.concurrency - busy
+    if free > 0:
+        background_room = taskflow.low_priority_batch_size - background
+        if background_room <= 0:
+            return await taskflow.pull(max_tasks=free, min_priority=0)
+        return await taskflow.pull(
+            max_tasks=free,
+            priority_bands=[{"below": 0, "maxTasks": min(free, background_room)}],
         )
-        if more:
-            leases.extend(more)
-            if not burst:
-                burst = True
-                deadline = time.monotonic() + 1.0
-        elif not burst:
-            break
-    return leases
+    boost_free = taskflow.concurrency + taskflow.boost_slots - busy
+    if boost_free > 0:
+        return await taskflow.pull(max_tasks=boost_free, min_priority=_PLAY_PRIORITY)
+    return []
 
 
 class _DisconnectWatchdog:
@@ -934,6 +1068,8 @@ async def _serve_taskflow(
             heartbeat_task: asyncio.Task[None] | None = None
             reason = "taskflow connection lost"
             reconnect = True
+            # Lease batches in flight -> (leases, negative-priority leases).
+            running: dict[asyncio.Task[None], tuple[int, int]] = {}
             try:
                 if taskflow.session_token:
                     await taskflow.heartbeat()
@@ -945,19 +1081,36 @@ async def _serve_taskflow(
                 joined_once = True
                 failures = 0
                 _LOGGER.info("LZAI Taskflow worker ready id=%s", taskflow.worker_id)
+                # Each pull runs as its own batch while the next pull goes
+                # out: nano-vLLM batches across them, so a job never waits for
+                # a batch it wasn't in to finish.
                 while not connection_lost.is_set():
-                    leases = await _pull_task_batch(taskflow)
-                    if leases:
-                        try:
-                            await _process_leases(taskflow, inference, leases, acks)
-                        except Exception as error:
+                    for task in [task for task in running if task.done()]:
+                        del running[task]
+                        error = task.exception()
+                        if error is not None:
                             # _process_leases only re-raises when the inference
                             # runtime itself is broken (per-lease errors are
                             # handled internally). Drop to ``error`` so the
                             # orchestrator pulls traffic before reconnect storms.
                             reason = f"inference runtime failed: {error}"
                             set_status("error", reason=reason)
-                            raise
+                            raise error
+                    busy = sum(count for count, _ in running.values())
+                    background = sum(count for _, count in running.values())
+                    leases = await _pull_leases(taskflow, busy, background)
+                    if leases:
+                        task = asyncio.create_task(
+                            _process_leases(taskflow, inference, leases, acks)
+                        )
+                        running[task] = (
+                            len(leases),
+                            sum(1 for lease in leases if lease.get("priority", 0) < 0),
+                        )
+                    elif busy >= taskflow.concurrency + taskflow.boost_slots:
+                        await asyncio.wait(
+                            running, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
+                        )
             except ProtocolError as error:
                 if error.loses_lease:
                     # A lease-level rejection (cancelled run, expired lease) says
@@ -977,6 +1130,10 @@ async def _serve_taskflow(
             except Exception:
                 _LOGGER.exception("Taskflow connection lost; reconnecting without reloading models")
             finally:
+                # Let the batches in flight finish (and settle) while the
+                # heartbeat still renews their leases.
+                if running:
+                    await asyncio.gather(*running, return_exceptions=True)
                 # Once joined, any disconnection is a failure worth surfacing;
                 # ``starting`` only means models are up but never joined yet.
                 if joined_once:
@@ -990,7 +1147,7 @@ async def _serve_taskflow(
             if not reconnect:
                 await asyncio.sleep(_RECONNECT_BASE_DELAY)
                 continue
-            # Nothing else uses the client now (the batch is done and the
+            # Nothing else uses the client now (the batches are done and the
             # heartbeat stopped), so drop its pool before trying again.
             await taskflow.reset_client()
             delay = min(_RECONNECT_MAX_DELAY, _RECONNECT_BASE_DELAY * 2 ** min(failures, 5))
@@ -1029,6 +1186,7 @@ async def run_worker() -> None:
         worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lzai-{socket.gethostname()}"),
         concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "8"))),
         low_priority_batch_size=max(1, int(os.environ.get("TASKFLOW_LOW_PRIORITY_BATCH_SIZE", "3"))),
+        boost_slots=max(0, int(os.environ.get("TASKFLOW_BOOST_SLOTS", "3"))),
         persistent=_env_bool("TASKFLOW_WORKER_PERSISTENT", False),
     )
     inference = LzTtsInferenceSession()
