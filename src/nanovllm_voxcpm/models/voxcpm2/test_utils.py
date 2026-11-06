@@ -77,6 +77,22 @@ class CharTokenizerWrapperTest(unittest.TestCase):
         self.assertNotIn("弱势", tokens)
         self.assertEqual(len(offsets), len(tokens))
 
+    def test_ipa_span_maps_to_single_char_tokens(self):
+        text = "Viajamos a /mˈexiko ˈel/ verano, and/or https://x.org/a/ ok."
+        tokens = self.wrapper.tokenize(text)
+        offsets = self.wrapper.tokenize_with_offsets(text)
+        self.assertEqual(len(offsets), len(tokens))
+        start, end = text.index("/mˈ"), text.index("/ verano") + 1
+        inside = [t for t, (s, e) in zip(tokens, offsets) if s < end and e > start]
+        self.assertEqual("".join(inside).replace("▁", " ").strip(), text[start:end])
+        self.assertTrue(all(len(t.replace("▁", "")) <= 1 for t in inside), inside)
+        for token, (s, e) in zip(tokens, offsets):
+            if start <= s < end:
+                self.assertEqual(token.replace("▁", " "), text[s:e])
+        # Outside the span (and/or, the URL) the base tokenization stands.
+        tail = text[end:]
+        self.assertEqual(self.wrapper(tail), self.base(tail, add_special_tokens=False)["input_ids"])
+
 
 if __name__ == "__main__":
     unittest.main()
