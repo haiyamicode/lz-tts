@@ -6,7 +6,6 @@ from typing import Any
 from .api.audio_utils import _audio_to_mp3_bytes
 from .api.take_stream import Mp3Segment
 from .taskflow_worker import (
-    _PLAY_PRIORITY,
     ProtocolError,
     TaskflowWorker,
     _pull_leases,
@@ -100,19 +99,17 @@ def test_lost_lease_is_not_retried_whole():
     assert taskflow.uploads == []
 
 
-def test_pull_fills_base_slots_then_only_takes_play_boosts():
+def test_pull_fills_free_slots_only():
     taskflow = FakeTaskflow()
-    taskflow.concurrency, taskflow.boost_slots, taskflow.low_priority_batch_size = 8, 3, 3
+    taskflow.concurrency, taskflow.low_priority_batch_size = 8, 3
 
     async def run():
         await _pull_leases(taskflow, busy=2, background=0)
         await _pull_leases(taskflow, busy=5, background=3)
-        await _pull_leases(taskflow, busy=8, background=0)
-        assert await _pull_leases(taskflow, busy=11, background=0) == []
+        assert await _pull_leases(taskflow, busy=8, background=0) == []
 
     asyncio.run(run())
     assert taskflow.pulls == [
         {"max_tasks": 6, "priority_bands": [{"below": 0, "maxTasks": 3}]},
         {"max_tasks": 3, "min_priority": 0},
-        {"max_tasks": 3, "min_priority": _PLAY_PRIORITY},
     ]

@@ -48,9 +48,6 @@ _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.
 _CONTROL_TIMEOUT = httpx.Timeout(connect=30.0, read=60.0, write=60.0, pool=30.0)
 _CALLBACK_MAX_ATTEMPTS = 3
 _RECONNECT_BASE_DELAY = 2.0
-# The priority the API gives a block someone pressed Play on, above any bulk
-# work; the worker keeps its boost slots for it.
-_PLAY_PRIORITY = 100
 # Length of the segments a streamed take is uploaded in.
 _SEGMENT_SECONDS = 1.0
 _RECONNECT_MAX_DELAY = 60.0
@@ -122,9 +119,6 @@ class TaskflowWorker:
     # Batch cap for negative-priority (background) work, so a long low-priority
     # batch never keeps a normal job waiting behind it.
     low_priority_batch_size: int = 3
-    # Slots on top of ``concurrency`` that only take Play-boosted leases, so a
-    # line someone is waiting on starts even while the worker is full.
-    boost_slots: int = 3
     persistent: bool = False
     session_id: str | None = None
     session_token: str | None = None
@@ -203,7 +197,7 @@ class TaskflowWorker:
                 "metadata": metadata,
                 "capabilities": {
                     "taskTypes": list(TASK_TYPES),
-                    "concurrency": self.concurrency + self.boost_slots,
+                    "concurrency": self.concurrency,
                 },
             },
         )
@@ -996,22 +990,18 @@ async def _pull_leases(
 
     Taskflow's highest-priority ready task picks the band for the whole pull.
     Negative priority (background work) only runs when nothing >= 0 is ready,
-    and never more than ``low_priority_batch_size`` at once. Once the worker is
-    full, only Play-boosted leases come in, into its boost slots.
+    and never more than ``low_priority_batch_size`` at once.
     """
     free = taskflow.concurrency - busy
-    if free > 0:
-        background_room = taskflow.low_priority_batch_size - background
-        if background_room <= 0:
-            return await taskflow.pull(max_tasks=free, min_priority=0)
-        return await taskflow.pull(
-            max_tasks=free,
-            priority_bands=[{"below": 0, "maxTasks": min(free, background_room)}],
-        )
-    boost_free = taskflow.concurrency + taskflow.boost_slots - busy
-    if boost_free > 0:
-        return await taskflow.pull(max_tasks=boost_free, min_priority=_PLAY_PRIORITY)
-    return []
+    if free <= 0:
+        return []
+    background_room = taskflow.low_priority_batch_size - background
+    if background_room <= 0:
+        return await taskflow.pull(max_tasks=free, min_priority=0)
+    return await taskflow.pull(
+        max_tasks=free,
+        priority_bands=[{"below": 0, "maxTasks": min(free, background_room)}],
+    )
 
 
 class _DisconnectWatchdog:
@@ -1105,7 +1095,7 @@ async def _serve_taskflow(
                             _process_lease(taskflow, inference, lease, acks)
                         )
                         running[task] = (1, int(lease.get("priority", 0) < 0))
-                    if not leases and busy >= taskflow.concurrency + taskflow.boost_slots:
+                    if not leases and busy >= taskflow.concurrency:
                         await asyncio.wait(
                             running, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
                         )
@@ -1184,7 +1174,6 @@ async def run_worker() -> None:
         worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lzai-{socket.gethostname()}"),
         concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "8"))),
         low_priority_batch_size=max(1, int(os.environ.get("TASKFLOW_LOW_PRIORITY_BATCH_SIZE", "3"))),
-        boost_slots=max(0, int(os.environ.get("TASKFLOW_BOOST_SLOTS", "3"))),
         persistent=_env_bool("TASKFLOW_WORKER_PERSISTENT", False),
     )
     inference = LzTtsInferenceSession()
