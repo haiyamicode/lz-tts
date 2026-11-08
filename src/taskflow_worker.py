@@ -553,21 +553,52 @@ class _AckFailure:
 
 
 class SynthesisAckClient:
-    """Acks a lease batch's synthesis outcomes to the API in one request.
+    """Acks synthesis outcomes to the API, as many as are ready in one request.
 
     The ack is what settles a block (attaching its audio, or recording a
     terminal failure) and runs post-synthesis work such as charging, so a run
     is only completed once its ack was accepted. The API applies acks
     idempotently, so resending items from a partially applied request is safe.
+
+    Leases finish one by one, and the API commits each request's acks for a
+    project as one project op. So an ack goes out at once when none is in
+    flight; the ones that finish meanwhile go together in the next request.
     """
 
     def __init__(self, taskflow: TaskflowWorker, endpoint: str) -> None:
         # Shares the worker's HTTP client, which a reconnect may replace.
         self._taskflow = taskflow
         self._endpoint = endpoint
+        self._waiting: list[tuple[list[dict[str, Any]], asyncio.Future[dict[str, _AckFailure]]]] = []
+        self._sender: asyncio.Task[None] | None = None
 
     async def send(self, items: list[dict[str, Any]]) -> dict[str, _AckFailure]:
         """Ack ``items``; returns the ones the API did not accept, by runId."""
+        result: asyncio.Future[dict[str, _AckFailure]] = asyncio.get_running_loop().create_future()
+        self._waiting.append((items, result))
+        if self._sender is None or self._sender.done():
+            self._sender = asyncio.create_task(self._send_waiting())
+        return await result
+
+    async def _send_waiting(self) -> None:
+        while self._waiting:
+            batch, self._waiting = self._waiting, []
+            try:
+                failures = await self._send_items([item for items, _ in batch for item in items])
+            except BaseException as error:  # pylint: disable=broad-exception-caught
+                for _, result in batch:
+                    if not result.done():
+                        result.set_exception(error)
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+                continue
+            for items, result in batch:
+                if not result.done():
+                    result.set_result(
+                        {item["runId"]: failures[item["runId"]] for item in items if item["runId"] in failures}
+                    )
+
+    async def _send_items(self, items: list[dict[str, Any]]) -> dict[str, _AckFailure]:
         failures: dict[str, _AckFailure] = {}
         pending = items
         for attempt in range(_CALLBACK_MAX_ATTEMPTS):

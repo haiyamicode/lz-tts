@@ -7,6 +7,7 @@ from .api.audio_utils import _audio_to_mp3_bytes
 from .api.take_stream import Mp3Segment
 from .taskflow_worker import (
     ProtocolError,
+    SynthesisAckClient,
     TaskflowWorker,
     _pull_leases,
     _SegmentUploads,
@@ -113,3 +114,41 @@ def test_pull_fills_free_slots_only():
         {"max_tasks": 6, "priority_bands": [{"below": 0, "maxTasks": 3}]},
         {"max_tasks": 3, "min_priority": 0},
     ]
+
+
+class FakeAckResponse:
+    is_error = False
+
+    def __init__(self, items):
+        self._items = items
+
+    def json(self):
+        return {"results": [{"runId": item["runId"], "ok": item["runId"] != "bad"} for item in self._items]}
+
+
+class FakeAckHttp:
+    def __init__(self):
+        self.requests: list[list[str]] = []
+
+    async def post(self, endpoint, json):
+        self.requests.append([item["runId"] for item in json["items"]])
+        await asyncio.sleep(0.01)
+        return FakeAckResponse(json["items"])
+
+
+def test_acks_finishing_meanwhile_go_in_one_request():
+    taskflow = FakeTaskflow()
+    http = FakeAckHttp()
+    taskflow._client = http  # type: ignore[assignment]  # pylint: disable=protected-access
+    acks = SynthesisAckClient(taskflow, "/acks")
+
+    async def run():
+        first = asyncio.create_task(acks.send([{"runId": "a"}]))
+        await asyncio.sleep(0)
+        rest = [asyncio.create_task(acks.send([{"runId": run_id}])) for run_id in ("b", "bad", "c")]
+        return await asyncio.gather(first, *rest)
+
+    results = asyncio.run(run())
+    assert http.requests[0] == ["a"]
+    assert http.requests[1][:1] == ["b"] and sorted(http.requests[1]) == ["b", "bad", "c"]
+    assert [list(result) for result in results] == [[], [], ["bad"], []]
