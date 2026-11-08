@@ -1068,7 +1068,7 @@ async def _serve_taskflow(
             heartbeat_task: asyncio.Task[None] | None = None
             reason = "taskflow connection lost"
             reconnect = True
-            # Lease batches in flight -> (leases, negative-priority leases).
+            # Leases in flight -> (1, 1 if negative-priority else 0).
             running: dict[asyncio.Task[None], tuple[int, int]] = {}
             try:
                 if taskflow.session_token:
@@ -1081,9 +1081,10 @@ async def _serve_taskflow(
                 joined_once = True
                 failures = 0
                 _LOGGER.info("LZAI Taskflow worker ready id=%s", taskflow.worker_id)
-                # Each pull runs as its own batch while the next pull goes
-                # out: nano-vLLM batches across them, so a job never waits for
-                # a batch it wasn't in to finish.
+                # Each lease runs as its own task while the next pull goes
+                # out: nano-vLLM batches across them, and a lease acks (its
+                # block turns Ready) the moment its own take is done instead
+                # of waiting for the longest line it was pulled with.
                 while not connection_lost.is_set():
                     for task in [task for task in running if task.done()]:
                         del running[task]
@@ -1099,15 +1100,12 @@ async def _serve_taskflow(
                     busy = sum(count for count, _ in running.values())
                     background = sum(count for _, count in running.values())
                     leases = await _pull_leases(taskflow, busy, background)
-                    if leases:
+                    for lease in leases:
                         task = asyncio.create_task(
-                            _process_leases(taskflow, inference, leases, acks)
+                            _process_lease(taskflow, inference, lease, acks)
                         )
-                        running[task] = (
-                            len(leases),
-                            sum(1 for lease in leases if lease.get("priority", 0) < 0),
-                        )
-                    elif busy >= taskflow.concurrency + taskflow.boost_slots:
+                        running[task] = (1, int(lease.get("priority", 0) < 0))
+                    if not leases and busy >= taskflow.concurrency + taskflow.boost_slots:
                         await asyncio.wait(
                             running, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
                         )
@@ -1130,7 +1128,7 @@ async def _serve_taskflow(
             except Exception:
                 _LOGGER.exception("Taskflow connection lost; reconnecting without reloading models")
             finally:
-                # Let the batches in flight finish (and settle) while the
+                # Let the leases in flight finish (and settle) while the
                 # heartbeat still renews their leases.
                 if running:
                     await asyncio.gather(*running, return_exceptions=True)
