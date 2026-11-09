@@ -52,7 +52,7 @@ def start_child(ctx: Any, target: Callable[..., Any], args: tuple[Any, ...] = ()
 def exit_with_parent() -> None:
     """Ask the kernel to kill this process when its parent process exits.
 
-    Every backend worker child (Sparrow, Starling, Seed-VC, VoxCPM) owns a
+    Every backend worker child (speech, transcribe, VoxCPM) owns a
     multi-gigabyte CUDA context. If the worker process is SIGKILLed (pm2 kill
     timeout, OOM killer) plain ``multiprocessing`` cannot clean them up, and the
     orphans keep the GPU memory while the restarted worker tries to load its

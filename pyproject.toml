@@ -131,8 +131,6 @@ include = ["src*"]
 lz-tts = "src.cli:main"
 lzai-worker = "src.taskflow_worker:run"
 lzai-forwarder = "src.taskflow_forwarder:run"
-lz-starling-train = "src.starling.train:main"
-lz-starling-eval = "src.starling.evaluate:main"
 
 [tool.uv]
 override-dependencies = ["hydra-core>=1.3.2", "omegaconf>=2.2", "transformers==4.57.6"]

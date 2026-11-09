@@ -50,13 +50,11 @@ from ..ssml_postprocessing import (
 )
 from ..text_splitter import count_cl100k_tokens
 from ..voxcpm_ipa_adapter import approximate_ipa_spelling, resolve_ipa_control_schedules
-from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
-from ..matcha_inference import MatchaBatcher as ProductionStarlingBatcher
 from .audio_utils import _audio_to_mp3_bytes, _audio_to_pcm16, _audio_to_wav_bytes, _resample_audio
 from .audio_adjustments import AudioEffect, adjust_audio
 from .take_stream import OrderedChunkAudio, StreamingMp3Encoder
 from .locale_utils import normalize_locale as _normalize_locale_with_region
-from .model_workers import speech_worker_main, starling_worker_main
+from .model_workers import speech_worker_main, transcribe_worker_main
 from .seed_vc_backend import (
     SeedVCBackend as _SeedVCBackend,
     SeedVCBatchRequest,
@@ -71,6 +69,12 @@ from .text_chunking import (
     sparrow_batch_weights,
 )
 from .language_id import LanguageDetectRequest, LanguageInputError, SpokenLanguageIdentifier
+from .transcribe import (
+    SAMPLE_RATE as TRANSCRIBE_SAMPLE_RATE,
+    TranscribeInputError,
+    TranscribeRequest,
+    decode_transcribe_audio,
+)
 from .nudity_detection import NudityDetectRequest, NudityDetector, NudityInputError
 from .voice_anchor import ANCHOR_SEED, LANGUAGE_ANCHORS, VoiceAnchorRequest, anchor_language
 from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
@@ -116,30 +120,6 @@ PUBLIC_SPARROW_MODEL = "sparrow"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SEED_VC_ROOT = PROJECT_ROOT / "data" / "seed-vc"
 SEED_VC_RUNTIME_ROOT = PROJECT_ROOT / "src" / "seed_vc_runtime"
-MATCHA_LANGUAGE_ID_MAP = {
-    "en": 1,
-    "ar": 2,
-    "bn": 3,
-    "de": 4,
-    "es": 5,
-    "fa": 6,
-    "fr": 7,
-    "hi": 8,
-    "id": 9,
-    "it": 10,
-    "ja": 11,
-    "jv": 12,
-    "ko": 13,
-    "pt": 14,
-    "ru": 15,
-    "sw": 16,
-    "ta": 17,
-    "te": 18,
-    "tr": 19,
-    "ur": 20,
-    "vi": 21,
-    "zh": 22,
-}
 
 
 @contextlib.contextmanager
@@ -250,8 +230,6 @@ class EngineEnableConfig(BaseModel):
 
     pipertts: bool = Field(default_factory=lambda: _env_bool("PIPER_TTS_ENABLED", True))
     voxcpm: bool = Field(default_factory=lambda: _env_bool("VOXCPM_ENABLED", False))
-    starling: bool = Field(default_factory=lambda: _env_bool("STARLING_TTS_ENABLED", _env_bool("MATCHA_TTS_ENABLED", False)))
-    matcha: bool = Field(default_factory=lambda: _env_bool("MATCHA_TTS_ENABLED", False))
     seed_vc: bool = Field(default_factory=lambda: _env_bool("SEED_VC_ENABLED", True))
 
 
@@ -395,46 +373,6 @@ class VoxCPMConfig(BaseModel):
         return self
 
 
-class MatchaConfig(BaseModel):
-    """Starling backend configuration."""
-
-    enabled: bool = Field(default_factory=lambda: _env_bool("STARLING_TTS_ENABLED", _env_bool("MATCHA_TTS_ENABLED", False)))
-    preload: bool = Field(default_factory=lambda: _env_bool("STARLING_TTS_PRELOAD", _env_bool("MATCHA_TTS_PRELOAD", True)))
-    device: str = Field(default_factory=lambda: os.environ.get("STARLING_TTS_DEVICE", os.environ.get("MATCHA_TTS_DEVICE", "cuda:2")))
-    checkpoint: str = Field(default_factory=lambda: os.environ.get("STARLING_TTS_CHECKPOINT", os.environ.get("MATCHA_TTS_CHECKPOINT", "")))
-    config_path: str = Field(default_factory=lambda: os.environ.get("STARLING_TTS_CONFIG", "data/lzspeech-starling/config.json"))
-    semantic_model_name: str = Field(
-        default_factory=lambda: os.environ.get("STARLING_TTS_SEMANTIC_MODEL", "distilbert/distilbert-base-multilingual-cased")
-    )
-    semantic_max_tokens: Optional[int] = Field(
-        default_factory=lambda: None
-        if os.environ.get("STARLING_TTS_SEMANTIC_MAX_TOKENS", "").lower() in {"", "none", "null"}
-        else int(os.environ.get("STARLING_TTS_SEMANTIC_MAX_TOKENS", "0"))
-    )
-    icbpe_vocab_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_ICBPE_VOCAB", ""))
-    phoneme_vocab_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_PHONEME_VOCAB", ""))
-    filelist_path: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_FILELIST", ""))
-    max_batch_size: int = Field(default_factory=lambda: int(os.environ.get("MATCHA_TTS_MAX_BATCH_SIZE", "128")), ge=1)
-    batch_wait_ms: float = Field(default_factory=lambda: float(os.environ.get("MATCHA_TTS_BATCH_WAIT_MS", "10")), ge=0)
-    n_timesteps: int = Field(default_factory=lambda: int(os.environ.get("MATCHA_TTS_STEPS", "32")), ge=1)
-    temperature: float = Field(default_factory=lambda: float(os.environ.get("MATCHA_TTS_TEMPERATURE", "0.667")), ge=0)
-    length_scale: float = Field(default_factory=lambda: float(os.environ.get("MATCHA_TTS_LENGTH_SCALE", "1.0")), gt=0)
-    sample_rate: int = Field(default_factory=lambda: int(os.environ.get("MATCHA_TTS_SAMPLE_RATE", "24000")), ge=1)
-    vocoder: str = Field(default_factory=lambda: os.environ.get("MATCHA_TTS_VOCODER", "vocos24k"))
-    n_mels: int = Field(default_factory=lambda: int(os.environ.get("MATCHA_TTS_N_MELS", "100")), ge=1)
-    n_fft: int = Field(default_factory=lambda: int(os.environ.get("MATCHA_TTS_N_FFT", "1024")), ge=1)
-    hop_length: int = Field(default_factory=lambda: int(os.environ.get("MATCHA_TTS_HOP_LENGTH", "256")), ge=1)
-    win_length: int = Field(default_factory=lambda: int(os.environ.get("MATCHA_TTS_WIN_LENGTH", "1024")), ge=1)
-    f_min: float = Field(default_factory=lambda: float(os.environ.get("MATCHA_TTS_F_MIN", "0")))
-    f_max: Optional[float] = Field(
-        default_factory=lambda: None
-        if os.environ.get("MATCHA_TTS_F_MAX", "none").lower() in {"none", "null", ""}
-        else float(os.environ.get("MATCHA_TTS_F_MAX", "none"))
-    )
-    mel_mean: float = Field(default_factory=lambda: float(os.environ.get("MATCHA_TTS_MEL_MEAN", "-5.772607")))
-    mel_std: float = Field(default_factory=lambda: float(os.environ.get("MATCHA_TTS_MEL_STD", "2.773259")))
-
-
 class SeedVCConfig(BaseModel):
     """Embedded Seed-VC voice conversion configuration."""
 
@@ -504,6 +442,15 @@ class AlignerConfig(BaseModel):
     dtype: str = Field(default_factory=lambda: os.environ.get("ALIGNER_DTYPE", "float16"))
 
 
+class TranscribeConfig(BaseModel):
+    """Qwen3-ASR speech-to-text (the ``transcribe`` task), hosted in its own GPU process."""
+
+    enabled: bool = False
+    model: str = "data/qwen3-asr-0.6b"
+    device: str = "cuda:0"
+    dtype: str = "float16"
+
+
 class SSMLConfig(BaseModel):
     """Settings for SSML operations (breaks, IPA pronunciations)."""
 
@@ -521,11 +468,10 @@ class ServerConfig(BaseModel):
     chunking: SynthesisChunkingConfig = Field(default_factory=SynthesisChunkingConfig)
     pipertts: PiperTTSConfig = Field(default_factory=PiperTTSConfig)
     voxcpm: VoxCPMConfig = Field(default_factory=VoxCPMConfig)
-    starling: MatchaConfig = Field(default_factory=MatchaConfig)
-    matcha: MatchaConfig = Field(default_factory=MatchaConfig)
     seed_vc: SeedVCConfig = Field(default_factory=SeedVCConfig)
     ssml: SSMLConfig = Field(default_factory=SSMLConfig)
     aligner: AlignerConfig = Field(default_factory=AlignerConfig)
+    transcribe: TranscribeConfig = Field(default_factory=TranscribeConfig)
 
 
 class SparrowSynthesizeOptions(BaseModel):
@@ -829,21 +775,6 @@ class BatchSynthesizeResponse(BaseModel):
     rtf: float
 
 
-class MatchaSynthesizeRequest(BaseModel):
-    """Request body for the Starling backend."""
-
-    text: str
-    language: str = Field("en", description="Language code used for phonemization and speaker/language conditioning")
-    format: Literal["wav", "json"] = "wav"
-    input_type: Literal["aligned"] = "aligned"
-    speaker_id: Optional[int] = Field(None, ge=0, description="Override language speaker id; 0 means auto")
-    neural: bool = True
-    steps: Optional[int] = None
-    temperature: Optional[float] = None
-    length_scale: Optional[float] = None
-
-
-
 class SynthesisCapabilitiesResponse(BaseModel):
     """Model capabilities needed by the task dispatcher."""
 
@@ -1007,14 +938,11 @@ _lang_speaker_map: dict[str, str] = {}  # canonical locale -> speaker
 _splitter: MultilingualSplitter | None = None
 _splitter_languages: tuple[str, ...] | None = None
 _APPLICATION_LANGUAGE_CODES = {detector: application for application, detector in CLD2_LANGUAGE_CODES.items()}
-_starling_backend: "ProductionStarlingBackend | None" = None
-_starling_batcher: "ProductionStarlingBatcher | None" = None
 _seed_vc_backend: "_SeedVCBackend | None" = None
 _speech_worker: WorkerProcessClient | None = None
 _sparrow_worker: EngineClient | None = None
 _sparrow_model_info: dict[str, dict[str, Any]] = {}
-_starling_worker: WorkerProcessClient | None = None
-_starling_info: dict[str, Any] = {}
+_transcribe_worker: WorkerProcessClient | None = None
 _seed_vc_worker: EngineClient | None = None
 _seed_vc_info: dict[str, Any] = {}
 _voxcpm_runtime: VoxCPMRuntime | None = None
@@ -1034,7 +962,7 @@ class _EngineLoadState:
 
 _engine_load_states: dict[str, _EngineLoadState] = {
     name: _EngineLoadState(name=name, ready=threading.Event())
-    for name in ("pipertts", "voxcpm", "starling", "seed_vc")
+    for name in ("pipertts", "voxcpm", "seed_vc", "transcribe")
 }
 
 _inference_counter = 0
@@ -1176,23 +1104,16 @@ def _load_config() -> ServerConfig:
         return ServerConfig()
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    if "starling" not in data and "matcha" in data:
-        data["starling"] = data["matcha"]
-    engines = data.get("engines")
-    if isinstance(engines, dict) and "starling" not in engines and "matcha" in engines:
-        engines["starling"] = engines["matcha"]
     return ServerConfig(**data)
 
 
 def _engine_enabled(
-    engine: Literal["pipertts", "voxcpm", "starling", "matcha", "seed_vc"],
+    engine: Literal["pipertts", "voxcpm", "seed_vc", "transcribe"],
     config: ServerConfig | None = None,
 ) -> bool:
     cfg = config or _server_config
-    if engine == "starling":
-        return bool(cfg.engines.starling or cfg.engines.matcha)
-    if engine == "matcha":
-        return bool(cfg.engines.matcha or cfg.engines.starling)
+    if engine == "transcribe":
+        return bool(cfg.transcribe.enabled)
     return bool(getattr(cfg.engines, engine))
 
 
@@ -1299,7 +1220,7 @@ def _engine_status(engine: str) -> dict[str, Any]:
 
 
 def _wait_for_engine_ready(engine: str, *, timeout: float | None = None) -> None:
-    if not _engine_enabled("starling" if engine == "starling" else engine):  # type: ignore[arg-type]
+    if not _engine_enabled(engine):  # type: ignore[arg-type]
         raise HTTPException(status_code=503, detail=f"{engine} backend is disabled")
 
     state = _engine_state(engine)
@@ -1361,17 +1282,6 @@ def _ensure_sparrow_worker() -> EngineClient:
     return _sparrow_worker
 
 
-def _ensure_starling_worker() -> WorkerProcessClient:
-    global _starling_worker
-    if _starling_worker is None:
-        _starling_worker = WorkerProcessClient(
-            name="starling",
-            target=starling_worker_main,
-            args=(_worker_settings_data(),),
-        )
-    return _starling_worker
-
-
 def _ensure_seed_vc_worker() -> EngineClient:
     global _seed_vc_worker
     if _seed_vc_worker is None:
@@ -1387,13 +1297,25 @@ def _number_modes_client() -> EngineClient:
     return EngineClient(_ensure_speech_worker(), "numbers")
 
 
+def _ensure_transcribe_worker() -> WorkerProcessClient:
+    """Qwen3-ASR's own GPU process (the ``transcribe`` task)."""
+    global _transcribe_worker
+    if _transcribe_worker is None:
+        _transcribe_worker = WorkerProcessClient(
+            name="transcribe",
+            target=transcribe_worker_main,
+            args=(_worker_settings_data(),),
+        )
+    return _transcribe_worker
+
+
 def _worker_name_to_engines(name: str) -> tuple[str, ...]:
     if name == "speech":
         return ("pipertts", "seed_vc")
-    if name in {"starling", "matcha"}:
-        return ("starling",)
     if name == "voxcpm":
         return ("voxcpm",)
+    if name == "transcribe":
+        return ("transcribe",)
     return ()
 
 
@@ -1412,13 +1334,12 @@ def _mark_engine_failed_from_child(worker_name: str, exc: BaseException) -> None
 
 
 def _stop_model_workers() -> None:
-    global _speech_worker, _sparrow_worker, _starling_worker, _seed_vc_worker
-    for worker in (_speech_worker, _starling_worker):
+    global _speech_worker, _sparrow_worker, _seed_vc_worker
+    for worker in (_speech_worker, _transcribe_worker):
         if worker is not None:
             worker.stop()
     _speech_worker = None
     _sparrow_worker = None
-    _starling_worker = None
     _seed_vc_worker = None
 
 
@@ -2247,54 +2168,6 @@ async def synthesize_configured_voice_batch(request: _SharedBatchSynthesizeReque
     ]
 
     for (model_name, voice_adapter), records in segment_groups.items():
-        if _is_starling_model(model_name):
-            await _await_engine_ready("starling")
-            starling_batcher = _get_starling_batcher()
-            starling_length_scale = request.options.length_scale if request.options and request.options.length_scale is not None else None
-            batch_started = time.perf_counter()
-            _log_synthesize_batch_stage(
-                "starling_batch_start",
-                pipeline="configured_voice",
-                voice_id=request.voice_id,
-                model=model_name,
-                voice_adapter=voice_adapter,
-                item_count=len(texts),
-                segment_count=len(records),
-                batch_size=len(records),
-                languages=sorted({str(record["lang"]) for record in records}),
-                neural=request.neural,
-            )
-            batch_results = await asyncio.gather(
-                *[
-                    starling_batcher.submit(
-                        MatchaSynthesizeRequest(
-                            text=record["text"],
-                            language=record["lang"],
-                            format="wav",
-                            neural=request.neural,
-                            length_scale=starling_length_scale,
-                        )
-                    )
-                    for record in records
-                ]
-            )
-            audio_seconds = sum(result.audio_seconds for result in batch_results)
-            elapsed = time.perf_counter() - batch_started
-            _log_synthesize_batch_stage(
-                "starling_batch_done",
-                pipeline="configured_voice",
-                voice_id=request.voice_id,
-                model=model_name,
-                output_count=len(batch_results),
-                audio_seconds=round(audio_seconds, 6),
-                wall_seconds=round(elapsed, 6),
-                rtf=round(elapsed / audio_seconds, 6) if audio_seconds else 0.0,
-                sample_rate=_server_config.starling.sample_rate,
-            )
-            for record, result in zip(records, batch_results):
-                generated_segments[record["item_idx"]][record["segment_idx"]] = (result.audio, result.sample_rate)
-            continue
-
         inference = _get_inference(model_name)
         model_sample_rate = inference.sample_rate
         batch_texts = [record["text"] for record in records]
@@ -2845,8 +2718,6 @@ async def _synthesize_sparrow_ipa_ssml(
     generated: list[tuple[np.ndarray, int]] = []
     for segment in segments:
         model_name = str(segment["model"])
-        if _is_starling_model(model_name):
-            raise ValueError("SSML IPA pronunciation requires a Sparrow model")
         inference = _get_inference(model_name)
         internal_speaker = _resolve_internal_speaker(
             model_name,
@@ -3652,51 +3523,6 @@ async def _postprocess_ssml_response(
         return _binary_response(_audio_to_mp3_bytes(audio, sample_rate), "audio/mpeg")
     return _binary_response(_audio_to_wav_bytes(audio, sample_rate), "audio/wav")
 
-
-
-class _StarlingBatcherProxy:
-    """Parent-process async proxy for the Starling worker."""
-
-    async def submit(self, request: MatchaSynthesizeRequest) -> Any:
-        queued_at = time.perf_counter()
-        response = await asyncio.to_thread(
-            _ensure_starling_worker().call,
-            "synthesize_batch",
-            {
-                "items": [
-                    {
-                        "text": request.text,
-                        "language": request.language,
-                        "input_type": request.input_type,
-                        "speaker_id": request.speaker_id,
-                        "neural": request.neural,
-                        "steps": request.steps,
-                        "temperature": request.temperature,
-                        "length_scale": request.length_scale,
-                        "queued_at": queued_at,
-                    }
-                ]
-            },
-        )
-        results = (response.get("data") or {}).get("results") or []
-        if not results:
-            raise HTTPException(status_code=502, detail="Starling worker returned no result")
-        return results[0]
-
-
-def _get_starling_batcher() -> ProductionStarlingBatcher:
-    if not _engine_enabled("starling"):
-        raise HTTPException(status_code=503, detail="Starling backend is disabled")
-    _wait_for_engine_ready("starling")
-    if _starling_worker is not None:
-        return _StarlingBatcherProxy()
-    if _starling_batcher is None:
-        raise HTTPException(status_code=503, detail="Starling backend is not enabled or not loaded")
-    return _starling_batcher
-
-
-def _is_starling_model(model_name: str | None) -> bool:
-    return bool(model_name) and str(model_name).lower() in {"lzspeech-starling", "starling"}
 
 
 class _SeedVCBackendProxy:
@@ -5388,19 +5214,13 @@ async def _load_voxcpm_engine() -> None:
         _voxcpm_runtime = runtime
 
 
-async def _load_starling_engine() -> None:
-    global _starling_info
-    with _logged_startup_step(
-        "starling_worker",
-        device=_server_config.starling.device,
-        checkpoint=_server_config.starling.checkpoint,
-        vocoder=_server_config.starling.vocoder,
-    ):
-        worker = _ensure_starling_worker()
+async def _load_transcribe_engine() -> None:
+    config = _server_config.transcribe
+    with _logged_startup_step("transcribe_worker", model=config.model, device=config.device):
+        worker = _ensure_transcribe_worker()
         worker.stop()
-        worker.start()
-        response = await asyncio.to_thread(worker.call, "health")
-        _starling_info = dict(response.get("data") or {})
+        # The child loads Qwen3-ASR before it reads its first request, so "health" returns once it is ready.
+        await asyncio.to_thread(worker.call, "health")
 
 
 async def _load_seed_vc_engine() -> None:
@@ -5416,8 +5236,8 @@ async def _load_seed_vc_engine() -> None:
 _ENGINE_LOADERS: dict[str, Callable[[], Awaitable[None]]] = {
     "pipertts": _load_sparrow_engine,
     "voxcpm": _load_voxcpm_engine,
-    "starling": _load_starling_engine,
     "seed_vc": _load_seed_vc_engine,
+    "transcribe": _load_transcribe_engine,
 }
 _engine_reload_tasks: dict[str, asyncio.Task[None]] = {}
 _ENGINE_RELOAD_BACKOFF_SECONDS = 10.0
@@ -5488,9 +5308,9 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
     """Initialize the process-wide model runtime without constructing an API app."""
     global _server_config, _speaker_routes
     global _lang_speaker_map, _splitter, _splitter_languages
-    global _starling_backend, _starling_batcher, _seed_vc_backend
+    global _seed_vc_backend
     global _voxcpm_runtime
-    global _sparrow_model_info, _starling_info, _seed_vc_info
+    global _sparrow_model_info, _seed_vc_info
     global _startup_loader_task
 
     _server_config = config
@@ -5508,14 +5328,11 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
         _speaker_routes.clear()
         _splitter = None
         _splitter_languages = None
-        _starling_backend = None
-        _starling_batcher = None
         _seed_vc_backend = None
         _sparrow_model_info = {}
-        _starling_info = {}
         _seed_vc_info = {}
         for engine in _engine_load_states:
-            if _engine_enabled("starling" if engine == "starling" else engine):  # type: ignore[arg-type]
+            if _engine_enabled(engine):  # type: ignore[arg-type]
                 _mark_engine_loading(engine)
             else:
                 _mark_engine_disabled(engine)
@@ -5540,10 +5357,10 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
         else:
             _LOGGER.info("VoxCPM backend disabled")
 
-        if _engine_enabled("starling"):
-            startup_tasks.append(asyncio.create_task(_run_engine_loader("starling", _load_starling_engine)))
+        if _engine_enabled("transcribe"):
+            startup_tasks.append(asyncio.create_task(_run_engine_loader("transcribe", _load_transcribe_engine)))
         else:
-            _LOGGER.info("Starling backend disabled")
+            _LOGGER.info("Transcribe backend disabled")
 
         if _engine_enabled("seed_vc"):
             startup_tasks.append(asyncio.create_task(_run_engine_loader("seed_vc", _load_seed_vc_engine)))
@@ -6136,6 +5953,11 @@ class LzTtsInferenceSession:
                     result = await self._detect_language(request_data)
                 except LanguageInputError as exc:
                     raise InferenceOperationError(400, str(exc)) from exc
+            elif operation == "transcribe":
+                try:
+                    result = await self._transcribe(request_data)
+                except TranscribeInputError as exc:
+                    raise InferenceOperationError(400, str(exc)) from exc
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported TTS operation: {operation}")
         except ValidationError as exc:
@@ -6254,13 +6076,70 @@ class LzTtsInferenceSession:
         data = await asyncio.to_thread(self.language_identifier.identify, audio, request.top_k)
         return InferenceResult(kind="json", data=data)
 
+    async def _transcribe(self, request_data: dict[str, Any]) -> InferenceResult:
+        if not _server_config.transcribe.enabled:
+            raise InferenceOperationError(503, "transcribe is not enabled on this worker")
+        request = TranscribeRequest.model_validate(request_data)
+        if request.audio_base64:
+            try:
+                audio_bytes = base64.b64decode(request.audio_base64, validate=True)
+            except ValueError as exc:
+                raise TranscribeInputError("audio_base64 is not valid base64") from exc
+        elif request.audio_url:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+                response = await client.get(request.audio_url)
+                response.raise_for_status()
+            audio_bytes = response.content
+        else:
+            raise InferenceOperationError(400, "Provide 'audio_url' or 'audio_base64'")
+        audio = await asyncio.to_thread(decode_transcribe_audio, audio_bytes)
+        response = await asyncio.to_thread(
+            _ensure_transcribe_worker().call,
+            "transcribe",
+            {"audio": audio, "language": request.language},
+        )
+        transcript = response.get("data") or {}
+        text = str(transcript.get("text") or "")
+        language = request.language or transcript.get("languageCode")
+        data: dict[str, Any] = {
+            "text": text,
+            "language": transcript.get("language"),
+            "languageCode": transcript.get("languageCode"),
+        }
+        if request.timestamps:
+            data["timestamps"] = await self._transcript_timestamps(text, audio, language)
+        return InferenceResult(kind="json", data=data)
+
+    async def _transcript_timestamps(
+        self,
+        text: str,
+        audio: np.ndarray,
+        language: str | None,
+    ) -> list[dict[str, Any]]:
+        if not text.strip():
+            return []
+        # The aligner can't read digits: align the words the numbers were spoken as.
+        spoken = (await asyncio.to_thread(_verbalize_voxcpm_numbers, [text], [language], None))[0]
+        words = await _align_words(spoken, audio, TRANSCRIBE_SAMPLE_RATE, language, None)
+        if spoken != text:
+            words = _source_word_timestamps(text, spoken, words)
+        return [_word_timestamp(text, word) for word in words]
+
 
 class SyncTaskInput(BaseModel):
     """Generic development task accepted by /task/sync."""
 
     model_config = {"extra": "forbid"}
 
-    operation: Literal["synthesize", "voice-design", "voice-enhance", "voice-anchor", "detect-nudity", "detect-language"]
+    operation: Literal[
+        "synthesize",
+        "voice-design",
+        "voice-enhance",
+        "voice-anchor",
+        "detect-nudity",
+        "detect-language",
+        "transcribe",
+    ]
     request: dict[str, Any]
 
 

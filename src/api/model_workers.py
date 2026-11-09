@@ -13,9 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
+import numpy as np
 import torch
-from ..matcha_inference import MatchaBackend as ProductionStarlingBackend
-from ..matcha_inference import MatchaBatchRequest
 from ..ctc_forced_alignment import CtcAlignmentConfig, CtcForcedAligner
 from ..piper import PiperInference
 from .locale_utils import normalize_locale
@@ -402,49 +401,6 @@ def _sparrow_engine(settings_data: dict[str, Any]) -> Handler:
     return handler
 
 
-def starling_worker_main(settings_data: dict[str, Any], request_queue: Any, response_queue: Any) -> None:
-    """Own the Starling model in a dedicated process."""
-    config = _settings_data_to_config(settings_data)
-    backend = ProductionStarlingBackend(config.starling)
-    _freeze_loaded_objects()
-
-    def handler(action: str, payload: Any) -> dict[str, Any]:
-        if action == "health":
-            return {
-                "ok": True,
-                "data": {
-                    "worker": "ok",
-                    "sample_rate": backend.sample_rate,
-                    "device": config.starling.device,
-                    "checkpoint": config.starling.checkpoint,
-                },
-            }
-        if action == "synthesize_batch":
-            if not isinstance(payload, dict):
-                raise ValueError("worker payload must be an object")
-            items = []
-            for item in list(payload.get("items") or []):
-                items.append(
-                    MatchaBatchRequest(
-                        text=str(item.get("text") or ""),
-                        language=str(item.get("language") or "en"),
-                        input_type=str(item.get("input_type") or "aligned"),
-                        speaker_id=item.get("speaker_id"),
-                        neural=bool(item.get("neural", True)),
-                        steps=item.get("steps"),
-                        temperature=item.get("temperature"),
-                        length_scale=item.get("length_scale"),
-                        future=None,
-                        queued_at=float(item.get("queued_at") or time.perf_counter()),
-                    )
-                )
-            results = backend.synthesize_batch(items)
-            return {"ok": True, "data": {"results": results}}
-        raise ValueError(f"unknown worker action: {action}")
-
-    run_worker_loop("Starling", _with_gpu_cleanup(handler), request_queue, response_queue)
-
-
 def _seed_vc_engine(settings_data: dict[str, Any]) -> Handler:
     """Load the Seed-VC model and return the action handler."""
     config = _settings_data_to_config(settings_data)
@@ -582,6 +538,27 @@ def _number_modes_engine(settings_data: dict[str, Any]) -> Handler:
     return handler
 
 
+def _qwen_asr_engine(settings_data: dict[str, Any]) -> Handler:
+    """Load Qwen3-ASR (the ``transcribe`` task) and return the action handler."""
+    from .transcribe import QwenTranscriber
+
+    settings = _settings_data_to_config(settings_data).transcribe
+    transcriber = QwenTranscriber(settings.model, device=settings.device, dtype=settings.dtype)
+    transcriber.load()
+
+    def handler(action: str, payload: Any) -> dict[str, Any]:
+        if action == "health":
+            return {"ok": True, "data": {"worker": "ok", "model": settings.model, "device": settings.device}}
+        if not isinstance(payload, dict):
+            raise ValueError("worker payload must be an object")
+        if action == "transcribe":
+            audio = np.asarray(payload["audio"], dtype=np.float32)
+            return {"ok": True, "data": transcriber.transcribe(audio, payload.get("language"))}
+        raise ValueError(f"unknown worker action: {action}")
+
+    return handler
+
+
 # engine -> (loader, cuDNN enabled). The CUDA driver keeps a host copy of every
 # cuDNN engine it loads (one per conv shape the heuristics pick), ~120-250 MB
 # of RAM per model, and torch's native convs are no slower for the Sparrow
@@ -618,3 +595,15 @@ def speech_worker_main(settings_data: dict[str, Any], request_queue: Any, respon
         return handlers[engine]("health" if engine_action == "load" else engine_action, payload)
 
     run_worker_loop("Speech", _with_gpu_cleanup(handler), request_queue, response_queue)
+
+
+def transcribe_worker_main(settings_data: dict[str, Any], request_queue: Any, response_queue: Any) -> None:
+    """Own Qwen3-ASR (the ``transcribe`` task) in a dedicated GPU process.
+
+    Speech-to-text is its own model, job type and GPU session. It shares no
+    process with the synthesis engines, so loading or evicting one never
+    touches the other. The model loads before the first request is read.
+    """
+    handler = _qwen_asr_engine(settings_data)
+    _freeze_loaded_objects()
+    run_worker_loop("Transcribe", _with_gpu_cleanup(handler), request_queue, response_queue)
