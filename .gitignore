@@ -31,4 +31,4 @@ CLAUDE.md
 
 # Environment variables
 .env
-src/music_runtime/.cache/
+src/media_runtime/.cache/

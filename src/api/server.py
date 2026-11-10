@@ -454,11 +454,11 @@ class TranscribeConfig(BaseModel):
 
 
 class MusicConfig(BaseModel):
-    """YuE2 + YingMusic-SVC (the ``generate-music`` task), in its own venv and process (src/music_runtime)."""
+    """YuE2 + YingMusic-SVC (the ``generate-music`` task), in its own venv and process (src/media_runtime)."""
 
     enabled: bool = False
-    python: str = "src/music_runtime/.venv/bin/python"
-    runtime_dir: str = "src/music_runtime"
+    python: str = "src/media_runtime/.venv/bin/python"
+    runtime_dir: str = "src/media_runtime"
     port: int = 8270
     # CUDA_VISIBLE_DEVICES for the runtime (PCI-order index or UUID). One GPU, Ampere or newer
     # (YuE2 needs bf16, ~11 GB); the runtime holds one model group at a time.
@@ -960,7 +960,7 @@ _speech_worker: WorkerProcessClient | None = None
 _sparrow_worker: EngineClient | None = None
 _sparrow_model_info: dict[str, dict[str, Any]] = {}
 _transcribe_worker: WorkerProcessClient | None = None
-_music_runtime: MusicRuntime | None = None
+_media_runtime: MusicRuntime | None = None
 _seed_vc_worker: EngineClient | None = None
 _seed_vc_info: dict[str, Any] = {}
 _voxcpm_runtime: VoxCPMRuntime | None = None
@@ -1329,19 +1329,19 @@ def _ensure_transcribe_worker() -> WorkerProcessClient:
     return _transcribe_worker
 
 
-def _ensure_music_runtime() -> MusicRuntime:
+def _ensure_media_runtime() -> MusicRuntime:
     """YuE2 / YingMusic-SVC in their own venv and process (the ``generate-music`` task)."""
-    global _music_runtime
-    if _music_runtime is None:
+    global _media_runtime
+    if _media_runtime is None:
         config = _server_config.music
-        _music_runtime = MusicRuntime(
+        _media_runtime = MusicRuntime(
             python=config.python,
             runtime_dir=config.runtime_dir,
             port=config.port,
             gpu=config.gpu,
             ready_timeout_seconds=config.ready_timeout_seconds,
         )
-    return _music_runtime
+    return _media_runtime
 
 
 def _worker_name_to_engines(name: str) -> tuple[str, ...]:
@@ -1369,13 +1369,13 @@ def _mark_engine_failed_from_child(worker_name: str, exc: BaseException) -> None
 
 
 def _stop_model_workers() -> None:
-    global _speech_worker, _sparrow_worker, _seed_vc_worker, _music_runtime
+    global _speech_worker, _sparrow_worker, _seed_vc_worker, _media_runtime
     for worker in (_speech_worker, _transcribe_worker):
         if worker is not None:
             worker.stop()
-    if _music_runtime is not None:
-        _music_runtime.stop()
-    _music_runtime = None
+    if _media_runtime is not None:
+        _media_runtime.stop()
+    _media_runtime = None
     _speech_worker = None
     _sparrow_worker = None
     _seed_vc_worker = None
@@ -5263,8 +5263,8 @@ async def _load_transcribe_engine() -> None:
 
 async def _load_music_engine() -> None:
     config = _server_config.music
-    with _logged_startup_step("music_runtime", runtime_dir=config.runtime_dir, port=config.port):
-        runtime = _ensure_music_runtime()
+    with _logged_startup_step("media_runtime", runtime_dir=config.runtime_dir, port=config.port):
+        runtime = _ensure_media_runtime()
         # A reload replaces the child: stop the old one, then wait for the new one's models to load.
         runtime.stop()
         await runtime.ensure_ready()
@@ -6195,7 +6195,7 @@ class LzTtsInferenceSession:
             body["output_dir"] = scratch
             if request.reference_url:
                 body["reference_path"] = str(await fetch_reference(request.reference_url, Path(scratch) / "reference"))
-            produced = await _ensure_music_runtime().generate(body, config.generate_timeout_seconds)
+            produced = await _ensure_media_runtime().generate(body, config.generate_timeout_seconds)
             audio = await asyncio.to_thread(Path(produced["path"]).read_bytes)
         return InferenceResult(
             kind="audio",

@@ -1,4 +1,4 @@
-"""generate-music: client for the music runtime process (src/music_runtime).
+"""generate-music: client for the music runtime process (src/media_runtime).
 
 YuE2 and YingMusic-SVC run from their own venv (Python 3.11, torch 2.14, cu130), so
 the runtime cannot be a multiprocessing child like the speech and transcribe

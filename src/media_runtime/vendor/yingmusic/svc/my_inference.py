@@ -344,7 +344,7 @@ def run_inference(args, model_bundle, device=torch.device("cuda")):
     return output_path
 
 
-if False:  # CLI entry point removed; see src/music_runtime/voice_convert.py
+if False:  # CLI entry point removed; see src/media_runtime/voice_convert.py
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=str)
     parser.add_argument("--target", type=str)

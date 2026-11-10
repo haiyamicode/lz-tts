@@ -34,7 +34,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2b. Music runtime venv (src/music_runtime: YuE2 + YingMusic-SVC, Python 3.11,
+# 2b. Music runtime venv (src/media_runtime: YuE2 + YingMusic-SVC, Python 3.11,
 #     its own torch). Separate lockfile and interpreter; the image's uv is
 #     system-python-only, so this sync lets uv fetch a managed 3.11. The
 #     prebuilt pyworld / yue2-infer wheels come from data/runtime-wheels (S3
@@ -44,7 +44,7 @@ fi
 if [ "${LZAI_SKIP_MUSIC_RUNTIME:-0}" = "1" ]; then
     echo "[bootstrap] LZAI_SKIP_MUSIC_RUNTIME=1 — skipping music runtime venv"
 else
-    MUSIC_DIR=src/music_runtime
+    MUSIC_DIR=src/media_runtime
     MUSIC_HASH="$(cat $MUSIC_DIR/uv.lock $MUSIC_DIR/pyproject.toml | md5sum | awk '{print $1}')"
     if [ -f $MUSIC_DIR/.venv/.sync-hash ] && [ "$(cat $MUSIC_DIR/.venv/.sync-hash)" = "$MUSIC_HASH" ]; then
         echo "[bootstrap] music .venv matches its uv.lock + pyproject.toml (${MUSIC_HASH}*) — skipping uv sync"

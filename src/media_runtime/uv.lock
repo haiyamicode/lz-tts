@@ -885,7 +885,7 @@ wheels = [
 ]
 
 [[package]]
-name = "lzai-music"
+name = "lzai-media"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
