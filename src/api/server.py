@@ -15,6 +15,7 @@ import re
 import secrets
 import signal
 import sys
+import tempfile
 import threading
 import time
 import httpx
@@ -55,6 +56,7 @@ from .audio_adjustments import AudioEffect, adjust_audio
 from .take_stream import OrderedChunkAudio, StreamingMp3Encoder
 from .locale_utils import normalize_locale as _normalize_locale_with_region
 from .model_workers import speech_worker_main, transcribe_worker_main
+from .music import MusicInputError, MusicRequest, MusicRuntime, fetch_reference
 from .seed_vc_backend import (
     SeedVCBackend as _SeedVCBackend,
     SeedVCBatchRequest,
@@ -451,6 +453,20 @@ class TranscribeConfig(BaseModel):
     dtype: str = "float16"
 
 
+class MusicConfig(BaseModel):
+    """ACE-Step + YingMusic-SVC (the ``generate-music`` task), in its own venv and process (src/music_runtime)."""
+
+    enabled: bool = False
+    python: str = "src/music_runtime/.venv/bin/python"
+    runtime_dir: str = "src/music_runtime"
+    port: int = 8270
+    # CUDA_VISIBLE_DEVICES for the runtime (PCI-order index or UUID). One GPU, Ampere or newer
+    # (ACE-Step needs bf16, ~22 GB); the runtime holds one model group at a time.
+    gpu: str | None = None
+    ready_timeout_seconds: float = Field(default=1800.0, gt=0)
+    generate_timeout_seconds: float = Field(default=3600.0, gt=0)
+
+
 class SSMLConfig(BaseModel):
     """Settings for SSML operations (breaks, IPA pronunciations)."""
 
@@ -472,6 +488,7 @@ class ServerConfig(BaseModel):
     ssml: SSMLConfig = Field(default_factory=SSMLConfig)
     aligner: AlignerConfig = Field(default_factory=AlignerConfig)
     transcribe: TranscribeConfig = Field(default_factory=TranscribeConfig)
+    music: MusicConfig = Field(default_factory=MusicConfig)
 
 
 class SparrowSynthesizeOptions(BaseModel):
@@ -943,6 +960,7 @@ _speech_worker: WorkerProcessClient | None = None
 _sparrow_worker: EngineClient | None = None
 _sparrow_model_info: dict[str, dict[str, Any]] = {}
 _transcribe_worker: WorkerProcessClient | None = None
+_music_runtime: MusicRuntime | None = None
 _seed_vc_worker: EngineClient | None = None
 _seed_vc_info: dict[str, Any] = {}
 _voxcpm_runtime: VoxCPMRuntime | None = None
@@ -962,7 +980,7 @@ class _EngineLoadState:
 
 _engine_load_states: dict[str, _EngineLoadState] = {
     name: _EngineLoadState(name=name, ready=threading.Event())
-    for name in ("pipertts", "voxcpm", "seed_vc", "transcribe")
+    for name in ("pipertts", "voxcpm", "seed_vc", "transcribe", "music")
 }
 
 _inference_counter = 0
@@ -1108,12 +1126,14 @@ def _load_config() -> ServerConfig:
 
 
 def _engine_enabled(
-    engine: Literal["pipertts", "voxcpm", "seed_vc", "transcribe"],
+    engine: Literal["pipertts", "voxcpm", "seed_vc", "transcribe", "music"],
     config: ServerConfig | None = None,
 ) -> bool:
     cfg = config or _server_config
     if engine == "transcribe":
         return bool(cfg.transcribe.enabled)
+    if engine == "music":
+        return bool(cfg.music.enabled)
     return bool(getattr(cfg.engines, engine))
 
 
@@ -1309,6 +1329,21 @@ def _ensure_transcribe_worker() -> WorkerProcessClient:
     return _transcribe_worker
 
 
+def _ensure_music_runtime() -> MusicRuntime:
+    """ACE-Step / YingMusic-SVC in their own venv and process (the ``generate-music`` task)."""
+    global _music_runtime
+    if _music_runtime is None:
+        config = _server_config.music
+        _music_runtime = MusicRuntime(
+            python=config.python,
+            runtime_dir=config.runtime_dir,
+            port=config.port,
+            gpu=config.gpu,
+            ready_timeout_seconds=config.ready_timeout_seconds,
+        )
+    return _music_runtime
+
+
 def _worker_name_to_engines(name: str) -> tuple[str, ...]:
     if name == "speech":
         return ("pipertts", "seed_vc")
@@ -1334,10 +1369,13 @@ def _mark_engine_failed_from_child(worker_name: str, exc: BaseException) -> None
 
 
 def _stop_model_workers() -> None:
-    global _speech_worker, _sparrow_worker, _seed_vc_worker
+    global _speech_worker, _sparrow_worker, _seed_vc_worker, _music_runtime
     for worker in (_speech_worker, _transcribe_worker):
         if worker is not None:
             worker.stop()
+    if _music_runtime is not None:
+        _music_runtime.stop()
+    _music_runtime = None
     _speech_worker = None
     _sparrow_worker = None
     _seed_vc_worker = None
@@ -5223,6 +5261,15 @@ async def _load_transcribe_engine() -> None:
         await asyncio.to_thread(worker.call, "health")
 
 
+async def _load_music_engine() -> None:
+    config = _server_config.music
+    with _logged_startup_step("music_runtime", runtime_dir=config.runtime_dir, port=config.port):
+        runtime = _ensure_music_runtime()
+        # A reload replaces the child: stop the old one, then wait for the new one's models to load.
+        runtime.stop()
+        await runtime.ensure_ready()
+
+
 async def _load_seed_vc_engine() -> None:
     global _seed_vc_info
     with _logged_startup_step(
@@ -5238,6 +5285,7 @@ _ENGINE_LOADERS: dict[str, Callable[[], Awaitable[None]]] = {
     "voxcpm": _load_voxcpm_engine,
     "seed_vc": _load_seed_vc_engine,
     "transcribe": _load_transcribe_engine,
+    "music": _load_music_engine,
 }
 _engine_reload_tasks: dict[str, asyncio.Task[None]] = {}
 _ENGINE_RELOAD_BACKOFF_SECONDS = 10.0
@@ -5361,6 +5409,11 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
             startup_tasks.append(asyncio.create_task(_run_engine_loader("transcribe", _load_transcribe_engine)))
         else:
             _LOGGER.info("Transcribe backend disabled")
+
+        if _engine_enabled("music"):
+            startup_tasks.append(asyncio.create_task(_run_engine_loader("music", _load_music_engine)))
+        else:
+            _LOGGER.info("Music backend disabled")
 
         if _engine_enabled("seed_vc"):
             startup_tasks.append(asyncio.create_task(_run_engine_loader("seed_vc", _load_seed_vc_engine)))
@@ -5958,6 +6011,11 @@ class LzTtsInferenceSession:
                     result = await self._transcribe(request_data)
                 except TranscribeInputError as exc:
                     raise InferenceOperationError(400, str(exc)) from exc
+            elif operation == "generate-music":
+                try:
+                    result = await self._generate_music(request_data)
+                except MusicInputError as exc:
+                    raise InferenceOperationError(400, str(exc)) from exc
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported TTS operation: {operation}")
         except ValidationError as exc:
@@ -6126,6 +6184,27 @@ class LzTtsInferenceSession:
         return [_word_timestamp(text, word) for word in words]
 
 
+    async def _generate_music(self, request_data: dict[str, Any]) -> InferenceResult:
+        """ACE-Step song from the prompt; with ``reference_url``, the vocal is re-voiced by YingMusic-SVC."""
+        config = _server_config.music
+        if not config.enabled:
+            raise InferenceOperationError(503, "generate-music is not enabled on this worker")
+        request = MusicRequest.model_validate(request_data)
+        body: dict[str, Any] = request.model_dump(exclude={"reference_url"})
+        with tempfile.TemporaryDirectory(prefix="generate-music-") as scratch:
+            body["output_dir"] = scratch
+            if request.reference_url:
+                body["reference_path"] = str(await fetch_reference(request.reference_url, Path(scratch) / "reference"))
+            produced = await _ensure_music_runtime().generate(body, config.generate_timeout_seconds)
+            audio = await asyncio.to_thread(Path(produced["path"]).read_bytes)
+        return InferenceResult(
+            kind="audio",
+            content_type="audio/wav",
+            audio=audio,
+            data={"seed": produced["seed"], "mode": produced["mode"]},
+        )
+
+
 class SyncTaskInput(BaseModel):
     """Generic development task accepted by /task/sync."""
 
@@ -6139,6 +6218,7 @@ class SyncTaskInput(BaseModel):
         "detect-nudity",
         "detect-language",
         "transcribe",
+        "generate-music",
     ]
     request: dict[str, Any]
 

@@ -38,6 +38,7 @@ TASK_TYPES = (
     "nudity-detect",
     "language-detect",
     "transcribe",
+    "generate-music",
 )
 
 # Task types whose payload carries no operation field: the task type implies
@@ -48,6 +49,7 @@ _TYPE_OPERATIONS = {
     "nudity-detect": "detect-nudity",
     "language-detect": "detect-language",
     "transcribe": "transcribe",
+    "generate-music": "generate-music",
 }
 _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
 # Join, heartbeat, pull, settle and leave are small requests (pulls long-poll
