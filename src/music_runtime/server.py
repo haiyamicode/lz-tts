@@ -1,6 +1,6 @@
 """Music runtime: a localhost HTTP process for the generate-music task.
 
-Runs from its own venv (src/music_runtime/.venv, Python 3.11, torch 2.10) so the
+Runs from its own venv (src/music_runtime/.venv, Python 3.11, torch 2.14, cu130) so the
 YuE2 and YingMusic dependencies stay apart from lz-tts. The lz-tts API
 starts it as a child with ``python server.py --port N``, polls GET /health until
 it reports ``ok``, and sends POST /generate for each task.

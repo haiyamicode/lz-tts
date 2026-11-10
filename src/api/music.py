@@ -1,6 +1,6 @@
 """generate-music: client for the music runtime process (src/music_runtime).
 
-YuE2 and YingMusic-SVC run from their own venv (Python 3.11, torch 2.10), so
+YuE2 and YingMusic-SVC run from their own venv (Python 3.11, torch 2.14, cu130), so
 the runtime cannot be a multiprocessing child like the speech and transcribe
 workers. The API starts it as ``server.py --port N``, polls GET /health until it
 reports ``ok``, and sends each task as POST /generate on 127.0.0.1.
