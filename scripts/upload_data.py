@@ -24,6 +24,14 @@ load_dotenv()
 
 PRIORITY_DATA_DIRS = ("runtime-wheels",)
 
+# HF cache dirs: snapshots/ hold the real files (symlinks into blobs/ that the
+# upload follows), so blobs/ would store every weight twice.
+HF_BLOBS_MARKER = "/hf_cache/"
+
+
+def _is_hf_blob(rel: str) -> bool:
+    return HF_BLOBS_MARKER in f"/{rel}" and "/blobs/" in f"/{rel}"
+
 
 def get_s3_client():
     """Create and return S3 client with Wasabi configuration"""
@@ -119,7 +127,10 @@ def upload_file(s3_client, local_path, bucket, s3_key, display_path, force=False
 def _manifest_files(model_dir: Path) -> tuple[list[Path], list[Path]]:
     manifest_path = model_dir / "manifest.json"
     if not manifest_path.exists():
-        files = [f for f in model_dir.rglob("*") if f.is_file()]
+        files = [
+            f for f in model_dir.rglob("*")
+            if f.is_file() and not _is_hf_blob(f.relative_to(model_dir.parent).as_posix())
+        ]
         return sorted(files), []
 
     with manifest_path.open("r", encoding="utf-8") as f:

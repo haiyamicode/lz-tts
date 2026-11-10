@@ -121,6 +121,15 @@ _EXCLUDE_PREFIXES = (
 )
 
 
+def _is_excluded(rel: str) -> bool:
+    # Retired model; older uploads may still sit in the bucket.
+    if rel.startswith("acestep-xl-turbo/"):
+        return True
+    # HF cache blobs/ duplicate snapshots/ (see upload_data.py).
+    return "/hf_cache/" in f"/{rel}" and "/blobs/" in f"/{rel}"
+
+
+
 def sync_data_from_s3(
     data_dir: Path | None = None,
     name_filter: str | None = None,
@@ -183,7 +192,7 @@ def sync_data_from_s3(
         to_download = []
         skipped = 0
         for obj, rel in filtered:
-            if any(rel.startswith(p) for p in _EXCLUDE_PREFIXES):
+            if _is_excluded(rel) or any(rel.startswith(p) for p in _EXCLUDE_PREFIXES):
                 print(f"Skipping {rel} (handled separately)")
                 skipped += 1
                 continue
