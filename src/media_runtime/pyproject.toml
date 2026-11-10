@@ -41,12 +41,37 @@ dependencies = [
     "tiktoken==0.12.0",
     "uvicorn[standard]>=0.27.0",
     "yue2-infer==0.1.5",
+    "aiohttp>=3.11.8",
+    "alembic>=1.18.5",
+    "av>=17.0.0",
+    "blake3>=1.0.9",
+    "comfy-aimdo==0.5.5",
+    "comfy-angle>=0.1.1",
+    "comfy-kitchen==0.2.37",
+    "demucs==4.0.1",
+    "faster-whisper==1.2.1",
+    "kornia>=0.7.1",
+    "opencv-python-headless>=4.9",
+    "pillow",
+    "psutil",
+    "pydantic>=2,<3",
+    "pydantic-settings>=2,<3",
+    "pyopengl>=3.1.8",
+    "python-speech-features>=0.6",
+    "sentencepiece",
+    "simpleeval>=1.0.0",
+    "spandrel>=0.4.2",
+    "sqlalchemy>=2.0.0",
+    "tokenizers",
+    "torchsde==0.2.6",
+    "torchvision==0.29.1",
+    "yarl>=1.18.0",
     "vector-quantize-pytorch>=1.27.15",
 ]
 
 [tool.uv]
 # yue2-infer pins numpy 2.2.6 / safetensors 0.7.0; the voice stack needs numpy 1.26
-override-dependencies = ["huggingface-hub>=1.31", "torch==2.14.1", "torchaudio==2.11.0", "numpy==1.26.4", "safetensors>=0.7.0", "transformers>=5.0"]
+override-dependencies = ["huggingface-hub>=1.31", "torch==2.14.1", "torchaudio==2.11.0", "torchvision==0.29.1", "numpy==1.26.4", "safetensors>=0.7.0", "transformers>=5.0"]
 
 [tool.uv.sources]
 yue2-infer = { path = "../../data/runtime-wheels/yue2_infer-0.1.5-py3-none-any.whl" }
@@ -54,6 +79,7 @@ yue2-infer = { path = "../../data/runtime-wheels/yue2_infer-0.1.5-py3-none-any.w
 pyworld = { path = "../../data/runtime-wheels/pyworld-0.3.5-cp311-cp311-linux_x86_64.whl" }
 torch = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
