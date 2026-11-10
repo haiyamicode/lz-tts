@@ -13,7 +13,7 @@ RUNTIME_DIR = Path(__file__).resolve().parent
 REPO_DIR = RUNTIME_DIR.parents[1]
 DATA_DIR = REPO_DIR / "data"
 
-ACESTEP_DIR = DATA_DIR / "acestep-xl-turbo"
+YUE2_DIR = DATA_DIR / "yue2-3b"
 YINGMUSIC_DIR = DATA_DIR / "yingmusic-svc"
 
 VENDOR_SVC_DIR = RUNTIME_DIR / "vendor" / "yingmusic" / "svc"

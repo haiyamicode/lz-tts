@@ -1,6 +1,6 @@
 """generate-music: client for the music runtime process (src/music_runtime).
 
-ACE-Step and YingMusic-SVC run from their own venv (Python 3.11, torch 2.10), so
+YuE2 and YingMusic-SVC run from their own venv (Python 3.11, torch 2.10), so
 the runtime cannot be a multiprocessing child like the speech and transcribe
 workers. The API starts it as ``server.py --port N``, polls GET /health until it
 reports ``ok``, and sends each task as POST /generate on 127.0.0.1.
@@ -16,10 +16,10 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ..process_guard import exit_with_parent
 
@@ -37,20 +37,52 @@ class MusicRuntimeError(RuntimeError):
     """The music runtime failed to start, load, or generate."""
 
 
-class MusicRequest(BaseModel):
-    """The ``generate-music`` request. Without ``reference_url`` the song is ACE-Step's render; with it, the lead vocal is re-voiced by YingMusic-SVC."""
+class SamplingOverrides(BaseModel):
+    """Token sampling for one YuE2 pass; every field is optional and falls back to the model default."""
 
-    caption: str = Field(min_length=1, max_length=2000)
-    duration: float = Field(default=30.0, gt=0, le=240.0)
-    lyrics: str = Field(default="", max_length=8000)
-    instrumental: bool = False
-    vocal_language: str = Field(default="en", max_length=16)
-    bpm: int | None = Field(default=None, ge=30, le=300)
-    keyscale: str | None = Field(default=None, max_length=40)
-    timesignature: str = Field(default="4/4", max_length=8)
+    model_config = {"extra": "forbid"}
+
+    temperature: float | None = Field(default=None, ge=0, le=5)
+    top_p: float | None = Field(default=None, gt=0, le=1)
+    top_k: int | None = Field(default=None, ge=1, le=1000)
+    repetition_penalty: float | None = Field(default=None, gt=0, le=3)
+    penalty_window: int | None = Field(default=None, ge=1, le=100)
+    min_tokens: int | None = Field(default=None, ge=0, le=9000)
+    max_tokens: int | None = Field(default=None, ge=1, le=9000)
+
+
+class MusicRequest(BaseModel):
+    """The ``generate-music`` request.
+
+    YuE2 writes the song from ``style`` and ``lyrics``; the length follows the lyrics sections (there is
+    no duration, BPM, key or instrumental parameter: put tempo and mood in ``style``, or give ``abc``).
+    Without ``reference_url`` the song is YuE2's render; with it, the lead vocal is re-voiced by YingMusic-SVC.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    style: str = Field(min_length=1, max_length=2000, description="Comma-separated genre, vocal, instruments, mood")
+    lyrics: str = Field(min_length=1, max_length=8000, description="Plain text in [verse]/[chorus]... sections")
+    cot: Literal["full", "melody", "off"] = Field(
+        default="full", description="Planning pass: melody and chords, melody only, or none (covers: melody)"
+    )
+    cfg_scale: float | None = Field(default=None, ge=0, le=20, description="Text guidance; null = model default")
     seed: int | None = Field(default=None, ge=0, le=2**31 - 2)
-    inference_steps: int = Field(default=8, ge=1, le=100)
+    abc: str | None = Field(
+        default=None, max_length=20000, description="Your own ABC melody score (cot melody or full); skips planning"
+    )
+    ode_steps: int | None = Field(default=None, ge=1, le=100, description="Audio-stage flow steps; model default 32")
+    abc_sampling: SamplingOverrides | None = None
+    semantic_sampling: SamplingOverrides | None = Field(
+        default=None, description="max_tokens caps the song length at about 25 tokens per second"
+    )
     reference_url: str | None = None
+
+    @model_validator(mode="after")
+    def _abc_needs_plan(self) -> "MusicRequest":
+        if self.abc is not None and self.cot == "off":
+            raise ValueError("abc needs cot 'melody' or 'full'")
+        return self
 
 
 async def fetch_reference(url: str, dest: Path) -> Path:

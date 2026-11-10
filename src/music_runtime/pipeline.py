@@ -1,7 +1,7 @@
-"""generate-music: ACE-Step song, then YingMusic-SVC when there is a clone reference.
+"""generate-music: YuE2 song, then YingMusic-SVC when there is a clone reference.
 
-Without a reference the song is the ACE-Step render, untouched.
-With a reference: ACE-Step renders the song, BS-RoFormer splits the lead vocal
+Without a reference the song is the YuE2 render, untouched.
+With a reference: YuE2 renders the song, BS-RoFormer splits the lead vocal
 from the rest, YingMusic-SVC re-voices the vocal toward the reference, and the
 converted vocal is mixed back over the accompaniment.
 """
@@ -22,7 +22,7 @@ import soundfile as sf
 import torch
 
 from separation import SAMPLE_RATE, VocalSeparator
-from song import AceStepSong, SongRequest
+from song import SongRequest, YuE2Song
 from voice_convert import YingMusicConverter
 
 PEAK_CEILING = 0.98
@@ -32,7 +32,7 @@ PEAK_CEILING = 0.98
 class RenderResult:
     path: Path
     seed: int
-    mode: str  # "prompt" (ACE-Step only) or "clone" (ACE-Step + YingMusic-SVC)
+    mode: str  # "prompt" (YuE2 only) or "clone" (YuE2 + YingMusic-SVC)
 
 
 def mix_over_accompaniment(vocal_path: Path, accompaniment: np.ndarray, out_path: Path) -> Path:
@@ -60,21 +60,22 @@ def mix_over_accompaniment(vocal_path: Path, accompaniment: np.ndarray, out_path
 
 
 class MusicPipeline:
-    """One model group on the GPU at a time: ACE-Step ("song"), or BS-RoFormer + YingMusic-SVC ("voice").
+    """One model group on the GPU at a time: YuE2 ("song"), or BS-RoFormer + YingMusic-SVC ("voice").
 
-    ACE-Step alone takes ~22 GB, so a clone job loads it, renders, unloads it, then loads
+    YuE2 peaks near 11 GB and the voice models take ~8 GB; one group at a time keeps the
+    runtime inside a single smaller GPU. A clone job loads YuE2, renders, unloads it, then loads
     the two voice models. A model group stays resident until the other one is needed.
     """
 
     def __init__(self, device: str = "cuda:0", fp16: bool = True):
-        self.song = AceStepSong(device=device)
+        self.song = YuE2Song(device=device)
         self.separator = VocalSeparator(device=device)
         self.converter = YingMusicConverter(device=device, fp16=fp16)
         self._resident: str | None = None
         self._lock = threading.Lock()
 
     def load(self) -> None:
-        """Load ACE-Step so /health reports ok only when it can generate (the voice models load on first clone)."""
+        """Load YuE2 so /health reports ok only when it can generate (the voice models load on first clone)."""
         with self._lock:
             self._activate("song")
 
@@ -106,7 +107,7 @@ class MusicPipeline:
             self._activate("song")
             started = time.monotonic()
             song_path, seed = self.song.generate(request, work / "song.wav")
-            print(f"[timing] ace-step generate: {time.monotonic() - started:.1f}s", flush=True)
+            print(f"[timing] yue2 generate: {time.monotonic() - started:.1f}s", flush=True)
             if reference_path is None:
                 final = output_dir / f"song-{seed}.wav"
                 shutil.move(str(song_path), final)

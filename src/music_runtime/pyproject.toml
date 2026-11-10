@@ -29,7 +29,7 @@ dependencies = [
     "pyworld>=0.3.5",
     "pyyaml>=6.0.3",
     "rotary-embedding-torch==0.3.5",
-    "safetensors>=0.8.0",
+    "safetensors>=0.7.0",
     "scipy>=1.10.1",
     "soundfile>=0.13.1",
     "toml>=0.10.2",
@@ -38,11 +38,18 @@ dependencies = [
     "torchcodec>=0.9.1",
     "tqdm>=4.66.5",
     "transformers>=4.51.0,<4.58.0",
+    "tiktoken==0.12.0",
     "uvicorn[standard]>=0.27.0",
+    "yue2-infer==0.1.5",
     "vector-quantize-pytorch>=1.27.15",
 ]
 
+[tool.uv]
+# yue2-infer pins numpy 2.2.6 / safetensors 0.7.0; the voice stack needs numpy 1.26
+override-dependencies = ["numpy==1.26.4", "safetensors>=0.7.0"]
+
 [tool.uv.sources]
+yue2-infer = { path = "../../data/runtime-wheels/yue2_infer-0.1.5-py3-none-any.whl" }
 # no PyPI wheel for pyworld; prebuilt so the container needs no compiler
 pyworld = { path = "../../data/runtime-wheels/pyworld-0.3.5-cp311-cp311-linux_x86_64.whl" }
 torch = { index = "pytorch-cu128" }

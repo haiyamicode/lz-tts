@@ -454,14 +454,14 @@ class TranscribeConfig(BaseModel):
 
 
 class MusicConfig(BaseModel):
-    """ACE-Step + YingMusic-SVC (the ``generate-music`` task), in its own venv and process (src/music_runtime)."""
+    """YuE2 + YingMusic-SVC (the ``generate-music`` task), in its own venv and process (src/music_runtime)."""
 
     enabled: bool = False
     python: str = "src/music_runtime/.venv/bin/python"
     runtime_dir: str = "src/music_runtime"
     port: int = 8270
     # CUDA_VISIBLE_DEVICES for the runtime (PCI-order index or UUID). One GPU, Ampere or newer
-    # (ACE-Step needs bf16, ~22 GB); the runtime holds one model group at a time.
+    # (YuE2 needs bf16, ~11 GB); the runtime holds one model group at a time.
     gpu: str | None = None
     ready_timeout_seconds: float = Field(default=1800.0, gt=0)
     generate_timeout_seconds: float = Field(default=3600.0, gt=0)
@@ -1330,7 +1330,7 @@ def _ensure_transcribe_worker() -> WorkerProcessClient:
 
 
 def _ensure_music_runtime() -> MusicRuntime:
-    """ACE-Step / YingMusic-SVC in their own venv and process (the ``generate-music`` task)."""
+    """YuE2 / YingMusic-SVC in their own venv and process (the ``generate-music`` task)."""
     global _music_runtime
     if _music_runtime is None:
         config = _server_config.music
@@ -6185,12 +6185,12 @@ class LzTtsInferenceSession:
 
 
     async def _generate_music(self, request_data: dict[str, Any]) -> InferenceResult:
-        """ACE-Step song from the prompt; with ``reference_url``, the vocal is re-voiced by YingMusic-SVC."""
+        """YuE2 song from the style and lyrics; with ``reference_url``, the vocal is re-voiced by YingMusic-SVC."""
         config = _server_config.music
         if not config.enabled:
             raise InferenceOperationError(503, "generate-music is not enabled on this worker")
         request = MusicRequest.model_validate(request_data)
-        body: dict[str, Any] = request.model_dump(exclude={"reference_url"})
+        body: dict[str, Any] = request.model_dump(exclude={"reference_url"}, exclude_none=True)
         with tempfile.TemporaryDirectory(prefix="generate-music-") as scratch:
             body["output_dir"] = scratch
             if request.reference_url:

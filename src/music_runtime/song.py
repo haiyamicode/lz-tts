@@ -1,126 +1,93 @@
-"""ACE-Step 1.5 XL Turbo: text (+ lyrics) to a full song, prompt only.
+"""YuE2-3B: style + lyrics to a full song with vocals, prompt only.
 
-ACE-Step runs bf16 on Ampere and newer only. Pre-Ampere cards fall back to
-fp16, which produces NaN latents (observed on a V100), so this module refuses
-to load there rather than generating silence.
+The song length is not a request parameter: YuE2 plans the structure (intro,
+verse, chorus...) from the lyrics sections and writes as much as they need.
+YuE2 runs bf16 on Ampere or newer.
 """
 
 from __future__ import annotations
 
-import os
+import dataclasses
+import gc
 import random
-import shutil
-import tempfile
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+import soundfile as sf
 import torch
 
-from paths import ACESTEP_DIR
+from paths import YUE2_DIR
 
 MIN_COMPUTE_CAPABILITY = (8, 0)
-CONFIG_PATH = "acestep-v15-xl-turbo"
 
 
 @dataclass
 class SongRequest:
-    caption: str
-    duration: float
-    lyrics: str = ""
-    instrumental: bool = False
-    vocal_language: str = "en"
-    bpm: int | None = None
-    keyscale: str | None = None
-    timesignature: str = "4/4"
+    style: str
+    lyrics: str
+    cot: str = "full"  # "full" plans melody and chords, "melody" melody only, "off" no plan
+    cfg_scale: float | None = None
     seed: int | None = None
-    inference_steps: int = 8
+    abc: str | None = None  # your own ABC melody score (needs cot "melody" or "full"); skips the planning pass
+    ode_steps: int | None = None  # flow-matching steps of the audio stage (model default 32)
+    # Sampling overrides for the planning pass and the song-token pass: any of temperature, top_p,
+    # top_k, repetition_penalty, penalty_window, min_tokens, max_tokens (about 25 song tokens per second).
+    abc_sampling: dict | None = None
+    semantic_sampling: dict | None = None
 
 
-class AceStepSong:
-    def __init__(self, model_dir: Path = ACESTEP_DIR, device: str = "cuda:0"):
+class YuE2Song:
+    def __init__(self, model_dir: Path = YUE2_DIR, device: str = "cuda:0"):
         self.model_dir = Path(model_dir)
         self.device = device
-        self._dit = None
-        self._llm = None
-        self._lock = threading.Lock()
+        self._pipe = None
+        self._base_config = None
 
     def load(self) -> None:
-        if self._dit is not None:
+        if self._pipe is not None:
             return
         capability = torch.cuda.get_device_capability(torch.device(self.device))
         if capability < MIN_COMPUTE_CAPABILITY:
             raise RuntimeError(
-                f"ACE-Step needs bf16 (compute capability >= {MIN_COMPUTE_CAPABILITY[0]}.{MIN_COMPUTE_CAPABILITY[1]}); "
+                f"YuE2 needs bf16 (compute capability >= {MIN_COMPUTE_CAPABILITY[0]}.{MIN_COMPUTE_CAPABILITY[1]}); "
                 f"{self.device} is {capability[0]}.{capability[1]}"
             )
-        # Checkpoints resolve as <ACESTEP_CHECKPOINTS_DIR>/<component>; the model
-        # dir holds the components directly, so point the resolver at it.
-        os.environ["ACESTEP_CHECKPOINTS_DIR"] = str(self.model_dir)
-        from acestep.handler import AceStepHandler
-        from acestep.llm_inference import LLMHandler
+        from yue2 import YuE2Pipeline
 
-        dit = AceStepHandler()
-        status = dit.initialize_service(
-            project_root=str(self.model_dir),
-            config_path=CONFIG_PATH,
+        self._pipe = YuE2Pipeline.from_pretrained(
+            "m-a-p/YuE2-3B",
             device=self.device,
-            use_flash_attention=False,
-            compile_model=False,
-            offload_to_cpu=False,
-            offload_dit_to_cpu=False,
+            cache_dir=str(self.model_dir / "hf_cache"),
+            local_files_only=True,
+            progress=False,
         )
-        message = status[0] if isinstance(status, tuple) else str(status)
-        if not message.startswith("[OK]"):
-            raise RuntimeError(f"ACE-Step init failed: {message}")
-        self._llm = LLMHandler()
-        self._dit = dit
+        self._base_config = self._pipe.generation_config
 
     def unload(self) -> None:
-        """Drop the handler's models; the caller then frees the CUDA cache."""
-        dit, self._dit, self._llm = self._dit, None, None
-        if dit is not None:
-            for name in ("model", "vae", "text_encoder", "text_tokenizer", "silence_latent"):
-                setattr(dit, name, None)
+        pipe, self._pipe = self._pipe, None
+        if pipe is not None:
+            pipe.close()
+        del pipe
+        gc.collect()
 
     def generate(self, request: SongRequest, out_path: str | Path) -> tuple[Path, int]:
-        """Render the song to ``out_path`` (WAV as ACE-Step writes it). Returns (path, seed used)."""
+        """Render the song to ``out_path`` (48 kHz WAV). Returns (path, seed used)."""
         self.load()
-        from acestep.inference import GenerationConfig, GenerationParams, generate_music
-
         seed = request.seed if request.seed is not None else random.randrange(2**31 - 1)
-        params = GenerationParams(
-            task_type="text2music",
-            caption=request.caption,
-            lyrics="" if request.instrumental else request.lyrics,
-            instrumental=request.instrumental,
-            vocal_language=request.vocal_language,
-            bpm=request.bpm,
-            keyscale=request.keyscale or "",
-            timesignature=request.timesignature,
-            duration=float(request.duration),
-            inference_steps=request.inference_steps,
+        base = self._base_config
+        self._pipe.generation_config = (
+            base if request.ode_steps is None else dataclasses.replace(base, ode_steps=request.ode_steps)
+        )
+        song = self._pipe(
+            style=request.style,
+            lyrics=request.lyrics,
+            cot=request.cot,
+            cfg_scale=request.cfg_scale,
             seed=seed,
-            shift=3.0,
-            infer_method="ode",
-            thinking=False,
-            use_cot_metas=False,
-            use_cot_caption=False,
-            use_cot_lyrics=False,
-            use_cot_language=False,
+            abc=request.abc,
+            abc_sampling=request.abc_sampling,
+            semantic_sampling=request.semantic_sampling,
         )
-        config = GenerationConfig(
-            batch_size=1,
-            use_random_seed=False,
-            seeds=[seed],
-            audio_format="wav",
-        )
-        with self._lock, tempfile.TemporaryDirectory(prefix="acestep-") as scratch:
-            result = generate_music(self._dit, self._llm, params, config, save_dir=scratch)
-            if not result.success or not result.audios:
-                raise RuntimeError(f"ACE-Step generation failed: {result.error}")
-            produced = Path(result.audios[0]["path"])
-            out_path = Path(out_path)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(produced), out_path)
+        out_path = Path(out_path)
+        sf.write(str(out_path), song.audio, song.sample_rate, subtype="PCM_16")
         return out_path, seed
