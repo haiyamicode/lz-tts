@@ -26,7 +26,7 @@ from .api.server import (
     get_health_status,
     set_status,
 )
-from .api.take_stream import Mp3Segment, Mp3Segmenter
+from .api.take_stream import Mp3Segment, Mp3Segmenter, mp3_duration_seconds
 from .api.worker_common import ChildWorkerDied
 from .process_guard import hard_exit
 
@@ -531,6 +531,22 @@ def _callback_token(lease: dict[str, Any]) -> str | None:
     return token if isinstance(token, str) and token else None
 
 
+def _artifact_duration(audio: bytes, content_type: str | None) -> float | None:
+    """Length of a finished artifact in seconds; None when it can't be measured.
+
+    An MP3 is counted frame by frame. A take is a bare LAME stream, so ffprobe
+    has only the first frame's bitrate to go on and reads a VBR take 10-20%
+    short — and a short duration is what the exporter trims each block to, which
+    cuts the end off the line. Other containers state their length in the header,
+    where ffprobe is exact.
+    """
+    if (content_type or "").startswith("audio/mpeg"):
+        seconds = mp3_duration_seconds(audio)
+        if seconds is not None:
+            return seconds
+    return _measure_audio_duration(audio)
+
+
 def _measure_audio_duration(audio: bytes) -> float | None:
     """Measure audio duration in seconds via ffprobe; None when unavailable."""
     if not audio:
@@ -798,7 +814,7 @@ async def _prepare_result(
             await segments.finish(audio)
         else:
             await taskflow.upload(lease, artifact_id, audio)
-        duration = await asyncio.to_thread(_measure_audio_duration, audio)
+        duration = await asyncio.to_thread(_artifact_duration, audio, result.content_type)
         completion: dict[str, Any] = {
             **(result.data or {}),
             "kind": "artifact",

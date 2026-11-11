@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import tempfile
 import unittest
 
 import numpy as np
@@ -12,6 +13,7 @@ from .take_stream import (
     OrderedChunkAudio,
     StreamingEncodeError,
     StreamingMp3Encoder,
+    mp3_duration_seconds,
     parse_mp3_frame,
 )
 
@@ -39,6 +41,20 @@ def _sample_rate(audio: bytes) -> int:
         if parse_mp3_frame(audio[start : start + 4]) is not None:
             return (44100, 48000, 32000)[(audio[start + 2] >> 2) & 0x03]
     raise AssertionError("no MP3 frame")
+
+
+def _ffprobe_seconds(audio: bytes) -> float:
+    """What ffprobe makes of the file's own header, which is what the worker used to report."""
+    with tempfile.NamedTemporaryFile(suffix=".mp3") as handle:
+        handle.write(audio)
+        handle.flush()
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+             handle.name],
+            capture_output=True,
+            check=True,
+        )
+    return float(result.stdout.strip())
 
 
 def _segments(audio: bytes, chunk: int, seconds: float = 1.0):
@@ -71,6 +87,31 @@ class Mp3FrameTest(unittest.TestCase):
         self.assertIsNone(parse_mp3_frame(b"ID3\x04"))
         self.assertIsNone(parse_mp3_frame(bytes([0xFF, 0xFD, 0xE4, 0x00])))  # layer II
         self.assertIsNone(parse_mp3_frame(bytes([0xFF, 0xFB, 0xF4, 0x00])))  # bad bitrate
+
+
+class Mp3DurationTest(unittest.TestCase):
+    def test_counts_a_streamed_take_ffprobe_reads_short(self):
+        take, _ = asyncio.run(_encode(_tone(6.0)))
+        played = _probe_seconds(take)
+        self.assertAlmostEqual(mp3_duration_seconds(take), played, delta=0.05)
+        # The take carries no Xing frame, so ffprobe has only the first frame's
+        # bitrate to go on and reads the take short - the length that used to be
+        # stored, and that the exporter then cut each block to.
+        self.assertLess(_ffprobe_seconds(take), played - 0.3)
+
+    def test_counts_a_take_with_an_id3_tag_and_xing_frame(self):
+        take = _audio_to_mp3_bytes(_tone(4.0), SAMPLE_RATE)
+        self.assertEqual(take[:3], b"ID3")
+        played = _probe_seconds(take)
+        counted = mp3_duration_seconds(take)
+        # Over by the encoder's padding frame, never under: the exporter trims to
+        # this, so erring long leaves silence and erring short cuts speech.
+        self.assertGreaterEqual(counted, played)
+        self.assertAlmostEqual(counted, played, delta=0.05)
+
+    def test_no_frames(self):
+        self.assertIsNone(mp3_duration_seconds(b""))
+        self.assertIsNone(mp3_duration_seconds(b"not audio"))
 
 
 class Mp3SegmenterTest(unittest.TestCase):

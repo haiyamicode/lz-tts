@@ -75,6 +75,42 @@ def _id3v2_length(data: bytes | bytearray) -> int | None:
     return 10 + size + footer
 
 
+def mp3_duration_seconds(data: bytes | bytearray | memoryview) -> float | None:
+    """Length of a complete MP3 in seconds, counted frame by frame.
+
+    A take is a bare LAME stream with no Xing header — each segment has to stand
+    on its own — and ffprobe then has nothing to read the length from but the
+    first frame's bitrate, which reads a VBR take 10-20% short. Adding up the
+    frames is exact with or without a Xing header, and costs one pass over the
+    buffer. None when the data holds no frames.
+    """
+    view = memoryview(data)
+    offset = 0
+    if view[:3] == b"ID3":
+        tag_length = _id3v2_length(view)
+        if tag_length is None:
+            return None
+        offset = tag_length
+    seconds = 0.0
+    first = True
+    while offset + 4 <= len(view):
+        frame = parse_mp3_frame(view[offset : offset + 4])
+        if frame is None:
+            offset += 1
+            continue
+        # A Xing/Info header is a silent frame describing the stream, not audio.
+        if not (first and _is_xing_frame(view[offset : offset + frame.length])):
+            seconds += frame.seconds
+        first = False
+        offset += frame.length
+    return seconds if not first else None
+
+
+def _is_xing_frame(frame: bytes | bytearray | memoryview) -> bool:
+    head = bytes(frame[:48])
+    return b"Xing" in head or b"Info" in head
+
+
 @dataclass(frozen=True)
 class Mp3Segment:
     data: bytes
