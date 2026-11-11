@@ -15,6 +15,8 @@ if [ "${LZAI_SKIP_DATA_DOWNLOAD:-0}" = "1" ]; then
     echo "[bootstrap] LZAI_SKIP_DATA_DOWNLOAD=1 — skipping S3 data sync"
 else
     echo "[bootstrap] Syncing model artifacts from S3..."
+    # Media weights (~60 GB in all) come down only for the features listed in
+    # LZAI_MEDIA_FEATURES ("music,videogen,lipsync"; unset = none).
     uv run --no-project --with boto3 --with python-dotenv \
         python scripts/download_data.py
 fi
@@ -34,26 +36,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2b. Music runtime venv (src/media_runtime: YuE2 + YingMusic-SVC, Python 3.11,
-#     its own torch). Separate lockfile and interpreter; the image's uv is
-#     system-python-only, so this sync lets uv fetch a managed 3.11. The
-#     prebuilt pyworld / yue2-infer wheels come from data/runtime-wheels (S3
-#     step above). LZAI_SKIP_MUSIC_RUNTIME=1 skips it on workers that never
-#     serve generate-music.
+# 2b. Media runtime venv (src/media_runtime: YuE2 + YingMusic-SVC + ComfyUI/H3,
+#     Python 3.11, its own torch cu130). Separate lockfile and interpreter; the
+#     image's uv is system-python-only, so this sync lets uv fetch a managed
+#     3.11. The prebuilt pyworld / yue2-infer wheels come from
+#     data/runtime-wheels (S3 step above). Synced only when LZAI_MEDIA_FEATURES
+#     whitelists at least one feature (music, videogen, lipsync).
 # ---------------------------------------------------------------------------
-if [ "${LZAI_SKIP_MUSIC_RUNTIME:-0}" = "1" ]; then
-    echo "[bootstrap] LZAI_SKIP_MUSIC_RUNTIME=1 — skipping music runtime venv"
+if [ -z "$(echo "${LZAI_MEDIA_FEATURES:-}" | tr -d ' ,')" ]; then
+    echo "[bootstrap] LZAI_MEDIA_FEATURES is empty — no media runtime venv"
 else
-    MUSIC_DIR=src/media_runtime
-    MUSIC_HASH="$(cat $MUSIC_DIR/uv.lock $MUSIC_DIR/pyproject.toml | md5sum | awk '{print $1}')"
-    if [ -f $MUSIC_DIR/.venv/.sync-hash ] && [ "$(cat $MUSIC_DIR/.venv/.sync-hash)" = "$MUSIC_HASH" ]; then
-        echo "[bootstrap] music .venv matches its uv.lock + pyproject.toml (${MUSIC_HASH}*) — skipping uv sync"
+    MEDIA_DIR=src/media_runtime
+    MEDIA_HASH="$(cat $MEDIA_DIR/uv.lock $MEDIA_DIR/pyproject.toml | md5sum | awk '{print $1}')"
+    if [ -f $MEDIA_DIR/.venv/.sync-hash ] && [ "$(cat $MEDIA_DIR/.venv/.sync-hash)" = "$MEDIA_HASH" ]; then
+        echo "[bootstrap] media .venv matches its uv.lock + pyproject.toml (${MEDIA_HASH}*) — skipping uv sync"
     else
-        echo "[bootstrap] Running uv sync for the music runtime..."
-        (cd $MUSIC_DIR && UV_PYTHON_PREFERENCE=managed \
+        echo "[bootstrap] Running uv sync for the media runtime..."
+        (cd $MEDIA_DIR && UV_PYTHON_PREFERENCE=managed \
             UV_PYTHON_INSTALL_DIR=/app/cache/uv-python uv sync --frozen --no-dev)
-        echo "$MUSIC_HASH" > $MUSIC_DIR/.venv/.sync-hash
-        echo "[bootstrap] music uv sync complete"
+        echo "$MEDIA_HASH" > $MEDIA_DIR/.venv/.sync-hash
+        echo "[bootstrap] media uv sync complete"
     fi
 fi
 

@@ -8,15 +8,14 @@ render, Whisper and the pin placement all get only the voice:
    model was trained at);
 2. the vocals go to 16 kHz mono, all the rest needs;
 3. ZipEnhancer (ModelScope ``iic/speech_zipenhancer_ans_multiloss_16k_base``;
-   the network vendored in :mod:`ai_worker._vendor.zipenhancer`) removes the
+   the network vendored in :mod:`h3.zipenhancer`) removes the
    noise left, in the 2 s windows (1.5 s stride, each window's outer 0.25 s
    dropped) of ModelScope's own pipeline, batched on the GPU;
 4. the result is set to the vocals' speech level, its peak kept under full
    scale.
 
 The caller's audio is still what the job delivers. Both models are the
-``speech_cleanup`` model artifact
-(:data:`apiserver.model_artifact_prepare.SPEECH_CLEANUP_ASSET_PATHS`).
+files under ``data/lipsync/speech-cleanup`` (the ``SPEECH_CLEANUP_*_PATH`` constants in :mod:`h3.compat`).
 """
 
 from __future__ import annotations
@@ -62,7 +61,7 @@ def _paths() -> tuple[Path, Path, Path]:
         SPEECH_CLEANUP_DEMUCS_PATH, SPEECH_CLEANUP_ZIPENHANCER_PATH, SPEECH_CLEANUP_ZIPENHANCER_CONFIG_PATH))
     missing = [str(path) for path in paths if not path.exists()]
     if missing:
-        raise FileNotFoundError(f"speech_cleanup models are missing (expected prepare-provisioned {', '.join(missing)})")
+        raise FileNotFoundError(f"speech_cleanup models are missing (expected {', '.join(missing)})")
     return paths
 
 

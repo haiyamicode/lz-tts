@@ -79,7 +79,12 @@ class MusicPipeline:
         with self._lock:
             self._activate("song")
 
-    def _activate(self, group: str) -> None:
+    def release(self) -> None:
+        """Unload whichever group is resident, so another runtime (H3) can have the GPU."""
+        with self._lock:
+            self._activate(None)
+
+    def _activate(self, group: str | None) -> None:
         if self._resident == group:
             return
         if self._resident == "song":
@@ -90,6 +95,8 @@ class MusicPipeline:
         self._resident = None
         gc.collect()
         torch.cuda.empty_cache()
+        if group is None:
+            return
         started = time.monotonic()
         if group == "song":
             self.song.load()

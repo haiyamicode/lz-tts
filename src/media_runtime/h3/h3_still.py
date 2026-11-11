@@ -191,7 +191,7 @@ def decode_still(vae: Any, samples: dict) -> Any:
 class VigenH3StillRender:
     """Text-to-image or reference edit: one H3 latent frame, sampled and decoded."""
 
-    CATEGORY = "vigen"
+    CATEGORY = "lzai"
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "render"
 

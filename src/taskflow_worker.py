@@ -39,7 +39,11 @@ TASK_TYPES = (
     "language-detect",
     "transcribe",
     "generate-music",
+    "videogen",
+    "lipsync",
 )
+# Media runtime task types: advertised only when the worker's server.json ``media`` enables them.
+_MEDIA_TASK_TYPES = {"generate-music": "music", "videogen": "videogen", "lipsync": "lipsync"}
 
 # Task types whose payload carries no operation field: the task type implies
 # exactly one operation. Everything else (tts-synthesis) reads payload["operation"].
@@ -50,7 +54,18 @@ _TYPE_OPERATIONS = {
     "language-detect": "detect-language",
     "transcribe": "transcribe",
     "generate-music": "generate-music",
+    "videogen": "videogen",
+    "lipsync": "lipsync",
 }
+
+
+def served_task_types(config: Any) -> tuple[str, ...]:
+    """TASK_TYPES minus the media task types this worker's config leaves off."""
+    return tuple(
+        task_type
+        for task_type in TASK_TYPES
+        if task_type not in _MEDIA_TASK_TYPES or getattr(config.media, _MEDIA_TASK_TYPES[task_type])
+    )
 _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
 # Join, heartbeat, pull, settle and leave are small requests (pulls long-poll
 # for at most a second); a minute is plenty, and a hung heartbeat must not hold
@@ -130,6 +145,7 @@ class TaskflowWorker:
     # batch never keeps a normal job waiting behind it.
     low_priority_batch_size: int = 3
     persistent: bool = False
+    task_types: tuple[str, ...] = TASK_TYPES
     session_id: str | None = None
     session_token: str | None = None
     heartbeat_interval: float = 15.0
@@ -206,7 +222,7 @@ class TaskflowWorker:
                 "ephemeral": not self.persistent,
                 "metadata": metadata,
                 "capabilities": {
-                    "taskTypes": list(TASK_TYPES),
+                    "taskTypes": list(self.task_types),
                     "concurrency": self.concurrency,
                 },
             },
@@ -277,7 +293,7 @@ class TaskflowWorker:
         body: dict[str, Any] = {
             "maxTasks": max_tasks or self.concurrency,
             "waitMs": wait_ms,
-            "taskTypes": list(TASK_TYPES),
+            "taskTypes": list(self.task_types),
         }
         # A Taskflow server older than these pull filters ignores them.
         if min_priority is not None:
@@ -1218,6 +1234,7 @@ async def run_worker() -> None:
         persistent=_env_bool("TASKFLOW_WORKER_PERSISTENT", False),
     )
     inference = LzTtsInferenceSession()
+    taskflow.task_types = served_task_types(inference.config)
     try:
         await inference.start()
     except BaseException:  # pylint: disable=broad-exception-caught

@@ -1,4 +1,4 @@
-"""Paths and logging the vigen H3 modules relied on from its apiserver package."""
+"""Paths and logging shared by the H3 videogen and lipsync modules."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ RUNTIME_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = RUNTIME_DIR.parents[1]
 DATA_DIR = REPO_DIR / "data"
 
+#: ComfyUI source, the two H3 custom nodes and the H3 weights (data/comfyui, S3-baked).
+COMFYUI_DIR = DATA_DIR / "comfyui"
 #: Support models for lipsync (data/lipsync, S3-baked like the rest of data/).
 LIPSYNC_DIR = DATA_DIR / "lipsync"
 WHISPER_MEDIUM_ROOT = LIPSYNC_DIR / "faster-whisper-medium"

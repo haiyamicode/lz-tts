@@ -1,61 +1,37 @@
-"""MiniMax H3 FL2VA videogen runtime (headless ComfyUI).
+"""MiniMax H3 FL2VA video runtime (headless ComfyUI), for ``videogen`` and ``lipsync``.
 
-Three sampling recipes share this runtime, selected by ``H3_VARIANT``:
-
-- ``int8_turbo`` (default) - the community-validated Turbo LoRA recipe below.
-- ``int8_dmd3`` - the same Turbo graph with our 3-step DMD2 avatar student
-  ("DMD3") in place of the ema850 LoRA, sampling every other sigma of the
-  6-step schedule. Roughly half the diffusion time of ``int8_turbo``.
-- ``nvfp4_vanilla`` - the unmodified pruned-NVFP4 FL2VA checkpoint with the
-  stock ComfyUI sampler chain (no LoRA), the recipe benchmarked on a single
-  RTX 5090 (10 steps, ``res_multistep`` on ``simple``).
-
-The default recipe is the serving runtime for ``backend == "minimax_h3"`` and it is the
-community-validated setup, node for node: the pruned **int8_convrot** H3 FL2VA
-base, the **nvfp4** Qwen3-VL text encoder, fp16 video / fp32 audio VAEs, the
-``MiniMaxH3TurboLoRA`` node (``ema_ckpt850`` weights, ``strength=1.0``,
-``low_vram=true``) and the ``MiniMaxH3TurboSampler``, scheduled by
-``BasicScheduler(simple, 6)``. Verified as a standalone reproduction in
-``local/experiments/flf2v-comfyui-20260908/workflow_flf2v_reddit.json``, whose
-graph :func:`build_h3_graph` mirrors exactly; ``tests/test_minimax_h3_comfy_runtime.py``
-fails if the two ever disagree.
+Served recipe (``H3_VARIANT=int8_turbo``, the default): the pruned
+**int8_convrot** FL2VA base, the **int4_convrot** Qwen3-VL 32B text encoder,
+fp16 video / fp32 audio VAEs, the ``MiniMaxH3TurboLoRA`` node (``strength=1.0``,
+``low_vram=true``) and the ``MiniMaxH3TurboSampler``, 4 steps on ``simple``.
+Lipsync swaps the LoRA for our 3-step student (:data:`LIPSYNC_LORA_NAME`) and
+samples under SLA block-sparse attention. ``int8_dmd3`` and ``nvfp4_vanilla``
+are kept as alternative recipes; the env overrides (``H3_UNET_NAME``,
+``H3_CLIP_NAME``, ``H3_TURBO_LORA_NAME``, ``H3_STEPS``...) still apply.
 
 The geometry is ours to choose, the grid is not. H3 encodes latents at 16x and
 patches them 2x2, so a canvas whose keyframes condition the DiT has to sit on a
 32-px lattice; ``resolve_output_dimensions`` searches that lattice for the pair
 holding the requested aspect ratio instead of rounding each axis on its own, and
 ``fit_video_dimensions`` finishes the clip at exactly the frame size the client
-named (uniform scale, sub-percent centre crop - never a squeeze). The uploaded
-keyframes are handed to ``LoadImage`` unmodified, exactly like the reference
-workflow hands one jpg to both the first- and last-frame inputs; the node crops
-them to the canvas, and the frame count is whatever the node's own ``17k+5``
-``temporal_shape`` snapping makes of the requested length. The one thing this
-module changes in the runtime tree is that fit: upstream stretches the first
-keyframe but crops the last one, which shows up as a first/last-frame scale
-mismatch on every off-grid canvas, so
-:func:`ensure_minimax_h3_keyframe_geometry` keeps both keyframes on the same
-aspect-preserving crop (see the constants below).
+named (uniform scale, sub-percent centre crop - never a squeeze). The frame count
+is whatever the node's own ``17k+5`` ``temporal_shape`` snapping makes of the
+requested length. The one thing this module changes in the ComfyUI tree is the
+keyframe fit: upstream stretches the first keyframe but crops the last one, so
+:func:`ensure_minimax_h3_keyframe_geometry` keeps both on the same
+aspect-preserving crop.
 
-Runtime provisioning contract (a worker-prepare
-pattern):
+Provisioning: ``data/comfyui`` (S3-baked like the rest of ``data/``; override
+with ``H3_COMFYUI_DIR``) holds the ComfyUI source, the ``ComfyUI-MiniMax-H3-Turbo``
+and ``ComfyUI-H3-SLA-Attention`` custom nodes and the weights under
+``models/<type>/``.
 
-- The ComfyUI runtime source tree is extracted by a worker-prepare
-  ``extract_zip`` action into ``data/runtime/comfyui`` (override with
-  ``H3_COMFYUI_DIR``); the action's ``ready_path`` is ``main.py``.
-- The Turbo node ships the same way into
-  ``data/runtime/comfyui/custom_nodes/ComfyUI-MiniMax-H3-Turbo``.
-- The H3 weights are downloaded into
-  ``data/model_artifacts/minimax-h3/comfyui/models/<type>/`` by the
-  ``minimax_h3_comfy_turbo`` model artifact and symlinked into the ComfyUI
-  model directories by worker-prepare ``symlink`` actions.
+The headless ComfyUI prompt executor runs in-process; the retained executor
+keeps the models warm between jobs, and :func:`unload_retained_h3_runtime`
+drops it, unloads every ComfyUI model and clears the CUDA cache (the media
+runtime does that before it loads the music models).
 
-Runs the headless ComfyUI prompt executor inside the worker process. The
-retained executor keeps the loaded models (int8_convrot transformer, Qwen3-VL
-NVFP4-AWQ text encoder, video/audio VAEs) warm between videogen jobs so
-consecutive jobs only pay pipeline cost. Unloading drops the retained executor,
-unloads all ComfyUI models, and clears the CUDA cache.
-
-FL2VA always decodes the audio VAE, so the output mp4 carries a synchronized
+FL2VA always decodes the audio VAE, so a videogen mp4 carries a synchronized
 audio track; the Turbo Sampler is what keeps that track intelligible.
 """
 
@@ -74,21 +50,22 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from .compat import log_event
-from .compat import data_dir, project_path
+from .compat import COMFYUI_DIR, data_dir, project_path
 
 H3_FPS = 24.0
 
 #: Pruned int8_convrot FL2VA base - the checkpoint the Turbo LoRA is validated
 #: against ("default pruned_int8_convrot model"), 21 GB, streamed by ComfyUI.
-DEFAULT_UNET_NAME = "MiniMax-H3_FL2VA-INT8-ConvRot.safetensors"
-DEFAULT_CLIP_NAME = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+DEFAULT_UNET_NAME = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+#: int4 ConvRot Qwen3-VL 32B text encoder (15 GB; the nvfp4 one needs Blackwell).
+DEFAULT_CLIP_NAME = "qwen3vl_32b_minimax_h3_int4_convrot.safetensors"
 DEFAULT_VIDEO_VAE_NAME = "minimax_h3_video_vae_fp16.safetensors"
 DEFAULT_AUDIO_VAE_NAME = "minimax_h3_audio_vae_fp32.safetensors"
 
 #: The Turbo LoRA the reference run uses ("the ema_ckpt850 version", which the
 #: author says beat the non-ema one, and which the node ships a silu(t_emb)
 #: grid for so one LoRA covers every pruned base).
-DEFAULT_TURBO_LORA_NAME = "minimax_h3_turbo_4step_ema_ckpt850.safetensors"
+DEFAULT_TURBO_LORA_NAME = "minimax_h3_turbo_4step_ema_ckpt500_pruned_comfyui.safetensors"
 #: README: "Keep strength at 1.0. It's tuned for 1.0 and holds up across the
 #: 4-8 step range."
 DEFAULT_TURBO_STRENGTH = 1.0
@@ -144,10 +121,9 @@ H3_CANVAS_ASPECT_WARN = 0.02
 H3_DEFAULT_WIDTH = 1344
 H3_DEFAULT_HEIGHT = 768
 
-#: Reference recipe: 6 steps on the ``simple`` schedule. The node's minimum is
-#: 4, and the validated 32 GB setup runs 6 ("with low_vram on it needs 6 steps
-#: otherwise there will be big issues with motion").
-DEFAULT_STEPS = 6
+#: Served recipe: the Turbo LoRA's 4 steps on the ``simple`` schedule (the node's
+#: minimum; the upstream reference runs 6).
+DEFAULT_STEPS = 4
 DEFAULT_SCHEDULER = "simple"
 #: Step count reported to the job record; :func:`h3_steps` is what the graph uses.
 H3_RECIPE_STEPS = DEFAULT_STEPS
@@ -299,7 +275,7 @@ def ensure_minimax_h3_keyframe_geometry(comfy_root: Path | None = None) -> str:
             continue
         out.append(line)
 
-    tmp_path = path.with_name(f".{path.name}.vigen.tmp")
+    tmp_path = path.with_name(f".{path.name}.h3.tmp")
     tmp_path.write_text("".join(out), encoding="utf-8")
     os.replace(tmp_path, path)
     if h3_keyframe_geometry_state(path.parent.parent) != "patched":
@@ -312,7 +288,7 @@ _SAVE_VIDEO_NODE_ID = "17"
 # Node id of the SaveImage in the still-image graph.
 _SAVE_IMAGE_NODE_ID = "40"
 # H3 inference output files land under this subfolder of the ComfyUI output dir.
-_OUTPUT_SUBDIR_PREFIX = "vigen_jobs"
+_OUTPUT_SUBDIR_PREFIX = "jobs"
 
 
 def _env(name: str, default: str) -> str:
@@ -408,7 +384,7 @@ def comfyui_runtime_dir() -> Path:
     value = os.getenv("H3_COMFYUI_DIR")
     if value:
         return project_path(value)
-    return data_dir() / "runtime" / "comfyui"
+    return COMFYUI_DIR
 
 
 def _stock_h3_nodes():
@@ -820,9 +796,8 @@ def ensure_comfyui_runtime() -> Path:
     comfy_root = comfyui_runtime_dir()
     if not (comfy_root / "main.py").exists():
         raise FileNotFoundError(
-            "ComfyUI runtime is not provisioned. Expected the worker-prepare "
-            f"'extract_zip' action to create {comfy_root} with main.py. "
-            "Set H3_COMFYUI_DIR to an existing ComfyUI checkout to override."
+            f"ComfyUI runtime is not provisioned: {comfy_root} has no main.py "
+            "(download data/comfyui, or set H3_COMFYUI_DIR to a ComfyUI checkout)."
         )
     return comfy_root
 
@@ -848,8 +823,7 @@ def ensure_minimax_h3_models(
     missing = [str(path) for path in required.values() if not path.exists()]
     if missing:
         raise FileNotFoundError(
-            "MiniMax H3 model artifacts are missing (expected prepare-provisioned "
-            f"symlinks under {comfy_root / 'models'}): " + ", ".join(missing)
+            f"MiniMax H3 weights are missing under {comfy_root / 'models'}: " + ", ".join(missing)
         )
     return required
 
@@ -872,8 +846,7 @@ def ensure_minimax_h3_turbo_node(comfy_root: Path | None = None) -> Path:
     missing = [str(path) for path in required.values() if not path.exists()]
     if missing:
         raise FileNotFoundError(
-            "MiniMax H3 Turbo ComfyUI node is not provisioned. Expected the "
-            f"worker-prepare 'extract_zip' action to create {node_dir} "
+            f"MiniMax H3 Turbo ComfyUI node is not provisioned at {node_dir} "
             "(https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo, v1.2.3 or "
             "newer - older versions garble the audio): " + ", ".join(missing)
         )
@@ -1231,6 +1204,14 @@ def _load_comfy_modules(comfy_root: Path) -> None:
     main.apply_custom_paths()
 
 
+def load_retained_h3_runtime(*, generate_audio: bool = True) -> Path:
+    """Import ComfyUI and register its nodes now (no model weights load until a job runs).
+
+    Returns the ComfyUI root; :func:`sparse_attention_unavailable` is only meaningful after this.
+    """
+    return _retained_runtime(generate_audio=generate_audio).comfy_root
+
+
 def _retained_runtime(
     *,
     generate_audio: bool = False,
@@ -1414,7 +1395,7 @@ def run_minimax_h3_inference(
 
     ``length`` is the requested frame count at 24 fps; the node's own
     ``temporal_shape`` snaps it up to the model's 17k+5 frame grid. ``steps``
-    defaults to the reference recipe's 6 on the ``simple`` schedule.
+    defaults to the served recipe's 4 (Turbo LoRA) on the ``simple`` schedule.
     ``generate_audio`` defaults to ``True``: FL2VA carries a synchronized audio
     stream and the Turbo Sampler is what keeps it intelligible.
 
@@ -1449,19 +1430,19 @@ def run_minimax_h3_inference(
         stage_timings[name] = round(seconds, 3)
         log_event("minimax_h3_stage_complete", job_id=job_id, stage=name, seconds=round(seconds, 3))
 
-    job_input_dir = comfy_root / "input" / "vigen_jobs" / job_id
+    job_input_dir = comfy_root / "input" / "jobs" / job_id
     job_input_dir.mkdir(parents=True, exist_ok=True)
     # Distinct node-side names: the same upload used for both keyframes (the
     # normal FL2VA-off-by-default case) and two different files that happen to
     # share a basename must both survive the copy.
-    first_frame_input = f"vigen_jobs/{job_id}/first_frame{image_path.suffix}"
+    first_frame_input = f"jobs/{job_id}/first_frame{image_path.suffix}"
     shutil.copyfile(image_path, comfy_root / "input" / first_frame_input)
     last_frame_input: str | None = None
     if last_frame_path is not None:
-        last_frame_input = f"vigen_jobs/{job_id}/last_frame{last_frame_path.suffix}"
+        last_frame_input = f"jobs/{job_id}/last_frame{last_frame_path.suffix}"
         shutil.copyfile(last_frame_path, comfy_root / "input" / last_frame_input)
 
-    filename_prefix = f"vigen_jobs/{job_id}/output"
+    filename_prefix = f"jobs/{job_id}/output"
     geometry = keyframe_geometry_report(
         image_path=image_path, last_frame_path=last_frame_path, canvas=canvas
     )
@@ -1512,10 +1493,10 @@ def run_minimax_h3_inference(
     move_started = time.perf_counter()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(saved_path), output_path)
-    generated_dir = comfy_output_dir / "vigen_jobs" / job_id
+    generated_dir = comfy_output_dir / "jobs" / job_id
     if generated_dir.exists():
         shutil.rmtree(generated_dir, ignore_errors=True)
-    _cleanup_job_inputs(comfy_root / "input" / "vigen_jobs" / job_id)
+    _cleanup_job_inputs(comfy_root / "input" / "jobs" / job_id)
     if not output_path.exists():
         raise FileNotFoundError(f"MiniMax H3 inference did not produce output at {output_path}")
 
@@ -1619,7 +1600,7 @@ def run_lipsync_chunk(
             log_event("minimax_h3_sparse_attention_unavailable", job_id=job_id, chunk=chunk_index, reason=reason)
             sparse_attention = False
 
-    relative_dir = f"vigen_jobs/{job_id}"
+    relative_dir = f"jobs/{job_id}"
     input_dir = comfy_root / "input" / relative_dir
     input_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"c{chunk_index:03d}"
@@ -1738,7 +1719,7 @@ def run_minimax_h3_still(
     """Render one still on the retained H3 runtime; returns stage metrics.
 
     ``width``/``height`` must already be an H3 canvas (32-pixel grid, at most
-    about 1 MP; see :mod:`ai_worker.h3_still`).
+    about 1 MP; see :mod:`h3.h3_still`).
     """
     from . import h3_still
 
@@ -1808,7 +1789,7 @@ def cleanup_h3_job_files(job_id: str) -> None:
     """Remove a job's staged inputs and leftover outputs from the ComfyUI tree."""
     comfy_root = comfyui_runtime_dir()
     for base in (comfy_root / "input", comfy_root / "output"):
-        shutil.rmtree(base / "vigen_jobs" / job_id, ignore_errors=True)
+        shutil.rmtree(base / "jobs" / job_id, ignore_errors=True)
 
 
 def _cleanup_job_inputs(job_input_dir: Path) -> None:

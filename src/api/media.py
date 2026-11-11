@@ -1,9 +1,9 @@
-"""generate-music: client for the music runtime process (src/media_runtime).
+"""Client for the media runtime process (src/media_runtime): generate-music, videogen, lipsync.
 
-YuE2 and YingMusic-SVC run from their own venv (Python 3.11, torch 2.14, cu130), so
-the runtime cannot be a multiprocessing child like the speech and transcribe
-workers. The API starts it as ``server.py --port N``, polls GET /health until it
-reports ``ok``, and sends each task as POST /generate on 127.0.0.1.
+YuE2, YingMusic-SVC and ComfyUI/H3 run from their own venv (Python 3.11, torch 2.14, cu130), so
+the runtime cannot be a multiprocessing child like the speech and transcribe workers. The API
+starts it as ``server.py --port N --features ...``, polls GET /health until it reports ``ok``, and
+sends each task as one POST on 127.0.0.1 (/generate, /videogen, /lipsync).
 """
 
 from __future__ import annotations
@@ -29,12 +29,12 @@ MAX_REFERENCE_BYTES = 30 * 1024 * 1024
 REFERENCE_TIMEOUT_SECONDS = 60.0
 
 
-class MusicInputError(ValueError):
-    """The request is invalid for the music runtime (HTTP 400)."""
+class MediaInputError(ValueError):
+    """The request is invalid for the media runtime (HTTP 400)."""
 
 
-class MusicRuntimeError(RuntimeError):
-    """The music runtime failed to start, load, or generate."""
+class MediaRuntimeError(RuntimeError):
+    """The media runtime failed to start, load, or render."""
 
 
 class SamplingOverrides(BaseModel):
@@ -85,6 +85,103 @@ class MusicRequest(BaseModel):
         return self
 
 
+class VideogenRequest(BaseModel):
+    """The ``videogen`` request: H3 image-to-video (4-step Turbo), with H3's own audio track.
+
+    ``width``/``height`` (both or neither) are the delivered frame size; omitted, the clip keeps
+    the image's aspect on H3's 32-px lattice (about 1 MP).
+    """
+
+    model_config = {"extra": "forbid"}
+
+    prompt: str = Field(min_length=1, max_length=4000, description="What happens in the clip")
+    image_url: str = Field(min_length=1, description="First frame")
+    last_frame_url: str | None = Field(default=None, description="Optional last frame")
+    duration_seconds: float = Field(default=3.0, gt=0, le=10, description="Clip length at 24 fps")
+    width: int | None = Field(default=None, ge=64, le=4096)
+    height: int | None = Field(default=None, ge=64, le=4096)
+    seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
+    generate_audio: bool = True
+
+    @model_validator(mode="after")
+    def _size_pair(self) -> "VideogenRequest":
+        if (self.width is None) != (self.height is None):
+            raise ValueError("width and height go together")
+        return self
+
+
+class LipsyncTranscriptItem(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    text: str = Field(min_length=1)
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+
+
+class LipsyncInstruction(BaseModel):
+    """A caller instruction at a ``timestamp`` or over ``start``-``end`` (seconds of the whole video)."""
+
+    model_config = {"extra": "forbid"}
+
+    instruction: str = Field(min_length=1, max_length=2000)
+    timestamp: float | None = Field(default=None, ge=0)
+    start: float | None = Field(default=None, ge=0)
+    end: float | None = Field(default=None, ge=0)
+    text_hint: str | None = Field(default=None, max_length=500)
+    pin_chunk: bool = False
+    pin_image_url: str | None = None
+    detect_flicker: bool | None = None
+    detect_desync: bool | None = None
+    detect_glitches: bool | None = None
+
+    @model_validator(mode="after")
+    def _when(self) -> "LipsyncInstruction":
+        point = self.timestamp is not None
+        span = self.start is not None and self.end is not None
+        if point == span or (self.start is None) != (self.end is None):
+            raise ValueError("an instruction takes either timestamp or start and end")
+        if span and self.end <= self.start:
+            raise ValueError("instruction end must be after start")
+        if self.pin_chunk and not span:
+            raise ValueError("pin_chunk needs start and end")
+        if self.pin_image_url and not self.pin_chunk:
+            raise ValueError("pin_image_url needs pin_chunk")
+        return self
+
+
+class OutputDimensions(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    width: int = Field(ge=64, le=4096)
+    height: int = Field(ge=64, le=4096)
+
+
+class LipsyncRequest(BaseModel):
+    """The ``lipsync`` request: the person in ``image_url`` speaks ``audio_url`` (H3 lipsync LoRA).
+
+    The output lasts as long as the audio and carries it unmodified; it has the image's size, or
+    fits inside ``output_dimensions`` with its aspect kept.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    image_url: str = Field(min_length=1)
+    audio_url: str = Field(min_length=1)
+    seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
+    prompt: str | None = Field(
+        default=None, max_length=8000, description="Prompt template with {{text}} (and optional {{language}})"
+    )
+    transcript: list[LipsyncTranscriptItem] | None = Field(
+        default=None, description="Timed words; omitted, Whisper transcribes the audio"
+    )
+    custom_instructions: list[LipsyncInstruction] = Field(default_factory=list, max_length=100)
+    sparse_attention: bool = True
+    detect_flicker: bool = True
+    detect_desync: bool = True
+    detect_glitches: bool = True
+    output_dimensions: OutputDimensions | None = None
+
+
 async def fetch_reference(url: str, dest: Path) -> Path:
     """Download the clone reference to ``dest``; a fetch failure is the caller's bad input."""
     try:
@@ -96,15 +193,15 @@ async def fetch_reference(url: str, dest: Path) -> Path:
                     async for chunk in response.aiter_bytes():
                         written += len(chunk)
                         if written > MAX_REFERENCE_BYTES:
-                            raise MusicInputError("reference_url is larger than 30 MB")
+                            raise MediaInputError("reference_url is larger than 30 MB")
                         handle.write(chunk)
     except httpx.HTTPError as exc:
-        raise MusicInputError(f"reference_url could not be fetched: {exc}") from exc
+        raise MediaInputError(f"reference_url could not be fetched: {exc}") from exc
     return dest
 
 
-class MusicRuntime:
-    """The music runtime child process and its HTTP client; one instance per API process."""
+class MediaRuntime:
+    """The media runtime child process and its HTTP client; one instance per API process."""
 
     def __init__(
         self,
@@ -113,12 +210,16 @@ class MusicRuntime:
         port: int,
         gpu: str | None,
         ready_timeout_seconds: float,
+        features: list[str],
     ):
-        self.python = python
-        self.runtime_dir = Path(runtime_dir)
+        # Relative paths are the repo's (server.json), not the runtime dir the child starts in.
+        repo_dir = Path(__file__).resolve().parents[2]
+        self.python = str(repo_dir / python) if not Path(python).is_absolute() and "/" in python else python
+        self.runtime_dir = repo_dir / runtime_dir
         self.port = port
         self.gpu = gpu
         self.ready_timeout_seconds = ready_timeout_seconds
+        self.features = list(features)
         self._process: subprocess.Popen | None = None
         self._start_lock = asyncio.Lock()
 
@@ -132,7 +233,7 @@ class MusicRuntime:
         if self.gpu is not None:
             env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
             env["CUDA_VISIBLE_DEVICES"] = self.gpu
-        _LOGGER.info("Starting music runtime on port %s (gpu=%s)", self.port, self.gpu)
+        _LOGGER.info("Starting media runtime on port %s (gpu=%s, features=%s)", self.port, self.gpu, self.features)
         self._process = subprocess.Popen(
             [
                 self.python,
@@ -143,6 +244,8 @@ class MusicRuntime:
                 str(self.port),
                 "--device",
                 "cuda:0",
+                "--features",
+                ",".join(self.features),
             ],
             cwd=self.runtime_dir,
             env=env,
@@ -162,7 +265,7 @@ class MusicRuntime:
         async with httpx.AsyncClient(base_url=self.base_url, timeout=5.0) as client:
             while True:
                 if self._process is None or self._process.poll() is not None:
-                    raise MusicRuntimeError("music runtime exited before it was ready")
+                    raise MediaRuntimeError("media runtime exited before it was ready")
                 try:
                     health = (await client.get("/health")).json()
                 except (httpx.HTTPError, ValueError):
@@ -171,23 +274,24 @@ class MusicRuntime:
                 if status == "ok":
                     return
                 if status == "error":
-                    raise MusicRuntimeError(f"music runtime failed: {health.get('reason')}")
+                    raise MediaRuntimeError(f"media runtime failed: {health.get('reason')}")
                 if time.monotonic() >= deadline:
-                    raise MusicRuntimeError(f"music runtime not ready after {self.ready_timeout_seconds:.0f} s")
+                    raise MediaRuntimeError(f"media runtime not ready after {self.ready_timeout_seconds:.0f} s")
                 await asyncio.sleep(2.0)
 
-    async def generate(self, body: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+    async def post(self, path: str, body: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+        """POST one task to the runtime; a 400 is the caller's bad input, anything else a runtime failure."""
         await self.ensure_ready()
         timeout = httpx.Timeout(connect=10.0, read=timeout_seconds, write=60.0, pool=10.0)
         async with httpx.AsyncClient(base_url=self.base_url, timeout=timeout) as client:
             try:
-                response = await client.post("/generate", json=body)
+                response = await client.post(path, json=body)
             except httpx.HTTPError as exc:
-                raise MusicRuntimeError(f"music runtime request failed: {exc}") from exc
+                raise MediaRuntimeError(f"media runtime request failed: {exc}") from exc
         if response.status_code == 400:
-            raise MusicInputError(str(response.json().get("detail", "invalid music request")))
+            raise MediaInputError(str(response.json().get("detail", "invalid media request")))
         if response.status_code >= 400:
-            raise MusicRuntimeError(f"music runtime returned {response.status_code}: {response.text[:500]}")
+            raise MediaRuntimeError(f"media runtime returned {response.status_code}: {response.text[:500]}")
         return response.json()
 
     def stop(self) -> None:

@@ -160,7 +160,7 @@ def transcribe(audio) -> Transcript:
         if _WHISPER is None:
             model_dir = whisper_model_dir()
             if not (model_dir / "model.bin").exists():
-                raise FileNotFoundError(f"faster-whisper medium is missing (expected prepare-provisioned {model_dir})")
+                raise FileNotFoundError(f"faster-whisper medium is missing (expected {model_dir})")
             on_gpu = torch.cuda.is_available()
             _WHISPER = WhisperModel(str(model_dir), device="cuda" if on_gpu else "cpu",
                                     compute_type="float16" if on_gpu else "int8")

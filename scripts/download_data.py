@@ -130,6 +130,26 @@ def _is_excluded(rel: str) -> bool:
 
 
 
+# Data dirs of each media runtime feature. Only features whitelisted in
+# LZAI_MEDIA_FEATURES ("music,lipsync"; unset = none) get theirs downloaded.
+MEDIA_FEATURE_DIRS = {
+    "music": ("yue2-3b", "yingmusic-svc"),
+    "videogen": ("comfyui",),
+    "lipsync": ("comfyui", "lipsync"),
+}
+
+
+def media_dirs_to_skip(features: str) -> set[str]:
+    wanted = {name.strip() for name in features.split(",") if name.strip()}
+    unknown = wanted - MEDIA_FEATURE_DIRS.keys()
+    if unknown:
+        raise SystemExit(
+            f"LZAI_MEDIA_FEATURES: unknown {', '.join(sorted(unknown))} "
+            f"(choose from {', '.join(MEDIA_FEATURE_DIRS)})"
+        )
+    every = {d for dirs in MEDIA_FEATURE_DIRS.values() for d in dirs}
+    return every - {d for name in wanted for d in MEDIA_FEATURE_DIRS[name]}
+
 def sync_data_from_s3(
     data_dir: Path | None = None,
     name_filter: str | None = None,
@@ -147,6 +167,8 @@ def sync_data_from_s3(
 
     local_data_dir.mkdir(parents=True, exist_ok=True)
     s3 = get_s3_client()
+    skipped_dirs = media_dirs_to_skip(os.getenv('LZAI_MEDIA_FEATURES', ''))
+    print(f"Media data dirs not downloaded: {', '.join(sorted(skipped_dirs)) or 'none'}")
 
     try:
         print(f"Connecting to Wasabi S3...")
@@ -169,6 +191,8 @@ def sync_data_from_s3(
             if not rel:
                 continue
             model_name = rel.split('/')[0]
+            if model_name in skipped_dirs:
+                continue
             if name_filter and name_filter not in model_name:
                 continue
             filtered.append((obj, rel))

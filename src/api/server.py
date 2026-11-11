@@ -16,6 +16,7 @@ import secrets
 import signal
 import sys
 import tempfile
+import uuid
 import threading
 import time
 import httpx
@@ -56,7 +57,7 @@ from .audio_adjustments import AudioEffect, adjust_audio
 from .take_stream import OrderedChunkAudio, StreamingMp3Encoder
 from .locale_utils import normalize_locale as _normalize_locale_with_region
 from .model_workers import speech_worker_main, transcribe_worker_main
-from .music import MusicInputError, MusicRequest, MusicRuntime, fetch_reference
+from .media import LipsyncRequest, MediaInputError, MediaRuntime, MusicRequest, VideogenRequest, fetch_reference
 from .seed_vc_backend import (
     SeedVCBackend as _SeedVCBackend,
     SeedVCBatchRequest,
@@ -453,18 +454,29 @@ class TranscribeConfig(BaseModel):
     dtype: str = "float16"
 
 
-class MusicConfig(BaseModel):
-    """YuE2 + YingMusic-SVC (the ``generate-music`` task), in its own venv and process (src/media_runtime)."""
+class MediaConfig(BaseModel):
+    """The media runtime (src/media_runtime): its own venv and process, one GPU, one model group at a time.
 
-    enabled: bool = False
+    ``music`` = YuE2 + YingMusic-SVC (``generate-music``), ``videogen`` = H3 image-to-video,
+    ``lipsync`` = H3 lipsync. Each enabled operation's task type is advertised to Taskflow.
+    """
+
+    music: bool = False
+    videogen: bool = False
+    lipsync: bool = False
     python: str = "src/media_runtime/.venv/bin/python"
     runtime_dir: str = "src/media_runtime"
     port: int = 8270
     # CUDA_VISIBLE_DEVICES for the runtime (PCI-order index or UUID). One GPU, Ampere or newer
-    # (YuE2 needs bf16, ~11 GB); the runtime holds one model group at a time.
+    # (YuE2 and H3 need bf16; H3 wants a 24 GB card); the runtime holds one model group at a time.
     gpu: str | None = None
     ready_timeout_seconds: float = Field(default=1800.0, gt=0)
-    generate_timeout_seconds: float = Field(default=3600.0, gt=0)
+    music_timeout_seconds: float = Field(default=3600.0, gt=0)
+    videogen_timeout_seconds: float = Field(default=1800.0, gt=0)
+    lipsync_timeout_seconds: float = Field(default=7200.0, gt=0)
+
+    def features(self) -> list[str]:
+        return [name for name in ("music", "videogen", "lipsync") if getattr(self, name)]
 
 
 class SSMLConfig(BaseModel):
@@ -488,7 +500,7 @@ class ServerConfig(BaseModel):
     ssml: SSMLConfig = Field(default_factory=SSMLConfig)
     aligner: AlignerConfig = Field(default_factory=AlignerConfig)
     transcribe: TranscribeConfig = Field(default_factory=TranscribeConfig)
-    music: MusicConfig = Field(default_factory=MusicConfig)
+    media: MediaConfig = Field(default_factory=MediaConfig)
 
 
 class SparrowSynthesizeOptions(BaseModel):
@@ -960,7 +972,7 @@ _speech_worker: WorkerProcessClient | None = None
 _sparrow_worker: EngineClient | None = None
 _sparrow_model_info: dict[str, dict[str, Any]] = {}
 _transcribe_worker: WorkerProcessClient | None = None
-_media_runtime: MusicRuntime | None = None
+_media_runtime: MediaRuntime | None = None
 _seed_vc_worker: EngineClient | None = None
 _seed_vc_info: dict[str, Any] = {}
 _voxcpm_runtime: VoxCPMRuntime | None = None
@@ -980,7 +992,7 @@ class _EngineLoadState:
 
 _engine_load_states: dict[str, _EngineLoadState] = {
     name: _EngineLoadState(name=name, ready=threading.Event())
-    for name in ("pipertts", "voxcpm", "seed_vc", "transcribe", "music")
+    for name in ("pipertts", "voxcpm", "seed_vc", "transcribe", "media")
 }
 
 _inference_counter = 0
@@ -1126,14 +1138,14 @@ def _load_config() -> ServerConfig:
 
 
 def _engine_enabled(
-    engine: Literal["pipertts", "voxcpm", "seed_vc", "transcribe", "music"],
+    engine: Literal["pipertts", "voxcpm", "seed_vc", "transcribe", "media"],
     config: ServerConfig | None = None,
 ) -> bool:
     cfg = config or _server_config
     if engine == "transcribe":
         return bool(cfg.transcribe.enabled)
-    if engine == "music":
-        return bool(cfg.music.enabled)
+    if engine == "media":
+        return bool(cfg.media.features())
     return bool(getattr(cfg.engines, engine))
 
 
@@ -1329,17 +1341,18 @@ def _ensure_transcribe_worker() -> WorkerProcessClient:
     return _transcribe_worker
 
 
-def _ensure_media_runtime() -> MusicRuntime:
-    """YuE2 / YingMusic-SVC in their own venv and process (the ``generate-music`` task)."""
+def _ensure_media_runtime() -> MediaRuntime:
+    """YuE2 / YingMusic-SVC / ComfyUI-H3 in their own venv and process (music, videogen, lipsync)."""
     global _media_runtime
     if _media_runtime is None:
-        config = _server_config.music
-        _media_runtime = MusicRuntime(
+        config = _server_config.media
+        _media_runtime = MediaRuntime(
             python=config.python,
             runtime_dir=config.runtime_dir,
             port=config.port,
             gpu=config.gpu,
             ready_timeout_seconds=config.ready_timeout_seconds,
+            features=config.features(),
         )
     return _media_runtime
 
@@ -5261,8 +5274,8 @@ async def _load_transcribe_engine() -> None:
         await asyncio.to_thread(worker.call, "health")
 
 
-async def _load_music_engine() -> None:
-    config = _server_config.music
+async def _load_media_engine() -> None:
+    config = _server_config.media
     with _logged_startup_step("media_runtime", runtime_dir=config.runtime_dir, port=config.port):
         runtime = _ensure_media_runtime()
         # A reload replaces the child: stop the old one, then wait for the new one's models to load.
@@ -5285,7 +5298,7 @@ _ENGINE_LOADERS: dict[str, Callable[[], Awaitable[None]]] = {
     "voxcpm": _load_voxcpm_engine,
     "seed_vc": _load_seed_vc_engine,
     "transcribe": _load_transcribe_engine,
-    "music": _load_music_engine,
+    "media": _load_media_engine,
 }
 _engine_reload_tasks: dict[str, asyncio.Task[None]] = {}
 _ENGINE_RELOAD_BACKOFF_SECONDS = 10.0
@@ -5410,10 +5423,10 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
         else:
             _LOGGER.info("Transcribe backend disabled")
 
-        if _engine_enabled("music"):
-            startup_tasks.append(asyncio.create_task(_run_engine_loader("music", _load_music_engine)))
+        if _engine_enabled("media"):
+            startup_tasks.append(asyncio.create_task(_run_engine_loader("media", _load_media_engine)))
         else:
-            _LOGGER.info("Music backend disabled")
+            _LOGGER.info("Media runtime disabled")
 
         if _engine_enabled("seed_vc"):
             startup_tasks.append(asyncio.create_task(_run_engine_loader("seed_vc", _load_seed_vc_engine)))
@@ -6011,10 +6024,13 @@ class LzTtsInferenceSession:
                     result = await self._transcribe(request_data)
                 except TranscribeInputError as exc:
                     raise InferenceOperationError(400, str(exc)) from exc
-            elif operation == "generate-music":
+            elif operation in ("generate-music", "videogen", "lipsync"):
                 try:
-                    result = await self._generate_music(request_data)
-                except MusicInputError as exc:
+                    if operation == "generate-music":
+                        result = await self._generate_music(request_data)
+                    else:
+                        result = await self._render_video(operation, request_data)
+                except MediaInputError as exc:
                     raise InferenceOperationError(400, str(exc)) from exc
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported TTS operation: {operation}")
@@ -6186,8 +6202,8 @@ class LzTtsInferenceSession:
 
     async def _generate_music(self, request_data: dict[str, Any]) -> InferenceResult:
         """YuE2 song from the style and lyrics; with ``reference_url``, the vocal is re-voiced by YingMusic-SVC."""
-        config = _server_config.music
-        if not config.enabled:
+        config = _server_config.media
+        if not config.music:
             raise InferenceOperationError(503, "generate-music is not enabled on this worker")
         request = MusicRequest.model_validate(request_data)
         body: dict[str, Any] = request.model_dump(exclude={"reference_url"}, exclude_none=True)
@@ -6195,7 +6211,7 @@ class LzTtsInferenceSession:
             body["output_dir"] = scratch
             if request.reference_url:
                 body["reference_path"] = str(await fetch_reference(request.reference_url, Path(scratch) / "reference"))
-            produced = await _ensure_media_runtime().generate(body, config.generate_timeout_seconds)
+            produced = await _ensure_media_runtime().post("/generate", body, config.music_timeout_seconds)
             audio = await asyncio.to_thread(Path(produced["path"]).read_bytes)
         return InferenceResult(
             kind="audio",
@@ -6203,6 +6219,50 @@ class LzTtsInferenceSession:
             audio=audio,
             data={"seed": produced["seed"], "mode": produced["mode"]},
         )
+
+    async def _render_video(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
+        """H3 ``videogen`` (image to video) or ``lipsync`` (image + speech to video); an mp4 result.
+
+        The result travels like audio (``kind`` "audio", ``audioBase64`` on /task/sync) with
+        ``content_type`` video/mp4; its data carries the seed, size, frames and render metrics.
+        """
+        config = _server_config.media
+        if not getattr(config, operation):
+            raise InferenceOperationError(503, f"{operation} is not enabled on this worker")
+        model = VideogenRequest if operation == "videogen" else LipsyncRequest
+        request = model.model_validate(request_data)
+        timeout = config.videogen_timeout_seconds if operation == "videogen" else config.lipsync_timeout_seconds
+        with tempfile.TemporaryDirectory(prefix=f"{operation}-") as scratch:
+            body = {
+                "job_id": f"{operation}-{uuid.uuid4().hex}",
+                "payload": request.model_dump(exclude_none=True),
+                "output_dir": scratch,
+            }
+            produced = await _ensure_media_runtime().post(f"/{operation}", body, timeout)
+            video = await asyncio.to_thread(Path(produced["path"]).read_bytes)
+        return InferenceResult(
+            kind="audio",
+            content_type="video/mp4",
+            audio=video,
+            data={
+                **_camel_keys(produced["item"]),
+                "seed": produced["seed"],
+                "wallSeconds": produced["metrics"].get("wall_seconds"),
+            },
+        )
+
+
+def _camel_keys(value: Any) -> Any:
+    """snake_case dict keys (the media runtime's) as the camelCase the API results use."""
+    if isinstance(value, dict):
+        return {
+            "".join(part if i == 0 else part[:1].upper() + part[1:] for i, part in enumerate(str(key).split("_"))):
+            _camel_keys(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_camel_keys(item) for item in value]
+    return value
 
 
 class SyncTaskInput(BaseModel):
@@ -6219,6 +6279,8 @@ class SyncTaskInput(BaseModel):
         "detect-language",
         "transcribe",
         "generate-music",
+        "videogen",
+        "lipsync",
     ]
     request: dict[str, Any]
 

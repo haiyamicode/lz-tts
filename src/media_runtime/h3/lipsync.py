@@ -1,29 +1,29 @@
 """Lipsync: one image of a person plus audio in, a talking video out.
 
 The video is generated with the lipsync student - our 3-step
-first-fold avatar LoRA (:data:`ai_worker.minimax_h3_runtime.LIPSYNC_LORA_NAME`)
+first-fold avatar LoRA (:data:`h3.minimax_h3_runtime.LIPSYNC_LORA_NAME`)
 - while the job's audio is pinned in the latent
-(:func:`ai_worker.minimax_h3_runtime.build_lipsync_graph`), so face, head,
+(:func:`h3.minimax_h3_runtime.build_lipsync_graph`), so face, head,
 hands and body all move with the speech and nothing is composited:
 
 - the output lasts as long as the audio;
 - the output has the image's size, or fits inside ``output_dimensions`` with
   its aspect kept;
-- the result carries ``outputs`` / ``item`` / ``metrics`` / ``seed`` / ``model``.
+- the result carries ``path`` / ``item`` / ``metrics`` / ``seed``.
 
-**Freestyle.** The job's image (``image_url`` / ``image_s3_key`` /
+**Freestyle.** The job's image (``image_url`` /
 ``image_path``) is the only image the render sees. The chunks are cut
-at the quietest frames of the voice (:func:`ai_worker.speech_chunks.quiet_cuts`),
+at the quietest frames of the voice (:func:`h3.speech_chunks.quiet_cuts`),
 and the input image is pinned on every chunk's first and last frame and inside
 it every ``speech_chunks.PIN_GAP_SECONDS`` (2.5-5 s) at the quietest frames in
-reach (:func:`ai_worker.speech_chunks.pause_pins`) - the middle of a pause where
+reach (:func:`h3.speech_chunks.pause_pins`) - the middle of a pause where
 there is one, else the lowest speech energy. Motion and gestures between the
 pins come from the prompt and the pinned audio, and a pose or framing the model
 invents never outlasts the next pin.
 
 **Voice.** The render never hears the raw audio: music, room tone and noise make
 H3 invent things (overlay graphics, punch-ins) and blur the pauses the pins go
-in. :func:`ai_worker.speech_cleanup.clean_voice` separates the vocals (Demucs)
+in. :func:`h3.speech_cleanup.clean_voice` separates the vocals (Demucs)
 and denoises them (ZipEnhancer) into a 16 kHz voice, and that voice is what
 Whisper transcribes, what places the cuts and pins, and what is pinned into
 every chunk's latent. The caller's audio is what the job delivers.
@@ -31,9 +31,9 @@ every chunk's latent. The caller's audio is what the job delivers.
 **Speech.** Each chunk's words come from a timed transcript: the caller's
 ``transcript`` (text items with start/end seconds), or a Whisper transcription
 when there is none. Unless the caller overrides ``prompt``, every chunk is
-prompted with :data:`ai_worker.speech_chunks.PROMPT_TEMPLATE` (general for any
+prompted with :data:`h3.speech_chunks.PROMPT_TEMPLATE` (general for any
 person on camera) and the words spoken in it; a caller ``prompt`` is a template
-of the same kind (:mod:`apiserver.lipsync_prompt`: ``{{text}}`` required,
+of the same kind (:mod:`h3.lipsync_prompt`: ``{{text}}`` required,
 ``{{language}}`` optional) rendered per chunk the same way. The caller's
 ``custom_instructions`` (a ``timestamp`` or a ``start``-``end`` range in
 seconds of the whole video, ``instruction``, optional ``text_hint``) are added
@@ -44,7 +44,7 @@ seconds: ...``, :func:`chunk_instructions`), so each one steers those chunks onl
 A range with ``pin_chunk`` is its own chunk instead, and its instruction is that
 whole chunk's, without a time (:func:`pinned_instructions`): in the built-in
 template it takes the place of the hand choreography
-(:data:`ai_worker.speech_chunks.GESTURE_LINE` and ``SETTLE_LINE``), which
+(:data:`h3.speech_chunks.GESTURE_LINE` and ``SETTLE_LINE``), which
 otherwise wins over it; a caller template gets it as an added line.
 
 **Chunks.** H3 renders one window per pass, so the timeline is cut into chunks
@@ -60,7 +60,7 @@ image; the quiet cuts and pause pins fill the stretches between pinned chunks
 **Validators.** ``detect_flicker`` (lighting jumps, punch-ins, cuts),
 ``detect_desync`` (SyncNet) and ``detect_glitches`` (a CNN for invented
 graphics, sparkles and botched hands) are on unless the payload sets them
-``false``. Each rendered chunk is checked (:mod:`ai_worker.lipsync_checks`) and one that fails is rendered
+``false``. Each rendered chunk is checked (:mod:`h3.lipsync_checks`) and one that fails is rendered
 again on a new seed, up to ``DEFAULT_CHECK_RETRIES`` times; the best take is
 kept and every take's scores are in the chunk's metrics. A custom instruction
 with ``detect_flicker`` / ``detect_desync`` / ``detect_glitches`` set ``false``
@@ -70,7 +70,7 @@ fail it on purpose.
 
 **Attention.** By default every chunk samples with Comfy Kitchen INT8 attention
 under the SLA block-sparse node
-(:func:`ai_worker.minimax_h3_runtime.add_sparse_attention`), the attention the
+(:func:`h3.minimax_h3_runtime.add_sparse_attention`), the attention the
 student was trained with, where the worker supports it, and dense otherwise;
 ``sparse_attention: false`` asks for dense. The result reports what every chunk
 ran.
@@ -83,7 +83,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -91,6 +90,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from urllib.error import URLError
 
 from .lipsync_prompt import render_prompt_template
 from .compat import log_event
@@ -132,6 +132,11 @@ RESEED_STRIDE = 1000
 # planning
 # ---------------------------------------------------------------------------
 
+
+#: Longest audio a job may lipsync (``LIPSYNC_MAX_SECONDS`` overrides).
+DEFAULT_MAX_SECONDS = 300.0
+#: Largest image / audio a job may fetch.
+MAX_INPUT_BYTES = 200 * 1024 * 1024
 
 #: Pins of the job's own image; a pinned chunk's ``pin_image_url`` names its image instead.
 INPUT_IMAGE = "input"
@@ -195,10 +200,10 @@ def pinned_spans(items: list[dict[str, Any]], *, fps: float, total_frames: int, 
 def freestyle_plan(samples, *, total_frames: int, fps: float, chunk_cap: int,
                    pinned: list[PinnedSpan] = ()) -> tuple[list[int], list[int]]:
     """Freestyle's chunk cuts and pins from the cleaned 16 kHz voice: the cuts at
-    the quietest frames (:func:`ai_worker.speech_chunks.quiet_cuts`, chunks of at
+    the quietest frames (:func:`h3.speech_chunks.quiet_cuts`, chunks of at
     most ``MAX_CHUNK_SECONDS`` and ``chunk_cap``), and the pins - every chunk's
     ends plus its inner pins every ``PIN_GAP_SECONDS`` at the quietest frames
-    (:func:`ai_worker.speech_chunks.pause_pins`). Each ``pinned`` span is its own
+    (:func:`h3.speech_chunks.pause_pins`). Each ``pinned`` span is its own
     chunk with no inner pins, and the quiet cuts fill the stretches between them.
     Returns ``(cut_frames, pins)``, the pins sorted and including frame 0 and the
     last frame."""
@@ -527,9 +532,18 @@ def _download_url(job_id: str, url: str, path: Path, *, input_name: str, kind: s
         raise ValueError(f"{input_name} must use http or https")
     path.parent.mkdir(parents=True, exist_ok=True)
     log_event("job_input_download_started", job_id=job_id, kind=kind, input=input_name, url_host=parsed.netloc)
-    with urlopen(Request(url, headers={"User-Agent": "vigen-api/0.1"}), timeout=120) as response:
-        with path.open("wb") as file:
-            shutil.copyfileobj(response, file, 1024 * 1024)
+    written = 0
+    try:
+        with urlopen(Request(url, headers={"User-Agent": "lzai-media/1.0"}), timeout=120) as response:
+            with path.open("wb") as file:
+                while chunk := response.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > MAX_INPUT_BYTES:
+                        raise ValueError(f"{input_name} is larger than {MAX_INPUT_BYTES // 2**20} MB")
+                    file.write(chunk)
+    except (URLError, TimeoutError) as exc:
+        # A dead link or an unreachable host is the caller's input, not a worker failure.
+        raise ValueError(f"{input_name} could not be fetched: {exc}") from exc
     log_event("job_input_download_complete", job_id=job_id, kind=kind, input=input_name, bytes=path.stat().st_size)
     return path
 
@@ -543,15 +557,12 @@ def download_job_input(
     *,
     kind: str = "lipsync",
 ) -> Path:
-    """Fetch a ``<name>_url`` / ``<name>_s3_key`` / ``<name>_path`` job input."""
+    """Fetch a ``<name>_url`` / ``<name>_path`` job input."""
     job_id = str(job["id"])
     url = payload.get(f"{name}_url")
-    s3_key = payload.get(f"{name}_s3_key")
     if url:
         suffix = Path(urlparse(str(url)).path).suffix or fallback_suffix
         return _download_url(job_id, str(url), scratch_dir / "inputs" / f"{name}_url{suffix}", input_name=f"{name}_url", kind=kind)
-    if s3_key:
-        raise ValueError(f"{name}_s3_key is not supported here: pass {name}_url or {name}_path")
     if payload.get(f"{name}_path"):
         from .compat import project_path
 
@@ -559,7 +570,7 @@ def download_job_input(
         if not path.exists():
             raise FileNotFoundError(f"{name}_path does not exist: {path}")
         return path
-    raise ValueError(f"{kind} job payload requires {name}_url, {name}_s3_key or {name}_path")
+    raise ValueError(f"{kind} job payload requires {name}_url or {name}_path")
 
 
 def extract_frame(video_path: Path, frame_index: int, output_path: Path) -> Path:
@@ -587,15 +598,9 @@ def _check(render: Path, audio: Path, chunk: LipsyncChunk, *, flicker: bool, des
         return {"error": f"{type(exc).__name__}: {exc}", "flagged": False, "badness": 0.0}
 
 
-#: Layout of a paused job's ``result.progress`` (:mod:`ai_worker.job_checkpoint`); progress saved under
-#: another version is ignored and the job starts over.
-PROGRESS_VERSION = 1
-
-
 def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, input_image: Path,
               pin_images: int, fps: float, job_id: str, finish: Any) -> dict[str, Any]:
-    """The job's plan - chunks, pins, prompts and per-chunk validators - as JSON, so a paused job
-    resumes on exactly this plan wherever it is claimed next."""
+    """The job's plan: chunks, pins, prompts and per-chunk validators."""
     from .minimax_h3_runtime import resolve_canvas
 
     # Timing: the caller's timed transcript, else Whisper's word timestamps.
@@ -610,6 +615,9 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
 
     began = time.perf_counter()
     audio_duration = media_duration(audio_path)
+    max_seconds = float(os.environ.get("LIPSYNC_MAX_SECONDS") or DEFAULT_MAX_SECONDS)
+    if audio_duration > max_seconds:
+        raise ValueError(f"audio is {audio_duration:.1f} s; lipsync takes at most {max_seconds:g} s")
     total_frames = max(1, int(round(audio_duration * fps)))
     source_width, source_height = image_size(input_image)
     canvas = resolve_canvas(image_path=input_image)
@@ -701,9 +709,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     checking = detect_flicker or detect_desync or detect_glitches
     check_retries = _env_int("LIPSYNC_CHECK_RETRIES", DEFAULT_CHECK_RETRIES)
     fps = float(H3_FPS)
-    # A job paused at a checkpoint carries on from its saved progress.
-    progress = None  # no pause/resume here: Taskflow schedules whole jobs
-    stage_timings: dict[str, float] = dict(progress["stage_timings"]) if progress else {}
+    stage_timings: dict[str, float] = {}
 
     def finish(name: str, began: float) -> None:
         stage_timings[name] = round(time.perf_counter() - began, 3)
@@ -722,9 +728,6 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
             str(item["pin_image_url"]) for item in custom_instructions if item.get("pin_chunk") and item.get("pin_image_url")
         ))
     }
-    if progress:
-        voice_path = _download_url(job_id, progress["voice"]["download_url"], work_dir / "voice.wav",
-                                   input_name="progress_voice")
     finish("input_download_seconds", began)
 
     # The job's image, the only image the render sees.
@@ -734,17 +737,12 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
         url: prepare_pin_image(path, work_dir / "anchors" / f"pin{index}.png", size=(source_width, source_height))
         for index, (url, path) in enumerate(pin_downloads.items())
     }}
-    if progress:
-        plan = progress["plan"]
-        log_event("lipsync_resumed", job_id=job_id, chunks_done=len(progress["chunks"]),
-                  chunks=len(plan["chunk_texts"]), claims=progress["claims"])
-    else:
-        # The voice alone - no music, no noise - is what the rest of the job hears.
-        began = time.perf_counter()
-        voice_path = clean_voice(audio_path, work_dir / "voice.wav", job_id=job_id)
-        finish("voice_cleanup_seconds", began)
-        plan = _new_plan(payload, voice_path=voice_path, audio_path=audio_path, input_image=input_image,
-                         pin_images=len(pin_downloads), fps=fps, job_id=job_id, finish=finish)
+    # The voice alone - no music, no noise - is what the rest of the job hears.
+    began = time.perf_counter()
+    voice_path = clean_voice(audio_path, work_dir / "voice.wav", job_id=job_id)
+    finish("voice_cleanup_seconds", began)
+    plan = _new_plan(payload, voice_path=voice_path, audio_path=audio_path, input_image=input_image,
+                     pin_images=len(pin_downloads), fps=fps, job_id=job_id, finish=finish)
     audio_duration = float(plan["audio_duration"])
     total_frames = int(plan["total_frames"])
     canvas_width, canvas_height = plan["canvas"]
@@ -753,22 +751,10 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     chunks = plan_chunks(total_frames, max_frames=int(plan["chunk_cap"]), anchors=anchors, cut_frames=plan["cut_frames"])
     pinned_chunks = set(plan["pinned_chunks"])
     chunk_texts, prompts, instructions = plan["chunk_texts"], plan["prompts"], plan["instructions"]
-    claims = (progress["claims"] if progress else 0) + 1
-
-    # The chunks rendered in earlier claims.
-    done = list(progress["chunks"]) if progress else []
     chunk_paths: list[tuple[Path, int]] = []
     chunk_metrics: list[dict[str, Any]] = []
-    for entry in done:
-        index = int(entry["index"])
-        path = _download_url(job_id, entry["download_url"], work_dir / f"chunk{index:03d}" / "kept.mp4",
-                             input_name="progress_chunk")
-        chunk_paths.append((path, chunks[index].frames))
-        chunk_metrics.append(entry["metrics"])
-
-    claim_output_seconds = 0.0
     try:
-        for chunk in chunks[len(done):]:
+        for chunk in chunks:
             began = time.perf_counter()
             chunk_dir = work_dir / f"chunk{chunk.index:03d}"
             audio_slice = extract_audio_slice(
@@ -832,10 +818,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
                 **({"checks": [attempt_verdict for _, _, attempt_verdict in attempts if attempt_verdict is not None],
                     "kept_attempt": kept, "flagged": bool(verdict and verdict["flagged"])} if checking else {}),
                 **({"checks_off": sorted(off)} if checking and off else {}),
-                # The claim that rendered it: 1, or later when the job paused for other work.
-                "claim": claims,
             })
-            claim_output_seconds += chunk.frames / fps
     finally:
         cleanup_h3_job_files(job_id)
 
@@ -865,11 +848,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     if bounding_box is not None:
         delivered_width, delivered_height = image_size(output_path)
 
-    began = time.perf_counter()
-    uploaded = {"download_url": None, "size": output_path.stat().st_size, "etag": None}
-    finish("upload_seconds", began)
-
-    total_seconds = (progress["wall_seconds"] if progress else 0.0) + time.perf_counter() - job_started
+    total_seconds = time.perf_counter() - job_started
     render_seconds = sum(float(m["pipeline_seconds"]) for m in chunk_metrics)
     transcript = plan["transcript"]
     item = {
@@ -903,18 +882,11 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     }
     if bounding_box is not None:
         item["output_dimensions"] = {"width": bounding_box[0], "height": bounding_box[1]}
-    log_event("lipsync_complete", job_id=job_id, wall_seconds=round(total_seconds, 3), claims=claims, **{
+    log_event("lipsync_complete", job_id=job_id, wall_seconds=round(total_seconds, 3), **{
         key: item[key] for key in ("frames", "chunks", "anchors", "width", "height")
     })
     return {
-        "outputs": [
-            {
-                "name": output_name,
-                "path": str(output_path),
-                "size": uploaded["size"],
-                "etag": uploaded["etag"],
-            }
-        ],
+        "path": str(output_path),
         "item": item,
         "metrics": {
             "engine": "comfyui_lipsync",
@@ -922,8 +894,6 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
             "render_seconds": round(render_seconds, 3),
             "wall_rtf": round(total_seconds / audio_duration, 3) if audio_duration else None,
             "render_rtf": round(render_seconds / audio_duration, 3) if audio_duration else None,
-            # Claims the job was rendered over: more than one when it paused for other work.
-            "claims": claims,
             "stage_timings": stage_timings,
             "chunks": chunk_metrics,
         },
