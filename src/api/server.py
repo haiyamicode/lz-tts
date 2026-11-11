@@ -57,7 +57,15 @@ from .audio_adjustments import AudioEffect, adjust_audio
 from .take_stream import OrderedChunkAudio, StreamingMp3Encoder
 from .locale_utils import normalize_locale as _normalize_locale_with_region
 from .model_workers import speech_worker_main, transcribe_worker_main
-from .media import LipsyncRequest, MediaInputError, MediaRuntime, MusicRequest, VideogenRequest, fetch_reference
+from .media import (
+    ImagegenRequest,
+    LipsyncRequest,
+    MediaInputError,
+    MediaRuntime,
+    MusicRequest,
+    VideogenRequest,
+    fetch_reference,
+)
 from .seed_vc_backend import (
     SeedVCBackend as _SeedVCBackend,
     SeedVCBatchRequest,
@@ -458,12 +466,14 @@ class MediaConfig(BaseModel):
     """The media runtime (src/media_runtime): its own venv and process, one GPU, one model group at a time.
 
     ``music`` = YuE2 + YingMusic-SVC (``generate-music``), ``videogen`` = H3 image-to-video,
-    ``lipsync`` = H3 lipsync. Each enabled operation's task type is advertised to Taskflow.
+    ``lipsync`` = H3 lipsync, ``imagegen`` = H3 stills. Each enabled operation's task type is
+    advertised to Taskflow.
     """
 
     music: bool = False
     videogen: bool = False
     lipsync: bool = False
+    imagegen: bool = False
     python: str = "src/media_runtime/.venv/bin/python"
     runtime_dir: str = "src/media_runtime"
     port: int = 8270
@@ -474,9 +484,10 @@ class MediaConfig(BaseModel):
     music_timeout_seconds: float = Field(default=3600.0, gt=0)
     videogen_timeout_seconds: float = Field(default=1800.0, gt=0)
     lipsync_timeout_seconds: float = Field(default=7200.0, gt=0)
+    imagegen_timeout_seconds: float = Field(default=900.0, gt=0)
 
     def features(self) -> list[str]:
-        return [name for name in ("music", "videogen", "lipsync") if getattr(self, name)]
+        return [name for name in ("music", "videogen", "lipsync", "imagegen") if getattr(self, name)]
 
 
 class SSMLConfig(BaseModel):
@@ -6024,12 +6035,12 @@ class LzTtsInferenceSession:
                     result = await self._transcribe(request_data)
                 except TranscribeInputError as exc:
                     raise InferenceOperationError(400, str(exc)) from exc
-            elif operation in ("generate-music", "videogen", "lipsync"):
+            elif operation in ("generate-music", "videogen", "lipsync", "imagegen"):
                 try:
                     if operation == "generate-music":
                         result = await self._generate_music(request_data)
                     else:
-                        result = await self._render_video(operation, request_data)
+                        result = await self._render_h3(operation, request_data)
                 except MediaInputError as exc:
                     raise InferenceOperationError(400, str(exc)) from exc
             else:
@@ -6220,18 +6231,19 @@ class LzTtsInferenceSession:
             data={"seed": produced["seed"], "mode": produced["mode"]},
         )
 
-    async def _render_video(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
-        """H3 ``videogen`` (image to video) or ``lipsync`` (image + speech to video); an mp4 result.
+    async def _render_h3(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
+        """H3 ``videogen`` (image to video) / ``lipsync`` (image + speech to video), an mp4, or
+        ``imagegen`` (a still), a PNG.
 
         The result travels like audio (``kind`` "audio", ``audioBase64`` on /task/sync) with
-        ``content_type`` video/mp4; its data carries the seed, size, frames and render metrics.
+        ``content_type`` video/mp4 or image/png; its data carries the seed, size and render metrics.
         """
         config = _server_config.media
         if not getattr(config, operation):
             raise InferenceOperationError(503, f"{operation} is not enabled on this worker")
-        model = VideogenRequest if operation == "videogen" else LipsyncRequest
+        model = {"videogen": VideogenRequest, "lipsync": LipsyncRequest, "imagegen": ImagegenRequest}[operation]
         request = model.model_validate(request_data)
-        timeout = config.videogen_timeout_seconds if operation == "videogen" else config.lipsync_timeout_seconds
+        timeout = getattr(config, f"{operation}_timeout_seconds")
         with tempfile.TemporaryDirectory(prefix=f"{operation}-") as scratch:
             body = {
                 "job_id": f"{operation}-{uuid.uuid4().hex}",
@@ -6239,11 +6251,11 @@ class LzTtsInferenceSession:
                 "output_dir": scratch,
             }
             produced = await _ensure_media_runtime().post(f"/{operation}", body, timeout)
-            video = await asyncio.to_thread(Path(produced["path"]).read_bytes)
+            output = await asyncio.to_thread(Path(produced["path"]).read_bytes)
         return InferenceResult(
             kind="audio",
-            content_type="video/mp4",
-            audio=video,
+            content_type="image/png" if operation == "imagegen" else "video/mp4",
+            audio=output,
             data={
                 **_camel_keys(produced["item"]),
                 "seed": produced["seed"],
@@ -6281,6 +6293,7 @@ class SyncTaskInput(BaseModel):
         "generate-music",
         "videogen",
         "lipsync",
+        "imagegen",
     ]
     request: dict[str, Any]
 

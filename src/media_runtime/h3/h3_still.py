@@ -17,7 +17,7 @@ image: they add no real detail and invent hard specks.
 Vendored, not installed: the node is a minimal port of
 ComfyUI-MiniMax-H3-Image-Studio (github.com/astropuzzo, Unlicense), whose single-
 frame decoder is adapted from ComfyUI-Fizgig-H3-Still commit 10d5171 by Peter
-Neill (MIT, notice below). It runs on the worker's ComfyUI 0.34 and is
+Neill (MIT, notice below). It runs on the worker's ComfyUI 0.39 and is
 registered into the retained runtime by :func:`register_nodes`.
 
 ``decode_still`` - MIT License

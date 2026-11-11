@@ -1,9 +1,9 @@
-"""Client for the media runtime process (src/media_runtime): generate-music, videogen, lipsync.
+"""Client for the media runtime process (src/media_runtime): generate-music, videogen, lipsync, imagegen.
 
 YuE2, YingMusic-SVC and ComfyUI/H3 run from their own venv (Python 3.11, torch 2.14, cu130), so
 the runtime cannot be a multiprocessing child like the speech and transcribe workers. The API
 starts it as ``server.py --port N --features ...``, polls GET /health until it reports ``ok``, and
-sends each task as one POST on 127.0.0.1 (/generate, /videogen, /lipsync).
+sends each task as one POST on 127.0.0.1 (/generate, /videogen, /lipsync, /imagegen).
 """
 
 from __future__ import annotations
@@ -154,6 +154,29 @@ class OutputDimensions(BaseModel):
 
     width: int = Field(ge=64, le=4096)
     height: int = Field(ge=64, le=4096)
+
+
+class ImagegenRequest(BaseModel):
+    """The ``imagegen`` request: an H3 still (50 steps, plain base), text-only or edited from references.
+
+    ``image_urls`` are ``<Picture 1>``..``<Picture N>`` (the prompt may say "image 1" / "picture 2").
+    ``width``/``height`` (both or neither) are the delivered size; the render is H3's ~1 MP canvas
+    with that aspect, resized. Omitted: an edit follows picture 1's shape, text-only is 768x1024.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    prompt: str = Field(min_length=1, max_length=4000)
+    image_urls: list[str] = Field(default_factory=list, max_length=9)
+    width: int | None = Field(default=None, ge=64, le=4096)
+    height: int | None = Field(default=None, ge=64, le=4096)
+    seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
+
+    @model_validator(mode="after")
+    def _size_pair(self) -> "ImagegenRequest":
+        if (self.width is None) != (self.height is None):
+            raise ValueError("width and height go together")
+        return self
 
 
 class LipsyncRequest(BaseModel):

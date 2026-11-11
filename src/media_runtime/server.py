@@ -1,4 +1,4 @@
-"""Media runtime: a localhost HTTP process for the music, videogen and lipsync tasks.
+"""Media runtime: a localhost HTTP process for the music, videogen, lipsync and imagegen tasks.
 
 Runs from its own venv (src/media_runtime/.venv, Python 3.11, torch 2.14, cu130) so the
 YuE2, YingMusic and ComfyUI/H3 dependencies stay apart from lzai. The lzai API
@@ -17,6 +17,8 @@ POST /videogen  -> {"path", "seed", "item", "metrics"}
     body: {"job_id", "payload": h3.videogen payload, "output_dir"}
 POST /lipsync   -> {"path", "seed", "item", "metrics"}
     body: {"job_id", "payload": h3.lipsync payload, "output_dir"}
+POST /imagegen  -> {"path", "seed", "item", "metrics"}  (a PNG)
+    body: {"job_id", "payload": h3.imagegen payload, "output_dir"}
 """
 
 from __future__ import annotations
@@ -33,7 +35,8 @@ from pydantic import BaseModel
 
 import paths  # noqa: F401  (sets the offline Hugging Face cache before model imports)
 
-FEATURES = ("music", "videogen", "lipsync")
+FEATURES = ("music", "videogen", "lipsync", "imagegen")
+H3_FEATURES = ("videogen", "lipsync", "imagegen")
 
 app = FastAPI(title="lzai media runtime")
 _state: dict = {"status": "starting", "reason": "loading models", "features": []}
@@ -118,6 +121,8 @@ def _run_h3(feature: str, body: H3Body) -> dict[str, Any]:
     _require(feature)
     if feature == "videogen":
         from h3.videogen import run_videogen as run
+    elif feature == "imagegen":
+        from h3.imagegen import run_imagegen as run
     else:
         from h3.lipsync import run_lipsync_inference as run
     from h3.compat import job_dir
@@ -130,7 +135,7 @@ def _run_h3(feature: str, body: H3Body) -> dict[str, Any]:
         _h3_resident = True
         try:
             result = run({"id": body.job_id, "payload": body.payload})
-            final = output_dir / f"{feature}-{result['seed']}.mp4"
+            final = output_dir / f"{feature}-{result['seed']}{Path(result['path']).suffix}"
             shutil.move(result["path"], final)
         except (ValueError, FileNotFoundError) as exc:
             # Bad payload or an input that could not be fetched / read.
@@ -148,6 +153,11 @@ def videogen(body: H3Body):
 @app.post("/lipsync")
 def lipsync(body: H3Body):
     return _run_h3("lipsync", body)
+
+
+@app.post("/imagegen")
+def imagegen(body: H3Body):
+    return _run_h3("imagegen", body)
 
 
 def _check_h3_assets(features: list[str]) -> None:
@@ -186,7 +196,7 @@ def _check_h3_assets(features: list[str]) -> None:
 def _load(features: list[str], device: str, fp16: bool) -> None:
     global _pipeline
     try:
-        if "videogen" in features or "lipsync" in features:
+        if any(feature in H3_FEATURES for feature in features):
             _check_h3_assets(features)
         if "music" in features:
             from pipeline import MusicPipeline

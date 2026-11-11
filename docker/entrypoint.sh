@@ -16,7 +16,7 @@ if [ "${LZAI_SKIP_DATA_DOWNLOAD:-0}" = "1" ]; then
 else
     echo "[bootstrap] Syncing model artifacts from S3..."
     # Media weights (~60 GB in all) come down only for the features listed in
-    # LZAI_MEDIA_FEATURES ("music,videogen,lipsync"; unset = none).
+    # LZAI_MEDIA_FEATURES ("music,videogen,lipsync,imagegen"; unset = none).
     uv run --no-project --with boto3 --with python-dotenv \
         python scripts/download_data.py
 fi
@@ -41,7 +41,7 @@ fi
 #     image's uv is system-python-only, so this sync lets uv fetch a managed
 #     3.11. The prebuilt pyworld / yue2-infer wheels come from
 #     data/runtime-wheels (S3 step above). Synced only when LZAI_MEDIA_FEATURES
-#     whitelists at least one feature (music, videogen, lipsync).
+#     whitelists at least one feature (music, videogen, lipsync, imagegen).
 # ---------------------------------------------------------------------------
 if [ -z "$(echo "${LZAI_MEDIA_FEATURES:-}" | tr -d ' ,')" ]; then
     echo "[bootstrap] LZAI_MEDIA_FEATURES is empty — no media runtime venv"

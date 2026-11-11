@@ -41,9 +41,10 @@ TASK_TYPES = (
     "generate-music",
     "videogen",
     "lipsync",
+    "imagegen",
 )
 # Media runtime task types: advertised only when the worker's server.json ``media`` enables them.
-_MEDIA_TASK_TYPES = {"generate-music": "music", "videogen": "videogen", "lipsync": "lipsync"}
+_MEDIA_TASK_TYPES = {"generate-music": "music", "videogen": "videogen", "lipsync": "lipsync", "imagegen": "imagegen"}
 
 # Task types whose payload carries no operation field: the task type implies
 # exactly one operation. Everything else (tts-synthesis) reads payload["operation"].
@@ -56,6 +57,7 @@ _TYPE_OPERATIONS = {
     "generate-music": "generate-music",
     "videogen": "videogen",
     "lipsync": "lipsync",
+    "imagegen": "imagegen",
 }
 
 

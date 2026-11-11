@@ -136,6 +136,7 @@ MEDIA_FEATURE_DIRS = {
     "music": ("yue2-3b", "yingmusic-svc"),
     "videogen": ("comfyui",),
     "lipsync": ("comfyui", "lipsync"),
+    "imagegen": ("comfyui",),
 }
 
 
