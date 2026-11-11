@@ -66,6 +66,45 @@ DEFAULT_STEPS = 50
 DEFAULT_SAMPLER = "er_sde"
 DEFAULT_SCHEDULER = "simple"
 
+#: ``imagegen`` presets. ``standard`` is the plain base (best quality);
+#: ``turbo-8`` is the 8-step FL2V Turbo LoRA (a generic ComfyUI LoRA with
+#: ``diffusion_model.`` keys, so it loads through ``LoraLoaderModelOnly``),
+#: close to ``standard`` on edits, illustrated look on text-only images;
+#: ``turbo-4`` is videogen's 4-step ema ckpt850 LoRA (bare keys + adaln rows,
+#: ``MiniMaxH3TurboLoRA``), fastest and roughest. Measured on the 3090, warm:
+#: a 1-reference edit takes ~54 / 21 / 17.5 s.
+STILL_PRESETS: dict[str, dict[str, Any]] = {
+    "standard": {"steps": DEFAULT_STEPS, "sampler": DEFAULT_SAMPLER, "scheduler": DEFAULT_SCHEDULER, "lora": None},
+    "turbo-8": {
+        "steps": 8,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "lora": {
+            "class_type": "LoraLoaderModelOnly",
+            "name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            "inputs": {"strength_model": 1.0},
+        },
+    },
+    "turbo-4": {
+        "steps": 4,
+        "sampler": "euler",
+        "scheduler": "simple",
+        "lora": {
+            "class_type": "MiniMaxH3TurboLoRA",
+            "name": "minimax_h3_turbo_4step_ema_ckpt850.safetensors",
+            "inputs": {"strength": 1.0, "low_vram": True},
+        },
+    },
+}
+DEFAULT_PRESET = "standard"
+
+
+def still_preset(name: str) -> dict[str, Any]:
+    try:
+        return STILL_PRESETS[name]
+    except KeyError:
+        raise ValueError(f"unknown imagegen preset {name!r}; one of {', '.join(STILL_PRESETS)}") from None
+
 _IMAGE_LABEL = re.compile(r"\bImage\s+([1-9])\b")
 _PICTURE_1 = re.compile(r"<picture\s+1>", re.IGNORECASE)
 

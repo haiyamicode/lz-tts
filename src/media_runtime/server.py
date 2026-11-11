@@ -172,6 +172,13 @@ def _check_h3_assets(features: list[str]) -> None:
     comfy_root, _ = ensure_minimax_h3_runtime_assets(generate_audio=True)
     load_retained_h3_runtime(generate_audio=True)
     _h3_resident = True
+    if "imagegen" in features:
+        from h3.h3_still import STILL_PRESETS
+
+        loras = [comfy_root / "models" / "loras" / spec["lora"]["name"] for spec in STILL_PRESETS.values() if spec["lora"]]
+        missing = [str(path) for path in loras if not path.exists()]
+        if missing:
+            raise FileNotFoundError("imagegen LoRAs are missing: " + ", ".join(missing))
     if "lipsync" in features:
         from h3.minimax_h3_runtime import LIPSYNC_LORA_NAME
 

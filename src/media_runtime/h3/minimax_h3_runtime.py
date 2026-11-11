@@ -1659,22 +1659,23 @@ def build_h3_still_graph(
     seed: int,
     width: int,
     height: int,
-    steps: int,
+    preset: str,
     reference_inputs: list[str],
     filename_prefix: str,
-    sampler: str | None = None,
-    scheduler: str | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """One H3 still: ``{UNET, CLIP, VAE} -> VigenH3StillRender(<- LoadImage x N) -> SaveImage``.
+    """One H3 still: ``{UNET, CLIP, VAE} -> [LoRA] -> VigenH3StillRender(<- LoadImage x N) -> SaveImage``.
 
     The loaders keep the node ids and inputs of :func:`build_h3_graph`, so the
     retained executor's cache hands the still the base model, encoder and VAE
-    that videogen/lipsync already loaded. The base runs without any LoRA
-    (lipsync's student is applied on a clone, never in place).
+    that videogen/lipsync already loaded. ``preset`` (``h3_still.STILL_PRESETS``)
+    sets steps, sampler, scheduler and the optional Turbo LoRA; both LoRA
+    loaders patch a clone, never the cached base.
     ``reference_inputs`` are LoadImage values (relative to the ComfyUI input
     directory) in ``<Picture 1>``..``<Picture N>`` order.
     """
     from . import h3_still
+
+    spec = h3_still.still_preset(preset)
 
     if len(reference_inputs) > h3_still.MAX_REFERENCES:
         raise ValueError(f"H3 conditions on at most {h3_still.MAX_REFERENCES} reference images")
@@ -1683,17 +1684,25 @@ def build_h3_still_graph(
         "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip_name(), "type": "minimax", "device": "default"}},
         "4": {"class_type": "VAELoader", "inputs": {"vae_name": video_vae_name()}},
     }
+    model: list[Any] = ["2", 0]
+    lora = spec["lora"]
+    if lora is not None:
+        graph["18"] = {
+            "class_type": lora["class_type"],
+            "inputs": {"model": ["2", 0], "lora_name": lora["name"], **lora["inputs"]},
+        }
+        model = ["18", 0]
     still_inputs: dict[str, Any] = {
-        "model": ["2", 0],
+        "model": model,
         "clip": ["3", 0],
         "vae": ["4", 0],
         "prompt": prompt,
         "width": int(width),
         "height": int(height),
-        "steps": int(steps),
+        "steps": int(spec["steps"]),
         "seed": int(seed),
-        "sampler_name": sampler or h3_still.DEFAULT_SAMPLER,
-        "scheduler": scheduler or h3_still.DEFAULT_SCHEDULER,
+        "sampler_name": spec["sampler"],
+        "scheduler": spec["scheduler"],
     }
     for index, value in enumerate(reference_inputs, start=1):
         node_id = str(30 + index)
@@ -1716,15 +1725,16 @@ def run_minimax_h3_still(
     width: int,
     height: int,
     seed: int,
-    steps: int,
+    preset: str,
 ) -> dict[str, Any]:
-    """Render one still on the retained H3 runtime; returns stage metrics.
+    """Render one still on the retained H3 runtime with ``preset``; returns stage metrics.
 
     ``width``/``height`` must already be an H3 canvas (32-pixel grid, at most
     about 1 MP; see :mod:`h3.h3_still`).
     """
     from . import h3_still
 
+    spec = h3_still.still_preset(preset)
     h3_still.validate_canvas(int(width), int(height))
     # Take whichever H3 runtime is loaded (videogen and lipsync both keep the
     # audio VAE), so an image job never tears down their models.
@@ -1734,6 +1744,7 @@ def run_minimax_h3_still(
         "unet": comfy_root / "models" / "diffusion_models" / unet_name(),
         "clip": comfy_root / "models" / "text_encoders" / clip_name(),
         "video_vae": comfy_root / "models" / "vae" / video_vae_name(),
+        **({"lora": comfy_root / "models" / "loras" / spec["lora"]["name"]} if spec["lora"] else {}),
     }.items():
         if not path.exists():
             raise FileNotFoundError(f"MiniMax H3 {name} for still images is missing: {path}")
@@ -1753,7 +1764,7 @@ def run_minimax_h3_still(
         seed=seed,
         width=width,
         height=height,
-        steps=steps,
+        preset=preset,
         reference_inputs=reference_inputs,
         filename_prefix=f"{_OUTPUT_SUBDIR_PREFIX}/{job_id}/still",
     )
@@ -1770,16 +1781,18 @@ def run_minimax_h3_still(
         seed=int(seed),
         width=int(width),
         height=int(height),
-        steps=int(steps),
+        preset=preset,
         references=len(reference_paths),
         seconds=round(saved["pipeline_seconds"], 3),
     )
     return {
         "engine": "comfyui_minimax_h3_still",
         "unet": unet_name(),
-        "steps": int(steps),
-        "sampler": h3_still.DEFAULT_SAMPLER,
-        "scheduler": h3_still.DEFAULT_SCHEDULER,
+        "preset": preset,
+        "steps": int(spec["steps"]),
+        "sampler": spec["sampler"],
+        "scheduler": spec["scheduler"],
+        "lora": spec["lora"]["name"] if spec["lora"] else None,
         "pipeline_seconds": round(saved["pipeline_seconds"], 3),
         "cuda_peak_allocated_gib": round(saved["cuda_peak_allocated_gib"], 3),
         "cuda_peak_reserved_gib": round(saved["cuda_peak_reserved_gib"], 3),

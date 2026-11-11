@@ -157,7 +157,10 @@ class OutputDimensions(BaseModel):
 
 
 class ImagegenRequest(BaseModel):
-    """The ``imagegen`` request: an H3 still (50 steps, plain base), text-only or edited from references.
+    """The ``imagegen`` request: an H3 still, text-only or edited from references.
+
+    ``preset``: ``standard`` (plain base, 50 steps, best), ``turbo-8`` (8-step Turbo LoRA, close on
+    edits, illustrated look text-only, ~2.5x faster) or ``turbo-4`` (4-step Turbo LoRA, fastest, roughest).
 
     ``image_urls`` are ``<Picture 1>``..``<Picture N>`` (the prompt may say "image 1" / "picture 2").
     ``width``/``height`` (both or neither) are the delivered size; the render is H3's ~1 MP canvas
@@ -171,6 +174,7 @@ class ImagegenRequest(BaseModel):
     width: int | None = Field(default=None, ge=64, le=4096)
     height: int | None = Field(default=None, ge=64, le=4096)
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
+    preset: Literal["standard", "turbo-8", "turbo-4"] = "standard"
 
     @model_validator(mode="after")
     def _size_pair(self) -> "ImagegenRequest":

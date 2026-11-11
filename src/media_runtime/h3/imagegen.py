@@ -1,7 +1,7 @@
 """H3 still images (``imagegen``): text-to-image and multi-reference editing.
 
-Ported from vigen's ``run_h3_image_generation``. The recipe is :mod:`h3.h3_still`'s
-(plain FL2VA INT8 base, no LoRA, ``er_sde``/``simple``, 50 steps, no CFG). The
+Ported from vigen's ``run_h3_image_generation``. The recipe is a
+:data:`h3.h3_still.STILL_PRESETS` entry on the FL2VA INT8 base, no CFG. The
 still renders on H3's native ~1 MP canvas with the delivered aspect and is then
 Lanczos-resized to the delivered size.
 
@@ -13,7 +13,9 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
 - ``width`` / ``height``: the delivered size (both or neither, 64..4096).
   Omitted, an edit follows ``<Picture 1>``'s shape at the native area and a
   text-only image is 768x1024;
-- ``seed`` (random when omitted).
+- ``seed`` (random when omitted);
+- ``preset``: ``standard`` (default; plain base, 50 steps), ``turbo-8`` (8-step
+  Turbo LoRA) or ``turbo-4`` (videogen's 4-step Turbo LoRA).
 
 The result is ``{"path", "item", "metrics", "seed"}`` like :mod:`h3.videogen`.
 """
@@ -71,6 +73,8 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
         width, height = int(width), int(height)
         if not (64 <= width <= 4096 and 64 <= height <= 4096):
             raise ValueError("width/height must be within 64..4096")
+    preset = str(payload.get("preset") or h3_still.DEFAULT_PRESET)
+    spec = h3_still.still_preset(preset)
     seed = int(payload["seed"]) if payload.get("seed") is not None else random.randint(0, 2**31 - 1)
 
     scratch_dir = job_dir(job_id)
@@ -95,7 +99,7 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
     )
     render_path = scratch_dir / "outputs" / "h3_still.png"
     output_path = scratch_dir / "outputs" / "output.png"
-    log_event("imagegen_started", job_id=job_id, seed=seed, references=len(references),
+    log_event("imagegen_started", job_id=job_id, preset=preset, seed=seed, references=len(references),
               render=[render_width, render_height], delivered=[width, height])
     inference_started = time.perf_counter()
     render_metrics = run_minimax_h3_still(
@@ -106,7 +110,7 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
         width=render_width,
         height=render_height,
         seed=seed,
-        steps=h3_still.DEFAULT_STEPS,
+        preset=preset,
     )
     with Image.open(render_path) as rendered:
         image = rendered.convert("RGB")
@@ -125,7 +129,8 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
             "render_width": render_width,
             "render_height": render_height,
             "references": len(references),
-            "steps": h3_still.DEFAULT_STEPS,
+            "preset": preset,
+            "steps": spec["steps"],
         },
         "metrics": {
             "wall_seconds": round(wall_seconds, 3),
