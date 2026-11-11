@@ -64,8 +64,10 @@ DEFAULT_AUDIO_VAE_NAME = "minimax_h3_audio_vae_fp32.safetensors"
 
 #: The Turbo LoRA the reference run uses ("the ema_ckpt850 version", which the
 #: author says beat the non-ema one, and which the node ships a silu(t_emb)
-#: grid for so one LoRA covers every pruned base).
-DEFAULT_TURBO_LORA_NAME = "minimax_h3_turbo_4step_ema_ckpt500_pruned_comfyui.safetensors"
+#: grid for so one LoRA covers every pruned base). Its keys are bare module
+#: names (``blocks.0...``) with the adaln rows; a ``diffusion_model.``-prefixed
+#: export patches nothing in this node (the old ckpt500 file did exactly that).
+DEFAULT_TURBO_LORA_NAME = "minimax_h3_turbo_4step_ema_ckpt850.safetensors"
 #: README: "Keep strength at 1.0. It's tuned for 1.0 and holds up across the
 #: 4-8 step range."
 DEFAULT_TURBO_STRENGTH = 1.0
