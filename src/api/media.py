@@ -85,8 +85,17 @@ class MusicRequest(BaseModel):
         return self
 
 
+class VideogenPinnedFrame(BaseModel):
+    """A guide image pinned ``seconds`` into the clip (an anchor the render passes through)."""
+
+    model_config = {"extra": "forbid"}
+
+    image_url: str = Field(min_length=1)
+    seconds: float = Field(ge=0, le=10)
+
+
 class VideogenRequest(BaseModel):
-    """The ``videogen`` request: H3 image-to-video (4-step Turbo), with H3's own audio track.
+    """The ``videogen`` request: H3 image-to-video (4-step Turbo), with H3's own audio track or a pinned one.
 
     ``width``/``height`` (both or neither) are the delivered frame size; omitted, the clip keeps
     the image's aspect on H3's 32-px lattice (about 1 MP).
@@ -97,16 +106,32 @@ class VideogenRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000, description="What happens in the clip")
     image_url: str = Field(min_length=1, description="First frame")
     last_frame_url: str | None = Field(default=None, description="Optional last frame")
-    duration_seconds: float = Field(default=3.0, gt=0, le=10, description="Clip length at 24 fps")
+    duration_seconds: float | None = Field(
+        default=None, gt=0, le=10,
+        description="Clip length at 24 fps; omitted: the pinned audio's length, else 3 s",
+    )
     width: int | None = Field(default=None, ge=64, le=4096)
     height: int | None = Field(default=None, ge=64, le=4096)
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
-    generate_audio: bool = True
+    generate_audio: bool = Field(
+        default=True, description="Audio track on the output (the pinned audio when one is given)"
+    )
+    pinned_frames: list[VideogenPinnedFrame] = Field(
+        default_factory=list, max_length=16, description="Guide images pinned at times in the clip"
+    )
+    pinned_audio_url: str | None = Field(
+        default=None, min_length=1,
+        description="Audio pinned in the latent: the video moves to it; it is the output's audio track",
+    )
 
     @model_validator(mode="after")
     def _size_pair(self) -> "VideogenRequest":
         if (self.width is None) != (self.height is None):
             raise ValueError("width and height go together")
+        if self.duration_seconds is not None:
+            late = [pin.seconds for pin in self.pinned_frames if pin.seconds >= self.duration_seconds]
+            if late:
+                raise ValueError(f"pinned_frames at {late} s are past duration_seconds")
         return self
 
 

@@ -1066,6 +1066,50 @@ def build_h3_graph(
     return graph
 
 
+def add_frame_guides(graph: dict[str, dict[str, Any]], guides: list[tuple[int, str]], *, length: int) -> None:
+    """Pin ``(frame_idx, LoadImage input)`` guide images through chained ``MiniMaxH3AddGuide`` nodes.
+
+    Each guide conditions the clip at its pixel frame (an anchor, not an overwrite);
+    ``frame_idx`` must sit inside ``[0, length)``.
+    """
+    conditioning: list[Any] = ["8", 0]
+    for index, (frame_idx, image_input) in enumerate(guides):
+        if not 0 <= int(frame_idx) < int(length):
+            raise ValueError(f"guide frame {frame_idx} is outside the {length}-frame clip")
+        load_id, guide_id = str(100 + index), str(200 + index)
+        graph[load_id] = {"class_type": "LoadImage", "inputs": {"image": image_input}}
+        graph[guide_id] = {
+            "class_type": "MiniMaxH3AddGuide",
+            "inputs": {
+                "positive": conditioning,
+                "vae": ["4", 0],
+                "latent": ["8", 1],
+                "image": [load_id, 0],
+                "frame_idx": int(frame_idx),
+            },
+        }
+        conditioning = [guide_id, 0]
+    graph["11"]["inputs"]["conditioning"] = conditioning
+
+
+def pin_audio(graph: dict[str, dict[str, Any]], audio_input: str) -> None:
+    """Pin ``audio_input`` in the AV latent: the audio VAE (node "5") encodes it and an all-zero
+    ``SolidMask`` through ``SetLatentNoiseMask`` keeps it out of denoising, so the sampler sees the
+    clean audio at every step and moves only the video. The audio is never decoded: the clip comes
+    out video-only and the caller muxes the original audio back."""
+    graph.pop("15", None)
+    graph["16"]["inputs"].pop("audio", None)
+    graph["40"] = {"class_type": "LoadAudio", "inputs": {"audio": audio_input}}
+    graph["41"] = {"class_type": "VAEEncodeAudio", "inputs": {"audio": ["40", 0], "vae": ["5", 0]}}
+    graph["42"] = {"class_type": "SolidMask", "inputs": {"value": 0.0, "width": 8, "height": 8}}
+    graph["43"] = {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["41", 0], "mask": ["42", 0]}}
+    graph["44"] = {
+        "class_type": "LTXVConcatAVLatent",
+        "inputs": {"video_latent": ["8", 1], "audio_latent": ["43", 0]},
+    }
+    graph["13"]["inputs"]["latent_image"] = ["44", 0]
+
+
 def build_lipsync_graph(
     *,
     prompt: str,
@@ -1118,38 +1162,8 @@ def build_lipsync_graph(
         generate_audio=True,
         lora_name=lora_name,
     )
-    # Keep the audio VAE (node "5") as the encoder; drop its decoder.
-    del graph["15"]
-    graph["16"]["inputs"].pop("audio")
-
-    conditioning: list[Any] = ["8", 0]
-    for index, (frame_idx, image_input) in enumerate(guides):
-        if not 0 <= int(frame_idx) < int(length):
-            raise ValueError(f"guide frame {frame_idx} is outside the {length}-frame clip")
-        load_id, guide_id = str(100 + index), str(200 + index)
-        graph[load_id] = {"class_type": "LoadImage", "inputs": {"image": image_input}}
-        graph[guide_id] = {
-            "class_type": "MiniMaxH3AddGuide",
-            "inputs": {
-                "positive": conditioning,
-                "vae": ["4", 0],
-                "latent": ["8", 1],
-                "image": [load_id, 0],
-                "frame_idx": int(frame_idx),
-            },
-        }
-        conditioning = [guide_id, 0]
-    graph["11"]["inputs"]["conditioning"] = conditioning
-
-    graph["40"] = {"class_type": "LoadAudio", "inputs": {"audio": audio_input}}
-    graph["41"] = {"class_type": "VAEEncodeAudio", "inputs": {"audio": ["40", 0], "vae": ["5", 0]}}
-    graph["42"] = {"class_type": "SolidMask", "inputs": {"value": 0.0, "width": 8, "height": 8}}
-    graph["43"] = {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["41", 0], "mask": ["42", 0]}}
-    graph["44"] = {
-        "class_type": "LTXVConcatAVLatent",
-        "inputs": {"video_latent": ["8", 1], "audio_latent": ["43", 0]},
-    }
-    graph["13"]["inputs"]["latent_image"] = ["44", 0]
+    add_frame_guides(graph, guides, length=length)
+    pin_audio(graph, audio_input)
     if sparse_attention:
         add_sparse_attention(graph)
     if sigmas is not None:  # after the attention rewiring: ManualSigmas takes no model
@@ -1392,8 +1406,14 @@ def run_minimax_h3_inference(
     generate_audio: bool = True,
     output_width: int | None = None,
     output_height: int | None = None,
+    guides: list[tuple[int, Path]] | None = None,
+    pinned_audio_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run one H3 FL2VA/i2v generation; returns stage metrics.
+
+    ``guides`` are ``(frame_idx, image)`` pins (:func:`add_frame_guides`).
+    ``pinned_audio_path`` pins that audio in the latent (:func:`pin_audio`; it should
+    last the snapped clip): the video moves to it and the mp4 comes out silent.
 
     ``length`` is the requested frame count at 24 fps; the node's own
     ``temporal_shape`` snaps it up to the model's 17k+5 frame grid. ``steps``
@@ -1423,7 +1443,9 @@ def run_minimax_h3_inference(
     vanilla = is_nvfp4_vanilla()
     engine_name = h3_engine_name()
     started = time.perf_counter()
-    retained = _retained_runtime(generate_audio=generate_audio)
+    # A pinned audio needs the audio VAE as its encoder.
+    audio_vae = generate_audio or pinned_audio_path is not None
+    retained = _retained_runtime(generate_audio=audio_vae)
     comfy_root = retained.comfy_root
     stage_timings: dict[str, float] = {"minimax_h3_runtime_init_seconds": retained.init_seconds}
 
@@ -1472,8 +1494,19 @@ def run_minimax_h3_inference(
         first_frame_input=first_frame_input,
         last_frame_input=last_frame_input,
         filename_prefix=filename_prefix,
-        generate_audio=generate_audio,
+        generate_audio=audio_vae,
     )
+    if guides:
+        staged = []
+        for index, (frame_idx, path) in enumerate(guides):
+            relative = f"jobs/{job_id}/guide{index}{path.suffix}"
+            shutil.copyfile(path, comfy_root / "input" / relative)
+            staged.append((int(frame_idx), relative))
+        add_frame_guides(graph, staged, length=length)
+    if pinned_audio_path is not None:
+        relative = f"jobs/{job_id}/pinned_audio{pinned_audio_path.suffix}"
+        shutil.copyfile(pinned_audio_path, comfy_root / "input" / relative)
+        pin_audio(graph, relative)
     saved_result = _execute_graph(retained, graph, job_id=job_id)
     stage_timings["minimax_h3_pipeline_seconds"] = round(saved_result["pipeline_seconds"], 3)
     log_event(
