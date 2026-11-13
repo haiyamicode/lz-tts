@@ -142,3 +142,15 @@ def test_numeral_characters_are_aligned_as_their_syllables() -> None:
         ("零", "l i n g"),
         ("二", "e r"),
     ]
+
+
+def test_token_pieces_split_letters_over_source_characters():
+    from src.ctc_forced_alignment import _prepare_ctc_transcript
+
+    def pieces(text, language):
+        units = _prepare_ctc_transcript(text, language, star_frequency="segment").units
+        return [[(text[start:end], letters) for start, end, letters in unit.pieces] for unit in units]
+
+    assert pieces("naïve cat", "en") == [[("n", 1), ("a", 1), ("ï", 1), ("v", 1), ("e", 1)], [("c", 1), ("a", 1), ("t", 1)]]
+    assert pieces("今天三月", "zh") == [[("今", 3), ("天", 4)], [("三", 3), ("月", 3)]]
+    assert pieces("안녕", "ko") == [[("안", 2), ("녕", 6)]]

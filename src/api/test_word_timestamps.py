@@ -36,3 +36,23 @@ def test_unspaced_text_maps_each_number():
         ("会", 0, 1), ("议", 1, 2), ("在", 2, 3), ("3", 3, 4), ("月", 4, 5), ("15", 5, 7), ("日", 7, 8),
         ("开", 8, 9), ("始", 9, 10), ("。", 10, 11),
     ]
+
+
+def test_character_tokens_move_past_a_spoken_number():
+    spoken = "in nineteen eighty-seven ok"
+    words = aligned(spoken)
+    for word in words:
+        start, end = word["source_start"], word["source_end"]
+        word["tokens"] = [
+            {"source_start": i, "source_end": i + 1, "start_seconds": word["start_seconds"] + (i - start) / 10,
+             "end_seconds": word["start_seconds"] + (i + 1 - start) / 10}
+            for i in range(start, end)
+        ]
+    text = "in 1987 ok"
+    mapped = [_word_timestamp(text, w) for w in _source_word_timestamps(text, spoken, words)]
+    tokens = [[(t["text"], t["charStart"], t["start"]) for t in w["tokens"]] for w in mapped]
+    assert tokens == [
+        [("i", 0, 0.0), ("n", 1, 0.1)],
+        [("1987", 3, 1.0)],  # spoken-only characters: one token over the written number
+        [("o", 8, 3.0), ("k", 9, 3.1)],
+    ]

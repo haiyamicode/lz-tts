@@ -83,6 +83,7 @@ from .language_id import LanguageDetectRequest, LanguageInputError, SpokenLangua
 from .transcribe import (
     SAMPLE_RATE as TRANSCRIBE_SAMPLE_RATE,
     TranscribeInputError,
+    ForceAlignRequest,
     TranscribeRequest,
     decode_transcribe_audio,
 )
@@ -5082,13 +5083,23 @@ def _word_timestamp(text: str, word: dict[str, Any]) -> dict[str, Any]:
         start += 1
     while end > start and text[end - 1].isspace():
         end -= 1
-    return {
-        "text": text[start:end],
-        "start": round(float(word["start_seconds"]), 3),
-        "end": round(float(word["end_seconds"]), 3),
-        "charStart": start,
-        "charEnd": end,
-    }
+
+    def timing(start_char: int, end_char: int, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "text": text[start_char:end_char],
+            "start": round(float(item["start_seconds"]), 3),
+            "end": round(float(item["end_seconds"]), 3),
+            "charStart": start_char,
+            "charEnd": end_char,
+        }
+
+    # Tokens are characters (a letter, a CJK or kana character, a Hangul syllable); a word
+    # whose characters can't be timed one by one is a single token.
+    tokens = [
+        timing(int(token["source_start"]), int(token["source_end"]), token)
+        for token in word.get("tokens") or ()
+    ]
+    return {**timing(start, end, word), "tokens": tokens or [timing(start, end, word)]}
 
 
 # A CJK character is a token of its own; other tokens run between spaces.
@@ -5107,7 +5118,8 @@ def _source_word_timestamps(
     The tokens of the two texts are matched by edit script; a run of changed
     tokens (1987 -> nineteen eighty-seven) maps every spoken word onto the
     whole written run, and words that land on the same written span become
-    one timestamp.
+    one timestamp. Character tokens move with unchanged written tokens; a word
+    with any spoken-only character keeps one token over its written span.
     """
     source = [match.span() for match in _TIMESTAMP_TOKEN_RE.finditer(text)]
     target = [match.span() for match in _TIMESTAMP_TOKEN_RE.finditer(spoken)]
@@ -5119,12 +5131,16 @@ def _source_word_timestamps(
             [spoken[start:end] for start, end in target],
         )
     ]
+    char_origins: dict[int, int] = {}
     index = 0
     while index < len(opcodes):
         tag, i1, i2, j1, j2 = opcodes[index]
         if tag == "equal":
             for offset in range(j2 - j1):
                 origins[j1 + offset] = source[i1 + offset]
+                spoken_start, spoken_end = target[j1 + offset]
+                for position in range(spoken_end - spoken_start):
+                    char_origins[spoken_start + position] = source[i1 + offset][0] + position
             index += 1
             continue
         while index + 1 < len(opcodes) and opcodes[index + 1][0] != "equal":
@@ -5134,10 +5150,21 @@ def _source_word_timestamps(
             origins[position] = (source[i1][0], source[i2 - 1][1]) if i2 > i1 else None
         index += 1
 
+    def source_tokens(word: dict[str, Any]) -> list[dict[str, Any]] | None:
+        moved = []
+        for piece in word.get("tokens") or ():
+            first = char_origins.get(int(piece["source_start"]))
+            last = char_origins.get(int(piece["source_end"]) - 1)
+            if first is None or last is None or last - first != int(piece["source_end"]) - 1 - int(piece["source_start"]):
+                return None
+            moved.append({**piece, "source_start": first, "source_end": last + 1})
+        return moved or None
+
     mapped: list[dict[str, Any]] = []
     pending_start: float | None = None
     token = 0
     for word in words:
+        tokens = source_tokens(word)
         start, end = int(word["source_start"]), int(word["source_end"])
         while token < len(target) and target[token][1] <= start:
             token += 1
@@ -5151,6 +5178,7 @@ def _source_word_timestamps(
             # Spoken words with nothing written under them join a neighbour.
             if mapped:
                 mapped[-1]["end_seconds"] = word["end_seconds"]
+                mapped[-1]["tokens"] = None
             elif pending_start is None:
                 pending_start = word["start_seconds"]
             continue
@@ -5159,6 +5187,7 @@ def _source_word_timestamps(
         if mapped and source_start < mapped[-1]["source_end"]:
             mapped[-1]["source_end"] = max(mapped[-1]["source_end"], source_end)
             mapped[-1]["end_seconds"] = word["end_seconds"]
+            mapped[-1]["tokens"] = mapped[-1]["tokens"] + tokens if mapped[-1]["tokens"] and tokens else None
             continue
         mapped.append(
             {
@@ -5166,9 +5195,12 @@ def _source_word_timestamps(
                 "start_seconds": word["start_seconds"] if pending_start is None else pending_start,
                 "source_start": source_start,
                 "source_end": source_end,
+                "tokens": tokens if pending_start is None else None,
             }
         )
         pending_start = None
+    # A word whose characters were not all written (1987 -> nineteen eighty-seven)
+    # gets one token: _word_timestamp spans it over the word.
     return mapped
 
 
@@ -6037,9 +6069,12 @@ class LzTtsInferenceSession:
                     result = await self._detect_language(request_data)
                 except LanguageInputError as exc:
                     raise InferenceOperationError(400, str(exc)) from exc
-            elif operation == "transcribe":
+            elif operation in ("transcribe", "force-align"):
                 try:
-                    result = await self._transcribe(request_data)
+                    if operation == "transcribe":
+                        result = await self._transcribe(request_data)
+                    else:
+                        result = await self._force_align(request_data)
                 except TranscribeInputError as exc:
                     raise InferenceOperationError(400, str(exc)) from exc
             elif operation in ("generate-music", "videogen", "lipsync", "imagegen"):
@@ -6177,10 +6212,9 @@ class LzTtsInferenceSession:
         data = await asyncio.to_thread(self.language_identifier.identify, audio, request.top_k)
         return InferenceResult(kind="json", data=data)
 
-    async def _transcribe(self, request_data: dict[str, Any]) -> InferenceResult:
-        request = TranscribeRequest.model_validate(request_data)
-        if request.text is None and not _server_config.transcribe.enabled:
-            raise InferenceOperationError(503, "transcribe is not enabled on this worker")
+    @staticmethod
+    async def _request_audio(request: TranscribeRequest | ForceAlignRequest) -> np.ndarray:
+        """The request's audio, decoded to 16 kHz mono float32."""
         if request.audio_base64:
             try:
                 audio_bytes = base64.b64decode(request.audio_base64, validate=True)
@@ -6193,17 +6227,13 @@ class LzTtsInferenceSession:
             audio_bytes = response.content
         else:
             raise InferenceOperationError(400, "Provide 'audio_url' or 'audio_base64'")
-        audio = await asyncio.to_thread(decode_transcribe_audio, audio_bytes)
-        if request.text is not None:
-            # Forced alignment only: the caller's text, no ASR pass.
-            try:
-                timestamps = await self._transcript_timestamps(request.text, audio, request.language)
-            except ValueError as exc:
-                raise TranscribeInputError(str(exc)) from exc
-            return InferenceResult(
-                kind="json",
-                data={"text": request.text, "language": None, "languageCode": None, "timestamps": timestamps},
-            )
+        return await asyncio.to_thread(decode_transcribe_audio, audio_bytes)
+
+    async def _transcribe(self, request_data: dict[str, Any]) -> InferenceResult:
+        if not _server_config.transcribe.enabled:
+            raise InferenceOperationError(503, "transcribe is not enabled on this worker")
+        request = TranscribeRequest.model_validate(request_data)
+        audio = await self._request_audio(request)
         response = await asyncio.to_thread(
             _ensure_transcribe_worker().call,
             "transcribe",
@@ -6220,6 +6250,16 @@ class LzTtsInferenceSession:
         if request.timestamps:
             data["timestamps"] = await self._transcript_timestamps(text, audio, language)
         return InferenceResult(kind="json", data=data)
+
+    async def _force_align(self, request_data: dict[str, Any]) -> InferenceResult:
+        """Word timings of the caller's text on the audio (CTC aligner only, no ASR)."""
+        request = ForceAlignRequest.model_validate(request_data)
+        audio = await self._request_audio(request)
+        try:
+            timestamps = await self._transcript_timestamps(request.text, audio, request.language)
+        except ValueError as exc:
+            raise TranscribeInputError(str(exc)) from exc
+        return InferenceResult(kind="json", data={"text": request.text, "timestamps": timestamps})
 
     async def _transcript_timestamps(
         self,
@@ -6317,6 +6357,7 @@ class SyncTaskInput(BaseModel):
         "detect-face",
         "detect-language",
         "transcribe",
+        "force-align",
         "generate-music",
         "videogen",
         "lipsync",

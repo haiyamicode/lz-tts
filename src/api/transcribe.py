@@ -75,12 +75,18 @@ class TranscribeRequest(BaseModel):
     audio_base64: str | None = None
     # BCP-47 locale or language code ("vi", "vi-VN"); omitted means auto-detect.
     language: str | None = None
-    # Also return word timestamps (force-aligned on the decoded audio).
-    timestamps: bool = False
-    # Forced alignment only: what the audio says. Skips the ASR pass (no Qwen3-ASR needed)
-    # and always returns word timestamps of this text; ``language`` is a hint, else detected
-    # from the text.
-    text: str | None = Field(default=None, min_length=1, max_length=100_000)
+    # Word and character timestamps (force-aligned on the decoded audio); on by default.
+    timestamps: bool = True
+
+
+class ForceAlignRequest(BaseModel):
+    """Input for the ``force-align`` operation: one audio clip and what it says."""
+
+    audio_url: str | None = None
+    audio_base64: str | None = None
+    text: str = Field(min_length=1, max_length=100_000)
+    # BCP-47 locale or language code; a hint for the aligner, omitted means detected from the text.
+    language: str | None = None
 
 
 def qwen_language(language: str | None) -> str | None:

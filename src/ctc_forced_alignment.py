@@ -36,6 +36,9 @@ class _TranscriptUnit:
     source_start: int
     source_end: int
     language: str
+    # (source_start, source_end, letters): the source characters behind each run of
+    # the token's letters, in order; the letters add up to the token's.
+    pieces: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,33 @@ def _ctc_token_for_range(
     return " ".join(character for character in romanized if not character.isspace())
 
 
+def _token_pieces(
+    edges: list[Any],
+    start: int,
+    end: int,
+    letters: int,
+) -> tuple[tuple[int, int, int], ...]:
+    """Split a token's letters over the source characters they were romanized from.
+
+    Each Uroman edge is one source character or an atomic run of them (a CJK
+    character and its pinyin, a Latin letter, a digraph rule). If the per-edge
+    letters don't add up to the token, the token stays one piece.
+    """
+    from ctc_forced_aligner.text_utils import normalize_uroman
+
+    pieces = []
+    for edge in edges:
+        edge_start, edge_end = max(int(edge.start), start), min(int(edge.end), end)
+        if edge_end <= edge_start:
+            continue
+        count = sum(1 for character in normalize_uroman(str(edge.txt)) if not character.isspace())
+        if count:
+            pieces.append((edge_start, edge_end, count))
+    if sum(count for _, _, count in pieces) != letters:
+        return ((start, end, letters),)
+    return tuple(pieces)
+
+
 def _span_transcript_units(
     text: str,
     *,
@@ -161,6 +191,7 @@ def _span_transcript_units(
     units: list[_TranscriptUnit] = []
     for index, (group, token) in enumerate(tokenized_groups):
         lexical_start = group[0].start
+        lexical_end = group[-1].end
         display_start = 0 if index == 0 else lexical_start
         display_end = (
             tokenized_groups[index + 1][0][0].start
@@ -174,6 +205,12 @@ def _span_transcript_units(
                 source_start=source_offset + display_start,
                 source_end=source_offset + display_end,
                 language=language,
+                pieces=tuple(
+                    (source_offset + piece_start, source_offset + piece_end, count)
+                    for piece_start, piece_end, count in _token_pieces(
+                        edges, lexical_start, lexical_end, len(token.split(" "))
+                    )
+                ),
             )
         )
     return units
@@ -250,6 +287,35 @@ def _prepare_ctc_transcript(
         units=units,
         languages=languages,
     )
+
+
+def _piece_timestamps(
+    pieces: Sequence[tuple[int, int, int]],
+    letter_starts: Sequence[float],
+    word_start: float,
+    word_end: float,
+) -> list[dict[str, Any]]:
+    """Time each piece of a word from its first letter's frame.
+
+    Pieces tile the word: one ends where the next starts, the first starts with
+    the word and the last ends with it (the word's own padded bounds).
+    """
+    starts: list[float] = []
+    letter = 0
+    for _, _, count in pieces:
+        starts.append(letter_starts[letter] if letter < len(letter_starts) else word_end)
+        letter += count
+    if starts:
+        starts[0] = word_start
+    return [
+        {
+            "source_start": piece_start,
+            "source_end": piece_end,
+            "start_seconds": max(word_start, min(start, word_end)),
+            "end_seconds": max(word_start, min(starts[index + 1] if index + 1 < len(starts) else word_end, word_end)),
+        }
+        for index, ((piece_start, piece_end, _), start) in enumerate(zip(pieces, starts))
+    ]
 
 
 class CtcForcedAligner:
@@ -346,6 +412,10 @@ class CtcForcedAligner:
                 "CTC aligner returned a different number of timestamps than transcript units: "
                 f"{len(raw_words)} != {len(prepared.units)}"
             )
+        unit_spans = [
+            span for token, span in zip(prepared.tokens, spans) if token != "<star>"
+        ]
+        stride_seconds = stride_ms / 1000
         word_timestamps = [
             {
                 "text": word["text"],
@@ -355,8 +425,14 @@ class CtcForcedAligner:
                 "source_start": unit.source_start,
                 "source_end": unit.source_end,
                 "language": unit.language,
+                "tokens": _piece_timestamps(
+                    unit.pieces,
+                    [segment.start * stride_seconds for segment in span if segment.label != blank],
+                    float(word["start"]),
+                    float(word["end"]),
+                ),
             }
-            for word, unit in zip(raw_words, prepared.units)
+            for word, unit, span in zip(raw_words, prepared.units, unit_spans)
         ]
         return {
             "backend": "ctc",
