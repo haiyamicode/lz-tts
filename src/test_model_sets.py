@@ -103,3 +103,18 @@ def test_falcon_downloads_only_what_server_json_serves(server_json, monkeypatch)
     assert not wanted("voxcpm-lora/accent/accent-en-US-falcon/lora_weights.safetensors")
     assert wanted("lzspeech-sparrow/model.ckpt") and wanted("comfyui/x", {"videogen"})
     assert not wanted("lzspeech-falcon-v1.2/model.safetensors", ("transcribe",))
+
+
+def test_join_pool_metadata(monkeypatch):
+    from src.taskflow_worker import pool_metadata
+
+    monkeypatch.delenv("TASKFLOW_WORKER_POOL", raising=False)
+    monkeypatch.delenv("TASKFLOW_WORKER_CAPACITY", raising=False)
+    assert pool_metadata() == {"capacity": 1.0}
+    monkeypatch.setenv("TASKFLOW_WORKER_POOL", "owned")
+    monkeypatch.setenv("TASKFLOW_WORKER_CAPACITY", "1.8")
+    assert pool_metadata() == {"pool": "owned", "capacity": 1.8}
+    for bad in ("fast", "-1", "nan"):
+        monkeypatch.setenv("TASKFLOW_WORKER_CAPACITY", bad)
+        with pytest.raises(ValueError, match="TASKFLOW_WORKER_CAPACITY"):
+            pool_metadata()

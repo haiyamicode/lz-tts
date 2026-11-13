@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import signal
 import socket
@@ -25,6 +26,7 @@ from .api.server import (
     create_app,
     deferred_engines,
     get_health_status,
+    residency_snapshot,
     set_status,
 )
 from .api.take_stream import Mp3Segment, Mp3Segmenter, mp3_duration_seconds
@@ -79,6 +81,39 @@ _TYPE_ENGINES = {
 def ready_task_types(task_types: tuple[str, ...], deferred: frozenset[str]) -> tuple[str, ...]:
     """The task types whose engines are all loaded (none of them in ``deferred``)."""
     return tuple(t for t in task_types if not deferred.intersection(_TYPE_ENGINES.get(t, ())))
+
+
+# load.mode on-demand: the swappable engine each task type needs. tts-synthesis may route to
+# Sparrow, but counts as VoxCPM work here; the other types run on the always-loaded engines.
+_TYPE_SWAP_ENGINE = {
+    "tts-synthesis": "voxcpm",
+    "voice-design": "voxcpm",
+    "transcribe": "transcribe",
+    **{task_type: "media" for task_type in _MEDIA_TASK_TYPES},
+}
+
+
+def on_demand_task_types(
+    task_types: tuple[str, ...],
+    resident: frozenset[str],
+    waiting_for: str | None,
+    sticky: bool,
+) -> tuple[str, ...]:
+    """What an on-demand worker pulls.
+
+    While a job waits for memory to load ``waiting_for``, only that engine's types (and the
+    types needing no swappable engine): anything else would run on an engine about to be
+    unloaded. While ``sticky``, the loaded engines' types, so a mixed queue does not swap
+    models on every job; the caller drops stickiness after an empty pull or a while after
+    the last swap, so the other types still get pulled.
+    """
+    if waiting_for is not None:
+        allowed = {waiting_for}
+    elif sticky and resident:
+        allowed = set(resident)
+    else:
+        return task_types
+    return tuple(t for t in task_types if t not in _TYPE_SWAP_ENGINE or _TYPE_SWAP_ENGINE[t] in allowed)
 
 
 def served_task_types(config: Any) -> tuple[str, ...]:
@@ -172,6 +207,14 @@ class TaskflowWorker:
     # What pulls ask for: the joined ``task_types`` minus those whose engines are still
     # waiting for their model sets (Taskflow narrows a pull to a subset of the join's types).
     pull_task_types: tuple[str, ...] | None = None
+    # On-demand mode: the last pull was narrowed to the loaded engines' types (stickiness),
+    # the last such pull came back empty, and when the loaded set last changed.
+    pull_sticky: bool = False
+    sticky_missed: bool = False
+    resident: frozenset[str] = frozenset()
+    resident_since: float = 0.0
+    pool_metadata: dict[str, object] = field(default_factory=dict)
+    sticky_seconds: float = 300.0
     session_id: str | None = None
     session_token: str | None = None
     heartbeat_interval: float = 15.0
@@ -1083,9 +1126,30 @@ async def _process_lease(
 
 def _update_pull_task_types(taskflow: TaskflowWorker) -> None:
     ready = ready_task_types(taskflow.task_types, deferred_engines())
+    note = ""
+    waiting = [t for t in taskflow.task_types if t not in ready]
+    if waiting:
+        note = f" (waiting for model sets: {waiting})"
+    snapshot = residency_snapshot()
+    taskflow.pull_sticky = False
+    if snapshot is not None:
+        now = time.monotonic()
+        if snapshot.resident != taskflow.resident:
+            taskflow.resident = snapshot.resident
+            taskflow.resident_since = now
+        sticky = not taskflow.sticky_missed and now - taskflow.resident_since < taskflow.sticky_seconds
+        taskflow.sticky_missed = False  # one full pull per empty sticky pull
+        narrowed = on_demand_task_types(ready, snapshot.resident, snapshot.waiting_for, sticky)
+        if narrowed != ready:
+            taskflow.pull_sticky = snapshot.waiting_for is None
+            note += (
+                f" (loading {snapshot.waiting_for})"
+                if snapshot.waiting_for
+                else f" (loaded: {sorted(snapshot.resident)})"
+            )
+        ready = narrowed
     if ready != taskflow.pull_task_types:
-        waiting = [t for t in taskflow.task_types if t not in ready]
-        _LOGGER.info("Pulling task types %s%s", list(ready), f" (waiting for model sets: {waiting})" if waiting else "")
+        _LOGGER.info("Pulling task types %s%s", list(ready), note)
         taskflow.pull_task_types = ready
 
 
@@ -1171,7 +1235,7 @@ async def _serve_taskflow(
                 if taskflow.session_token:
                     await taskflow.heartbeat()
                 else:
-                    await taskflow.join({"service": "lzai", "synthesis": synthesis_capabilities})
+                    await taskflow.join({"service": "lzai", "synthesis": synthesis_capabilities, **taskflow.pool_metadata})
                 connection_lost = asyncio.Event()
                 heartbeat_task = asyncio.create_task(taskflow.heartbeat_loop(connection_lost))
                 set_status("ok")
@@ -1198,6 +1262,9 @@ async def _serve_taskflow(
                     background = sum(count for _, count in running.values())
                     _update_pull_task_types(taskflow)
                     leases = await _pull_leases(taskflow, busy, background)
+                    if taskflow.pull_sticky:
+                        # Nothing ready for the loaded engines: let the next pull take any type.
+                        taskflow.sticky_missed = not leases and busy < taskflow.concurrency
                     for lease in leases:
                         task = asyncio.create_task(
                             _process_lease(taskflow, inference, lease, acks)
@@ -1270,6 +1337,24 @@ def _start_http_server(inference: LzTtsInferenceSession) -> tuple[Any, asyncio.T
     return server, asyncio.create_task(server.serve())
 
 
+def pool_metadata() -> dict[str, object]:
+    """Join metadata maydeploy sizes the rented fleet from (/admin/pipeline-stats).
+
+    ``TASKFLOW_WORKER_POOL``: "owned" on our own always-on boxes, "spot" on rented workers;
+    omitted when unset. ``TASKFLOW_WORKER_CAPACITY``: 3090-GPU-seconds of work cleared per
+    wall second (one RTX 3090 = 1, default 1).
+    """
+    raw = os.environ.get("TASKFLOW_WORKER_CAPACITY", "").strip() or "1"
+    try:
+        capacity = float(raw)
+    except ValueError:
+        raise ValueError(f"TASKFLOW_WORKER_CAPACITY must be a number, got {raw!r}") from None
+    if not math.isfinite(capacity) or capacity < 0:
+        raise ValueError(f"TASKFLOW_WORKER_CAPACITY must be a non-negative number, got {raw!r}")
+    pool = os.environ.get("TASKFLOW_WORKER_POOL", "").strip()
+    return {**({"pool": pool} if pool else {}), "capacity": capacity}
+
+
 async def run_worker() -> None:
     load_dotenv()
     worker_token = os.environ.get("TASKFLOW_WORKER_TOKEN", "").strip()
@@ -1283,7 +1368,9 @@ async def run_worker() -> None:
         concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "8"))),
         low_priority_batch_size=max(1, int(os.environ.get("TASKFLOW_LOW_PRIORITY_BATCH_SIZE", "3"))),
         persistent=_env_bool("TASKFLOW_WORKER_PERSISTENT", False),
+        sticky_seconds=float(os.environ.get("LZAI_SWAP_STICKY_SECONDS", "300")),
     )
+    taskflow.pool_metadata = pool_metadata()
     inference = LzTtsInferenceSession()
     taskflow.task_types = served_task_types(inference.config)
     try:

@@ -19,6 +19,7 @@ import tempfile
 import uuid
 import threading
 import time
+import contextvars
 import httpx
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -88,6 +89,7 @@ from .transcribe import (
     TranscribeRequest,
     decode_transcribe_audio,
 )
+from .residency import SWAPPABLE_ENGINES, EngineResidency, ResidencySnapshot
 from .face_detection import FaceDetector, FaceDetectRequest, FaceInputError
 from .nudity_detection import NudityDetectRequest, NudityDetector, NudityInputError
 from .voice_anchor import ANCHOR_SEED, LANGUAGE_ANCHORS, VoiceAnchorRequest, anchor_language
@@ -503,6 +505,28 @@ class SSMLConfig(BaseModel):
     voxcpm_ipa_refinement_passes: int = Field(default=1, ge=0)
 
 
+class LoadConfig(BaseModel):
+    """When the swappable engines (voxcpm, transcribe, media) load.
+
+    ``all`` (default): every enabled engine loads at startup and stays (a dedicated worker).
+    ``on-demand`` (a flex worker on one GPU): they start unloaded and load when a job needs one,
+    unloading idle ones (least recently used first) so the loaded ones stay within
+    ``budget_gb``; see ``src/api/residency.py``. The speech process (Sparrow, Seed-VC, aligner,
+    number classifier) always loads at startup; ``budget_gb`` is the VRAM left beside it.
+    Env ``LZAI_LOAD_MODE`` and ``LZAI_VRAM_BUDGET_GB`` override the mode and the budget.
+    """
+
+    mode: Literal["all", "on-demand"] = "all"
+    budget_gb: float | None = Field(default=None, gt=0)
+    # Peak VRAM of each engine's process, GB, measured on the 3090 with the server.json defaults:
+    # voxcpm preallocates gpu_memory_utilization x the GPU (0.4 x 24 GB), transcribe 2.2 GB. An
+    # engine left out uses the whole budget: media (ComfyUI keeps models cached in whatever is
+    # free, 20.4 GB measured), so it never shares the GPU with another swappable engine.
+    footprints_gb: dict[str, float] = Field(default_factory=lambda: {"voxcpm": 10.0, "transcribe": 2.5})
+    # Engines to load at startup in on-demand mode (the rest load when a job needs them).
+    preload: list[Literal["voxcpm", "transcribe", "media"]] = Field(default_factory=list)
+
+
 class ServerConfig(BaseModel):
     """Server configuration."""
 
@@ -515,6 +539,7 @@ class ServerConfig(BaseModel):
     aligner: AlignerConfig = Field(default_factory=AlignerConfig)
     transcribe: TranscribeConfig = Field(default_factory=TranscribeConfig)
     media: MediaConfig = Field(default_factory=MediaConfig)
+    load: LoadConfig = Field(default_factory=LoadConfig)
 
 
 class SparrowSynthesizeOptions(BaseModel):
@@ -996,6 +1021,8 @@ _startup_loader_task: asyncio.Task | None = None
 _deferred_engines: set[str] = set()
 _deferred_loader_task: asyncio.Task | None = None
 _DEFERRED_POLL_SECONDS = 5.0
+# load.mode on-demand: what keeps voxcpm / transcribe / media inside the VRAM budget (None = all loaded).
+_residency: EngineResidency | None = None
 
 
 @dataclass
@@ -1149,10 +1176,27 @@ def _get_base_language(speaker_or_locale: str) -> str:
 def _load_config() -> ServerConfig:
     """Load server configuration from local/server.json."""
     if not CONFIG_PATH.exists():
-        return ServerConfig()
+        return _apply_load_env(ServerConfig())
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    return _restrict_to_model_sets(ServerConfig(**data))
+    return _apply_load_env(_restrict_to_model_sets(ServerConfig(**data)))
+
+
+def _apply_load_env(config: ServerConfig) -> ServerConfig:
+    """``LZAI_LOAD_MODE`` / ``LZAI_VRAM_BUDGET_GB`` override server.json ``load``."""
+    mode = os.environ.get("LZAI_LOAD_MODE", "").strip()
+    budget = os.environ.get("LZAI_VRAM_BUDGET_GB", "").strip()
+    if mode or budget:
+        config.load = LoadConfig.model_validate(
+            {
+                **config.load.model_dump(),
+                **({"mode": mode} if mode else {}),
+                **({"budget_gb": float(budget)} if budget else {}),
+            }
+        )
+    if config.load.mode == "on-demand" and config.load.budget_gb is None:
+        raise ValueError("load.mode on-demand needs load.budget_gb (or LZAI_VRAM_BUDGET_GB)")
+    return config
 
 
 def _restrict_to_model_sets(config: ServerConfig) -> ServerConfig:
@@ -1278,6 +1322,16 @@ def _mark_engine_ready(engine: str) -> None:
     state.ready.set()
 
 
+def _mark_engine_unloaded(engine: str) -> None:
+    """On-demand mode: enabled but not loaded; the next job that needs it loads it."""
+    state = _engine_state(engine)
+    state.status = "unloaded"
+    state.error = None
+    state.started_at = None
+    state.finished_at = None
+    state.ready.clear()
+
+
 def _mark_engine_failed(engine: str, exc: BaseException) -> None:
     state = _engine_state(engine)
     state.status = "error"
@@ -1309,6 +1363,8 @@ def _wait_for_engine_ready(engine: str, *, timeout: float | None = None) -> None
         return
     if state.status == "disabled":
         raise HTTPException(status_code=503, detail=f"{engine} backend is disabled")
+    if state.status == "unloaded":
+        raise HTTPException(status_code=503, detail=f"{engine} backend is unloaded")
 
     if state.status == "loading":
         _LOGGER.info("Waiting for %s backend readiness", engine)
@@ -1327,7 +1383,65 @@ def _wait_for_engine_ready(engine: str, *, timeout: float | None = None) -> None
     raise HTTPException(status_code=503, detail=f"{engine} backend is still loading")
 
 
+class _EngineHolds:
+    """The engines one job (or one backend batch) keeps loaded until it finishes (on-demand mode)."""
+
+    def __init__(self) -> None:
+        self.engines: set[str] = set()
+        self.stack = contextlib.AsyncExitStack()
+
+
+_engine_holds: contextvars.ContextVar[_EngineHolds | None] = contextvars.ContextVar("engine_holds", default=None)
+
+
+@contextlib.asynccontextmanager
+async def _engine_hold_scope():
+    """Engines the body waits for (``_await_engine_ready``) stay loaded until it ends.
+
+    Wrap one job, or one backend batch, never several jobs that need different swappable
+    engines: a scope holding one engine while waiting for another could wait for itself.
+    """
+    if _residency is None:
+        yield
+        return
+    holds = _EngineHolds()
+    token = _engine_holds.set(holds)
+    try:
+        async with holds.stack:
+            yield
+    finally:
+        _engine_holds.reset(token)
+
+
+async def _hold_engine(engine: str) -> None:
+    """On-demand mode: load ``engine`` if needed and keep it for the current hold scope."""
+    holds = _engine_holds.get()
+    if holds is None:
+        # Not inside a job scope (a direct route): make sure it is loaded; it may be
+        # swapped out again once another job needs the memory.
+        _LOGGER.warning("%s requested outside an engine hold scope; loading without holding it", engine)
+        async with _residency.hold(engine):
+            return
+    if engine in holds.engines:
+        return
+    holds.engines.add(engine)
+    try:
+        await holds.stack.enter_async_context(_residency.hold(engine))
+    except BaseException:
+        holds.engines.discard(engine)
+        raise
+
+
 async def _await_engine_ready(engine: str, *, timeout: float | None = None) -> None:
+    if _residency is not None and engine in SWAPPABLE_ENGINES and _engine_enabled(engine):  # type: ignore[arg-type]
+        try:
+            await _hold_engine(engine)
+        except ChildWorkerDied:
+            raise
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"{engine} backend failed to load: {exc}") from exc
     while True:
         try:
             await asyncio.to_thread(_wait_for_engine_ready, engine, timeout=timeout)
@@ -5423,8 +5537,46 @@ async def _run_engine_loader(engine: str, loader: Callable[[], Awaitable[None]])
             )
 
 
+async def _residency_load(engine: str) -> None:
+    """On-demand mode: load one swappable engine (raises when it fails to load)."""
+    _mark_engine_loading(engine)
+    await _run_engine_loader(engine, _ENGINE_LOADERS[engine])
+    state = _engine_state(engine)
+    if state.status != "ready":
+        raise RuntimeError(state.error or f"{engine} backend failed to load")
+
+
+async def _residency_unload(engine: str) -> None:
+    """On-demand mode: stop one swappable engine's process(es) so its VRAM goes back to the driver."""
+    global _voxcpm_runtime
+    _mark_engine_unloaded(engine)
+    if engine == "voxcpm":
+        runtime, _voxcpm_runtime = _voxcpm_runtime, None
+        if runtime is not None:
+            await runtime.stop()
+    elif engine == "transcribe":
+        if _transcribe_worker is not None:
+            await asyncio.to_thread(_transcribe_worker.stop)
+    elif engine == "media":
+        if _media_runtime is not None:
+            await asyncio.to_thread(_media_runtime.stop)
+    await asyncio.to_thread(_release_gpu_cache)
+
+
+def residency_snapshot() -> ResidencySnapshot | None:
+    """What the on-demand worker has loaded and is waiting to load (None in load-all mode)."""
+    return _residency.snapshot() if _residency is not None else None
+
+
 def _schedule_engine_reload(engine: str) -> None:
     """Reload one backend, at most one reload in flight per engine."""
+    if _residency is not None and engine in SWAPPABLE_ENGINES:
+        # On demand, a dead engine is just unloaded: the next job that needs it loads it
+        # within the budget (a reload here would bypass the budget).
+        _LOGGER.warning("%s backend is gone; marking it unloaded", engine)
+        _mark_engine_unloaded(engine)
+        _residency.forget(engine)
+        return
     task = _engine_reload_tasks.get(engine)
     if task is not None and not task.done():
         return
@@ -5452,7 +5604,7 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
     global _seed_vc_backend
     global _voxcpm_runtime
     global _sparrow_model_info, _seed_vc_info
-    global _startup_loader_task, _deferred_loader_task
+    global _startup_loader_task, _deferred_loader_task, _residency
 
     _server_config = config
     startup_started = time.perf_counter()
@@ -5475,6 +5627,28 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
         _sparrow_model_info = {}
         _seed_vc_info = {}
         _deferred_engines.clear()
+        on_demand = config.load.mode == "on-demand"
+        _residency = (
+            EngineResidency(
+                budget_gb=float(config.load.budget_gb or 0),
+                footprints_gb={
+                    engine: config.load.footprints_gb.get(engine, float(config.load.budget_gb or 0))
+                    for engine in SWAPPABLE_ENGINES
+                    if _engine_enabled(engine)  # type: ignore[arg-type]
+                },
+                load=_residency_load,
+                unload=_residency_unload,
+            )
+            if on_demand
+            else None
+        )
+        if on_demand:
+            _LOGGER.info(
+                "Load mode on-demand budget=%.1f GB footprints=%s preload=%s",
+                config.load.budget_gb,
+                _residency.footprints,
+                config.load.preload,
+            )
         for engine in _engine_load_states:
             if _engine_enabled(engine):  # type: ignore[arg-type]
                 _mark_engine_loading(engine)
@@ -5482,6 +5656,8 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
                 if pending:
                     _LOGGER.info("Deferring %s backend until model sets download: %s", engine, sorted(pending))
                     _deferred_engines.add(engine)
+                elif on_demand and engine in SWAPPABLE_ENGINES:
+                    _mark_engine_unloaded(engine)
             else:
                 _mark_engine_disabled(engine)
 
@@ -5501,19 +5677,19 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
             _LOGGER.info("PiperTTS backend disabled")
 
         if _engine_enabled("voxcpm"):
-            if "voxcpm" not in _deferred_engines:
+            if "voxcpm" not in _deferred_engines and _residency is None:
                 startup_tasks.append(asyncio.create_task(_run_engine_loader("voxcpm", _load_voxcpm_engine)))
         else:
             _LOGGER.info("VoxCPM backend disabled")
 
         if _engine_enabled("transcribe"):
-            if "transcribe" not in _deferred_engines:
+            if "transcribe" not in _deferred_engines and _residency is None:
                 startup_tasks.append(asyncio.create_task(_run_engine_loader("transcribe", _load_transcribe_engine)))
         else:
             _LOGGER.info("Transcribe backend disabled")
 
         if _engine_enabled("media"):
-            if "media" not in _deferred_engines:
+            if "media" not in _deferred_engines and _residency is None:
                 startup_tasks.append(asyncio.create_task(_run_engine_loader("media", _load_media_engine)))
         else:
             _LOGGER.info("Media runtime disabled")
@@ -5526,6 +5702,11 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
 
         if startup_tasks:
             await asyncio.gather(*startup_tasks)
+        if _residency is not None:
+            for engine in dict.fromkeys(_server_config.load.preload):
+                if _engine_state(engine).status == "unloaded":
+                    async with _residency.hold(engine):
+                        pass
 
         failed_engines = {
             name: state.error
@@ -5594,6 +5775,11 @@ async def _load_deferred_engines() -> None:
             await asyncio.sleep(_DEFERRED_POLL_SECONDS)
             continue
         engine = ready[0]
+        if _residency is not None and engine in SWAPPABLE_ENGINES:
+            _LOGGER.info("Model sets for %s backend downloaded; it loads when a job needs it", engine)
+            _mark_engine_unloaded(engine)
+            _deferred_engines.discard(engine)
+            continue
         _LOGGER.info("Model sets for %s backend downloaded; loading it", engine)
         await _run_engine_loader(engine, _ENGINE_LOADERS[engine])
         if _engine_state(engine).status != "ready":
@@ -5608,7 +5794,7 @@ def deferred_engines() -> frozenset[str]:
 
 
 async def _stop_inference_runtime() -> None:
-    global _startup_loader_task, _deferred_loader_task, _voxcpm_runtime
+    global _startup_loader_task, _deferred_loader_task, _voxcpm_runtime, _residency
     if _startup_loader_task is not None and not _startup_loader_task.done():
         _startup_loader_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -5630,6 +5816,7 @@ async def _stop_inference_runtime() -> None:
         await _voxcpm_runtime.stop()
         _voxcpm_runtime = None
     _stop_model_workers()
+    _residency = None
 
 
 async def _synthesize(request: SynthesizeRequest, model: str | None = None) -> Response:
@@ -5998,70 +6185,75 @@ class LzTtsInferenceSession:
         )
 
         for plan in plans:
-            line_encoders: list[StreamingMp3Encoder | None] | None = None
-            if plan.pipeline == "voxcpm" and mp3_sinks is not None:
-                line_encoders = [
-                    _streaming_encoder(
-                        batch_requests[batch_item_index],
-                        mp3_sinks[batch_operation_indices[batch_item_index]],
+            async with _engine_hold_scope():
+                line_encoders: list[StreamingMp3Encoder | None] | None = None
+                try:
+                    if plan.pipeline == "voxcpm":
+                        # On demand: loads VoxCPM if needed and keeps it for this batch.
+                        await _await_engine_ready("voxcpm")
+                    if plan.pipeline == "voxcpm" and mp3_sinks is not None:
+                        line_encoders = [
+                            _streaming_encoder(
+                                batch_requests[batch_item_index],
+                                mp3_sinks[batch_operation_indices[batch_item_index]],
+                            )
+                            if item.format == "mp3"
+                            else None
+                            for batch_item_index, item, _ in plan.records
+                        ]
+                    response = await _execute_synthesis_batch_plan(plan, line_encoders)
+                    if len(response.items) != len(plan.records):
+                        raise RuntimeError(
+                            "backend batch returned a different number of results"
+                        )
+                    for (batch_item_index, item, _), response_item, encoder in zip(
+                        plan.records,
+                        response.items,
+                        line_encoders or [None] * len(plan.records),
+                        strict=True,
+                    ):
+                        request = batch_requests[batch_item_index]
+                        result = InferenceResult(
+                            kind="audio",
+                            content_type=(
+                                "audio/mpeg" if item.format == "mp3" else "audio/wav"
+                            ),
+                            audio=base64.b64decode(response_item.audio_base64),
+                        )
+                        if encoder is None:
+                            # A streamed take was adjusted as it was encoded.
+                            result = await _apply_audio_adjustments(result, request)
+                        outcomes[batch_operation_indices[batch_item_index]] = (
+                            await _add_word_timestamps(result, request)
+                        )
+                except HTTPException as error:
+                    await _abort_encoders(line_encoders)
+                    outcome: BaseException = InferenceOperationError(
+                        error.status_code, error.detail
                     )
-                    if item.format == "mp3"
-                    else None
-                    for batch_item_index, item, _ in plan.records
-                ]
-            try:
-                response = await _execute_synthesis_batch_plan(plan, line_encoders)
-                if len(response.items) != len(plan.records):
-                    raise RuntimeError(
-                        "backend batch returned a different number of results"
+                    for batch_item_index, _, _ in plan.records:
+                        outcomes[batch_operation_indices[batch_item_index]] = outcome
+                except ChildWorkerDied as error:
+                    await _abort_encoders(line_encoders)
+                    # A backend subprocess is gone (OOM, crash). Don't retry the
+                    # leases in this batch — escalate to the worker so it surfaces
+                    # ``error`` and stops pulling new leases.
+                    _mark_engine_failed_from_child(error.name, error)
+                    raise
+                except Exception as error:
+                    await _abort_encoders(line_encoders)
+                    _LOGGER.exception(
+                        "Inference task batch failed pipeline=%s count=%d",
+                        plan.pipeline,
+                        len(plan.records),
                     )
-                for (batch_item_index, item, _), response_item, encoder in zip(
-                    plan.records,
-                    response.items,
-                    line_encoders or [None] * len(plan.records),
-                    strict=True,
-                ):
-                    request = batch_requests[batch_item_index]
-                    result = InferenceResult(
-                        kind="audio",
-                        content_type=(
-                            "audio/mpeg" if item.format == "mp3" else "audio/wav"
-                        ),
-                        audio=base64.b64decode(response_item.audio_base64),
-                    )
-                    if encoder is None:
-                        # A streamed take was adjusted as it was encoded.
-                        result = await _apply_audio_adjustments(result, request)
-                    outcomes[batch_operation_indices[batch_item_index]] = (
-                        await _add_word_timestamps(result, request)
-                    )
-            except HTTPException as error:
-                await _abort_encoders(line_encoders)
-                outcome: BaseException = InferenceOperationError(
-                    error.status_code, error.detail
-                )
-                for batch_item_index, _, _ in plan.records:
-                    outcomes[batch_operation_indices[batch_item_index]] = outcome
-            except ChildWorkerDied as error:
-                await _abort_encoders(line_encoders)
-                # A backend subprocess is gone (OOM, crash). Don't retry the
-                # leases in this batch — escalate to the worker so it surfaces
-                # ``error`` and stops pulling new leases.
-                _mark_engine_failed_from_child(error.name, error)
-                raise
-            except Exception as error:
-                await _abort_encoders(line_encoders)
-                _LOGGER.exception(
-                    "Inference task batch failed pipeline=%s count=%d",
-                    plan.pipeline,
-                    len(plan.records),
-                )
-                for batch_item_index, _, _ in plan.records:
-                    outcomes[batch_operation_indices[batch_item_index]] = error
+                    for batch_item_index, _, _ in plan.records:
+                        outcomes[batch_operation_indices[batch_item_index]] = error
 
         if voice_design_requests:
             try:
-                voice_designs = await synthesize_voice_designs(voice_design_requests)
+                async with _engine_hold_scope():
+                    voice_designs = await synthesize_voice_designs(voice_design_requests)
             except HTTPException as error:
                 voice_designs = [InferenceOperationError(error.status_code, error.detail)] * len(
                     voice_design_requests
@@ -6115,58 +6307,8 @@ class LzTtsInferenceSession:
         }
         _LOGGER.info("Inference operation started: %s", json.dumps(context, default=str))
         try:
-            if operation == "synthesize":
-                request = SynthesizeRequest.model_validate(request_data)
-                response = await _synthesize(request, model=_resolve_api_model(request.model))
-                result = InferenceResult(
-                    kind="audio",
-                    content_type=response.media_type,
-                    audio=bytes(response.body),
-                )
-                result = await _apply_audio_adjustments(result, request)
-                result = await _add_word_timestamps(result, request)
-            elif operation == "voice-design":
-                outcome = (await synthesize_voice_designs([VoiceDesignRequest.model_validate(request_data)]))[0]
-                if isinstance(outcome, BaseException):
-                    raise outcome
-                result = outcome
-            elif operation == "voice-enhance":
-                result = await self._enhance(VoiceEnhanceRequest.model_validate(request_data))
-            elif operation == "voice-anchor":
-                result = await self._voice_anchor(VoiceAnchorRequest.model_validate(request_data))
-            elif operation == "detect-nudity":
-                try:
-                    result = await self._detect_nudity(request_data)
-                except NudityInputError as exc:
-                    raise InferenceOperationError(400, str(exc)) from exc
-            elif operation == "detect-face":
-                try:
-                    result = await self._detect_face(request_data)
-                except FaceInputError as exc:
-                    raise InferenceOperationError(400, str(exc)) from exc
-            elif operation == "detect-language":
-                try:
-                    result = await self._detect_language(request_data)
-                except LanguageInputError as exc:
-                    raise InferenceOperationError(400, str(exc)) from exc
-            elif operation in ("transcribe", "force-align"):
-                try:
-                    if operation == "transcribe":
-                        result = await self._transcribe(request_data)
-                    else:
-                        result = await self._force_align(request_data)
-                except TranscribeInputError as exc:
-                    raise InferenceOperationError(400, str(exc)) from exc
-            elif operation in ("generate-music", "videogen", "lipsync", "imagegen"):
-                try:
-                    if operation == "generate-music":
-                        result = await self._generate_music(request_data)
-                    else:
-                        result = await self._render_h3(operation, request_data)
-                except MediaInputError as exc:
-                    raise InferenceOperationError(400, str(exc)) from exc
-            else:
-                raise HTTPException(status_code=400, detail=f"Unsupported TTS operation: {operation}")
+            async with _engine_hold_scope():
+                result = await self._dispatch(operation, request_data)
         except ValidationError as exc:
             _LOGGER.warning("Inference input rejected context=%s errors=%s", context, exc.errors())
             raise InferenceOperationError(400, jsonable_encoder(exc.errors())) from exc
@@ -6195,6 +6337,61 @@ class LzTtsInferenceSession:
             len(result.audio or b"") if result.kind == "audio" else None,
             time.perf_counter() - started,
         )
+        return result
+
+    async def _dispatch(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
+        if operation == "synthesize":
+            request = SynthesizeRequest.model_validate(request_data)
+            response = await _synthesize(request, model=_resolve_api_model(request.model))
+            result = InferenceResult(
+                kind="audio",
+                content_type=response.media_type,
+                audio=bytes(response.body),
+            )
+            result = await _apply_audio_adjustments(result, request)
+            result = await _add_word_timestamps(result, request)
+        elif operation == "voice-design":
+            outcome = (await synthesize_voice_designs([VoiceDesignRequest.model_validate(request_data)]))[0]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            result = outcome
+        elif operation == "voice-enhance":
+            result = await self._enhance(VoiceEnhanceRequest.model_validate(request_data))
+        elif operation == "voice-anchor":
+            result = await self._voice_anchor(VoiceAnchorRequest.model_validate(request_data))
+        elif operation == "detect-nudity":
+            try:
+                result = await self._detect_nudity(request_data)
+            except NudityInputError as exc:
+                raise InferenceOperationError(400, str(exc)) from exc
+        elif operation == "detect-face":
+            try:
+                result = await self._detect_face(request_data)
+            except FaceInputError as exc:
+                raise InferenceOperationError(400, str(exc)) from exc
+        elif operation == "detect-language":
+            try:
+                result = await self._detect_language(request_data)
+            except LanguageInputError as exc:
+                raise InferenceOperationError(400, str(exc)) from exc
+        elif operation in ("transcribe", "force-align"):
+            try:
+                if operation == "transcribe":
+                    result = await self._transcribe(request_data)
+                else:
+                    result = await self._force_align(request_data)
+            except TranscribeInputError as exc:
+                raise InferenceOperationError(400, str(exc)) from exc
+        elif operation in ("generate-music", "videogen", "lipsync", "imagegen"):
+            try:
+                if operation == "generate-music":
+                    result = await self._generate_music(request_data)
+                else:
+                    result = await self._render_h3(operation, request_data)
+            except MediaInputError as exc:
+                raise InferenceOperationError(400, str(exc)) from exc
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported TTS operation: {operation}")
         return result
 
     async def _voice_anchor(self, request: VoiceAnchorRequest) -> InferenceResult:
@@ -6314,6 +6511,7 @@ class LzTtsInferenceSession:
             raise InferenceOperationError(503, "transcribe is not enabled on this worker")
         request = TranscribeRequest.model_validate(request_data)
         audio = await self._request_audio(request)
+        await _await_engine_ready("transcribe")
         response = await asyncio.to_thread(
             _ensure_transcribe_worker().call,
             "transcribe",
@@ -6368,6 +6566,7 @@ class LzTtsInferenceSession:
             body["output_dir"] = scratch
             if request.reference_url:
                 body["reference_path"] = str(await fetch_reference(request.reference_url, Path(scratch) / "reference"))
+            await _await_engine_ready("media")
             produced = await _ensure_media_runtime().post("/generate", body, config.music_timeout_seconds)
             audio = await asyncio.to_thread(Path(produced["path"]).read_bytes)
         return InferenceResult(
@@ -6396,6 +6595,7 @@ class LzTtsInferenceSession:
                 "payload": request.model_dump(exclude_none=True),
                 "output_dir": scratch,
             }
+            await _await_engine_ready("media")
             produced = await _ensure_media_runtime().post(f"/{operation}", body, timeout)
             output = await asyncio.to_thread(Path(produced["path"]).read_bytes)
         return InferenceResult(
