@@ -6178,9 +6178,9 @@ class LzTtsInferenceSession:
         return InferenceResult(kind="json", data=data)
 
     async def _transcribe(self, request_data: dict[str, Any]) -> InferenceResult:
-        if not _server_config.transcribe.enabled:
-            raise InferenceOperationError(503, "transcribe is not enabled on this worker")
         request = TranscribeRequest.model_validate(request_data)
+        if request.text is None and not _server_config.transcribe.enabled:
+            raise InferenceOperationError(503, "transcribe is not enabled on this worker")
         if request.audio_base64:
             try:
                 audio_bytes = base64.b64decode(request.audio_base64, validate=True)
@@ -6194,6 +6194,16 @@ class LzTtsInferenceSession:
         else:
             raise InferenceOperationError(400, "Provide 'audio_url' or 'audio_base64'")
         audio = await asyncio.to_thread(decode_transcribe_audio, audio_bytes)
+        if request.text is not None:
+            # Forced alignment only: the caller's text, no ASR pass.
+            try:
+                timestamps = await self._transcript_timestamps(request.text, audio, request.language)
+            except ValueError as exc:
+                raise TranscribeInputError(str(exc)) from exc
+            return InferenceResult(
+                kind="json",
+                data={"text": request.text, "language": None, "languageCode": None, "timestamps": timestamps},
+            )
         response = await asyncio.to_thread(
             _ensure_transcribe_worker().call,
             "transcribe",

@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .language_id import LanguageInputError, decode_audio_16k_mono
 
@@ -77,6 +77,10 @@ class TranscribeRequest(BaseModel):
     language: str | None = None
     # Also return word timestamps (force-aligned on the decoded audio).
     timestamps: bool = False
+    # Forced alignment only: what the audio says. Skips the ASR pass (no Qwen3-ASR needed)
+    # and always returns word timestamps of this text; ``language`` is a hint, else detected
+    # from the text.
+    text: str | None = Field(default=None, min_length=1, max_length=100_000)
 
 
 def qwen_language(language: str | None) -> str | None:
