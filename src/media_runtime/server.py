@@ -172,18 +172,22 @@ def _check_h3_assets(features: list[str]) -> None:
     comfy_root, _ = ensure_minimax_h3_runtime_assets(generate_audio=True)
     load_retained_h3_runtime(generate_audio=True)
     _h3_resident = True
+    # Every preset of every enabled op must be servable.
+    from h3.h3_still import STILL_PRESETS
+    from h3.minimax_h3_runtime import LIPSYNC_PRESETS, VIDEO_PRESETS
+
+    lora_names = set()
     if "imagegen" in features:
-        from h3.h3_still import STILL_PRESETS
-
-        loras = [comfy_root / "models" / "loras" / spec["lora"]["name"] for spec in STILL_PRESETS.values() if spec["lora"]]
-        missing = [str(path) for path in loras if not path.exists()]
-        if missing:
-            raise FileNotFoundError("imagegen LoRAs are missing: " + ", ".join(missing))
+        lora_names |= {spec["lora"]["name"] for spec in STILL_PRESETS.values() if spec["lora"]}
+    if "videogen" in features:
+        lora_names |= {recipe.lora_name for recipe in VIDEO_PRESETS.values() if recipe.lora_name}
     if "lipsync" in features:
-        from h3.minimax_h3_runtime import LIPSYNC_LORA_NAME
-
+        lora_names |= {recipe.lora_name for recipe in LIPSYNC_PRESETS.values() if recipe.lora_name}
+    missing = [str(path) for path in (comfy_root / "models" / "loras" / name for name in sorted(lora_names)) if not path.exists()]
+    if missing:
+        raise FileNotFoundError("H3 preset LoRAs are missing: " + ", ".join(missing))
+    if "lipsync" in features:
         required = [
-            comfy_root / "models" / "loras" / LIPSYNC_LORA_NAME,
             compat.WHISPER_MEDIUM_ROOT / "model.bin",
             compat.SPEECH_CLEANUP_DEMUCS_PATH,
             compat.SPEECH_CLEANUP_ZIPENHANCER_PATH,

@@ -71,8 +71,9 @@ DEFAULT_SCHEDULER = "simple"
 #: ``diffusion_model.`` keys, so it loads through ``LoraLoaderModelOnly``),
 #: close to ``standard`` on edits, illustrated look on text-only images;
 #: ``turbo-4`` is videogen's 4-step ema ckpt850 LoRA (bare keys + adaln rows,
-#: ``MiniMaxH3TurboLoRA``), fastest and roughest. Measured on the 3090, warm:
-#: a 1-reference edit takes ~54 / 21 / 17.5 s.
+#: ``MiniMaxH3TurboLoRA``), fastest and roughest; ``turbo-6`` runs that LoRA at 6
+#: steps (vigen's production recipe). Measured on the 3090, warm: a 1-reference
+#: edit takes ~54 / 21 / 17.5 s (standard / turbo-8 / turbo-4).
 STILL_PRESETS: dict[str, dict[str, Any]] = {
     "standard": {"steps": DEFAULT_STEPS, "sampler": DEFAULT_SAMPLER, "scheduler": DEFAULT_SCHEDULER, "lora": None},
     "turbo-8": {
@@ -83,6 +84,16 @@ STILL_PRESETS: dict[str, dict[str, Any]] = {
             "class_type": "LoraLoaderModelOnly",
             "name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
             "inputs": {"strength_model": 1.0},
+        },
+    },
+    "turbo-6": {
+        "steps": 6,
+        "sampler": "euler",
+        "scheduler": "simple",
+        "lora": {
+            "class_type": "MiniMaxH3TurboLoRA",
+            "name": "minimax_h3_turbo_4step_ema_ckpt850.safetensors",
+            "inputs": {"strength": 1.0, "low_vram": True},
         },
     },
     "turbo-4": {

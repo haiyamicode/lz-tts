@@ -94,8 +94,15 @@ class VideogenPinnedFrame(BaseModel):
     seconds: float = Field(ge=0, le=10)
 
 
+H3VideoPreset = Literal["standard", "turbo-8", "turbo-6", "turbo-4"]
+
+
 class VideogenRequest(BaseModel):
-    """The ``videogen`` request: H3 image-to-video (4-step Turbo), with H3's own audio track or a pinned one.
+    """The ``videogen`` request: H3 image-to-video, with H3's own audio track or a pinned one.
+
+    ``preset``: ``standard`` (plain base, res_multistep 10 steps, slowest), ``turbo-8`` (8-step
+    Turbo LoRA), ``turbo-6`` (the 4-step LoRA at 6 steps) or ``turbo-4`` (4-step LoRA, fastest);
+    omitted, the worker's default recipe (``turbo-4``).
 
     ``width``/``height`` (both or neither) are the delivered frame size; omitted, the clip keeps
     the image's aspect on H3's 32-px lattice (about 1 MP).
@@ -123,6 +130,7 @@ class VideogenRequest(BaseModel):
         default=None, min_length=1,
         description="Audio pinned in the latent: the video moves to it; it is the output's audio track",
     )
+    preset: H3VideoPreset | None = None
 
     @model_validator(mode="after")
     def _size_pair(self) -> "VideogenRequest":
@@ -185,7 +193,8 @@ class ImagegenRequest(BaseModel):
     """The ``imagegen`` request: an H3 still, text-only or edited from references.
 
     ``preset``: ``standard`` (plain base, 50 steps, best), ``turbo-8`` (8-step Turbo LoRA, close on
-    edits, illustrated look text-only, ~2.5x faster) or ``turbo-4`` (4-step Turbo LoRA, fastest, roughest).
+    edits, illustrated look text-only, ~2.5x faster), ``turbo-6`` (the 4-step Turbo LoRA at 6 steps) or
+    ``turbo-4`` (4-step Turbo LoRA, fastest, roughest).
 
     ``image_urls`` are ``<Picture 1>``..``<Picture N>`` (the prompt may say "image 1" / "picture 2").
     ``width``/``height`` (both or neither) are the delivered size; the render is H3's ~1 MP canvas
@@ -199,7 +208,7 @@ class ImagegenRequest(BaseModel):
     width: int | None = Field(default=None, ge=64, le=4096)
     height: int | None = Field(default=None, ge=64, le=4096)
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
-    preset: Literal["standard", "turbo-8", "turbo-4"] = "standard"
+    preset: H3VideoPreset = "standard"
 
     @model_validator(mode="after")
     def _size_pair(self) -> "ImagegenRequest":
@@ -213,6 +222,10 @@ class LipsyncRequest(BaseModel):
 
     The output lasts as long as the audio and carries it unmodified; it has the image's size, or
     fits inside ``output_dimensions`` with its aspect kept.
+
+    ``preset``: ``turbo-3`` (default: the 3-step lipsync student, trained for this mode with
+    sparse attention) or one of the videogen presets (``standard``, ``turbo-8``, ``turbo-6``,
+    ``turbo-4``) on the same pinned-audio graph.
     """
 
     model_config = {"extra": "forbid"}
@@ -227,6 +240,7 @@ class LipsyncRequest(BaseModel):
         default=None, description="Timed words; omitted, Whisper transcribes the audio"
     )
     custom_instructions: list[LipsyncInstruction] = Field(default_factory=list, max_length=100)
+    preset: Literal["turbo-3", "standard", "turbo-8", "turbo-6", "turbo-4"] = "turbo-3"
     sparse_attention: bool = True
     detect_flicker: bool = True
     detect_desync: bool = True

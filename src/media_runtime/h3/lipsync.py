@@ -690,11 +690,11 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     """Run one ``lipsync`` job; returns the result.
     """
     from .minimax_h3_runtime import (
+        DEFAULT_LIPSYNC_PRESET,
         H3_FPS,
-        LIPSYNC_LORA_NAME,
-        LIPSYNC_SIGMAS,
-        LIPSYNC_STEPS,
+        LIPSYNC_PRESETS,
         cleanup_h3_job_files,
+        h3_preset,
         run_lipsync_chunk,
     )
 
@@ -702,6 +702,8 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     payload = job["payload"]
     job_id = str(job["id"])
     seed = int(payload["seed"]) if payload.get("seed") is not None else DEFAULT_SEED
+    preset = str(payload.get("preset") or DEFAULT_LIPSYNC_PRESET)
+    recipe = h3_preset(preset, LIPSYNC_PRESETS)
     sparse_attention = payload.get("sparse_attention") is not False
     detect_flicker = payload.get("detect_flicker") is not False
     detect_desync = payload.get("detect_desync") is not False
@@ -792,6 +794,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
                     guides=guides,
                     audio_path=audio_slice,
                     output_path=output,
+                    recipe=recipe,
                     sparse_attention=sparse_attention,
                 )
                 # Glitches are judged against the image the chunk opens on; a chunk moving into another
@@ -864,9 +867,11 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
         "canvas_width": canvas_width,
         "canvas_height": canvas_height,
         "chunks": len(chunks),
-        "steps": LIPSYNC_STEPS,
-        "sigmas": LIPSYNC_SIGMAS,
-        "turbo_lora": LIPSYNC_LORA_NAME,
+        "preset": preset,
+        "steps": recipe.steps,
+        "sampler": recipe.sampler_label,
+        "sigmas": recipe.sigmas,
+        "lora": recipe.lora_name,
         "sparse_attention": sparse_attention and all(metric["sparse_attention"] for metric in chunk_metrics),
         "checks": {
             "detect_flicker": detect_flicker,

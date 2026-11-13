@@ -80,8 +80,10 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     from .minimax_h3_runtime import (
         H3_FPS,
         cleanup_h3_job_files,
+        VIDEO_PRESETS,
         delivery_dimensions,
-        h3_steps,
+        env_recipe,
+        h3_preset,
         probe_image_dimensions,
         resolve_canvas,
         run_minimax_h3_inference,
@@ -101,6 +103,8 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("width/height must be within 64..4096")
     seed = int(payload["seed"]) if payload.get("seed") is not None else random.randint(0, 2**31 - 1)
     generate_audio = payload.get("generate_audio") is not False
+    preset = payload.get("preset") or None
+    recipe = h3_preset(str(preset), VIDEO_PRESETS) if preset else env_recipe()
 
     scratch_dir = job_dir(job_id)
     image_path = download_job_input(job, payload, "image", scratch_dir, ".png", kind="videogen")
@@ -150,6 +154,7 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
             width=width,
             height=height,
             length=length,
+            preset=preset,
             generate_audio=generate_audio,
             output_width=delivery[0] if delivery else None,
             output_height=delivery[1] if delivery else None,
@@ -177,7 +182,8 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
         "canvas_height": canvas.height,
         "frames": int(video.get("nb_frames") or 0) or length,
         "duration_seconds": round(float(video.get("duration") or 0.0), 3),
-        "steps": h3_steps(),
+        "preset": preset,
+        "steps": recipe.steps,
         "generate_audio": generate_audio,
         "last_frame": last_frame_path is not None,
         "pinned_frames": [frame for frame, _ in guides],

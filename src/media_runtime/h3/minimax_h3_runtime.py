@@ -167,6 +167,55 @@ LIPSYNC_LORA_NAME = "minimax_h3_foldfirst3_ff3sla2_ema_g00120.safetensors"
 LIPSYNC_SIGMAS = "1.0, 0.9230769276618958, 0.800000011920929, 0.0"
 LIPSYNC_STEPS = 3
 
+#: The upstream 8-step FL2V Turbo LoRA (``diffusion_model.*`` keys, so the stock
+#: ``LoraLoaderModelOnly`` loads it), sampled ``res_multistep``.
+TURBO8_LORA_NAME = "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
+
+
+@dataclass(frozen=True)
+class H3Recipe:
+    """One sampling recipe on the H3 base: the LoRA (if any), step count and sampler.
+
+    ``sampler`` is ``"turbo"`` for the ``MiniMaxH3TurboSampler`` node, else a stock
+    ``KSamplerSelect`` name. ``sigmas`` (``ManualSigmas``) replace the ``simple``
+    schedule when set; only the lipsync graph honours them.
+    """
+
+    steps: int
+    sampler: str = "turbo"
+    lora_name: str | None = None
+    lora_loader: str = "MiniMaxH3TurboLoRA"
+    sigmas: str | None = None
+
+    @property
+    def sampler_label(self) -> str:
+        return "minimax_h3_turbo_sampler" if self.sampler == "turbo" else self.sampler
+
+
+#: ``preset`` values of videogen jobs. ``standard`` is the plain base on the
+#: CFG-distilled checkpoint's benchmarked recipe (res_multistep, 10 steps, no LoRA);
+#: ``turbo-N`` are the Turbo LoRAs: ema850 at 4 (the served default) or 6 steps (vigen's
+#: production recipe), the upstream 8-step LoRA at 8.
+VIDEO_PRESETS: dict[str, H3Recipe] = {
+    "standard": H3Recipe(steps=NVFP4_VANILLA_STEPS, sampler=NVFP4_VANILLA_SAMPLER),
+    "turbo-8": H3Recipe(steps=8, sampler="res_multistep", lora_name=TURBO8_LORA_NAME, lora_loader="LoraLoaderModelOnly"),
+    "turbo-6": H3Recipe(steps=6, lora_name=DEFAULT_TURBO_LORA_NAME),
+    "turbo-4": H3Recipe(steps=4, lora_name=DEFAULT_TURBO_LORA_NAME),
+}
+#: ``preset`` values of lipsync jobs: the video presets plus ``turbo-3``, the lipsync
+#: student (:data:`LIPSYNC_LORA_NAME` on :data:`LIPSYNC_SIGMAS`), the default.
+LIPSYNC_PRESETS: dict[str, H3Recipe] = {
+    **VIDEO_PRESETS,
+    "turbo-3": H3Recipe(steps=LIPSYNC_STEPS, lora_name=LIPSYNC_LORA_NAME, sigmas=LIPSYNC_SIGMAS),
+}
+DEFAULT_LIPSYNC_PRESET = "turbo-3"
+
+
+def h3_preset(name: str, presets: dict[str, H3Recipe]) -> H3Recipe:
+    if name not in presets:
+        raise ValueError(f"unknown preset {name!r}; expected one of: {', '.join(presets)}")
+    return presets[name]
+
 #: Model-artifact name these weights are provisioned under.
 DEFAULT_ARTIFACT_NAME = "minimax_h3_comfy_turbo"
 #: The ``int8_dmd3`` artifact: the same base, text encoder and VAEs with the
@@ -380,6 +429,13 @@ def h3_sampler() -> str:
 
 def h3_scheduler() -> str:
     return _env("H3_SCHEDULER", DEFAULT_SCHEDULER)
+
+
+def env_recipe() -> H3Recipe:
+    """The worker's own recipe (``H3_VARIANT``/``H3_STEPS``/``H3_TURBO_LORA_NAME``): videogen without a preset."""
+    if is_nvfp4_vanilla():
+        return H3Recipe(steps=h3_steps(), sampler=NVFP4_VANILLA_SAMPLER)
+    return H3Recipe(steps=h3_steps(), lora_name=turbo_lora_name())
 
 
 def comfyui_runtime_dir() -> Path:
@@ -808,7 +864,7 @@ def ensure_minimax_h3_models(
     comfy_root: Path | None = None,
     *,
     generate_audio: bool = True,
-    lora_name: str | None = None,
+    recipe: H3Recipe | None = None,
 ) -> dict[str, Path]:
     comfy_root = comfy_root or ensure_comfyui_runtime()
     required = {
@@ -816,10 +872,9 @@ def ensure_minimax_h3_models(
         "clip": (comfy_root / "models" / "text_encoders" / clip_name()),
         "video_vae": (comfy_root / "models" / "vae" / video_vae_name()),
     }
-    if not is_nvfp4_vanilla():
-        # The vanilla recipe runs the pruned NVFP4 checkpoint without the Turbo
-        # LoRA, so its artifact is not required.
-        required["turbo_lora"] = comfy_root / "models" / "loras" / (lora_name or turbo_lora_name())
+    lora_name = (recipe or env_recipe()).lora_name
+    if lora_name:
+        required["turbo_lora"] = comfy_root / "models" / "loras" / lora_name
     if generate_audio:
         required["audio_vae"] = comfy_root / "models" / "vae" / audio_vae_name()
     missing = [str(path) for path in required.values() if not path.exists()]
@@ -904,16 +959,12 @@ def build_h3_graph(
     width: int,
     height: int,
     length: int,
-    steps: int,
     first_frame_input: str,
     last_frame_input: str | None,
     filename_prefix: str,
-    sampler: str | None = None,
+    recipe: H3Recipe | None = None,
     scheduler: str | None = None,
     generate_audio: bool = True,
-    lora_name: str | None = None,
-    lora_strength: float | None = None,
-    low_vram: bool | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Build the headless MiniMax H3 FL2VA prompt graph.
 
@@ -934,10 +985,13 @@ def build_h3_graph(
     ``filename_prefix`` is the SaveVideo output prefix.
     Set ``generate_audio=False`` to drop the audio VAE decoder (no audio track);
     the FL2VA latent always carries the audio stream, so the default keeps it.
+
+    ``recipe`` (a preset, default :func:`env_recipe`) picks the LoRA node (none,
+    ``MiniMaxH3TurboLoRA`` or the stock ``LoraLoaderModelOnly``), the steps and the
+    sampler node (the Turbo sampler or ``KSamplerSelect``).
     """
-    _ = sampler or h3_sampler()  # the sampler is a node type, not a name
+    recipe = recipe or env_recipe()
     scheduler_name = scheduler or h3_scheduler()
-    vanilla = is_nvfp4_vanilla()
     graph: dict[str, dict[str, Any]] = {}
 
     graph["1"] = {
@@ -948,19 +1002,22 @@ def build_h3_graph(
         "class_type": "UNETLoader",
         "inputs": {"unet_name": unet_name(), "weight_dtype": "default"},
     }
-    if vanilla:
-        # The NVFP4 vanilla recipe runs the pruned checkpoint unmodified: no
-        # Turbo LoRA node, the loader feeds the guider/scheduler directly.
-        model_source: list[str] = ["2", 0]
-    else:
+    model_source: list[Any] = ["2", 0]
+    if recipe.lora_name and recipe.lora_loader == "MiniMaxH3TurboLoRA":
         graph["18"] = {
             "class_type": "MiniMaxH3TurboLoRA",
             "inputs": {
                 "model": ["2", 0],
-                "lora_name": lora_name or turbo_lora_name(),
-                "strength": turbo_strength() if lora_strength is None else float(lora_strength),
-                "low_vram": turbo_low_vram() if low_vram is None else bool(low_vram),
+                "lora_name": recipe.lora_name,
+                "strength": turbo_strength(),
+                "low_vram": turbo_low_vram(),
             },
+        }
+        model_source = ["18", 0]
+    elif recipe.lora_name:
+        graph["18"] = {
+            "class_type": recipe.lora_loader,
+            "inputs": {"model": ["2", 0], "lora_name": recipe.lora_name, "strength_model": 1.0},
         }
         model_source = ["18", 0]
     graph["3"] = {
@@ -1000,7 +1057,7 @@ def build_h3_graph(
         "inputs": {
             "model": model_source,
             "scheduler": scheduler_name,
-            "steps": steps,
+            "steps": recipe.steps,
             "denoise": 1.0,
         },
     }
@@ -1012,16 +1069,10 @@ def build_h3_graph(
         "class_type": "BasicGuider",
         "inputs": {"model": model_source, "conditioning": ["8", 0]},
     }
-    if vanilla:
-        graph["12"] = {
-            "class_type": "KSamplerSelect",
-            "inputs": {"sampler_name": NVFP4_VANILLA_SAMPLER},
-        }
+    if recipe.sampler == "turbo":
+        graph["12"] = {"class_type": "MiniMaxH3TurboSampler", "inputs": {}}
     else:
-        graph["12"] = {
-            "class_type": "MiniMaxH3TurboSampler",
-            "inputs": {},
-        }
+        graph["12"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": recipe.sampler}}
     graph["13"] = {
         "class_type": "SamplerCustomAdvanced",
         "inputs": {
@@ -1122,9 +1173,7 @@ def build_lipsync_graph(
     guides: list[tuple[int, str]],
     audio_input: str,
     filename_prefix: str,
-    steps: int = LIPSYNC_STEPS,
-    lora_name: str = LIPSYNC_LORA_NAME,
-    sigmas: str | None = LIPSYNC_SIGMAS,
+    recipe: H3Recipe = LIPSYNC_PRESETS[DEFAULT_LIPSYNC_PRESET],
     sparse_attention: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """Pinned-audio lipsync: the Turbo graph re-rendering every frame to a fixed voice.
@@ -1141,11 +1190,11 @@ def build_lipsync_graph(
       carrying old mouth shapes often enough to fight the audio;
     - the audio is never decoded: the clip is video-only and the worker muxes the
       caller's original audio afterwards, bit-exact;
-    - ``sigmas`` (``ManualSigmas``) replace the ``simple`` schedule; ``None``
-      keeps ``BasicScheduler(simple, steps)``.
+    - the recipe's ``sigmas`` (``ManualSigmas``) replace the ``simple`` schedule;
+      ``None`` keeps ``BasicScheduler(simple, steps)``.
 
-    Defaults to the lipsync student's recipe (:data:`LIPSYNC_LORA_NAME` on
-    :data:`LIPSYNC_SIGMAS`, sparse attention), the one this mode ships.
+    Defaults to the lipsync student's recipe (``turbo-3``: :data:`LIPSYNC_LORA_NAME`
+    on :data:`LIPSYNC_SIGMAS`, sparse attention), the one this mode ships.
     ``guides`` are ``(frame_idx, LoadImage input)`` pairs inside ``[0, length)``.
     ``sparse_attention`` samples with :func:`add_sparse_attention`.
     """
@@ -1155,19 +1204,18 @@ def build_lipsync_graph(
         width=width,
         height=height,
         length=length,
-        steps=steps,
         first_frame_input=first_frame_input,
         last_frame_input=last_frame_input,
         filename_prefix=filename_prefix,
+        recipe=recipe,
         generate_audio=True,
-        lora_name=lora_name,
     )
     add_frame_guides(graph, guides, length=length)
     pin_audio(graph, audio_input)
     if sparse_attention:
         add_sparse_attention(graph)
-    if sigmas is not None:  # after the attention rewiring: ManualSigmas takes no model
-        graph["9"] = {"class_type": "ManualSigmas", "inputs": {"sigmas": sigmas}}
+    if recipe.sigmas is not None:  # after the attention rewiring: ManualSigmas takes no model
+        graph["9"] = {"class_type": "ManualSigmas", "inputs": {"sigmas": recipe.sigmas}}
     return graph
 
 
@@ -1231,7 +1279,7 @@ def load_retained_h3_runtime(*, generate_audio: bool = True) -> Path:
 def _retained_runtime(
     *,
     generate_audio: bool = False,
-    lora_name: str | None = None,
+    recipe: H3Recipe | None = None,
     check_models: bool = True,
 ) -> _RetainedH3Runtime:
     global _RETAINED_H3_RUNTIME
@@ -1252,7 +1300,7 @@ def _retained_runtime(
             ensure_minimax_h3_turbo_node(comfy_root)
         ensure_minimax_h3_keyframe_geometry(comfy_root)
         if check_models:
-            ensure_minimax_h3_models(comfy_root, generate_audio=generate_audio, lora_name=lora_name)
+            ensure_minimax_h3_models(comfy_root, generate_audio=generate_audio, recipe=recipe)
         log_event("minimax_h3_runtime_load_started", comfy_root=str(comfy_root), generate_audio=generate_audio)
         started = time.perf_counter()
         _load_comfy_modules(comfy_root)
@@ -1402,7 +1450,7 @@ def run_minimax_h3_inference(
     height: int | None = None,
     width: int | None = None,
     length: int,
-    steps: int | None = None,
+    preset: str | None = None,
     generate_audio: bool = True,
     output_width: int | None = None,
     output_height: int | None = None,
@@ -1416,8 +1464,9 @@ def run_minimax_h3_inference(
     last the snapped clip): the video moves to it and the mp4 comes out silent.
 
     ``length`` is the requested frame count at 24 fps; the node's own
-    ``temporal_shape`` snaps it up to the model's 17k+5 frame grid. ``steps``
-    defaults to the served recipe's 4 (Turbo LoRA) on the ``simple`` schedule.
+    ``temporal_shape`` snaps it up to the model's 17k+5 frame grid. ``preset`` is a
+    :data:`VIDEO_PRESETS` name; ``None`` runs the worker's :func:`env_recipe`
+    (``turbo-4`` on the default variant).
     ``generate_audio`` defaults to ``True``: FL2VA carries a synchronized audio
     stream and the Turbo Sampler is what keeps it intelligible.
 
@@ -1439,14 +1488,16 @@ def run_minimax_h3_inference(
     width = canvas.width
     height = canvas.height
 
-    effective_steps = int(steps) if steps else h3_steps()
-    vanilla = is_nvfp4_vanilla()
+    recipe = h3_preset(preset, VIDEO_PRESETS) if preset else env_recipe()
+    turbo_lora = recipe.lora_loader == "MiniMaxH3TurboLoRA" and recipe.lora_name is not None
     engine_name = h3_engine_name()
     started = time.perf_counter()
     # A pinned audio needs the audio VAE as its encoder.
     audio_vae = generate_audio or pinned_audio_path is not None
-    retained = _retained_runtime(generate_audio=audio_vae)
+    retained = _retained_runtime(generate_audio=audio_vae, recipe=recipe)
     comfy_root = retained.comfy_root
+    # The retained runtime may have been loaded for another recipe; check this one's LoRA.
+    ensure_minimax_h3_models(comfy_root, generate_audio=audio_vae, recipe=recipe)
     stage_timings: dict[str, float] = {"minimax_h3_runtime_init_seconds": retained.init_seconds}
 
     def finish_stage(name: str, began: float) -> None:
@@ -1490,10 +1541,10 @@ def run_minimax_h3_inference(
         width=width,
         height=height,
         length=length,
-        steps=effective_steps,
         first_frame_input=first_frame_input,
         last_frame_input=last_frame_input,
         filename_prefix=filename_prefix,
+        recipe=recipe,
         generate_audio=audio_vae,
     )
     if guides:
@@ -1518,9 +1569,9 @@ def run_minimax_h3_inference(
         warm=True,
         generate_audio=generate_audio,
         h3_variant=h3_variant(),
-        turbo_lora=None if vanilla else turbo_lora_name(),
-        turbo_strength=None if vanilla else turbo_strength(),
-        turbo_low_vram=None if vanilla else turbo_low_vram(),
+        preset=preset,
+        steps=recipe.steps,
+        lora=recipe.lora_name,
     )
 
     comfy_output_dir = comfy_root / "output"
@@ -1580,15 +1631,16 @@ def run_minimax_h3_inference(
         "output_resize": resize_metrics,
         **geometry,
         "fps": H3_FPS,
-        "steps": effective_steps,
-        "sampler": h3_sampler(),
+        "preset": preset,
+        "steps": recipe.steps,
+        "sampler": recipe.sampler_label,
         "scheduler": h3_scheduler(),
         "unet": unet_name(),
         "text_encoder": clip_name(),
         "h3_variant": h3_variant(),
-        "turbo_lora": None if vanilla else turbo_lora_name(),
-        "turbo_strength": None if vanilla else turbo_strength(),
-        "turbo_low_vram": None if vanilla else turbo_low_vram(),
+        "lora": recipe.lora_name,
+        "turbo_strength": turbo_strength() if turbo_lora else None,
+        "turbo_low_vram": turbo_low_vram() if turbo_lora else None,
         "generate_audio": generate_audio,
         "wall_seconds": round(time.perf_counter() - started, 3),
         "pipeline_seconds": stage_timings["minimax_h3_pipeline_seconds"],
@@ -1613,21 +1665,22 @@ def run_lipsync_chunk(
     guides: list[tuple[int, Path]],
     audio_path: Path,
     output_path: Path,
+    recipe: H3Recipe = LIPSYNC_PRESETS[DEFAULT_LIPSYNC_PRESET],
     sparse_attention: bool = True,
 ) -> dict[str, Any]:
-    """Render one pinned-audio lipsync chunk with the lipsync student's recipe.
+    """Render one pinned-audio lipsync chunk with ``recipe`` (default: the lipsync student).
 
     ``width``/``height`` must already sit on the H3 lattice (see
     :func:`resolve_canvas`) and ``length`` on the node's 17k+5 grid, so the
     render has exactly the frames the caller planned; ``audio_path`` must last
     ``length / H3_FPS`` seconds. Writes a video-only mp4 to ``output_path``.
     """
-    retained = _retained_runtime(generate_audio=True, lora_name=LIPSYNC_LORA_NAME)
+    retained = _retained_runtime(generate_audio=True, recipe=recipe)
     comfy_root = retained.comfy_root
-    # The retained runtime may have been loaded by a videogen job; this mode
-    # always samples the lipsync student, so check its weights per chunk.
+    # The retained runtime may have been loaded by a videogen job; check this
+    # recipe's weights per chunk.
     ensure_minimax_h3_turbo_node(comfy_root)
-    ensure_minimax_h3_models(comfy_root, generate_audio=True, lora_name=LIPSYNC_LORA_NAME)
+    ensure_minimax_h3_models(comfy_root, generate_audio=True, recipe=recipe)
     if sparse_attention:
         reason = sparse_attention_unavailable(comfy_root)
         if reason is not None:
@@ -1656,6 +1709,7 @@ def run_lipsync_chunk(
         guides=[(frame_idx, stage(path, f"guide{index}")) for index, (frame_idx, path) in enumerate(guides)],
         audio_input=stage(audio_path, "audio"),
         filename_prefix=f"{relative_dir}/{prefix}",
+        recipe=recipe,
         sparse_attention=sparse_attention,
     )
     saved_result = _execute_graph(retained, graph, job_id=job_id)
