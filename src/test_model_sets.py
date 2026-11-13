@@ -1,0 +1,83 @@
+"""Model set selection (LZAI_MODELS / LZAI_REQUIRED_MODELS) and ready task types."""
+
+import json
+
+import pytest
+
+from src import model_sets
+from src.taskflow_worker import ready_task_types, served_task_types
+
+
+@pytest.fixture
+def server_json(tmp_path, monkeypatch):
+    path = tmp_path / "server.json"
+    path.write_text(json.dumps({"engines": {"voxcpm": True, "seed_vc": False}, "transcribe": {"enabled": True}, "media": {"music": True}}))
+    monkeypatch.setenv("LZAI_SERVER_CONFIG", str(path))
+    monkeypatch.delenv("LZAI_MODELS", raising=False)
+    monkeypatch.delenv("LZAI_REQUIRED_MODELS", raising=False)
+    return path
+
+
+def test_default_is_what_server_json_enables_and_all_required(server_json):
+    assert model_sets.selected_sets() == ["transcribe", "falcon", "music"]
+    assert model_sets.required_sets() == ["transcribe", "falcon", "music"]
+    assert model_sets.explicit_selection() is None
+    assert model_sets.media_stage() == "required"
+
+
+def test_required_subset_defers_the_rest(server_json, monkeypatch):
+    monkeypatch.setenv("LZAI_MODELS", "falcon, music")
+    monkeypatch.setenv("LZAI_REQUIRED_MODELS", "falcon")
+    assert model_sets.selected_sets() == ["falcon", "music"]
+    assert model_sets.required_sets() == ["falcon"]
+    assert model_sets.media_stage() == "deferred"
+    monkeypatch.setenv("LZAI_REQUIRED_MODELS", "none")
+    assert model_sets.required_sets() == []
+
+
+def test_required_outside_models_and_unknown_names_fail(server_json, monkeypatch):
+    monkeypatch.setenv("LZAI_MODELS", "falcon")
+    monkeypatch.setenv("LZAI_REQUIRED_MODELS", "transcribe")
+    with pytest.raises(ValueError, match="not in LZAI_MODELS"):
+        model_sets.required_sets()
+    monkeypatch.setenv("LZAI_MODELS", "falcon,sparrow")
+    with pytest.raises(ValueError, match="unknown model set"):
+        model_sets.selected_sets()
+    monkeypatch.setenv("LZAI_MODELS", "all")
+    assert model_sets.selected_sets() == list(model_sets.MODEL_SETS)
+
+
+def test_dirs_map_to_sets_and_unclaimed_dirs_are_core():
+    assert model_sets.set_of_dir("lzspeech-falcon-v1.2") == {"falcon"}
+    assert model_sets.set_of_dir("voxcpm2-stable") == {"falcon"}
+    assert model_sets.set_of_dir("comfyui") == {"imagegen", "videogen", "lipsync"}
+    assert model_sets.set_of_dir("qwen3-asr-0.6b") == {"transcribe"}
+    for core in ("lzspeech-sparrow", "lzspeech-starling", "runtime-wheels", "number-modes", "voice-presets.json"):
+        assert model_sets.set_of_dir(core) == set()
+
+
+def test_pending_markers(tmp_path):
+    assert model_sets.pending_sets(tmp_path) == set()
+    model_sets.pending_dir(tmp_path).mkdir()
+    (model_sets.pending_dir(tmp_path) / "falcon").touch()
+    assert model_sets.pending_sets(tmp_path) == {"falcon"}
+
+
+def test_types_wait_for_their_deferred_engines():
+    types = ("tts-synthesis", "voice-design", "voice-enhance", "transcribe", "force-align", "videogen")
+    assert ready_task_types(types, frozenset()) == types
+    assert ready_task_types(types, frozenset({"voxcpm"})) == ("voice-enhance", "transcribe", "force-align", "videogen")
+    assert ready_task_types(types, frozenset({"transcribe", "media"})) == ("tts-synthesis", "voice-design", "voice-enhance", "force-align")
+
+
+def test_lzai_models_turns_engines_and_their_types_off(server_json, monkeypatch):
+    from src.api import server
+
+    monkeypatch.setattr(server, "CONFIG_PATH", server_json)
+    monkeypatch.setenv("LZAI_MODELS", "falcon")
+    config = server._load_config()
+    assert config.engines.voxcpm and not config.engines.seed_vc
+    assert not config.transcribe.enabled and config.media.features() == []
+    served = served_task_types(config)
+    assert "voice-design" in served and "transcribe" not in served and "generate-music" not in served
+    assert "force-align" in served and "tts-synthesis" in served

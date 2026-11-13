@@ -42,6 +42,7 @@ from ..multilingual_splitter.multilingual_splitter import CLD2_LANGUAGE_CODES
 from ..piper import PiperInference
 from ..piper.ipa_symbols import sparrow_ipa_symbols
 from ..heap_trim import IdleHeapTrimmer
+from .. import model_sets
 from ..process_guard import hard_exit
 from ..ctc_forced_alignment import CtcLanguageSpan
 from ..aligned_pauses import ResolvedPause, insert_resolved_pauses
@@ -991,6 +992,10 @@ _seed_vc_info: dict[str, Any] = {}
 _voxcpm_runtime: VoxCPMRuntime | None = None
 _voxcpm_reference_download_tasks: dict[str, asyncio.Task[tuple[bytes, str]]] = {}
 _startup_loader_task: asyncio.Task | None = None
+# Engines whose model sets were still downloading at startup; loaded once their markers clear.
+_deferred_engines: set[str] = set()
+_deferred_loader_task: asyncio.Task | None = None
+_DEFERRED_POLL_SECONDS = 5.0
 
 
 @dataclass
@@ -1147,7 +1152,38 @@ def _load_config() -> ServerConfig:
         return ServerConfig()
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    return ServerConfig(**data)
+    return _restrict_to_model_sets(ServerConfig(**data))
+
+
+def _restrict_to_model_sets(config: ServerConfig) -> ServerConfig:
+    """Disable the engines whose model set ``LZAI_MODELS`` leaves out (unset: config as is)."""
+    selected = model_sets.explicit_selection()
+    if selected is None:
+        return config
+    for engine, set_name in model_sets.ENGINE_SETS.items():
+        if set_name in selected:
+            continue
+        if engine == "transcribe":
+            config.transcribe.enabled = False
+        else:
+            setattr(config.engines, engine, False)
+    for name in model_sets.MEDIA_SETS:
+        if name not in selected:
+            setattr(config.media, name, False)
+    return config
+
+
+def _engine_pending_sets(engine: str, config: ServerConfig | None = None) -> set[str]:
+    """Model sets this engine needs that are still downloading (data/.pending markers)."""
+    cfg = config or _server_config
+    pending = model_sets.pending_sets()
+    if not pending:
+        return set()
+    if engine == "media":
+        needed = {*cfg.media.features(), model_sets.MEDIA_VENV_MARKER}
+    else:
+        needed = {model_sets.ENGINE_SETS[engine]} if engine in model_sets.ENGINE_SETS else set()
+    return needed & pending
 
 
 def _engine_enabled(
@@ -5416,7 +5452,7 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
     global _seed_vc_backend
     global _voxcpm_runtime
     global _sparrow_model_info, _seed_vc_info
-    global _startup_loader_task
+    global _startup_loader_task, _deferred_loader_task
 
     _server_config = config
     startup_started = time.perf_counter()
@@ -5424,6 +5460,8 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
     with _logged_startup_step("reset_runtime_state"):
         if _startup_loader_task is not None and not _startup_loader_task.done():
             _startup_loader_task.cancel()
+        if _deferred_loader_task is not None and not _deferred_loader_task.done():
+            _deferred_loader_task.cancel()
         if _voxcpm_runtime is not None:
             await _voxcpm_runtime.stop()
             _voxcpm_runtime = None
@@ -5436,9 +5474,14 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
         _seed_vc_backend = None
         _sparrow_model_info = {}
         _seed_vc_info = {}
+        _deferred_engines.clear()
         for engine in _engine_load_states:
             if _engine_enabled(engine):  # type: ignore[arg-type]
                 _mark_engine_loading(engine)
+                pending = _engine_pending_sets(engine)
+                if pending:
+                    _LOGGER.info("Deferring %s backend until model sets download: %s", engine, sorted(pending))
+                    _deferred_engines.add(engine)
             else:
                 _mark_engine_disabled(engine)
 
@@ -5458,22 +5501,26 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
             _LOGGER.info("PiperTTS backend disabled")
 
         if _engine_enabled("voxcpm"):
-            startup_tasks.append(asyncio.create_task(_run_engine_loader("voxcpm", _load_voxcpm_engine)))
+            if "voxcpm" not in _deferred_engines:
+                startup_tasks.append(asyncio.create_task(_run_engine_loader("voxcpm", _load_voxcpm_engine)))
         else:
             _LOGGER.info("VoxCPM backend disabled")
 
         if _engine_enabled("transcribe"):
-            startup_tasks.append(asyncio.create_task(_run_engine_loader("transcribe", _load_transcribe_engine)))
+            if "transcribe" not in _deferred_engines:
+                startup_tasks.append(asyncio.create_task(_run_engine_loader("transcribe", _load_transcribe_engine)))
         else:
             _LOGGER.info("Transcribe backend disabled")
 
         if _engine_enabled("media"):
-            startup_tasks.append(asyncio.create_task(_run_engine_loader("media", _load_media_engine)))
+            if "media" not in _deferred_engines:
+                startup_tasks.append(asyncio.create_task(_run_engine_loader("media", _load_media_engine)))
         else:
             _LOGGER.info("Media runtime disabled")
 
         if _engine_enabled("seed_vc"):
-            startup_tasks.append(asyncio.create_task(_run_engine_loader("seed_vc", _load_seed_vc_engine)))
+            if "seed_vc" not in _deferred_engines:
+                startup_tasks.append(asyncio.create_task(_run_engine_loader("seed_vc", _load_seed_vc_engine)))
         else:
             _LOGGER.info("Seed-VC backend disabled")
 
@@ -5525,6 +5572,8 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
 
     _startup_loader_task = asyncio.create_task(load_models_background())
     await _startup_loader_task
+    if _deferred_engines:
+        _deferred_loader_task = asyncio.create_task(_load_deferred_engines())
     # Startup state lives for the process; freeze it so the per-request
     # gc.collect() in _maybe_cleanup_gpu() stops walking ~1M objects.
     gc.collect()
@@ -5532,13 +5581,44 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
     _LOGGER.info("Inference runtime startup complete elapsed=%.2fs", time.perf_counter() - startup_started)
 
 
+async def _load_deferred_engines() -> None:
+    """Load each deferred engine once the background download clears its model sets.
+
+    One at a time, in the order their sets finish. A deferred engine that fails to load
+    restarts the worker: its task types are never pulled until it is ready, so a broken
+    one would otherwise sit unserved forever (the restart finds the data complete).
+    """
+    while _deferred_engines:
+        ready = [engine for engine in sorted(_deferred_engines) if not _engine_pending_sets(engine)]
+        if not ready:
+            await asyncio.sleep(_DEFERRED_POLL_SECONDS)
+            continue
+        engine = ready[0]
+        _LOGGER.info("Model sets for %s backend downloaded; loading it", engine)
+        await _run_engine_loader(engine, _ENGINE_LOADERS[engine])
+        if _engine_state(engine).status != "ready":
+            hard_exit(f"deferred {engine} backend failed to load: {_engine_state(engine).error}")
+        _deferred_engines.discard(engine)
+        _LOGGER.info("Deferred %s backend ready", engine)
+
+
+def deferred_engines() -> frozenset[str]:
+    """Enabled engines not loaded yet because their model sets are still downloading."""
+    return frozenset(_deferred_engines)
+
+
 async def _stop_inference_runtime() -> None:
-    global _startup_loader_task, _voxcpm_runtime
+    global _startup_loader_task, _deferred_loader_task, _voxcpm_runtime
     if _startup_loader_task is not None and not _startup_loader_task.done():
         _startup_loader_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await _startup_loader_task
     _startup_loader_task = None
+    if _deferred_loader_task is not None and not _deferred_loader_task.done():
+        _deferred_loader_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _deferred_loader_task
+    _deferred_loader_task = None
     pending_reloads = [task for task in _engine_reload_tasks.values() if not task.done()]
     for task in pending_reloads:
         task.cancel()

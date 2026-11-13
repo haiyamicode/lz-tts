@@ -23,6 +23,7 @@ from .api.server import (
     LzTtsInferenceSession,
     _env_bool,
     create_app,
+    deferred_engines,
     get_health_status,
     set_status,
 )
@@ -65,13 +66,29 @@ _TYPE_OPERATIONS = {
 }
 
 
+# Engines a task type may run on. A type is pulled only once none of them is still waiting
+# for its model sets to download (LZAI_REQUIRED_MODELS); the other types need core data only.
+_TYPE_ENGINES = {
+    "tts-synthesis": ("pipertts", "voxcpm", "seed_vc"),
+    "voice-design": ("voxcpm",),
+    "transcribe": ("transcribe",),
+    **{task_type: ("media",) for task_type in _MEDIA_TASK_TYPES},
+}
+
+
+def ready_task_types(task_types: tuple[str, ...], deferred: frozenset[str]) -> tuple[str, ...]:
+    """The task types whose engines are all loaded (none of them in ``deferred``)."""
+    return tuple(t for t in task_types if not deferred.intersection(_TYPE_ENGINES.get(t, ())))
+
+
 def served_task_types(config: Any) -> tuple[str, ...]:
-    """TASK_TYPES minus the media task types this worker's config leaves off."""
-    return tuple(
-        task_type
-        for task_type in TASK_TYPES
-        if task_type not in _MEDIA_TASK_TYPES or getattr(config.media, _MEDIA_TASK_TYPES[task_type])
-    )
+    """TASK_TYPES minus those whose engine this worker's config (or LZAI_MODELS) turns off."""
+    off = {task_type for task_type, feature in _MEDIA_TASK_TYPES.items() if not getattr(config.media, feature)}
+    if not config.transcribe.enabled:
+        off.add("transcribe")
+    if not config.engines.voxcpm:
+        off.add("voice-design")
+    return tuple(task_type for task_type in TASK_TYPES if task_type not in off)
 _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
 # Join, heartbeat, pull, settle and leave are small requests (pulls long-poll
 # for at most a second); a minute is plenty, and a hung heartbeat must not hold
@@ -152,6 +169,9 @@ class TaskflowWorker:
     low_priority_batch_size: int = 3
     persistent: bool = False
     task_types: tuple[str, ...] = TASK_TYPES
+    # What pulls ask for: the joined ``task_types`` minus those whose engines are still
+    # waiting for their model sets (Taskflow narrows a pull to a subset of the join's types).
+    pull_task_types: tuple[str, ...] | None = None
     session_id: str | None = None
     session_token: str | None = None
     heartbeat_interval: float = 15.0
@@ -299,7 +319,7 @@ class TaskflowWorker:
         body: dict[str, Any] = {
             "maxTasks": max_tasks or self.concurrency,
             "waitMs": wait_ms,
-            "taskTypes": list(self.task_types),
+            "taskTypes": list(self.task_types if self.pull_task_types is None else self.pull_task_types),
         }
         # A Taskflow server older than these pull filters ignores them.
         if min_priority is not None:
@@ -1061,6 +1081,14 @@ async def _process_lease(
     await _process_leases(taskflow, inference, [lease], acks)
 
 
+def _update_pull_task_types(taskflow: TaskflowWorker) -> None:
+    ready = ready_task_types(taskflow.task_types, deferred_engines())
+    if ready != taskflow.pull_task_types:
+        waiting = [t for t in taskflow.task_types if t not in ready]
+        _LOGGER.info("Pulling task types %s%s", list(ready), f" (waiting for model sets: {waiting})" if waiting else "")
+        taskflow.pull_task_types = ready
+
+
 async def _pull_leases(
     taskflow: TaskflowWorker, busy: int, background: int
 ) -> list[dict[str, Any]]:
@@ -1168,6 +1196,7 @@ async def _serve_taskflow(
                             raise error
                     busy = sum(count for count, _ in running.values())
                     background = sum(count for _, count in running.values())
+                    _update_pull_task_types(taskflow)
                     leases = await _pull_leases(taskflow, busy, background)
                     for lease in leases:
                         task = asyncio.create_task(
