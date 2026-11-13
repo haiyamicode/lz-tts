@@ -86,6 +86,7 @@ from .transcribe import (
     TranscribeRequest,
     decode_transcribe_audio,
 )
+from .face_detection import FaceDetector, FaceDetectRequest, FaceInputError
 from .nudity_detection import NudityDetectRequest, NudityDetector, NudityInputError
 from .voice_anchor import ANCHOR_SEED, LANGUAGE_ANCHORS, VoiceAnchorRequest, anchor_language
 from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
@@ -5770,6 +5771,7 @@ class LzTtsInferenceSession:
             os.environ.get("VOICE_ENHANCE_TMP_DIR", "data/voice-enhance/tmp")
         )
         self.nudity_detector = NudityDetector()
+        self.face_detector = FaceDetector()
         self.language_identifier = SpokenLanguageIdentifier()
         self._heap_trimmer = IdleHeapTrimmer()
         self._started = False
@@ -6025,6 +6027,11 @@ class LzTtsInferenceSession:
                     result = await self._detect_nudity(request_data)
                 except NudityInputError as exc:
                     raise InferenceOperationError(400, str(exc)) from exc
+            elif operation == "detect-face":
+                try:
+                    result = await self._detect_face(request_data)
+                except FaceInputError as exc:
+                    raise InferenceOperationError(400, str(exc)) from exc
             elif operation == "detect-language":
                 try:
                     result = await self._detect_language(request_data)
@@ -6133,18 +6140,27 @@ class LzTtsInferenceSession:
             },
         )
 
-    async def _detect_nudity(self, request_data: dict[str, Any]) -> InferenceResult:
-        request = NudityDetectRequest.model_validate(request_data)
+    @staticmethod
+    async def _request_image(request: NudityDetectRequest | FaceDetectRequest) -> bytes:
         if request.image_base64:
-            image_bytes = base64.b64decode(request.image_base64)
-        elif request.image_url:
+            return base64.b64decode(request.image_base64)
+        if request.image_url:
             async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
                 response = await client.get(request.image_url)
                 response.raise_for_status()
-            image_bytes = response.content
-        else:
-            raise InferenceOperationError(400, "Provide 'image_url' or 'image_base64'")
+            return response.content
+        raise InferenceOperationError(400, "Provide 'image_url' or 'image_base64'")
+
+    async def _detect_nudity(self, request_data: dict[str, Any]) -> InferenceResult:
+        request = NudityDetectRequest.model_validate(request_data)
+        image_bytes = await self._request_image(request)
         data = await asyncio.to_thread(self.nudity_detector.classify, image_bytes, request.threshold)
+        return InferenceResult(kind="json", data=data)
+
+    async def _detect_face(self, request_data: dict[str, Any]) -> InferenceResult:
+        request = FaceDetectRequest.model_validate(request_data)
+        image_bytes = await self._request_image(request)
+        data = await asyncio.to_thread(self.face_detector.detect, image_bytes, request.min_score, request.max_faces)
         return InferenceResult(kind="json", data=data)
 
     async def _detect_language(self, request_data: dict[str, Any]) -> InferenceResult:
@@ -6288,6 +6304,7 @@ class SyncTaskInput(BaseModel):
         "voice-enhance",
         "voice-anchor",
         "detect-nudity",
+        "detect-face",
         "detect-language",
         "transcribe",
         "generate-music",

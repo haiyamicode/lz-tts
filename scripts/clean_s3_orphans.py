@@ -37,6 +37,7 @@ SERVING_FILES = {
     "language-id/accent-id-commonaccent_ecapa/normalizer_input.ckpt",
     "language-id/lang-id-voxlingua107-ecapa/README.md",
     "language-id/lang-id-voxlingua107-ecapa/classifier.ckpt",
+    "face-detection/face_detection_yunet_2023mar.onnx",
     "language-id/lang-id-voxlingua107-ecapa/config.json",
     "language-id/lang-id-voxlingua107-ecapa/embedding_model.ckpt",
     "language-id/lang-id-voxlingua107-ecapa/hyperparams.yaml",
