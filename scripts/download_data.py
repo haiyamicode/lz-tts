@@ -137,23 +137,21 @@ def _is_excluded(rel: str) -> bool:
 
 
 
-def _dir_filter(stage: str) -> tuple[Callable[[str], bool], list[str]]:
-    """Which top-level data dirs a stage downloads, and the deferred sets (for markers).
+def _path_filter(stage: str) -> tuple[Callable[[str], bool], list[str]]:
+    """Which data files a stage downloads, and the deferred sets (for markers).
 
-    ``all``: core + LZAI_MODELS. ``required``: core + LZAI_REQUIRED_MODELS.
-    Dirs claimed only by sets outside LZAI_MODELS are never downloaded.
+    ``all``: core + LZAI_MODELS. ``required``: core + LZAI_REQUIRED_MODELS. Files claimed only by
+    sets outside LZAI_MODELS (or Falcon files the server.json doesn't serve) never download.
     """
     models = model_sets.selected_sets()
     required = model_sets.required_sets()
     deferred = [name for name in models if name not in required]
     stage_sets = set(required if stage == "required" else models)
     print(f"Model sets: {', '.join(models) or 'none'} (required: {', '.join(required) or 'none'})")
-
-    def wanted(dir_name: str) -> bool:
-        owners = model_sets.set_of_dir(dir_name)
-        return not owners or bool(owners & stage_sets)
-
-    return wanted, deferred
+    falcon = model_sets.falcon_paths()
+    if "falcon" in models:
+        print(f"Falcon: {', '.join(falcon)}")
+    return (lambda rel, sets=None: model_sets.wanted_path(rel, stage_sets if sets is None else sets, falcon)), deferred
 
 
 def _list_objects(bucket: str, s3_data_path: str) -> list[tuple[dict, str]]:
@@ -266,7 +264,7 @@ def sync_data_from_s3(
 
     local_data_dir.mkdir(parents=True, exist_ok=True)
     try:
-        wanted, deferred = _dir_filter(stage)
+        wanted, deferred = _path_filter(stage)
     except ValueError as error:
         print(f"Error: {error}")
         return 2
@@ -287,24 +285,23 @@ def sync_data_from_s3(
                     marker.unlink()
                 for name in deferred:
                     (pending / name).touch()
-            selected = [(obj, rel) for obj, rel in objects if wanted(rel.split('/')[0])]
+            selected = [(obj, rel) for obj, rel in objects if wanted(rel)]
             if not selected:
                 print(f"No matching files (filter: {name_filter})")
                 return 0
             return _sync_objects(bucket, selected, local_data_dir, force, dry_run, parallel)
 
         pending = model_sets.pending_sets(local_data_dir)
-        # Dirs shared with a required set (or an earlier deferred one) are already synced:
+        # Files shared with a required set (or an earlier deferred one) are already synced:
         # don't re-hash them (comfyui is 43 GB).
-        required = set(model_sets.required_sets())
-        synced = {rel.split('/')[0] for _, rel in objects if model_sets.set_of_dir(rel.split('/')[0]) & required}
+        required = model_sets.required_sets()
+        synced = {rel for _, rel in objects if wanted(rel, required)}
         for name in deferred:
             if name not in pending and not dry_run:
                 continue
             print(f"\n=== Model set {name} ===")
-            dirs = {rel.split('/')[0] for _, rel in objects if name in model_sets.set_of_dir(rel.split('/')[0])}
-            selected = [(obj, rel) for obj, rel in objects if rel.split('/')[0] in dirs - synced]
-            synced |= dirs
+            selected = [(obj, rel) for obj, rel in objects if rel not in synced and wanted(rel, {name})]
+            synced |= {rel for _, rel in selected}
             rc = _sync_objects(bucket, selected, local_data_dir, force, dry_run, parallel)
             if rc != 0:
                 return rc

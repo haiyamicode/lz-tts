@@ -81,3 +81,25 @@ def test_lzai_models_turns_engines_and_their_types_off(server_json, monkeypatch)
     served = served_task_types(config)
     assert "voice-design" in served and "transcribe" not in served and "generate-music" not in served
     assert "force-align" in served and "tts-synthesis" in served
+
+
+def test_falcon_downloads_only_what_server_json_serves(server_json, monkeypatch):
+    monkeypatch.delenv("VOXCPM_MODEL_PATH", raising=False)
+    assert model_sets.falcon_paths() == [model_sets.DEFAULT_FALCON_MODEL.removeprefix("data/")]
+    raw = json.loads(server_json.read_text())
+    raw["voxcpm"] = {
+        "model_path": "./data/lzspeech-falcon-v1.2",
+        "applicable_loras": {"ipa-text": "/srv/lzai/data/voxcpm-lora/ipa/ipa-text-falcon"},
+    }
+    server_json.write_text(json.dumps(raw))
+    falcon = model_sets.falcon_paths()
+    assert falcon == ["lzspeech-falcon-v1.2", "voxcpm-lora/ipa/ipa-text-falcon"]
+    wanted = lambda rel, sets=("falcon",): model_sets.wanted_path(rel, sets, falcon)  # noqa: E731
+    assert wanted("lzspeech-falcon-v1.2/model.safetensors")
+    assert wanted("voxcpm-lora/ipa/ipa-text-falcon/lora_weights.safetensors")
+    assert not wanted("lzspeech-falcon-v1.1/model.safetensors")
+    assert not wanted("lzspeech-falcon-v1.2-old/model.safetensors")
+    assert not wanted("voxcpm2-original/model.safetensors")
+    assert not wanted("voxcpm-lora/accent/accent-en-US-falcon/lora_weights.safetensors")
+    assert wanted("lzspeech-sparrow/model.ckpt") and wanted("comfyui/x", {"videogen"})
+    assert not wanted("lzspeech-falcon-v1.2/model.safetensors", ("transcribe",))

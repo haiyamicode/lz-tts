@@ -323,12 +323,12 @@ class VoxCPMConfig(BaseModel):
     enabled: bool = Field(default_factory=lambda: _env_bool("VOXCPM_ENABLED", False))
     preload: bool = Field(default_factory=lambda: _env_bool("VOXCPM_PRELOAD", True))
     model_id: Literal["voxcpm"] = "voxcpm"
-    model_path: str = Field(default_factory=lambda: os.environ.get("VOXCPM_MODEL_PATH", "data/lzspeech-falcon-v1"))
+    model_path: str = Field(default_factory=lambda: os.environ.get("VOXCPM_MODEL_PATH", "data/lzspeech-falcon-v1.2"))
     device: int = Field(default_factory=lambda: int(os.environ.get("VOXCPM_DEVICE", "1")), ge=0)
     dtype: Literal["auto", "bfloat16", "float16"] = Field(
         default_factory=lambda: os.environ.get("VOXCPM_DTYPE", "auto")
     )
-    inference_timesteps: int = Field(default=10, ge=1)
+    inference_timesteps: int = Field(default=16, ge=1)
     # True: one conditional DiT pass per step, no CFG, cfg_value ignored (what a model with CFG folded into its DiT,
     # Falcon v1.2, needs). False: the two-pass CFG solver. None: the model's config.json `guidance_folded`.
     guidance_folded: bool | None = None
