@@ -877,6 +877,17 @@ async def _prepare_result(
         audio = result.audio or b""
         if not audio:
             raise RuntimeError("LZAI returned an empty audio artifact")
+        # A result's further files (a continuable clip's lastFrame) each go to the artifact the
+        # API named for it; one it didn't name would be lost, so that is the API's bug to fix.
+        file_ids = lease["payload"].get("artifactIds") or {}
+        files = result.files or {}
+        missing = sorted(name for name in files if not isinstance(file_ids.get(name), str))
+        if missing:
+            raise ValueError(
+                f"TTS operation {work.operation} returned files {missing} without artifactIds"
+            )
+        for name, file in files.items():
+            await taskflow.upload(lease, file_ids[name], file.content)
         if segments is not None:
             await segments.finish(audio)
         else:
@@ -888,6 +899,20 @@ async def _prepare_result(
             "artifactId": artifact_id,
             "bytes": len(audio),
             "contentType": result.content_type or "application/octet-stream",
+            **(
+                {
+                    "files": {
+                        name: {
+                            "artifactId": file_ids[name],
+                            "bytes": len(file.content),
+                            "contentType": file.content_type,
+                        }
+                        for name, file in files.items()
+                    }
+                }
+                if files
+                else {}
+            ),
         }
         if duration is not None:
             completion["duration"] = duration

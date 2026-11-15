@@ -97,7 +97,25 @@ class VideogenPinnedFrame(BaseModel):
 H3VideoPreset = Literal["standard", "turbo-8", "turbo-6", "turbo-4"]
 
 
-class VideogenRequest(BaseModel):
+class H3Interpolation(BaseModel):
+    """``use_interpolation`` (vigen 7280e2f, ``h3/h3_interpolation.py``): H3 renders ``interpolation_fps``
+    frames a second and RIFE v4.26 makes the rest of the 24 fps output."""
+
+    use_interpolation: bool = Field(
+        default=False, description="Render at interpolation_fps and RIFE-interpolate up to 24 fps (faster)"
+    )
+    interpolation_fps: int | None = Field(
+        default=None, ge=12, le=23, description="Frames H3 renders a second under use_interpolation (default 16)"
+    )
+
+    @model_validator(mode="after")
+    def _fps_needs_flag(self):
+        if self.interpolation_fps is not None and not self.use_interpolation:
+            raise ValueError("interpolation_fps needs use_interpolation")
+        return self
+
+
+class VideogenRequest(H3Interpolation):
     """The ``videogen`` request: H3 image-to-video, with H3's own audio track or a pinned one.
 
     ``preset``: ``standard`` (plain base, res_multistep 10 steps, slowest), ``turbo-8`` (8-step
@@ -131,11 +149,24 @@ class VideogenRequest(BaseModel):
         description="Audio pinned in the latent: the video moves to it; it is the output's audio track",
     )
     preset: H3VideoPreset | None = None
+    continuable: bool = Field(
+        default=False,
+        description="End on a clean frame another clip can open on: the last frame is previewed, restored "
+        "toward anchor_url (else image_url) and pinned; the result returns it as its lastFrame file (JPEG)",
+    )
+    anchor_url: str | None = Field(
+        default=None, min_length=1,
+        description="The chain's look (its first clip's image): a continued clip passes it with continuable",
+    )
 
     @model_validator(mode="after")
     def _size_pair(self) -> "VideogenRequest":
         if (self.width is None) != (self.height is None):
             raise ValueError("width and height go together")
+        if self.continuable and self.last_frame_url:
+            raise ValueError("continuable clips end on their own restored frame; drop last_frame_url")
+        if self.anchor_url and not self.continuable:
+            raise ValueError("anchor_url needs continuable")
         if self.duration_seconds is not None:
             late = [pin.seconds for pin in self.pinned_frames if pin.seconds >= self.duration_seconds]
             if late:
@@ -217,7 +248,7 @@ class ImagegenRequest(BaseModel):
         return self
 
 
-class LipsyncRequest(BaseModel):
+class LipsyncRequest(H3Interpolation):
     """The ``lipsync`` request: the person in ``image_url`` speaks ``audio_url`` (H3 lipsync LoRA).
 
     The output lasts as long as the audio and carries it unmodified; it has the image's size, or
@@ -246,6 +277,11 @@ class LipsyncRequest(BaseModel):
     detect_desync: bool = True
     detect_glitches: bool = True
     output_dimensions: OutputDimensions | None = None
+    chunk_boundaries: Literal["input_image", "continuous"] = Field(
+        default="input_image",
+        description="input_image: every chunk boundary and pause pins the input image; continuous: the "
+        "motion carries on, each boundary pinned to the previous chunk's last frame restored toward the image",
+    )
 
 
 async def fetch_reference(url: str, dest: Path) -> Path:

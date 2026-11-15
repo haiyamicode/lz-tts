@@ -426,7 +426,7 @@ def desync_scores(render: Path, *, audio: Path, kept_frames: int) -> dict[str, A
 
 
 def _glitch_net() -> Any:
-    """The glitch detector on the CPU, built once per process; each check copies it to the GPU."""
+    """The glitch detector, built once per process and kept on the GPU (ResNet-18, about 45 MB)."""
     with _MODELS_LOCK:
         if not _GLITCH_NET:
             import torch
@@ -443,7 +443,8 @@ def _glitch_net() -> Any:
             net.conv1 = torch.nn.Conv2d(channels, 64, 7, 2, 3, bias=False)
             net.fc = torch.nn.Linear(net.fc.in_features, 1)
             net.load_state_dict(state)
-            _GLITCH_NET["net"] = net.eval()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            _GLITCH_NET["net"] = net.eval().to(device, memory_format=torch.channels_last)
         return _GLITCH_NET["net"]
 
 
@@ -454,8 +455,6 @@ def _fit_size(width: int, height: int) -> tuple[int, int]:
 
 def glitch_scores(render: Path, *, image: Path, kept_frames: int) -> dict[str, Any]:
     """The glitch detector's probability for each of a chunk's kept frames, against the job's input image."""
-    import copy
-
     import torch
 
     width, height = _fit_size(*_probe_size(image))
@@ -469,7 +468,7 @@ def glitch_scores(render: Path, *, image: Path, kept_frames: int) -> dict[str, A
     top, left = (side - height) // 2, (side - width) // 2
     mean = torch.tensor(np.tile(GLITCH_MEAN, len(GLITCH_PRIOR) + 2), device=device)[None, :, None, None]
     std = torch.tensor(np.tile(GLITCH_STD, len(GLITCH_PRIOR) + 2), device=device)[None, :, None, None]
-    net = copy.deepcopy(_glitch_net()).to(device, memory_format=torch.channels_last)
+    net = _glitch_net()
     probs = []
     try:
         with torch.no_grad(), torch.autocast(device, torch.bfloat16, enabled=device == "cuda"):
@@ -483,9 +482,8 @@ def glitch_scores(render: Path, *, image: Path, kept_frames: int) -> dict[str, A
                 logits = net(((boxed.float() - mean) / std).contiguous(memory_format=torch.channels_last))
                 probs.append(torch.sigmoid(logits.float()).squeeze(1).cpu().numpy())
     finally:
-        del net
         if device == "cuda":
-            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()  # the activations; the weights stay
     p = np.concatenate(probs)
     over = np.flatnonzero(p > GLITCH_THRESHOLD)
     return {

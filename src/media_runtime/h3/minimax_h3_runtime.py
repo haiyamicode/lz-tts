@@ -29,7 +29,9 @@ and ``ComfyUI-H3-SLA-Attention`` custom nodes and the weights under
 The headless ComfyUI prompt executor runs in-process; the retained executor
 keeps the models warm between jobs, and :func:`unload_retained_h3_runtime`
 drops it, unloads every ComfyUI model and clears the CUDA cache (the media
-runtime does that before it loads the music models).
+runtime does that only before it loads the music models). One executor serves
+every H3 graph (videogen with or without audio, lipsync, imagegen): each graph
+loads the VAEs it needs, so nothing is torn down between H3 jobs.
 
 FL2VA always decodes the audio VAE, so a videogen mp4 carries a synchronized
 audio track; the Turbo Sampler is what keeps that track intelligible.
@@ -178,7 +180,9 @@ class H3Recipe:
 
     ``sampler`` is ``"turbo"`` for the ``MiniMaxH3TurboSampler`` node, else a stock
     ``KSamplerSelect`` name. ``sigmas`` (``ManualSigmas``) replace the ``simple``
-    schedule when set; only the lipsync graph honours them.
+    schedule when set; only the lipsync graph honours them. ``preview_sigmas`` are the
+    short schedule of a one-frame preview (:mod:`h3.h3_restore`, clean chunk joins);
+    ``None`` previews on the recipe's full schedule.
     """
 
     steps: int
@@ -186,11 +190,19 @@ class H3Recipe:
     lora_name: str | None = None
     lora_loader: str = "MiniMaxH3TurboLoRA"
     sigmas: str | None = None
+    preview_sigmas: str | None = None
 
     @property
     def sampler_label(self) -> str:
         return "minimax_h3_turbo_sampler" if self.sampler == "turbo" else self.sampler
 
+
+#: Preview schedules of the clean chunk joins, measured by vigen (h3-derift-20261113): the lipsync
+#: student's sigma-1 prediction is already a clean frame; the ema850 Turbo LoRA needs 3 steps of its
+#: own schedule (1 step is a ghosted blur, 2 still double the edges). Other recipes were never
+#: measured and preview on their full schedule.
+LIPSYNC_PREVIEW_SIGMAS = "1.0, 0.0"
+TURBO_PREVIEW_SIGMAS = "1.0, 0.8575, 0.7064, 0.0"
 
 #: ``preset`` values of videogen jobs. ``standard`` is the plain base on the
 #: CFG-distilled checkpoint's benchmarked recipe (res_multistep, 10 steps, no LoRA);
@@ -199,14 +211,16 @@ class H3Recipe:
 VIDEO_PRESETS: dict[str, H3Recipe] = {
     "standard": H3Recipe(steps=NVFP4_VANILLA_STEPS, sampler=NVFP4_VANILLA_SAMPLER),
     "turbo-8": H3Recipe(steps=8, sampler="res_multistep", lora_name=TURBO8_LORA_NAME, lora_loader="LoraLoaderModelOnly"),
-    "turbo-6": H3Recipe(steps=6, lora_name=DEFAULT_TURBO_LORA_NAME),
-    "turbo-4": H3Recipe(steps=4, lora_name=DEFAULT_TURBO_LORA_NAME),
+    "turbo-6": H3Recipe(steps=6, lora_name=DEFAULT_TURBO_LORA_NAME, preview_sigmas=TURBO_PREVIEW_SIGMAS),
+    "turbo-4": H3Recipe(steps=4, lora_name=DEFAULT_TURBO_LORA_NAME, preview_sigmas=TURBO_PREVIEW_SIGMAS),
 }
 #: ``preset`` values of lipsync jobs: the video presets plus ``turbo-3``, the lipsync
 #: student (:data:`LIPSYNC_LORA_NAME` on :data:`LIPSYNC_SIGMAS`), the default.
 LIPSYNC_PRESETS: dict[str, H3Recipe] = {
     **VIDEO_PRESETS,
-    "turbo-3": H3Recipe(steps=LIPSYNC_STEPS, lora_name=LIPSYNC_LORA_NAME, sigmas=LIPSYNC_SIGMAS),
+    "turbo-3": H3Recipe(
+        steps=LIPSYNC_STEPS, lora_name=LIPSYNC_LORA_NAME, sigmas=LIPSYNC_SIGMAS, preview_sigmas=LIPSYNC_PREVIEW_SIGMAS
+    ),
 }
 DEFAULT_LIPSYNC_PRESET = "turbo-3"
 
@@ -435,7 +449,12 @@ def env_recipe() -> H3Recipe:
     """The worker's own recipe (``H3_VARIANT``/``H3_STEPS``/``H3_TURBO_LORA_NAME``): videogen without a preset."""
     if is_nvfp4_vanilla():
         return H3Recipe(steps=h3_steps(), sampler=NVFP4_VANILLA_SAMPLER)
-    return H3Recipe(steps=h3_steps(), lora_name=turbo_lora_name())
+    lora = turbo_lora_name()
+    return H3Recipe(
+        steps=h3_steps(),
+        lora_name=lora,
+        preview_sigmas=TURBO_PREVIEW_SIGMAS if lora == DEFAULT_TURBO_LORA_NAME else None,
+    )
 
 
 def comfyui_runtime_dir() -> Path:
@@ -965,6 +984,7 @@ def build_h3_graph(
     recipe: H3Recipe | None = None,
     scheduler: str | None = None,
     generate_audio: bool = True,
+    fps: float = H3_FPS,
 ) -> dict[str, dict[str, Any]]:
     """Build the headless MiniMax H3 FL2VA prompt graph.
 
@@ -1089,7 +1109,9 @@ def build_h3_graph(
     }
     create_video_inputs: dict[str, Any] = {
         "images": ["14", 0],
-        "fps": H3_FPS,
+        # The frame rate the time axis rendered at (h3.h3_interpolation.h3_time_axis), which the
+        # generated audio lasts: 24 unless an interpolated job renders fewer frames a second.
+        "fps": fps,
     }
     if generate_audio:
         graph["5"] = {
@@ -1286,14 +1308,11 @@ def _retained_runtime(
 
     with _RETAINED_H3_LOCK:
         retained = _RETAINED_H3_RUNTIME
-        if retained is not None and (retained.generate_audio == generate_audio or not check_models):
-            # A caller that checks its own models (keyframes) takes whatever
-            # runtime is loaded rather than tearing it down over the audio flag.
+        if retained is not None:
+            # The executor is graph-agnostic: a job without audio just leaves the
+            # audio VAE out of its graph (callers check their own weights), so a
+            # change of job type never reloads the shared weights.
             return retained
-        if retained is not None and retained.generate_audio != generate_audio:
-            # Audio mode changed; tear down the retained runtime so the new
-            # graph build can choose a different VAE set.
-            unload_retained_h3_runtime()
 
         comfy_root = ensure_comfyui_runtime()
         if not is_nvfp4_vanilla():
@@ -1355,6 +1374,18 @@ def _retained_runtime(
         _RETAINED_H3_RUNTIME = retained
         log_event("minimax_h3_runtime_load_complete", comfy_root=str(comfy_root), seconds=retained.init_seconds, generate_audio=generate_audio)
         return retained
+
+
+def _free_vram_gb() -> float | None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        free, _total = torch.cuda.mem_get_info()
+        return round(free / 2 ** 30, 2)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def unload_retained_h3_runtime() -> bool:
@@ -1456,8 +1487,14 @@ def run_minimax_h3_inference(
     output_height: int | None = None,
     guides: list[tuple[int, Path]] | None = None,
     pinned_audio_path: Path | None = None,
+    preview: Any = None,
+    fps: int | None = None,
 ) -> dict[str, Any]:
     """Run one H3 FL2VA/i2v generation; returns stage metrics.
+
+    ``preview`` (:class:`h3.h3_restore.FramePreview`) renders only that frame of
+    this graph to its PNG instead of the clip (``output_path`` unused); returns
+    ``{preview, frame, pipeline_seconds, width, height}``.
 
     ``guides`` are ``(frame_idx, image)`` pins (:func:`add_frame_guides`).
     ``pinned_audio_path`` pins that audio in the latent (:func:`pin_audio`; it should
@@ -1483,7 +1520,14 @@ def run_minimax_h3_inference(
     size we finish with a uniform scale plus a sub-percent centre crop
     (:func:`fit_video_dimensions`) instead of handing back 704x1248 for a
     720x1280 request.
+
+    ``fps`` below 24 renders that many frames a second of the clip
+    (:func:`h3.h3_interpolation.h3_time_axis`, an interpolated job with no pinned
+    audio): the frames and the generated audio last ``length / fps`` seconds.
     """
+    from .h3_interpolation import h3_time_axis
+
+    time_axis_fps = int(fps or H3_FPS)
     canvas = resolve_canvas(image_path=image_path, requested_width=width, requested_height=height)
     width = canvas.width
     height = canvas.height
@@ -1546,6 +1590,7 @@ def run_minimax_h3_inference(
         filename_prefix=filename_prefix,
         recipe=recipe,
         generate_audio=audio_vae,
+        fps=float(time_axis_fps),
     )
     if guides:
         staged = []
@@ -1558,7 +1603,19 @@ def run_minimax_h3_inference(
         relative = f"jobs/{job_id}/pinned_audio{pinned_audio_path.suffix}"
         shutil.copyfile(pinned_audio_path, comfy_root / "input" / relative)
         pin_audio(graph, relative)
-    saved_result = _execute_graph(retained, graph, job_id=job_id)
+    if preview is not None:
+        # The node renders the length snapped up to its grid; the preview indexes those frames.
+        try:
+            with h3_time_axis(time_axis_fps):
+                result = _run_frame_preview(
+                    retained, graph, preview, job_id=job_id, length=5 + 17 * -(-max(0, int(length) - 5) // 17),
+                    filename_prefix=f"jobs/{job_id}/preview",
+                )
+        finally:
+            _cleanup_job_inputs(job_input_dir)
+        return {**result, "width": canvas.width, "height": canvas.height}
+    with h3_time_axis(time_axis_fps):
+        saved_result = _execute_graph(retained, graph, job_id=job_id)
     stage_timings["minimax_h3_pipeline_seconds"] = round(saved_result["pipeline_seconds"], 3)
     log_event(
         "minimax_h3_inference_complete",
@@ -1630,7 +1687,7 @@ def run_minimax_h3_inference(
         "delivered_height": delivered_height,
         "output_resize": resize_metrics,
         **geometry,
-        "fps": H3_FPS,
+        "fps": float(time_axis_fps),
         "preset": preset,
         "steps": recipe.steps,
         "sampler": recipe.sampler_label,
@@ -1651,6 +1708,41 @@ def run_minimax_h3_inference(
     }
 
 
+def _run_frame_preview(
+    retained: _RetainedH3Runtime,
+    graph: dict[str, dict[str, Any]],
+    preview: Any,
+    *,
+    job_id: str,
+    length: int,
+    filename_prefix: str,
+) -> dict[str, Any]:
+    """Run ``graph`` as a one-frame preview (:func:`h3.h3_restore.preview_graph`); moves the PNG to
+    ``preview.output_path``."""
+    import nodes as comfy_nodes
+
+    from . import h3_restore
+
+    h3_restore.register_nodes(comfy_nodes)
+    save_node_id = h3_restore.preview_graph(
+        graph, frame=int(preview.frame), length=int(length), filename_prefix=filename_prefix, sigmas=preview.sigmas
+    )
+    saved = _execute_graph(retained, graph, job_id=job_id, save_node_id=save_node_id)
+    preview.output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(
+        str(retained.comfy_root / "output" / saved["saved_subfolder"] / saved["saved_filename"]), preview.output_path
+    )
+    log_event(
+        "minimax_h3_frame_preview_complete",
+        job_id=job_id,
+        frame=int(preview.frame),
+        length=int(length),
+        sigmas=preview.sigmas,
+        seconds=round(saved["pipeline_seconds"], 3),
+    )
+    return {"preview": str(preview.output_path), "frame": int(preview.frame), "pipeline_seconds": round(saved["pipeline_seconds"], 3)}
+
+
 def run_lipsync_chunk(
     *,
     job_id: str,
@@ -1667,8 +1759,12 @@ def run_lipsync_chunk(
     output_path: Path,
     recipe: H3Recipe = LIPSYNC_PRESETS[DEFAULT_LIPSYNC_PRESET],
     sparse_attention: bool = True,
+    preview: Any = None,
 ) -> dict[str, Any]:
     """Render one pinned-audio lipsync chunk with ``recipe`` (default: the lipsync student).
+
+    ``preview`` (:class:`h3.h3_restore.FramePreview`) renders only that frame
+    instead, to its PNG (``output_path`` unused).
 
     ``width``/``height`` must already sit on the H3 lattice (see
     :func:`resolve_canvas`) and ``length`` on the node's 17k+5 grid, so the
@@ -1712,6 +1808,14 @@ def run_lipsync_chunk(
         recipe=recipe,
         sparse_attention=sparse_attention,
     )
+    if preview is not None:
+        try:
+            return _run_frame_preview(
+                retained, graph, preview, job_id=job_id, length=length, filename_prefix=f"{relative_dir}/{prefix}_preview"
+            )
+        finally:
+            for staged in input_dir.glob(f"{prefix}_*"):
+                staged.unlink(missing_ok=True)
     saved_result = _execute_graph(retained, graph, job_id=job_id)
     saved_path = comfy_root / "output" / saved_result["saved_subfolder"] / saved_result["saved_filename"]
     output_path.parent.mkdir(parents=True, exist_ok=True)

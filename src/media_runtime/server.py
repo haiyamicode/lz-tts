@@ -6,14 +6,16 @@ starts it as a child with ``python server.py --port N --features ...``, polls
 GET /health until it reports ``ok``, and sends one POST per task.
 
 One model group holds the GPU at a time: YuE2 ("song"), BS-RoFormer +
-YingMusic-SVC ("voice"), or the retained H3 ComfyUI executor. A request for
-another group unloads the resident one first; requests run one at a time.
+YingMusic-SVC ("voice"), or H3 (the retained ComfyUI executor + the helper
+models its jobs keep: ZipEnhancer, CTC, SyncNet/S3FD, glitch, RIFE). Videogen,
+lipsync and imagegen share the H3 group, so nothing unloads between them; only
+a music job releases it. Requests run one at a time.
 
 GET  /health    -> {"status": "starting" | "ok" | "error", "reason": str, "features": [...]}
 POST /generate  -> {"path", "seed", "mode": "prompt" | "clone"}
     body: {"style", "lyrics", "cot"?, "cfg_scale"?, "seed"?, "abc"?, "ode_steps"?,
            "abc_sampling"?, "semantic_sampling"?, "reference_path"?, "output_dir"}
-POST /videogen  -> {"path", "seed", "item", "metrics"}
+POST /videogen  -> {"path", "seed", "item", "metrics", "last_frame_path"?}
     body: {"job_id", "payload": h3.videogen payload, "output_dir"}
 POST /lipsync   -> {"path", "seed", "item", "metrics"}
     body: {"job_id", "payload": h3.lipsync payload, "output_dir"}
@@ -78,11 +80,25 @@ def _require(feature: str) -> None:
 
 
 def _release_h3() -> None:
+    """Give the GPU to the music models: drop the H3 executor and the helper models the H3 jobs keep resident
+    (ZipEnhancer, the CTC transcriber, SyncNet/S3FD, the glitch detector, RIFE). Only a music job calls it."""
     global _h3_resident
     if _h3_resident:
+        import gc
+
+        import torch
+
+        from h3 import h3_interpolation, lipsync_checks, speech_chunks, speech_cleanup
         from h3.minimax_h3_runtime import unload_retained_h3_runtime
 
         unload_retained_h3_runtime()
+        speech_cleanup._ZIPENHANCER = None
+        speech_chunks._CTC.clear()
+        lipsync_checks._MODELS.clear()
+        lipsync_checks._GLITCH_NET.clear()
+        h3_interpolation._RIFE = None
+        gc.collect()
+        torch.cuda.empty_cache()
         _h3_resident = False
 
 
@@ -137,12 +153,23 @@ def _run_h3(feature: str, body: H3Body) -> dict[str, Any]:
             result = run({"id": body.job_id, "payload": body.payload})
             final = output_dir / f"{feature}-{result['seed']}{Path(result['path']).suffix}"
             shutil.move(result["path"], final)
+            last_frame = None
+            if result.get("last_frame_path"):
+                # A continuable videogen clip's restored last frame: the next job opens on it.
+                last_frame = output_dir / f"{feature}-{result['seed']}-last-frame{Path(result['last_frame_path']).suffix}"
+                shutil.move(result["last_frame_path"], last_frame)
         except (ValueError, FileNotFoundError) as exc:
             # Bad payload or an input that could not be fetched / read.
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
             shutil.rmtree(job_dir(body.job_id), ignore_errors=True)
-    return {"path": str(final), "seed": result["seed"], "item": result["item"], "metrics": result["metrics"]}
+    return {
+        "path": str(final),
+        "seed": result["seed"],
+        "item": result["item"],
+        "metrics": result["metrics"],
+        **({"last_frame_path": str(last_frame)} if last_frame else {}),
+    }
 
 
 @app.post("/videogen")
@@ -188,8 +215,7 @@ def _check_h3_assets(features: list[str]) -> None:
         raise FileNotFoundError("H3 preset LoRAs are missing: " + ", ".join(missing))
     if "lipsync" in features:
         required = [
-            compat.WHISPER_MEDIUM_ROOT / "model.bin",
-            compat.SPEECH_CLEANUP_DEMUCS_PATH,
+            compat.CTC_ROOT / "model.safetensors",
             compat.SPEECH_CLEANUP_ZIPENHANCER_PATH,
             compat.SPEECH_CLEANUP_ZIPENHANCER_CONFIG_PATH,
             compat.SYNCNET_EVAL_SYNCNET_PATH,

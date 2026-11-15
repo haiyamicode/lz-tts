@@ -1,8 +1,8 @@
 """Speech timing and prompts for lipsync (``lipsync``).
 
 - **Timed transcript.** The caller's ``transcript`` (items of text with their
-  start and end seconds), or faster-whisper ``medium`` (multilingual) with word
-  timestamps when there is none. It is the only source of timing.
+  start and end seconds), or greedy CTC (:func:`transcribe`, romanized words)
+  when there is none. It only places each chunk's words in its prompt.
 - **Split points.** The audio is cut into the fewest chunks that fit the cap,
   none shorter than ``MIN_CHUNK_SECONDS``. Each cut goes to the widest gap
   between timed items inside the window where both sides still fit; when that
@@ -79,7 +79,7 @@ PROMPT_TEMPLATE = (
     "the first frame, and only the person moves.\n"
     f"{SETTLE_LINE}"
 )
-#: Whisper language codes named in the prompt; others leave the language out.
+#: Language codes named in the prompt; others (and an unknown language) leave it out.
 LANGUAGE_NAMES = {
     "ar": "Arabic", "de": "German", "en": "English", "es": "Spanish", "fil": "Filipino", "fr": "French",
     "hi": "Hindi", "id": "Indonesian", "it": "Italian", "ja": "Japanese", "ko": "Korean", "ms": "Malay",
@@ -98,9 +98,9 @@ class Word:
 @dataclass(frozen=True)
 class Transcript:
     text: str
-    #: Whisper language code, or ``None`` for a caller transcript.
+    #: Language code, or ``None`` when unknown (CTC and caller transcripts).
     language: str | None
-    #: Timed items: Whisper's words, or the caller's words or phrases.
+    #: Timed items: the CTC words, or the caller's words or phrases.
     words: tuple[Word, ...] = ()
 
     @classmethod
@@ -134,49 +134,100 @@ def load_audio_16k(path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Whisper
+# CTC transcription
 # ---------------------------------------------------------------------------
 
-_WHISPER: Any = None
-_WHISPER_LOCK = threading.Lock()
+#: CTC frames a second (wav2vec2's 320-sample stride at 16 kHz).
+CTC_FPS = 50
+#: Audio per forward pass and the context on each side of it, as ctc-forced-aligner runs this model.
+CTC_WINDOW_SECONDS, CTC_CONTEXT_SECONDS = 30, 2
+#: Blank frames between two letters that start a new word: the vocabulary has no word separator.
+WORD_GAP_FRAMES = 3
+
+_CTC: dict[str, Any] = {}
+_CTC_LOCK = threading.Lock()
 
 
-def whisper_model_dir() -> Path:
-    from .compat import WHISPER_MEDIUM_ROOT
-    from .compat import project_path
+def _ctc_model() -> dict[str, Any]:
+    """MMS-300m CTC (``data/lipsync/mms-300m-ctc``: MahmoudAshraf/mms-300m-1130-forced-aligner in fp16, the
+    speech worker's aligner), loaded once and kept on the GPU."""
+    if not _CTC:
+        import json
 
-    return project_path(WHISPER_MEDIUM_ROOT)
+        import torch
+        from transformers import Wav2Vec2ForCTC
+
+        from .compat import CTC_ROOT, project_path
+
+        model_dir = project_path(CTC_ROOT)
+        if not (model_dir / "model.safetensors").exists():
+            raise FileNotFoundError(f"the CTC transcription model is missing (expected {model_dir})")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = Wav2Vec2ForCTC.from_pretrained(str(model_dir), dtype=torch.float16 if device == "cuda" else torch.float32)
+        vocab = json.loads((model_dir / "vocab.json").read_text())
+        letters = {index: token for token, index in vocab.items() if len(token) == 1}
+        _CTC.update(model=model.to(device).eval(), device=device, letters=letters, blank=vocab["<blank>"])
+    return _CTC
+
+
+def _ctc_frames(samples, ctc: dict[str, Any]):
+    """The most likely token of every CTC frame of 16 kHz ``samples``."""
+    import torch
+
+    model, device = ctc["model"], ctc["device"]
+    audio = torch.from_numpy(samples).to(device, model.dtype)
+    window, context = CTC_WINDOW_SECONDS * SAMPLE_RATE, CTC_CONTEXT_SECONDS * SAMPLE_RATE
+    stride = SAMPLE_RATE // CTC_FPS
+    try:
+        with torch.inference_mode():
+            if len(audio) <= window:
+                return model(audio[None]).logits[0].argmax(-1).cpu().numpy()
+            extension = -len(audio) % window
+            padded = torch.nn.functional.pad(audio, (context, context + extension))
+            pieces = padded.unfold(0, window + 2 * context, window)
+            keep = slice(context // stride, (context + window) // stride)
+            frames = torch.cat([model(piece[None]).logits[0, keep].argmax(-1) for piece in pieces])
+            return frames[: -(-len(audio) // stride)].cpu().numpy()
+    finally:
+        if device == "cuda":
+            torch.cuda.empty_cache()  # the activations; the weights stay
+
+
+def ctc_words(frames, letters: dict[int, str], *, blank: int) -> tuple[Word, ...]:
+    """Greedy CTC decoding of per-frame tokens: each run of a letter is one letter (a blank between two runs of the
+    same letter keeps both); a letter starts a new word after ``WORD_GAP_FRAMES`` frames without one. A word runs
+    from its first letter's first frame to its last letter's last frame."""
+    words: list[Word] = []
+    text, start, end, previous = "", 0, 0, blank
+    for frame, token in enumerate(int(token) for token in frames):
+        if token != previous and token in letters:
+            if text and frame - end > WORD_GAP_FRAMES:
+                words.append(Word(start / CTC_FPS, end / CTC_FPS, text))
+                text = ""
+            if not text:
+                start = frame
+            text += letters[token]
+        if token in letters:
+            end = frame + 1
+        previous = token
+    if text:
+        words.append(Word(start / CTC_FPS, end / CTC_FPS, text))
+    return tuple(words)
 
 
 def transcribe(audio) -> Transcript:
-    """Whisper ``medium`` with word timestamps. The model is kept in host memory
-    between jobs and only on the GPU while it transcribes, so it never holds
-    VRAM the H3 render needs."""
-    global _WHISPER
-    import torch
-    from faster_whisper import WhisperModel
+    """The words of 16 kHz mono ``audio`` with their times, by greedy CTC (MMS-300m, 1130 languages): one forward
+    pass per 30 s, so it cannot loop, run away or invent text in silence the way an autoregressive decoder can. The
+    text is romanized lowercase letters (uroman, the model's vocabulary) and the language is unknown; the words only
+    place each chunk's speech in its prompt."""
+    import numpy as np
 
-    with _WHISPER_LOCK:
-        if _WHISPER is None:
-            model_dir = whisper_model_dir()
-            if not (model_dir / "model.bin").exists():
-                raise FileNotFoundError(f"faster-whisper medium is missing (expected {model_dir})")
-            on_gpu = torch.cuda.is_available()
-            _WHISPER = WhisperModel(str(model_dir), device="cuda" if on_gpu else "cpu",
-                                    compute_type="float16" if on_gpu else "int8")
-        elif not _WHISPER.model.model_is_loaded:
-            _WHISPER.model.load_model()
-        try:
-            segments, info = _WHISPER.transcribe(audio, word_timestamps=True, beam_size=5)
-            segments = list(segments)
-        finally:
-            if _WHISPER.model.device == "cuda":
-                _WHISPER.model.unload_model(to_cpu=True)
-    words = tuple(Word(float(w.start), float(w.end), w.word.strip()) for s in segments for w in (s.words or []) if w.word.strip())
-    text = " ".join(s.text.strip() for s in segments if s.text.strip())
-    log_event("speech_transcribed", language=info.language, language_probability=round(info.language_probability, 3),
-              words=len(words), audio_seconds=round(len(audio) / SAMPLE_RATE, 3))
-    return Transcript(text=text, language=info.language, words=words)
+    with _CTC_LOCK:
+        ctc = _ctc_model()
+        frames = _ctc_frames(np.asarray(audio, dtype=np.float32), ctc)
+    words = ctc_words(frames, ctc["letters"], blank=ctc["blank"])
+    log_event("speech_transcribed", words=len(words), audio_seconds=round(len(audio) / SAMPLE_RATE, 3))
+    return Transcript(text=" ".join(word.text for word in words), language=None, words=words)
 
 
 # ---------------------------------------------------------------------------

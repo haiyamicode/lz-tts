@@ -21,16 +21,17 @@ there is one, else the lowest speech energy. Motion and gestures between the
 pins come from the prompt and the pinned audio, and a pose or framing the model
 invents never outlasts the next pin.
 
-**Voice.** The render never hears the raw audio: music, room tone and noise make
-H3 invent things (overlay graphics, punch-ins) and blur the pauses the pins go
-in. :func:`h3.speech_cleanup.clean_voice` separates the vocals (Demucs)
-and denoises them (ZipEnhancer) into a 16 kHz voice, and that voice is what
-Whisper transcribes, what places the cuts and pins, and what is pinned into
-every chunk's latent. The caller's audio is what the job delivers.
+**Voice.** The render never hears the raw audio: room tone and noise make H3
+invent things (overlay graphics, punch-ins) and blur the pauses the pins go in.
+:func:`h3.speech_cleanup.clean_voice` denoises it (ZipEnhancer; no music
+separation) into a 16 kHz voice, and that voice is what is transcribed, what
+places the cuts and pins, and what is pinned into every chunk's latent. The
+caller's audio is what the job delivers.
 
 **Speech.** Each chunk's words come from a timed transcript: the caller's
-``transcript`` (text items with start/end seconds), or a Whisper transcription
-when there is none. Unless the caller overrides ``prompt``, every chunk is
+``transcript`` (text items with start/end seconds), or a greedy CTC
+transcription (:func:`h3.speech_chunks.transcribe`, romanized words) when there
+is none. Unless the caller overrides ``prompt``, every chunk is
 prompted with :data:`h3.speech_chunks.PROMPT_TEMPLATE` (general for any
 person on camera) and the words spoken in it; a caller ``prompt`` is a template
 of the same kind (:mod:`h3.lipsync_prompt`: ``{{text}}`` required,
@@ -74,6 +75,13 @@ under the SLA block-sparse node
 student was trained with, where the worker supports it, and dense otherwise;
 ``sparse_attention: false`` asks for dense. The result reports what every chunk
 ran.
+
+**Interpolation** (vigen 7280e2f). ``use_interpolation`` renders ``interpolation_fps``
+(default 16) frames for every second of the audio: the plan's frames run at that
+rate, each chunk renders its frames on the model's own 24 fps clock from its voice
+sped up ``24/interpolation_fps`` (so a chunk covers that much more of the audio),
+its validators judge that render, and RIFE brings the joined video up to 24 fps
+(:mod:`h3.h3_interpolation`).
 
 Output frames are H3's native 24 fps; the caller's audio is muxed back
 unmodified (the model never decodes audio in this mode).
@@ -140,6 +148,12 @@ MAX_INPUT_BYTES = 200 * 1024 * 1024
 
 #: Pins of the job's own image; a pinned chunk's ``pin_image_url`` names its image instead.
 INPUT_IMAGE = "input"
+#: ``chunk_boundaries``: every chunk boundary and pause pins the input image (default), or the motion carries
+#: on through the boundaries, each pinned to the previous chunk's own last frame restored toward the input
+#: image (:mod:`h3.h3_restore`, vigen e9791cc).
+CHUNK_BOUNDARIES = ("input_image", "continuous")
+#: Image key of a continuous boundary's restored frame: ``restored:<frame>``, filled in when rendered.
+RESTORED_IMAGE = "restored:"
 
 
 @dataclass(frozen=True)
@@ -148,9 +162,11 @@ class Anchor:
 
     #: Output-timeline frame index.
     frame: int
-    #: ``start`` (frame 0), ``pin`` (an end of a pinned chunk) or ``pause`` (every other pin).
+    #: ``start`` (frame 0), ``pin`` (an end of a pinned chunk), ``boundary`` (a continuous chunk boundary)
+    #: or ``pause`` (every other pin).
     label: str
-    #: :data:`INPUT_IMAGE` or the ``pin_image_url`` of the pinned chunk this pin ends.
+    #: :data:`INPUT_IMAGE`, the ``pin_image_url`` of the pinned chunk this pin ends, or a continuous
+    #: boundary's ``restored:<frame>``.
     image: str = INPUT_IMAGE
 
 
@@ -165,7 +181,9 @@ class PinnedSpan:
 
 
 def longest_chunk(*, fps: float, chunk_cap: int) -> int:
-    """Most frames a chunk runs past its first: ``MAX_CHUNK_SECONDS``, within the render cap."""
+    """Most frames a chunk runs past its first: ``MAX_CHUNK_SECONDS`` at ``fps`` - the model's 24 fps, whatever
+    rate the timeline runs at (an interpolated job's chunks render as many frames and last longer) - within the
+    render cap."""
     return min(int(MAX_CHUNK_SECONDS * fps), chunk_cap - 1)
 
 
@@ -198,17 +216,20 @@ def pinned_spans(items: list[dict[str, Any]], *, fps: float, total_frames: int, 
 
 
 def freestyle_plan(samples, *, total_frames: int, fps: float, chunk_cap: int,
-                   pinned: list[PinnedSpan] = ()) -> tuple[list[int], list[int]]:
+                   pinned: list[PinnedSpan] = (), continuous: bool = False,
+                   model_fps: float | None = None) -> tuple[list[int], list[int]]:
     """Freestyle's chunk cuts and pins from the cleaned 16 kHz voice: the cuts at
     the quietest frames (:func:`h3.speech_chunks.quiet_cuts`, chunks of at
-    most ``MAX_CHUNK_SECONDS`` and ``chunk_cap``), and the pins - every chunk's
+    most ``MAX_CHUNK_SECONDS`` of the model's ``model_fps`` frames (default ``fps``)
+    and ``chunk_cap``), and the pins - every chunk's
     ends plus its inner pins every ``PIN_GAP_SECONDS`` at the quietest frames
     (:func:`h3.speech_chunks.pause_pins`). Each ``pinned`` span is its own
     chunk with no inner pins, and the quiet cuts fill the stretches between them.
     Returns ``(cut_frames, pins)``, the pins sorted and including frame 0 and the
-    last frame."""
+    last frame. ``continuous`` boundaries pin only frame 0, the cuts and the pinned
+    spans' ends: no pauses, and the last frame is free."""
     loudness = frame_loudness(samples, fps=fps, frames=total_frames)
-    shortest, longest = math.ceil(MIN_CHUNK_SECONDS * fps), longest_chunk(fps=fps, chunk_cap=chunk_cap)
+    shortest, longest = math.ceil(MIN_CHUNK_SECONDS * fps), longest_chunk(fps=model_fps or fps, chunk_cap=chunk_cap)
     last = total_frames - 1
     cuts: set[int] = set()
     free_start = 0
@@ -219,6 +240,9 @@ def freestyle_plan(samples, *, total_frames: int, fps: float, chunk_cap: int,
         cuts.update((span.first, span.last))
         free_start = span.last
     cut_frames = sorted(cut for cut in cuts if 0 < cut < last)
+    if continuous:
+        ends = {frame for span in pinned for frame in (span.first, span.last)}
+        return cut_frames, sorted({0, *cut_frames, *ends})
     bounds = [0, *cut_frames, last]
     inside_pinned = {(span.first, span.last) for span in pinned}
     pins = {0}
@@ -231,11 +255,19 @@ def freestyle_plan(samples, *, total_frames: int, fps: float, chunk_cap: int,
     return cut_frames, sorted(pins)
 
 
-def plan_anchors(pins: list[int], pinned: list[PinnedSpan]) -> list[Anchor]:
-    """``pins`` as anchors: a pinned span's ends pin its image, every other pin the input image."""
+def plan_anchors(pins: list[int], pinned: list[PinnedSpan], *, continuous: bool = False) -> list[Anchor]:
+    """``pins`` as anchors: a pinned span's ends pin its image, every other pin the input image, or with
+    ``continuous`` boundaries the frame restored there when the chunk ending on it renders."""
     ends = {frame: span.image for span in pinned for frame in (span.first, span.last)}
-    return [Anchor(frame=pin, label="start" if pin == 0 else "pin" if pin in ends else "pause",
-                   image=ends.get(pin, INPUT_IMAGE)) for pin in pins]
+    anchors = []
+    for pin in pins:
+        if pin == 0 or pin in ends:
+            anchors.append(Anchor(frame=pin, label="start" if pin == 0 else "pin", image=ends.get(pin, INPUT_IMAGE)))
+        elif continuous:
+            anchors.append(Anchor(frame=pin, label="boundary", image=f"{RESTORED_IMAGE}{pin}"))
+        else:
+            anchors.append(Anchor(frame=pin, label="pause", image=INPUT_IMAGE))
+    return anchors
 
 
 # ---------------------------------------------------------------------------
@@ -299,13 +331,17 @@ def instruction_chunks(item: dict[str, Any], chunks: list[LipsyncChunk], *, fps:
 
 
 def chunk_instructions(items: list[dict[str, Any]], chunks: list[LipsyncChunk], *, fps: float,
-                       total_frames: int) -> list[list[str]]:
+                       total_frames: int, model_fps: float | None = None) -> list[list[str]]:
     """The caller's ``custom_instructions`` as prompt lines per chunk (:func:`instruction_chunks`), in
     time order. Times are seconds into the chunk, a range clipped to it, and a ``text_hint`` names the
     words: ``At 3.25 seconds, when speaking "<text_hint>": <instruction>``, ``During 1.5 to 6 seconds:
-    ...``. ``pin_chunk`` ranges are left to :func:`pinned_instructions`."""
+    ...``. ``pin_chunk`` ranges are left to :func:`pinned_instructions`. The prompt's seconds are the
+    model's: an interpolated job's ``fps`` timeline renders on the model's ``model_fps`` clock, so its
+    times are scaled by ``fps / model_fps`` (the voice the model hears is that much faster)."""
+    scale = fps / (model_fps or fps)
+
     def clock(seconds: float) -> str:
-        return f"{max(0.0, seconds):.2f}".rstrip("0").rstrip(".")
+        return f"{max(0.0, seconds * scale):.2f}".rstrip("0").rstrip(".")
 
     def begins(item: dict[str, Any]) -> float:
         return float(item["timestamp"] if item.get("timestamp") is not None else item["start"])
@@ -481,13 +517,18 @@ def assemble_output(
     width: int | None,
     height: int | None,
     bounding_box: tuple[int, int] | None,
-) -> None:
+    output_fps: int | None = None,
+) -> dict[str, Any] | None:
     """Join the chunks - ``(render, frames kept)``, dropping each shared boundary
     frame and every chunk's grid surplus - trim to the audio's length, scale,
     and mux the caller's audio.
 
     ``width``/``height`` deliver an exact frame size (cover scale + centre crop,
     never a squeeze); ``bounding_box`` instead fits the frame inside it.
+
+    ``output_fps`` above ``fps`` (an interpolated job): the joined ``fps`` frames
+    stream through RIFE up to it (:func:`h3.h3_interpolation.upsample_video`)
+    before the scale and the one encode; returns the interpolation's metrics.
     """
     inputs: list[str] = []
     parts: list[str] = []
@@ -504,21 +545,32 @@ def assemble_output(
         scale = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1"
     else:
         scale = "setsar=1"
-    graph = ";".join(parts) + f";{joined}concat=n={len(chunks)}:v=1:a=0,{scale}[out]"
     audio_index = len(chunks)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    encode = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+              "-c:a", "aac", "-b:a", "192k", "-t", f"{duration_seconds:.6f}", "-movflags", "+faststart", str(output_path)]
+    if output_fps and output_fps != fps:
+        from .h3_interpolation import upsample_video
+
+        width_in, height_in = image_size(chunks[0][0])
+        join = ";".join(parts) + f";{joined}concat=n={len(chunks)}:v=1:a=0[out]"
+        return upsample_video(
+            [*inputs, "-filter_complex", join, "-map", "[out]", "-frames:v", str(int(total_frames))],
+            ["-i", str(audio_path), "-map", "0:v", "-map", "1:a:0", "-vf", scale, *encode],
+            width=width_in, height=height_in, source_fps=int(fps), output_fps=int(output_fps),
+            frames=max(1, round(duration_seconds * output_fps)),
+        )
+    graph = ";".join(parts) + f";{joined}concat=n={len(chunks)}:v=1:a=0,{scale}[out]"
     _run(
         [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             *inputs, "-i", str(audio_path),
             "-filter_complex", graph,
             "-map", "[out]", "-map", f"{audio_index}:a:0",
-            "-frames:v", str(int(total_frames)), "-r", str(fps),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-t", f"{duration_seconds:.6f}",
-            "-movflags", "+faststart", str(output_path),
+            "-frames:v", str(int(total_frames)), "-r", str(fps), *encode,
         ]
     )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -600,17 +652,19 @@ def _check(render: Path, audio: Path, chunk: LipsyncChunk, *, flicker: bool, des
 
 def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, input_image: Path,
               pin_images: int, fps: float, job_id: str, finish: Any) -> dict[str, Any]:
-    """The job's plan: chunks, pins, prompts and per-chunk validators."""
-    from .minimax_h3_runtime import resolve_canvas
+    """The job's plan: chunks, pins, prompts and per-chunk validators. Its frames run at ``fps``: the
+    model's 24, or an interpolated job's ``interpolation_fps``, whose every chunk still renders on the
+    model's own clock (:mod:`h3.h3_interpolation`)."""
+    from .minimax_h3_runtime import H3_FPS, resolve_canvas
 
-    # Timing: the caller's timed transcript, else Whisper's word timestamps.
+    # Timing: the caller's timed transcript, else the CTC words.
     began = time.perf_counter()
     caller_prompt = str(payload.get("prompt") or "").strip()
     caller_items = payload.get("transcript") or []
     custom_instructions = payload.get("custom_instructions") or []
     samples = load_audio_16k(voice_path)
     transcript = Transcript.from_items(list(caller_items)) if caller_items else transcribe(samples)
-    transcript_source = "caller" if caller_items else "whisper"
+    transcript_source = "caller" if caller_items else "ctc"
     finish("speech_seconds", began)
 
     began = time.perf_counter()
@@ -625,9 +679,14 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
     # The input image on both ends of every chunk and at the pauses between; a pinned
     # chunk is cut on its own times and pinned on its ends only, to its own image if it has one.
     pinned = pinned_spans(custom_instructions, fps=fps, total_frames=total_frames,
-                          longest=longest_chunk(fps=fps, chunk_cap=chunk_cap))
-    cut_frames, pins = freestyle_plan(samples, total_frames=total_frames, fps=fps, chunk_cap=chunk_cap, pinned=pinned)
-    anchors = plan_anchors(pins, pinned)
+                          longest=longest_chunk(fps=H3_FPS, chunk_cap=chunk_cap))
+    boundaries = str(payload.get("chunk_boundaries") or CHUNK_BOUNDARIES[0])
+    if boundaries not in CHUNK_BOUNDARIES:
+        raise ValueError(f"chunk_boundaries must be one of {', '.join(CHUNK_BOUNDARIES)}, got {boundaries!r}")
+    continuous = boundaries == "continuous"
+    cut_frames, pins = freestyle_plan(samples, total_frames=total_frames, fps=fps, chunk_cap=chunk_cap, pinned=pinned,
+                                      continuous=continuous, model_fps=H3_FPS)
+    anchors = plan_anchors(pins, pinned, continuous=continuous)
     chunks = plan_chunks(total_frames, max_frames=chunk_cap, anchors=anchors, cut_frames=cut_frames)
     pinned_chunks = sorted(chunk.index for chunk in chunks
                            if any((chunk.start_frame, chunk.last_frame) == (span.first, span.last) for span in pinned))
@@ -646,7 +705,8 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
         prompts = [render_prompt(text, transcript.language, pinned_instruction=pinned_lines.get(i))
                    for i, text in enumerate(chunk_texts)]
     # The caller's timed extra instructions, each on its own line at the end of its chunks' prompts.
-    timed_lines = chunk_instructions(custom_instructions, chunks, fps=fps, total_frames=total_frames)
+    timed_lines = chunk_instructions(custom_instructions, chunks, fps=fps, total_frames=total_frames,
+                                     model_fps=H3_FPS)
     prompts = ["\n".join([prompt, *extra]) for prompt, extra in zip(prompts, timed_lines)]
     instructions = [([pinned_lines[i]] if i in pinned_lines else []) + extra for i, extra in enumerate(timed_lines)]
     finish("plan_seconds", began)
@@ -675,6 +735,7 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
         "canvas": [canvas.width, canvas.height],
         "chunk_cap": chunk_cap,
         "cut_frames": list(cut_frames),
+        "chunk_boundaries": boundaries,
         "anchors": [[anchor.frame, anchor.label, anchor.image] for anchor in anchors],
         "pinned_chunks": pinned_chunks,
         "chunk_texts": chunk_texts,
@@ -686,9 +747,48 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
     }
 
 
+def _restore_boundary(chunk: LipsyncChunk, end_anchor: Anchor, *, images: dict[str, Path], anchor_at: dict[int, Anchor],
+                      job_id: str, prompt: str, seed: int, width: int, height: int, audio_slice: Path, work_dir: Path,
+                      recipe: Any, sparse_attention: bool) -> dict[str, Any]:
+    """Fill ``images[end_anchor.image]``: this chunk's last kept frame, previewed on its own pins (the
+    recipe's preview schedule, that frame alone decoded), then restored toward the input image."""
+    from .h3_restore import FramePreview, restore_frame
+    from .minimax_h3_runtime import run_lipsync_chunk
+
+    began = time.perf_counter()
+    preview_path = work_dir / "boundary_preview.png"
+    run_lipsync_chunk(
+        job_id=job_id,
+        chunk_index=chunk.index,
+        prompt=prompt,
+        seed=seed,
+        width=width,
+        height=height,
+        length=chunk.render_frames,
+        first_frame_path=images[anchor_at[chunk.start_frame].image],
+        last_frame_path=None,
+        guides=[(position, images[anchor.image]) for position, anchor in chunk.guides if anchor != end_anchor],
+        audio_path=audio_slice,
+        output_path=work_dir / "unused.mp4",
+        recipe=recipe,
+        sparse_attention=sparse_attention,
+        preview=FramePreview(frame=chunk.frames - 1, output_path=preview_path, sigmas=recipe.preview_sigmas),
+    )
+    preview_seconds = time.perf_counter() - began
+    restored = work_dir.parent / "anchors" / f"{end_anchor.image.replace(':', '_')}.png"
+    restore_frame(job_id=job_id, frame=preview_path, anchor=images[INPUT_IMAGE], output_path=restored,
+                  width=width, height=height, seed=seed)
+    images[end_anchor.image] = restored
+    metrics = {"frame": end_anchor.frame, "preview_seconds": round(preview_seconds, 3),
+               "seconds": round(time.perf_counter() - began, 3)}
+    log_event("lipsync_boundary_restored", job_id=job_id, chunk=chunk.index, **metrics)
+    return metrics
+
+
 def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     """Run one ``lipsync`` job; returns the result.
     """
+    from .h3_interpolation import requested_fps, speed_up
     from .minimax_h3_runtime import (
         DEFAULT_LIPSYNC_PRESET,
         H3_FPS,
@@ -710,7 +810,10 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     detect_glitches = payload.get("detect_glitches") is not False
     checking = detect_flicker or detect_desync or detect_glitches
     check_retries = _env_int("LIPSYNC_CHECK_RETRIES", DEFAULT_CHECK_RETRIES)
-    fps = float(H3_FPS)
+    # use_interpolation: the timeline runs at interpolation_fps, every chunk renders its frames on the model's
+    # 24 fps clock from its voice sped up to match, and RIFE brings the joined video up to 24 fps.
+    interpolation_fps = requested_fps(payload)
+    fps = float(interpolation_fps or H3_FPS)
     stage_timings: dict[str, float] = {}
 
     def finish(name: str, began: float) -> None:
@@ -763,10 +866,25 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
                 voice_path,
                 start_seconds=chunk.start_frame / fps,
                 duration_seconds=chunk.render_frames / fps,
-                output_path=chunk_dir / "audio.wav",
+                output_path=chunk_dir / ("voice.wav" if interpolation_fps else "audio.wav"),
             )
+            if interpolation_fps:
+                # The chunk's frames render on the model's 24 fps clock: it hears its voice that much faster.
+                audio_slice = speed_up(audio_slice, chunk_dir / "audio.wav", fps=interpolation_fps,
+                                       duration_seconds=chunk.render_frames / H3_FPS)
+            # A continuous boundary at this chunk's end: its own last frame, previewed and restored toward
+            # the input image, pinned there; the next chunk opens on it.
+            end_anchor = anchor_at.get(chunk.last_frame)
+            restore_metrics: dict[str, Any] | None = None
+            if end_anchor is not None and end_anchor.image.startswith(RESTORED_IMAGE) and end_anchor.image not in images:
+                restore_metrics = _restore_boundary(
+                    chunk, end_anchor, images=images, anchor_at=anchor_at, job_id=job_id, prompt=prompts[chunk.index],
+                    seed=seed + chunk.index, width=canvas_width, height=canvas_height, audio_slice=audio_slice,
+                    work_dir=chunk_dir, recipe=recipe, sparse_attention=sparse_attention)
+                stage_timings[f"chunk_{chunk.index}_boundary_seconds"] = restore_metrics["seconds"]
             # Every chunk opens on a pin and ends on one at its last kept frame (not the
-            # grid surplus past it): the input image, or a pinned chunk's own image.
+            # grid surplus past it): the input image, a pinned chunk's own image, or a
+            # continuous boundary's restored frame.
             first_image = images[anchor_at[chunk.start_frame].image]
             guides = [(position, images[anchor.image]) for position, anchor in chunk.guides]
             guide_labels = [f"{position}:{anchor.label}" for position, anchor in chunk.guides]
@@ -821,6 +939,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
                 **({"checks": [attempt_verdict for _, _, attempt_verdict in attempts if attempt_verdict is not None],
                     "kept_attempt": kept, "flagged": bool(verdict and verdict["flagged"])} if checking else {}),
                 **({"checks_off": sorted(off)} if checking and off else {}),
+                **({"boundary_restore": restore_metrics} if restore_metrics else {}),
             })
     finally:
         cleanup_h3_job_files(job_id)
@@ -836,7 +955,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     began = time.perf_counter()
     output_name = "output.mp4"
     output_path = scratch_dir / "outputs" / output_name
-    assemble_output(
+    interpolation = assemble_output(
         chunk_paths,
         audio_path=audio_path,
         total_frames=total_frames,
@@ -846,6 +965,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
         width=None if bounding_box else delivered_width,
         height=None if bounding_box else delivered_height,
         bounding_box=bounding_box,
+        output_fps=int(H3_FPS) if interpolation_fps else None,
     )
     finish("assemble_seconds", began)
     if bounding_box is not None:
@@ -856,12 +976,13 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     transcript = plan["transcript"]
     item = {
         "seed": seed,
-        "fps": fps,
+        "fps": float(H3_FPS),
         "width": delivered_width,
         "height": delivered_height,
-        "frames": total_frames,
+        "frames": interpolation["output_frames"] if interpolation else total_frames,
         "duration_seconds": round(audio_duration, 3),
         "source": "freestyle",
+        "chunk_boundaries": plan["chunk_boundaries"],
         "anchors": len(anchors),
         "pinned_chunks": len(pinned_chunks),
         "canvas_width": canvas_width,
@@ -887,6 +1008,11 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     }
     if bounding_box is not None:
         item["output_dimensions"] = {"width": bounding_box[0], "height": bounding_box[1]}
+    if interpolation:
+        # Rendered at interpolation_fps; RIFE made the rest of the 24 fps frames.
+        item["interpolation"] = {"fps": interpolation_fps, "rendered_frames": total_frames,
+                                 "rife_frames": interpolation["rife_frames"], "seconds": interpolation["seconds"]}
+        stage_timings["interpolation_seconds"] = interpolation["seconds"]
     log_event("lipsync_complete", job_id=job_id, wall_seconds=round(total_seconds, 3), **{
         key: item[key] for key in ("frames", "chunks", "anchors", "width", "height")
     })

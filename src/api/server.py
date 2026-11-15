@@ -5185,6 +5185,17 @@ class InferenceResult:
     content_type: str | None = None
     audio: bytes | None = None
     data: dict[str, Any] | None = None
+    # Further files of an audio result, by name (a continuable clip's ``lastFrame``): each is
+    # uploaded as its own Taskflow artifact (``artifactIds[name]`` in the lease payload).
+    files: dict[str, "ResultFile"] | None = None
+
+
+@dataclass(frozen=True)
+class ResultFile:
+    """One extra file of a result: its bytes and media type."""
+
+    content: bytes
+    content_type: str
 
 
 async def _apply_audio_adjustments(
@@ -6582,6 +6593,7 @@ class LzTtsInferenceSession:
 
         The result travels like audio (``kind`` "audio", ``audioBase64`` on /task/sync) with
         ``content_type`` video/mp4 or image/png; its data carries the seed, size and render metrics.
+        A continuable videogen clip also returns its restored last frame as the ``lastFrame`` file.
         """
         config = _server_config.media
         if not getattr(config, operation):
@@ -6598,6 +6610,12 @@ class LzTtsInferenceSession:
             await _await_engine_ready("media")
             produced = await _ensure_media_runtime().post(f"/{operation}", body, timeout)
             output = await asyncio.to_thread(Path(produced["path"]).read_bytes)
+            # A continuable videogen clip's restored last frame: the next clip's image_url.
+            last_frame = (
+                await asyncio.to_thread(Path(produced["last_frame_path"]).read_bytes)
+                if produced.get("last_frame_path")
+                else None
+            )
         return InferenceResult(
             kind="audio",
             content_type="image/png" if operation == "imagegen" else "video/mp4",
@@ -6607,6 +6625,7 @@ class LzTtsInferenceSession:
                 "seed": produced["seed"],
                 "wallSeconds": produced["metrics"].get("wall_seconds"),
             },
+            files={"lastFrame": ResultFile(last_frame, "image/jpeg")} if last_frame is not None else None,
         )
 
 
@@ -6672,6 +6691,16 @@ def _task_output_payload(result: InferenceResult) -> dict[str, Any]:
         "kind": "audio",
         "contentType": result.content_type,
         "audioBase64": base64.b64encode(result.audio or b"").decode("ascii"),
+        **(
+            {
+                "files": {
+                    name: {"contentType": file.content_type, "base64": base64.b64encode(file.content).decode("ascii")}
+                    for name, file in result.files.items()
+                }
+            }
+            if result.files
+            else {}
+        ),
     }
 
 

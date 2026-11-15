@@ -19,6 +19,7 @@ Env:
                              (default http://home.vnet.local:8000)
   API_KEY                    api key for the remote adapter (required)
   PORT                       this worker's own HTTP adapter port (default 8010)
+  TASKFLOW_WORKER_TYPES      comma-separated task types to join for (default: all of them)
 
 Run: python3 -m src.taskflow_forwarder  (or via console script once added)
 """
@@ -106,7 +107,9 @@ class ForwardingInferenceSession:
     async def execute_many(
         self,
         operations: list[tuple[str, dict[str, Any]]],
+        mp3_sinks: list[Any] | None = None,  # pylint: disable=unused-argument
     ) -> list[Any]:
+        """Forward each operation. A forwarded result arrives complete, so the sinks get nothing."""
         if not self._started:
             raise RuntimeError("Forwarding inference session has not been started")
         outcomes = await asyncio.gather(
@@ -176,12 +179,16 @@ async def run_forwarder_worker() -> None:
     forward_url = os.environ.get("LZAI_FORWARD_URL", "http://home.vnet.local:8000").strip()
     api_key = os.environ.get("API_KEY", "").strip()
 
+    task_types = tuple(
+        t.strip() for t in os.environ.get("TASKFLOW_WORKER_TYPES", "").split(",") if t.strip()
+    )
     taskflow = TaskflowWorker(
         base_url=f"{os.environ.get('LZB_API', 'http://localhost:4001').rstrip('/')}/internal/taskflow/v1",
         worker_token=worker_token,
         worker_id=os.environ.get("TASKFLOW_WORKER_ID", f"lzai-forwarder-{socket.gethostname()}"),
         concurrency=max(1, int(os.environ.get("TASKFLOW_WORKER_CONCURRENCY", "8"))),
         persistent=_env_bool("TASKFLOW_WORKER_PERSISTENT", False),
+        **({"task_types": task_types} if task_types else {}),
     )
     inference = ForwardingInferenceSession(forward_url, api_key)
     try:

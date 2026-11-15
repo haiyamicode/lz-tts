@@ -1,21 +1,20 @@
-"""The clean voice an lipsync render hears (``lipsync``).
+"""The clean voice a lipsync render hears (``lipsync``).
 
-Music, room tone and noise in a job's audio make H3 invent things - overlay
-graphics, punch-ins, flares - and blur the pauses the pins are placed in. So the
-render, Whisper and the pin placement all get only the voice:
+Room tone and noise in a job's audio make H3 invent things - overlay graphics,
+punch-ins, flares - and blur the pauses the pins are placed in. So the render,
+the transcription and the pin placement get the denoised voice:
 
-1. Demucs ``htdemucs`` separates the vocals (44.1 kHz stereo in, the rate the
-   model was trained at);
-2. the vocals go to 16 kHz mono, all the rest needs;
-3. ZipEnhancer (ModelScope ``iic/speech_zipenhancer_ans_multiloss_16k_base``;
-   the network vendored in :mod:`h3.zipenhancer`) removes the
-   noise left, in the 2 s windows (1.5 s stride, each window's outer 0.25 s
-   dropped) of ModelScope's own pipeline, batched on the GPU;
-4. the result is set to the vocals' speech level, its peak kept under full
-   scale.
+1. the audio goes to 16 kHz mono;
+2. ZipEnhancer (ModelScope ``iic/speech_zipenhancer_ans_multiloss_16k_base``;
+   the network vendored in :mod:`h3.zipenhancer`) removes the noise, in the 2 s
+   windows (1.5 s stride, each window's outer 0.25 s dropped) of ModelScope's own
+   pipeline, batched on the GPU;
+3. the result is set to the input's speech level, its peak kept under full scale.
 
-The caller's audio is still what the job delivers. Both models are the
-files under ``data/lipsync/speech-cleanup`` (the ``SPEECH_CLEANUP_*_PATH`` constants in :mod:`h3.compat`).
+No music separation (Demucs was dropped): a song's backing track reaches the
+render as it is. The caller's audio is still what the job delivers. ZipEnhancer
+is ``data/lipsync/speech-cleanup/zipenhancer`` (``SPEECH_CLEANUP_ZIPENHANCER_*``
+in :mod:`h3.compat`), loaded once and kept on the GPU.
 """
 
 from __future__ import annotations
@@ -31,7 +30,6 @@ from typing import Any
 from .compat import log_event
 
 SAMPLE_RATE = 16000
-DEMUCS_RATE = 44100
 #: ZipEnhancer's STFT and its pipeline's windows, samples at 16 kHz.
 N_FFT, HOP, WIN = 400, 100, 400
 COMPRESS = 0.3
@@ -45,45 +43,28 @@ LEVEL_HOP = SAMPLE_RATE // 100
 PEAK = 0.98
 
 _LOCK = threading.Lock()
-_DEMUCS: Any = None
 _ZIPENHANCER: Any = None
 
 
-def _paths() -> tuple[Path, Path, Path]:
-    from .compat import (
-        SPEECH_CLEANUP_DEMUCS_PATH,
-        SPEECH_CLEANUP_ZIPENHANCER_CONFIG_PATH,
-        SPEECH_CLEANUP_ZIPENHANCER_PATH,
-    )
-    from .compat import project_path
-
-    paths = tuple(project_path(path) for path in (
-        SPEECH_CLEANUP_DEMUCS_PATH, SPEECH_CLEANUP_ZIPENHANCER_PATH, SPEECH_CLEANUP_ZIPENHANCER_CONFIG_PATH))
-    missing = [str(path) for path in paths if not path.exists()]
-    if missing:
-        raise FileNotFoundError(f"speech_cleanup models are missing (expected {', '.join(missing)})")
-    return paths
-
-
-def _models():
-    """Both models, loaded once and kept in host memory between jobs."""
-    global _DEMUCS, _ZIPENHANCER
-    if _DEMUCS is None or _ZIPENHANCER is None:
+def _zipenhancer():
+    """ZipEnhancer, loaded once and kept on the GPU (about 8 MB of weights)."""
+    global _ZIPENHANCER
+    if _ZIPENHANCER is None:
         import torch
-        from demucs.states import load_model
 
+        from .compat import SPEECH_CLEANUP_ZIPENHANCER_CONFIG_PATH, SPEECH_CLEANUP_ZIPENHANCER_PATH, project_path
         from .zipenhancer.model import AttrDict, ZipEnhancer
 
-        demucs_path, zipenhancer_path, config_path = _paths()
-        # A trusted, provisioned Demucs package: it pickles its model class, which
-        # torch.load's default weights_only mode refuses.
-        _DEMUCS = load_model(torch.load(demucs_path, map_location="cpu", weights_only=False)).eval()
+        weights, config_path = project_path(SPEECH_CLEANUP_ZIPENHANCER_PATH), project_path(SPEECH_CLEANUP_ZIPENHANCER_CONFIG_PATH)
+        missing = [str(path) for path in (weights, config_path) if not path.exists()]
+        if missing:
+            raise FileNotFoundError(f"ZipEnhancer is missing (expected {', '.join(missing)})")
         config = json.loads(config_path.read_text())["model"]
-        zipenhancer = ZipEnhancer(AttrDict({key: config[key] for key in (
+        model = ZipEnhancer(AttrDict({key: config[key] for key in (
             "num_tsconformers", "dense_channel", "former_conf", "batch_first", "model_num_spks")}))
-        zipenhancer.load_state_dict(torch.load(zipenhancer_path, map_location="cpu", weights_only=True)["generator"])
-        _ZIPENHANCER = zipenhancer.eval()
-    return _DEMUCS, _ZIPENHANCER
+        model.load_state_dict(torch.load(weights, map_location="cpu", weights_only=True)["generator"])
+        _ZIPENHANCER = model.eval().to(_device())
+    return _ZIPENHANCER
 
 
 def _device() -> str:
@@ -101,29 +82,6 @@ def _decode(path: Path, *, rate: int, channels: int):
         capture_output=True,
     ).stdout
     return np.frombuffer(pcm, dtype=np.float32).reshape(-1, channels).T.copy()
-
-
-def separate_vocals(path: Path, model) -> Any:
-    """Demucs vocals of ``path`` as 16 kHz mono float32."""
-    import julius
-    import torch
-    from demucs.apply import apply_model
-
-    mix = torch.from_numpy(_decode(path, rate=DEMUCS_RATE, channels=2))
-    # Demucs' own normalization (demucs.separate): zero mean, unit variance.
-    reference = mix.mean(0)
-    mean, std = reference.mean(), reference.std().clamp_min(1e-8)
-    device = _device()
-    try:
-        model.to(device)
-        with torch.no_grad():
-            sources = apply_model(model, ((mix - mean) / std)[None], shifts=1, split=True, overlap=0.25, device=device)[0]
-    finally:
-        model.cpu()
-        if device == "cuda":
-            torch.cuda.empty_cache()
-    vocals = (sources[model.sources.index("vocals")].cpu() * std + mean).mean(0)
-    return julius.resample_frac(vocals, DEMUCS_RATE, SAMPLE_RATE).numpy().astype("float32")
 
 
 def _enhance_windows(windows, model, device: str):
@@ -165,13 +123,11 @@ def enhance(samples, model):
     windows = torch.stack([padded[step * STRIDE:step * STRIDE + span] for step in range(steps + 1)])
     device = _device()
     try:
-        model.to(device)
         with torch.no_grad():
             enhanced = torch.cat([_enhance_windows(windows[i:i + BATCH], model, device) for i in range(0, len(windows), BATCH)])
     finally:
-        model.cpu()
         if device == "cuda":
-            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()  # the activations; the weights stay
     if steps == 0:
         return enhanced[0, :length].numpy()
     out = torch.zeros(len(padded))
@@ -216,14 +172,12 @@ def write_wav(path: Path, samples) -> Path:
 
 
 def clean_voice(audio_path: Path, output_path: Path, *, job_id: str = "") -> Path:
-    """The job's voice, separated and denoised, as a 16 kHz mono wav at ``output_path``."""
+    """The job's voice, denoised, as a 16 kHz mono wav at ``output_path``."""
     with _LOCK:
-        demucs, zipenhancer = _models()
         began = time.perf_counter()
-        vocals = separate_vocals(audio_path, demucs)
-        separated = time.perf_counter()
-        voice = matched_level(enhance(vocals, zipenhancer), vocals)
+        samples = _decode(audio_path, rate=SAMPLE_RATE, channels=1)[0]
+        voice = matched_level(enhance(samples, _zipenhancer()), samples)
     write_wav(output_path, voice)
     log_event("voice_cleaned", job_id=job_id, audio_seconds=round(len(voice) / SAMPLE_RATE, 3),
-              demucs_seconds=round(separated - began, 3), zipenhancer_seconds=round(time.perf_counter() - separated, 3))
+              zipenhancer_seconds=round(time.perf_counter() - began, 3))
     return output_path
