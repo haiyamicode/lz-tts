@@ -34,10 +34,9 @@ SAMPLE_RATE = 16000
 N_FFT, HOP, WIN = 400, 100, 400
 COMPRESS = 0.3
 WINDOW, STRIDE = 2 * SAMPLE_RATE, int(2 * SAMPLE_RATE * 0.75)
-#: Inputs up to this long are enhanced in one pass, as in ModelScope's pipeline.
-WHOLE_MAX = 3 * WINDOW
-#: ZipEnhancer windows per forward pass.
-BATCH = 16
+#: Inputs up to this long are enhanced in one pass. Longer ones go one window per pass: a pass needs about
+#: 1.2 GB per 2 s of audio (ModelScope's 6 s whole pass 6.3 GB, 16 windows 18.7 GB) and batching is no faster.
+WHOLE_MAX = WINDOW
 #: Speech level: the 90th percentile of 10 ms RMS, in dB.
 LEVEL_HOP = SAMPLE_RATE // 100
 PEAK = 0.98
@@ -124,7 +123,7 @@ def enhance(samples, model):
     device = _device()
     try:
         with torch.no_grad():
-            enhanced = torch.cat([_enhance_windows(windows[i:i + BATCH], model, device) for i in range(0, len(windows), BATCH)])
+            enhanced = torch.cat([_enhance_windows(windows[i:i + 1], model, device) for i in range(len(windows))])
     finally:
         if device == "cuda":
             torch.cuda.empty_cache()  # the activations; the weights stay
@@ -173,9 +172,12 @@ def write_wav(path: Path, samples) -> Path:
 
 def clean_voice(audio_path: Path, output_path: Path, *, job_id: str = "") -> Path:
     """The job's voice, denoised, as a 16 kHz mono wav at ``output_path``."""
+    from .minimax_h3_runtime import make_room_beside_h3
+
     with _LOCK:
         began = time.perf_counter()
         samples = _decode(audio_path, rate=SAMPLE_RATE, channels=1)[0]
+        make_room_beside_h3()
         voice = matched_level(enhance(samples, _zipenhancer()), samples)
     write_wav(output_path, voice)
     log_event("voice_cleaned", job_id=job_id, audio_seconds=round(len(voice) / SAMPLE_RATE, 3),

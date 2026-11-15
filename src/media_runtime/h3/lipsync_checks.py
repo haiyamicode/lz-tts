@@ -506,6 +506,10 @@ def check_chunk(render: Path, *, audio: Path, kept_frames: int, flicker: bool, d
     ends on a different image, so flicker judges only sudden steps (:func:`flicker_scores`).
     """
     verdict: dict[str, Any] = {}
+    if desync or glitches:
+        from .minimax_h3_runtime import make_room_beside_h3
+
+        make_room_beside_h3()
     if flicker:
         verdict["flicker"] = flicker_scores(render, kept_frames=kept_frames, judge_drift=judge_drift)
     if desync:

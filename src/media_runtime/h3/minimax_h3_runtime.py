@@ -113,6 +113,9 @@ H3_CANVAS_MULTIPLE = 32
 #: Aspect error we treat as free: 0.005 is 0.5% of scale, about 6 px on a
 #: 1280-tall canvas, far below what anyone sees in a moving image.
 H3_ASPECT_TOLERANCE = 0.005
+#: VRAM a helper outside ComfyUI needs free beside H3 (``make_room_beside_h3``), measured with its weights loading:
+#: ZipEnhancer 1.18 GB at any length, RIFE 1.1 at 1 MP, CTC 0.69, S3FD/SyncNet + glitch 0.59 (3090, 2026-11-15).
+HELPER_VRAM_BYTES = 1536 << 20
 #: How much of the requested pixel budget we refuse to give up to chase a
 #: perfect ratio. The 32-px block is ~4.5% of a 700-px axis, so demanding the
 #: exact aspect would sometimes cost a quarter of the resolution; we only take
@@ -1280,6 +1283,11 @@ def _load_comfy_modules(comfy_root: Path) -> None:
         sys.argv[0],
         "--cache-classic",
         "--disable-api-nodes",
+        # DynamicVRAM fills the card with H3 weight pages; without headroom every lipsync step re-faults pages
+        # for its activations (warm 5 s lipsync on the 3090: 123-130 s at 0, 88 s at 2/4/8 GB for 16 fps;
+        # 12 fps 84 s at 2, 72 s at 4/8). Helpers outside ComfyUI also take this room first (make_room_beside_h3).
+        "--vram-headroom",
+        os.environ.get("H3_VRAM_HEADROOM_GB", "4"),
         "--input-directory",
         str(comfy_root / "input"),
         "--output-directory",
@@ -1417,6 +1425,28 @@ def unload_retained_h3_runtime() -> bool:
         pass
     log_event("minimax_h3_runtime_unloaded")
     return True
+
+
+def make_room_beside_h3(need_bytes: int | None = None) -> None:
+    """Free ``need_bytes`` (default ``HELPER_VRAM_BYTES``) of VRAM for a model run outside ComfyUI: ZipEnhancer,
+    the CTC transcriber, S3FD/SyncNet, the glitch net, RIFE. ComfyUI's DynamicVRAM fills every byte nobody else
+    holds with H3 weight pages and never yields them to a torch allocation, so on a full card a helper after an H3
+    graph runs out of memory. ``free_memory`` drops only the missing bytes of weight pages (``partially_unload``):
+    the models stay loaded and the pages come back on the next H3 step. No-op before the executor exists."""
+    if _RETAINED_H3_RUNTIME is None:
+        return
+    import comfy.model_management as model_management
+
+    device = model_management.get_torch_device()
+    need = HELPER_VRAM_BYTES if need_bytes is None else int(need_bytes)
+    free = model_management.get_free_memory(device)
+    if free >= need:
+        return
+    began = time.perf_counter()
+    model_management.free_memory(need, device)
+    log_event("minimax_h3_room_made", need_mib=need >> 20, free_mib=free >> 20,
+              now_free_mib=model_management.get_free_memory(device) >> 20,
+              seconds=round(time.perf_counter() - began, 3))
 
 
 def _execute_graph(

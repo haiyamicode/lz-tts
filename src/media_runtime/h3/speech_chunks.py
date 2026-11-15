@@ -222,7 +222,10 @@ def transcribe(audio) -> Transcript:
     place each chunk's speech in its prompt."""
     import numpy as np
 
+    from .minimax_h3_runtime import make_room_beside_h3
+
     with _CTC_LOCK:
+        make_room_beside_h3()
         ctc = _ctc_model()
         frames = _ctc_frames(np.asarray(audio, dtype=np.float32), ctc)
     words = ctc_words(frames, ctc["letters"], blank=ctc["blank"])

@@ -148,7 +148,10 @@ def upsample_video(source_args: list[str], output_args: list[str], *, width: int
     import torch
     import torch.nn.functional as F
 
+    from .minimax_h3_runtime import make_room_beside_h3
+
     started = time.perf_counter()
+    make_room_beside_h3()
     model = rife_model()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pad_h, pad_w = math.ceil(height / 128) * 128, math.ceil(width / 128) * 128
