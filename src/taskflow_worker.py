@@ -13,7 +13,9 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -21,6 +23,7 @@ from dotenv import load_dotenv
 
 from .api.server import (
     InferenceOperationError,
+    InferenceResult,
     LzTtsInferenceSession,
     _env_bool,
     create_app,
@@ -483,21 +486,29 @@ class TaskflowWorker:
                 scope="lease",
             )
 
-    async def upload(self, lease: dict[str, Any], artifact_id: str, audio: bytes) -> None:
+    async def upload(self, lease: dict[str, Any], artifact_id: str, content: bytes | Path) -> None:
+        """Send an artifact: audio made in memory as the bytes it is, a file as the file it is.
+
+        A render is a video of up to gigabytes, and nothing here has any use for its bytes, so
+        they are read a chunk at a time and sent as they come. The length is the file's, so the
+        upload is an ordinary one the API sizes up front, not a chunked stream.
+        """
         artifact_base_url = self.artifact_base_url
         started_at = time.monotonic()
+        size = len(content) if isinstance(content, bytes) else content.stat().st_size
         _LOGGER.info(
             "Artifact upload started lease=%s artifact=%s bytes=%d",
             lease["id"],
             artifact_id,
-            len(audio),
+            size,
         )
         response = await self._client.put(
             f"{artifact_base_url}/leases/{lease['id']}/{artifact_id}",
-            content=audio,
+            content=content if isinstance(content, bytes) else _file_chunks(content),
             headers={
                 "Authorization": f"Bearer {lease['leaseToken']}",
                 "Content-Type": "application/octet-stream",
+                "Content-Length": str(size),
             },
         )
         if response.is_error:
@@ -511,7 +522,7 @@ class TaskflowWorker:
             "Artifact upload completed lease=%s artifact=%s bytes=%d wall_seconds=%.3f",
             lease["id"],
             artifact_id,
-            len(audio),
+            size,
             time.monotonic() - started_at,
         )
 
@@ -687,7 +698,17 @@ def _callback_token(lease: dict[str, Any]) -> str | None:
     return token if isinstance(token, str) and token else None
 
 
-def _artifact_duration(audio: bytes, content_type: str | None) -> float | None:
+async def _file_chunks(path: Path, chunk_size: int = 1 << 20) -> AsyncIterator[bytes]:
+    """The file, a megabyte at a time, read off the event loop."""
+    handle = await asyncio.to_thread(path.open, "rb")
+    try:
+        while chunk := await asyncio.to_thread(handle.read, chunk_size):
+            yield chunk
+    finally:
+        await asyncio.to_thread(handle.close)
+
+
+def _artifact_duration(content: bytes | Path, content_type: str | None) -> float | None:
     """Length of a finished artifact in seconds; None when it can't be measured.
 
     An MP3 is counted frame by frame. A take is a bare LAME stream, so ffprobe
@@ -696,24 +717,39 @@ def _artifact_duration(audio: bytes, content_type: str | None) -> float | None:
     cuts the end off the line. Other containers state their length in the header,
     where ffprobe is exact.
     """
-    if (content_type or "").startswith("audio/mpeg"):
-        seconds = mp3_duration_seconds(audio)
+    if isinstance(content, bytes) and (content_type or "").startswith("audio/mpeg"):
+        seconds = mp3_duration_seconds(content)
         if seconds is not None:
             return seconds
-    return _measure_audio_duration(audio)
+    return _measure_audio_duration(content)
 
 
-def _measure_audio_duration(audio: bytes) -> float | None:
-    """Measure audio duration in seconds via ffprobe; None when unavailable."""
-    if not audio:
+def _measure_audio_duration(content: bytes | Path) -> float | None:
+    """Measure audio duration in seconds via ffprobe; None when unavailable.
+
+    A render is already a file, and ffprobe reads it where it is. Audio held in memory is written
+    out first, as that is the only way ffprobe can be shown it.
+    """
+    if isinstance(content, Path):
+        return _probe_duration(str(content))
+    if not content:
         return 0.0
     try:
         with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as handle:
-            handle.write(audio)
+            handle.write(content)
             path = handle.name
     except OSError:
         _LOGGER.exception("Failed to buffer audio for duration measurement")
         return None
+    try:
+        return _probe_duration(path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def _probe_duration(path: str) -> float | None:
+    """What ffprobe makes of the file's length, in seconds."""
     try:
         result = subprocess.run(
             [
@@ -741,9 +777,6 @@ def _measure_audio_duration(audio: bytes) -> float | None:
     except (OSError, subprocess.TimeoutExpired, ValueError) as error:
         _LOGGER.warning("Audio duration measurement unavailable: %s", error)
         return None
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(path)
 
 
 @dataclass
@@ -942,6 +975,20 @@ async def _prepare_result(
 
     Returns None when the server released the lease, leaving nothing to report.
     """
+    try:
+        return await _upload_result(taskflow, work, outcome, segments)
+    finally:
+        # A result's files are the worker's to delete, however the lease ended.
+        if isinstance(outcome, InferenceResult):
+            outcome.release()
+
+
+async def _upload_result(
+    taskflow: TaskflowWorker,
+    work: _LeaseWork,
+    outcome: Any,
+    segments: _SegmentUploads | None,
+) -> _LeaseResult | None:
     lease = work.lease
     lease_id = lease["id"]
     run_id = lease.get("runId")
@@ -963,8 +1010,8 @@ async def _prepare_result(
             raise ValueError(
                 f"TTS operation {work.operation} returned audio without an artifactId"
             )
-        audio = result.audio or b""
-        if not audio:
+        size = result.size
+        if not size:
             raise RuntimeError("LZAI returned an empty audio artifact")
         # A result's further files (a continuable clip's lastFrame) each go to the artifact the
         # API named for it; one it didn't name would be lost, so that is the API's bug to fix.
@@ -976,24 +1023,25 @@ async def _prepare_result(
                 f"TTS operation {work.operation} returned files {missing} without artifactIds"
             )
         for name, file in files.items():
-            await taskflow.upload(lease, file_ids[name], file.content)
+            await taskflow.upload(lease, file_ids[name], file.source)
         if segments is not None:
-            await segments.finish(audio)
+            # A streamed take, whose segments went up as they were encoded: it is in memory.
+            await segments.finish(result.audio or b"")
         else:
-            await taskflow.upload(lease, artifact_id, audio)
-        duration = await asyncio.to_thread(_artifact_duration, audio, result.content_type)
+            await taskflow.upload(lease, artifact_id, result.source)
+        duration = await asyncio.to_thread(_artifact_duration, result.source, result.content_type)
         completion: dict[str, Any] = {
             **(result.data or {}),
             "kind": "artifact",
             "artifactId": artifact_id,
-            "bytes": len(audio),
+            "bytes": size,
             "contentType": result.content_type or "application/octet-stream",
             **(
                 {
                     "files": {
                         name: {
                             "artifactId": file_ids[name],
-                            "bytes": len(file.content),
+                            "bytes": file.size,
                             "contentType": file.content_type,
                         }
                         for name, file in files.items()

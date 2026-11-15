@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import signal
 import sys
 import tempfile
@@ -5279,23 +5280,70 @@ class InferenceResult:
 
     ``data`` is the payload of a json result; on an audio result it carries
     extra fields reported alongside the audio (e.g. voice-enhance ``locale``).
+
+    An audio result is either ``audio``, synthesized in this process, or ``file``, written by the
+    media runtime: a render is a video of up to gigabytes, so it stays a file and is streamed to
+    its artifact from there. ``scratch`` is the directory those files are in, and whoever has
+    finished with the result — the upload, or the sync route that answered with it — calls
+    :meth:`release` to delete it.
     """
 
     kind: Literal["audio", "json"]
     content_type: str | None = None
     audio: bytes | None = None
+    file: "ResultFile | None" = None
     data: dict[str, Any] | None = None
     # Further files of an audio result, by name (a continuable clip's ``lastFrame``): each is
     # uploaded as its own Taskflow artifact (``artifactIds[name]`` in the lease payload).
     files: dict[str, "ResultFile"] | None = None
+    scratch: Path | None = None
+
+    @property
+    def size(self) -> int:
+        """How many bytes the audio is — asked of the filesystem, never by reading the file."""
+        if self.audio is not None:
+            return len(self.audio)
+        return self.file.size if self.file is not None else 0
+
+    @property
+    def source(self) -> bytes | Path:
+        """What the audio is sent from: the bytes themselves, or the file holding them."""
+        if self.audio is not None:
+            return self.audio
+        return self.file.source if self.file is not None else b""
+
+    def release(self) -> None:
+        """Deletes the result's files. Called once, by whoever finished with the result."""
+        if self.scratch is not None:
+            shutil.rmtree(self.scratch, ignore_errors=True)
 
 
 @dataclass(frozen=True)
 class ResultFile:
-    """One extra file of a result: its bytes and media type."""
+    """One file of a result: its media type, and its bytes or the file that holds them."""
 
-    content: bytes
     content_type: str
+    content: bytes | None = None
+    path: Path | None = None
+
+    @property
+    def size(self) -> int:
+        if self.content is not None:
+            return len(self.content)
+        return self.path.stat().st_size if self.path is not None else 0
+
+    @property
+    def source(self) -> bytes | Path:
+        """What the artifact is sent from: the bytes themselves, or the file holding them."""
+        if self.content is not None:
+            return self.content
+        return self.path if self.path is not None else b""
+
+    def read(self) -> bytes:
+        """The file's bytes, for the one caller that was asked for them: /task/sync."""
+        if self.content is not None:
+            return self.content
+        return self.path.read_bytes() if self.path is not None else b""
 
 
 async def _apply_audio_adjustments(
@@ -6534,7 +6582,7 @@ class LzTtsInferenceSession:
             "Inference operation completed context=%s kind=%s bytes=%s wall_seconds=%.3f",
             context,
             result.kind,
-            len(result.audio or b"") if result.kind == "audio" else None,
+            result.size if result.kind == "audio" else None,
             time.perf_counter() - started,
         )
         return result
@@ -6798,21 +6846,26 @@ class LzTtsInferenceSession:
         body: dict[str, Any] = request.model_dump(exclude={"reference_url"}, exclude_none=True)
         job_id = f"generate-music-{uuid.uuid4().hex}"
         body["job_id"] = job_id
-        with tempfile.TemporaryDirectory(prefix="generate-music-") as scratch:
-            body["output_dir"] = scratch
+        # The song stays the file the runtime wrote; the scratch goes when the result is released.
+        scratch = Path(tempfile.mkdtemp(prefix="generate-music-"))
+        try:
+            body["output_dir"] = str(scratch)
             if progress is not None:
                 progress("preparing", None, None)
             if request.reference_url:
-                body["reference_path"] = str(await fetch_reference(request.reference_url, Path(scratch) / "reference"))
+                body["reference_path"] = str(await fetch_reference(request.reference_url, scratch / "reference"))
             await _await_engine_ready("media")
             with listening_for_progress(job_id, progress):
                 produced = await _ensure_media_runtime().post("/generate", body, config.music_timeout_seconds)
-            audio = await asyncio.to_thread(Path(produced["path"]).read_bytes)
+        except BaseException:
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise
         return InferenceResult(
             kind="audio",
             content_type="audio/wav",
-            audio=audio,
+            file=ResultFile("audio/wav", path=Path(produced["path"])),
             data={"seed": produced["seed"], "mode": produced["mode"]},
+            scratch=scratch,
         )
 
     async def _render_h3(
@@ -6831,34 +6884,36 @@ class LzTtsInferenceSession:
         model = {"videogen": VideogenRequest, "lipsync": LipsyncRequest, "imagegen": ImagegenRequest}[operation]
         request = model.model_validate(request_data)
         timeout = getattr(config, f"{operation}_timeout_seconds")
-        with tempfile.TemporaryDirectory(prefix=f"{operation}-") as scratch:
+        # The render stays the file the runtime wrote; the scratch goes when the result is released.
+        scratch = Path(tempfile.mkdtemp(prefix=f"{operation}-"))
+        try:
             body = {
                 "job_id": f"{operation}-{uuid.uuid4().hex}",
                 "payload": request.model_dump(exclude_none=True),
-                "output_dir": scratch,
+                "output_dir": str(scratch),
             }
             if progress is not None:
                 progress("preparing", None, None)
             await _await_engine_ready("media")
             with listening_for_progress(body["job_id"], progress):
                 produced = await _ensure_media_runtime().post(f"/{operation}", body, timeout)
-            output = await asyncio.to_thread(Path(produced["path"]).read_bytes)
-            # A continuable videogen clip's restored last frame: the next clip's image_url.
-            last_frame = (
-                await asyncio.to_thread(Path(produced["last_frame_path"]).read_bytes)
-                if produced.get("last_frame_path")
-                else None
-            )
+        except BaseException:
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise
+        content_type = "image/png" if operation == "imagegen" else "video/mp4"
+        # A continuable videogen clip's restored last frame: the next clip's image_url.
+        last_frame = produced.get("last_frame_path")
         return InferenceResult(
             kind="audio",
-            content_type="image/png" if operation == "imagegen" else "video/mp4",
-            audio=output,
+            content_type=content_type,
+            file=ResultFile(content_type, path=Path(produced["path"])),
             data={
                 **_camel_keys(produced["item"]),
                 "seed": produced["seed"],
                 "wallSeconds": produced["metrics"].get("wall_seconds"),
             },
-            files={"lastFrame": ResultFile(last_frame, "image/jpeg")} if last_frame is not None else None,
+            files={"lastFrame": ResultFile("image/jpeg", path=Path(last_frame))} if last_frame else None,
+            scratch=scratch,
         )
 
 
@@ -6915,26 +6970,34 @@ class SyncTaskBatchRequest(BaseModel):
 
 
 def _task_output_payload(result: InferenceResult) -> dict[str, Any]:
-    """Shape one inference result for /task/sync and /task/batch alike."""
-    if result.kind == "json":
-        return {"status": "COMPLETED", "kind": "json", "data": result.data}
-    return {
-        **(result.data or {}),
-        "status": "COMPLETED",
-        "kind": "audio",
-        "contentType": result.content_type,
-        "audioBase64": base64.b64encode(result.audio or b"").decode("ascii"),
-        **(
-            {
-                "files": {
-                    name: {"contentType": file.content_type, "base64": base64.b64encode(file.content).decode("ascii")}
-                    for name, file in result.files.items()
+    """Shape one inference result for /task/sync and /task/batch alike.
+
+    These routes were asked for the bytes themselves, so a result held as a file is read here to
+    answer with — the one place that reads one — and released either way.
+    """
+    try:
+        if result.kind == "json":
+            return {"status": "COMPLETED", "kind": "json", "data": result.data}
+        audio = result.audio if result.audio is not None else (result.file.read() if result.file else b"")
+        return {
+            **(result.data or {}),
+            "status": "COMPLETED",
+            "kind": "audio",
+            "contentType": result.content_type,
+            "audioBase64": base64.b64encode(audio).decode("ascii"),
+            **(
+                {
+                    "files": {
+                        name: {"contentType": file.content_type, "base64": base64.b64encode(file.read()).decode("ascii")}
+                        for name, file in result.files.items()
+                    }
                 }
-            }
-            if result.files
-            else {}
-        ),
-    }
+                if result.files
+                else {}
+            ),
+        }
+    finally:
+        result.release()
 
 
 def _task_failure_payload(error: BaseException) -> dict[str, Any]:
