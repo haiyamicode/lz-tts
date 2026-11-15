@@ -122,23 +122,167 @@ def test_on_demand_pull_types():
     assert on_demand_task_types(TYPES, frozenset(), None, True) == TYPES
     assert on_demand_task_types(TYPES, frozenset({"media"}), None, False) == TYPES
     # Sticky on the loaded engines (+ the types that need no swappable engine).
-    assert on_demand_task_types(TYPES, frozenset({"media"}), None, True) == (
-        "voice-enhance",
-        "force-align",
-        "videogen",
-        "imagegen",
-    )
+    assert on_demand_task_types(TYPES, frozenset({"media"}), None, True) == ("voice-enhance", "videogen", "imagegen")
     assert on_demand_task_types(TYPES, frozenset({"voxcpm", "transcribe"}), None, True) == (
         "tts-synthesis",
         "voice-design",
         "voice-enhance",
         "transcribe",
-        "force-align",
     )
     # A job waits to load media: stop pulling work for the engines it will unload.
     assert on_demand_task_types(TYPES, frozenset({"voxcpm"}), "media", False) == (
+        "voice-enhance",
+        "videogen",
+        "imagegen",
+    )
+
+
+def test_pinned_footprints_come_off_the_budget():
+    # media (no footprint) gets what the pinned engines leave.
+    residency = EngineResidency(
+        budget_gb=20.0, footprints_gb={"voxcpm": 7.0, "transcribe": 3.0, "media": None}, load=None, unload=None,
+        pinned=["transcribe"],
+    )
+    assert residency.footprints == {"voxcpm": 7.0, "transcribe": 3.0, "media": 17.0}
+    with pytest.raises(ValueError, match="voxcpm"):  # 20 - 14 pinned leaves 6 < 7
+        EngineResidency(budget_gb=20.0, footprints_gb={"voxcpm": 7.0, "transcribe": 14.0}, load=None, unload=None,
+                        pinned=["transcribe"])
+    with pytest.raises(ValueError, match="more than"):
+        EngineResidency(budget_gb=20.0, footprints_gb={"voxcpm": 12.0, "transcribe": 9.0}, load=None, unload=None,
+                        pinned=["voxcpm", "transcribe"])
+    with pytest.raises(ValueError, match="media"):
+        EngineResidency(budget_gb=20.0, footprints_gb={"voxcpm": 7.0}, load=None, unload=None, pinned=["media"])
+
+
+def test_pinned_engine_is_never_unloaded():
+    async def scenario():
+        engines = _Engines(20.0)
+        residency = EngineResidency(
+            budget_gb=20.0, footprints_gb={"voxcpm": 7.0, "transcribe": 3.0, "media": None},
+            load=engines.load, unload=engines.unload, pinned=["transcribe"],
+        )
+        async with residency.hold("transcribe"):  # the startup load
+            pass
+
+        async def job(engine: str, delay: float):
+            await asyncio.sleep(delay)
+            async with residency.hold(engine):
+                assert engine in engines.loaded and "transcribe" in engines.loaded
+                await asyncio.sleep(0.03)
+
+        await asyncio.gather(job("media", 0), job("transcribe", 0.01), job("voxcpm", 0.02), job("media", 0.03))
+        return engines, residency
+
+    engines, residency = asyncio.run(scenario())
+    assert "unload transcribe" not in engines.events and engines.events.count("load transcribe") == 1
+    assert engines.events.count("unload media") == 1 and engines.events.count("unload voxcpm") == 1
+    assert residency.snapshot().pinned == frozenset({"transcribe"})
+
+
+def test_on_demand_pull_types_with_a_pinned_engine():
+    pinned = frozenset({"aligner"})  # the flex 3090: only the aligner pinned
+    # Only the pinned engine loaded: nothing to stick to, pull everything.
+    assert on_demand_task_types(TYPES, pinned, None, True, pinned) == TYPES
+    # Sticky on media keeps pulling the pinned engine's work.
+    assert on_demand_task_types(TYPES, frozenset({"media", "aligner"}), None, True, pinned) == (
         "voice-enhance",
         "force-align",
         "videogen",
         "imagegen",
     )
+    # Waiting to load voxcpm: the pinned engine stays, so its work is still pulled.
+    assert on_demand_task_types(TYPES, frozenset({"media", "aligner"}), "voxcpm", False, pinned) == (
+        "tts-synthesis",
+        "voice-design",
+        "voice-enhance",
+        "force-align",
+    )
+
+
+# The flex 3090: speech and aligner share one process, the others are their own.
+SPLIT = {"speech": 2.5, "aligner": 1.5, "voxcpm": 10.0, "transcribe": 2.5, "media": None}
+SYNTH = ("voxcpm", "speech", "aligner")
+
+
+def test_a_running_job_gets_the_rest_of_its_claim_while_a_swap_waits():
+    """Synthesis holds voxcpm, then needs speech and the aligner while a media job is queued:
+    the queued swap must not block it (that would deadlock: media waits for voxcpm's job)."""
+
+    async def scenario():
+        residency = EngineResidency(
+            budget_gb=22.0, footprints_gb=SPLIT, load=_noop, unload=_noop, claims=[SYNTH, ("media",)]
+        )
+        log: list[str] = []
+
+        async def synth():
+            job = residency.job(SYNTH)
+            async with residency.hold("voxcpm", job):
+                log.append("synth voxcpm")
+                await asyncio.sleep(0.05)  # media queues meanwhile
+                async with residency.hold("speech", job), residency.hold("aligner", job):
+                    log.append("synth speech+aligner")
+            log.append("synth done")
+
+        async def video():
+            await asyncio.sleep(0.02)
+            async with residency.hold("media"):
+                log.append("video")
+
+        await asyncio.wait_for(asyncio.gather(synth(), video()), timeout=5)
+        return log, residency
+
+    log, residency = asyncio.run(scenario())
+    assert log == ["synth voxcpm", "synth speech+aligner", "synth done", "video"]
+    assert residency.snapshot().resident == frozenset({"media"})
+
+
+def test_pinned_aligner_serves_force_align_beside_media():
+    async def scenario():
+        residency = EngineResidency(
+            budget_gb=22.0, footprints_gb=SPLIT, load=_noop, unload=_noop, pinned=["aligner"],
+            claims=[("media", "aligner")],
+        )
+        assert residency.footprints["media"] == 20.5
+        async with residency.hold("aligner"):  # the startup load
+            pass
+        log: list[str] = []
+
+        async def video():
+            async with residency.hold("media", residency.job(("media", "aligner"))):
+                log.append("video start")
+                await asyncio.sleep(0.05)
+                log.append("video end")
+
+        async def align():
+            await asyncio.sleep(0.03)  # media loaded (0.01) and running
+            async with residency.hold("aligner", residency.job(("aligner",))):
+                log.append("align")
+
+        await asyncio.wait_for(asyncio.gather(video(), align()), timeout=5)
+        return log
+
+    assert asyncio.run(scenario()) == ["video start", "align", "video end"]
+
+
+def test_a_claim_bigger_than_the_unpinned_budget_needs_a_pin():
+    # media takes the whole budget, so a job that also needs the aligner only fits it pinned.
+    with pytest.raises(ValueError, match="aligner, media"):
+        EngineResidency(budget_gb=22.0, footprints_gb=SPLIT, load=None, unload=None, claims=[("media", "aligner")])
+    EngineResidency(
+        budget_gb=22.0, footprints_gb=SPLIT, load=None, unload=None, pinned=["aligner"], claims=[("media", "aligner")]
+    )
+
+
+def test_pinning_speech_pins_the_aligner():
+    from src.api.server import LoadConfig
+
+    assert LoadConfig(pinned=["speech"]).pinned == ["speech", "aligner"]
+    assert LoadConfig(pinned=["aligner"]).pinned == ["aligner"]
+    # A footprint override keeps the other defaults.
+    assert LoadConfig(footprints_gb={"voxcpm": 9.0}).footprints_gb == {
+        "speech": 2.5, "aligner": 1.5, "voxcpm": 9.0, "transcribe": 2.5,
+    }
+
+
+async def _noop(engine: str) -> None:
+    await asyncio.sleep(0.01)

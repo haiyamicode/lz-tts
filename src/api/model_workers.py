@@ -559,6 +559,27 @@ def _qwen_asr_engine(settings_data: dict[str, Any]) -> Handler:
     return handler
 
 
+def _release_sparrow_globals() -> None:
+    from ..piper import context_replacer, heteronym
+
+    _inference_cache.clear()
+    heteronym._resolver = None  # pylint: disable=protected-access
+    context_replacer._replacer = None  # pylint: disable=protected-access
+
+
+def _release_number_modes_globals() -> None:
+    from ..piper import number_modes
+
+    with number_modes._resolver_lock:  # pylint: disable=protected-access
+        number_modes._resolver = None  # pylint: disable=protected-access
+
+
+# engine -> what its loader keeps in module globals (the rest lives in its handler).
+_SPEECH_ENGINE_GLOBALS: dict[str, Callable[[], None]] = {
+    "sparrow": _release_sparrow_globals,
+    "numbers": _release_number_modes_globals,
+}
+
 # engine -> (loader, cuDNN enabled). The CUDA driver keeps a host copy of every
 # cuDNN engine it loads (one per conv shape the heuristics pick), ~120-250 MB
 # of RAM per model, and torch's native convs are no slower for the Sparrow
@@ -579,7 +600,9 @@ def speech_worker_main(settings_data: dict[str, Any], request_queue: Any, respon
     launches, most of which these models share. Actions are named
     ``<engine>.<action>``; ``<engine>.load`` loads an engine (idempotent) and
     any other action loads it on first use, so a respawned process recovers
-    an engine on its own.
+    an engine on its own. ``<engine>.unload`` drops it and returns its VRAM to
+    the driver (on-demand mode swaps the speech engines out under the budget;
+    the process and its CUDA context stay).
     """
     handlers: dict[str, Handler] = {}
 
@@ -587,6 +610,19 @@ def speech_worker_main(settings_data: dict[str, Any], request_queue: Any, respon
         engine, _, engine_action = action.partition(".")
         if engine not in SPEECH_ENGINES:
             raise ValueError(f"unknown worker action: {action}")
+        if engine_action == "unload":
+            if handlers.pop(engine, None) is not None:
+                release = _SPEECH_ENGINE_GLOBALS.get(engine)
+                if release is not None:
+                    release()
+                # Its objects were frozen at load (_freeze_loaded_objects): unfreeze so the
+                # collector can free the cycles, then freeze what the other engines still hold.
+                gc.unfreeze()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.freeze()
+            return {"ok": True, "data": {"worker": "unloaded"}}
         loader, cudnn = SPEECH_ENGINES[engine]
         torch.backends.cudnn.enabled = cudnn
         if engine not in handlers:

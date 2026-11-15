@@ -22,7 +22,7 @@ import time
 import contextvars
 import httpx
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Optional
@@ -35,7 +35,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from rapidfuzz.distance import Levenshtein
 
 from ..multilingual_splitter import MultilingualSplitter, SplitResult
@@ -89,7 +89,7 @@ from .transcribe import (
     TranscribeRequest,
     decode_transcribe_audio,
 )
-from .residency import SWAPPABLE_ENGINES, EngineResidency, ResidencySnapshot
+from .residency import SWAPPABLE_ENGINES, EngineResidency, ResidencyJob, ResidencySnapshot
 from .face_detection import FaceDetector, FaceDetectRequest, FaceInputError
 from .nudity_detection import NudityDetectRequest, NudityDetector, NudityInputError
 from .voice_anchor import ANCHOR_SEED, LANGUAGE_ANCHORS, VoiceAnchorRequest, anchor_language
@@ -505,26 +505,52 @@ class SSMLConfig(BaseModel):
     voxcpm_ipa_refinement_passes: int = Field(default=1, ge=0)
 
 
+_DEFAULT_FOOTPRINTS_GB = {"speech": 2.5, "aligner": 1.5, "voxcpm": 10.0, "transcribe": 2.5}
+
+
 class LoadConfig(BaseModel):
-    """When the swappable engines (voxcpm, transcribe, media) load.
+    """When the swappable engines (speech, aligner, voxcpm, transcribe, media) load.
 
     ``all`` (default): every enabled engine loads at startup and stays (a dedicated worker).
     ``on-demand`` (a flex worker on one GPU): they start unloaded and load when a job needs one,
     unloading idle ones (least recently used first) so the loaded ones stay within
-    ``budget_gb``; see ``src/api/residency.py``. The speech process (Sparrow, Seed-VC, aligner,
-    number classifier) always loads at startup; ``budget_gb`` is the VRAM left beside it.
-    Env ``LZAI_LOAD_MODE`` and ``LZAI_VRAM_BUDGET_GB`` override the mode and the budget.
+    ``budget_gb``; see ``src/api/residency.py``. ``speech`` is Sparrow + Seed-VC and ``aligner``
+    the CTC aligner + the number classifier (timestamps, number reading); both live in the
+    speech process, whose bare CUDA context (~0.3 GB) is all that stays: ``budget_gb`` is the
+    VRAM beside it (~22 on a 24 GB card). Env ``LZAI_LOAD_MODE`` and ``LZAI_VRAM_BUDGET_GB``
+    override the mode and the budget.
     """
 
     mode: Literal["all", "on-demand"] = "all"
     budget_gb: float | None = Field(default=None, gt=0)
-    # Peak VRAM of each engine's process, GB, measured on the 3090 with the server.json defaults:
-    # voxcpm preallocates gpu_memory_utilization x the GPU (0.4 x 24 GB), transcribe 2.2 GB. An
-    # engine left out uses the whole budget: media (ComfyUI keeps models cached in whatever is
-    # free, 20.4 GB measured), so it never shares the GPU with another swappable engine.
-    footprints_gb: dict[str, float] = Field(default_factory=lambda: {"voxcpm": 10.0, "transcribe": 2.5})
-    # Engines to load at startup in on-demand mode (the rest load when a job needs them).
-    preload: list[Literal["voxcpm", "transcribe", "media"]] = Field(default_factory=list)
+    # Peak VRAM of each engine, GB, measured on the 3090 with the server.json defaults: voxcpm
+    # preallocates gpu_memory_utilization x the GPU (0.4 x 24 GB), transcribe 2.2 GB, speech
+    # 2.0 loaded (Sparrow 1.0 + Seed-VC 1.1) and aligner 1.2 (CTC 0.7 + numbers 0.6), plus room
+    # to run. An engine left out uses the whole budget less the pinned engines: media (ComfyUI
+    # keeps models cached in whatever is free, 20.4 GB measured), so it shares the GPU only with
+    # pinned engines.
+    # A server.json value overrides these per engine (the others keep their defaults).
+    footprints_gb: dict[str, float] = Field(default_factory=lambda: dict(_DEFAULT_FOOTPRINTS_GB))
+    # Engines to load at startup in on-demand mode (the rest load when a job needs them;
+    # "speech" brings "aligner" along, as in ``pinned``).
+    preload: list[Literal["speech", "aligner", "voxcpm", "transcribe", "media"]] = Field(default_factory=list)
+    # On-demand engines that load at startup and are never unloaded: their footprints come off
+    # the budget the others share (an engine with no footprint, media, gets what is left).
+    # Pinning "speech" pins "aligner" too (synthesis times its words with it); "aligner" pins
+    # alone. Disabled engines are ignored. In mode "all" every engine stays loaded anyway.
+    pinned: list[Literal["speech", "aligner", "voxcpm", "transcribe", "media"]] = Field(default_factory=list)
+
+    @field_validator("footprints_gb")
+    @classmethod
+    def _default_footprints(cls, footprints: dict[str, float]) -> dict[str, float]:
+        return {**_DEFAULT_FOOTPRINTS_GB, **footprints}
+
+    @field_validator("preload", "pinned")
+    @classmethod
+    def _speech_includes_aligner(cls, engines: list[str]) -> list[str]:
+        if "speech" in engines and "aligner" not in engines:
+            return [*engines, "aligner"]
+        return engines
 
 
 class ServerConfig(BaseModel):
@@ -1037,8 +1063,22 @@ class _EngineLoadState:
 
 _engine_load_states: dict[str, _EngineLoadState] = {
     name: _EngineLoadState(name=name, ready=threading.Event())
-    for name in ("pipertts", "voxcpm", "seed_vc", "transcribe", "media")
+    for name in ("pipertts", "voxcpm", "seed_vc", "aligner", "transcribe", "media")
 }
+
+# On-demand residency groups: Sparrow and Seed-VC load and unload together as "speech"; every
+# other engine is its own group (the aligner state covers the CTC aligner + number classifier).
+_RESIDENCY_GROUPS = {"pipertts": "speech", "seed_vc": "speech"}
+
+
+def _residency_group(engine: str) -> str:
+    return _RESIDENCY_GROUPS.get(engine, engine)
+
+
+def _group_engines(group: str) -> tuple[str, ...]:
+    """The engine states a residency group loads (the enabled ones)."""
+    members = [engine for engine, name in _RESIDENCY_GROUPS.items() if name == group] or [group]
+    return tuple(engine for engine in members if _engine_enabled(engine))  # type: ignore[arg-type]
 
 _inference_counter = 0
 _CLEANUP_EVERY = 1
@@ -1231,10 +1271,14 @@ def _engine_pending_sets(engine: str, config: ServerConfig | None = None) -> set
 
 
 def _engine_enabled(
-    engine: Literal["pipertts", "voxcpm", "seed_vc", "transcribe", "media"],
+    engine: Literal["pipertts", "voxcpm", "seed_vc", "aligner", "speech", "transcribe", "media"],
     config: ServerConfig | None = None,
 ) -> bool:
     cfg = config or _server_config
+    if engine == "aligner":
+        return True  # timestamps, force-align and number reading need it on every worker
+    if engine == "speech":
+        return bool(cfg.engines.pipertts or cfg.engines.seed_vc)
     if engine == "transcribe":
         return bool(cfg.transcribe.enabled)
     if engine == "media":
@@ -1386,25 +1430,42 @@ def _wait_for_engine_ready(engine: str, *, timeout: float | None = None) -> None
 class _EngineHolds:
     """The engines one job (or one backend batch) keeps loaded until it finishes (on-demand mode)."""
 
-    def __init__(self) -> None:
+    def __init__(self, job: ResidencyJob) -> None:
+        self.job = job
         self.engines: set[str] = set()
         self.stack = contextlib.AsyncExitStack()
+
+
+# The residency groups each operation may use (on-demand admission; see residency.py). Synthesis
+# may route to VoxCPM or Sparrow (+ Seed-VC) and times or verbalizes with the aligner.
+_OPERATION_CLAIMS: dict[str, tuple[str, ...]] = {
+    "synthesize": ("voxcpm", "speech", "aligner"),
+    "voice-anchor": ("voxcpm", "speech", "aligner"),
+    "voice-design": ("voxcpm", "aligner"),
+    "transcribe": ("transcribe", "aligner"),
+    "force-align": ("aligner",),
+    "generate-music": ("media",),
+    "videogen": ("media",),
+    "imagegen": ("media",),
+    "lipsync": ("media",),
+}
 
 
 _engine_holds: contextvars.ContextVar[_EngineHolds | None] = contextvars.ContextVar("engine_holds", default=None)
 
 
 @contextlib.asynccontextmanager
-async def _engine_hold_scope():
+async def _engine_hold_scope(claim: Iterable[str] = ()):
     """Engines the body waits for (``_await_engine_ready``) stay loaded until it ends.
 
-    Wrap one job, or one backend batch, never several jobs that need different swappable
-    engines: a scope holding one engine while waiting for another could wait for itself.
+    ``claim``: every residency group the body may wait for (``_OPERATION_CLAIMS``); the job is
+    admitted once they all fit, so it never waits for memory another job holds. Wrap one job,
+    or one backend batch, never several jobs.
     """
     if _residency is None:
         yield
         return
-    holds = _EngineHolds()
+    holds = _EngineHolds(_residency.job(claim))
     token = _engine_holds.set(holds)
     try:
         async with holds.stack:
@@ -1413,29 +1474,46 @@ async def _engine_hold_scope():
         _engine_holds.reset(token)
 
 
-async def _hold_engine(engine: str) -> None:
-    """On-demand mode: load ``engine`` if needed and keep it for the current hold scope."""
+async def _hold_engine(group: str) -> None:
+    """On-demand mode: load residency ``group`` if needed and keep it for the current hold scope."""
     holds = _engine_holds.get()
     if holds is None:
         # Not inside a job scope (a direct route): make sure it is loaded; it may be
         # swapped out again once another job needs the memory.
-        _LOGGER.warning("%s requested outside an engine hold scope; loading without holding it", engine)
-        async with _residency.hold(engine):
+        _LOGGER.warning("%s requested outside an engine hold scope; loading without holding it", group)
+        async with _residency.hold(group):
             return
-    if engine in holds.engines:
+    if group in holds.engines:
         return
-    holds.engines.add(engine)
+    holds.engines.add(group)
     try:
-        await holds.stack.enter_async_context(_residency.hold(engine))
+        await holds.stack.enter_async_context(_residency.hold(group, holds.job))
     except BaseException:
-        holds.engines.discard(engine)
+        holds.engines.discard(group)
         raise
 
 
+_member_load_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+async def _load_group_member(engine: str) -> None:
+    """Load one engine of a resident group that the group's load skipped (its model sets were
+    still downloading then). Its memory is already in the group's footprint."""
+    task = _member_load_tasks.get(engine)
+    if task is None or task.done():
+        _mark_engine_loading(engine)
+        task = asyncio.get_running_loop().create_task(_run_engine_loader(engine, _ENGINE_LOADERS[engine]))
+        _member_load_tasks[engine] = task
+    await asyncio.shield(task)
+
+
 async def _await_engine_ready(engine: str, *, timeout: float | None = None) -> None:
-    if _residency is not None and engine in SWAPPABLE_ENGINES and _engine_enabled(engine):  # type: ignore[arg-type]
+    group = _residency_group(engine)
+    if _residency is not None and group in SWAPPABLE_ENGINES and _engine_enabled(engine):  # type: ignore[arg-type]
         try:
-            await _hold_engine(engine)
+            await _hold_engine(group)
+            if _engine_state(engine).status == "unloaded" and engine not in _deferred_engines:
+                await _load_group_member(engine)
         except ChildWorkerDied:
             raise
         except HTTPException:
@@ -1522,7 +1600,7 @@ def _ensure_media_runtime() -> MediaRuntime:
 
 def _worker_name_to_engines(name: str) -> tuple[str, ...]:
     if name == "speech":
-        return ("pipertts", "seed_vc")
+        return ("pipertts", "seed_vc", "aligner")
     if name == "voxcpm":
         return ("voxcpm",)
     if name == "transcribe":
@@ -2618,6 +2696,7 @@ async def _align_words(
         language_hint,
         forced_language,
     )
+    await _await_engine_ready("aligner")
     response = await asyncio.to_thread(
         _aligner_client().call,
         "align_words",
@@ -3374,6 +3453,8 @@ async def _synthesize_voxcpm_ipa_text_ssml(
     await _await_engine_ready("voxcpm")
     runtime = _get_voxcpm_runtime()
     forced_language = _explicit_language(request.language, request.language_override)
+    if _server_config.voxcpm.verbalize_numbers:
+        await _await_engine_ready("aligner")  # the text's numbers are read with its classifier
     controlled_text, language, _controls = await asyncio.to_thread(
         _prepare_voxcpm_ipa_text,
         document,
@@ -3431,6 +3512,8 @@ async def _synthesize_voxcpm_ipa_ssml(
         request.language_override,
     )
     # The baseline read its numbers as words; the regenerated chunks must too.
+    if _server_config.voxcpm.verbalize_numbers:
+        await _await_engine_ready("aligner")
     controlled_text, language, controls = await asyncio.to_thread(
         _prepare_voxcpm_ipa_text,
         document,
@@ -4337,6 +4420,7 @@ def _verbalize_voxcpm_numbers(
     ]
     if not runs:
         return list(texts)
+    _wait_for_engine_ready("aligner")  # on demand, the caller holds it (_verbalize_numbers)
     response = _number_modes_client().call(
         "verbalize", {"items": [[run_text, run_language] for _, run_text, run_language in runs]}
     )
@@ -4344,6 +4428,22 @@ def _verbalize_voxcpm_numbers(
     for (index, _, _), text in zip(runs, response["data"]["texts"], strict=True):
         spoken[index] = spoken.get(index, "") + text
     return [spoken.get(index, text) for index, text in enumerate(texts)]
+
+
+async def _verbalize_numbers(
+    texts: list[str],
+    languages: list[str | None],
+    fallback_language: str | None = None,
+) -> list[str]:
+    """``_verbalize_voxcpm_numbers`` off the event loop, loading the aligner (its classifier) first."""
+    if not (
+        _engine_enabled("voxcpm")
+        and _server_config.voxcpm.verbalize_numbers
+        and any(_DIGIT_RE.search(text) for text in texts)
+    ):
+        return list(texts)
+    await _await_engine_ready("aligner")
+    return await asyncio.to_thread(_verbalize_voxcpm_numbers, texts, languages, fallback_language)
 
 
 def _prepare_voxcpm_text(
@@ -4541,7 +4641,7 @@ async def synthesize_voxcpm_batch(
         raise HTTPException(status_code=400, detail="VoxCPM languages length must match texts length")
 
     fallback_language = _configured_voice_language(request.voice_id, request.language)
-    spoken_texts = await asyncio.to_thread(_verbalize_voxcpm_numbers, texts, languages, fallback_language)
+    spoken_texts = await _verbalize_numbers(texts, languages, fallback_language)
     chunk_texts, chunk_counts = _chunk_voxcpm_texts(spoken_texts)
     chunk_languages = expand_chunks(languages, chunk_counts) or []
     chunk_seeds = expand_chunks(request.seeds, chunk_counts)
@@ -4781,8 +4881,7 @@ async def synthesize_voice_designs(
         request.seed if request.seed is not None else secrets.randbelow(_VOICE_DESIGN_SEED_LIMIT)
         for _, request, _, _ in valid
     ]
-    spoken_texts = await asyncio.to_thread(
-        _verbalize_voxcpm_numbers,
+    spoken_texts = await _verbalize_numbers(
         [request.text.strip() for _, request, _, _ in valid],
         [request.language for _, request, _, _ in valid],
     )
@@ -5387,14 +5486,7 @@ async def _timed_words(
     if not text.strip():
         return []
     # The aligner can't read digits: align the words the numbers were spoken as.
-    spoken = (
-        await asyncio.to_thread(
-            _verbalize_voxcpm_numbers,
-            [text],
-            [read_language],
-            _configured_voice_language(voice_id, language),
-        )
-    )[0]
+    spoken = (await _verbalize_numbers([text], [read_language], _configured_voice_language(voice_id, language)))[0]
     words = await _align_words(spoken, audio, sample_rate, language, forced_language)
     if spoken != text:
         words = _source_word_timestamps(text, spoken, words)
@@ -5525,10 +5617,21 @@ async def _load_seed_vc_engine() -> None:
         _seed_vc_info = await _load_speech_engine("seed_vc", _ensure_seed_vc_worker())
 
 
+async def _load_aligner_engine() -> None:
+    """The CTC aligner, and the number classifier when VoxCPM reads numbers, in the speech process."""
+    config = _server_config.aligner
+    with _logged_startup_step("ctc_aligner", model=config.model, device=config.device, dtype=config.dtype):
+        await _load_speech_engine("aligner", _aligner_client())
+    if _engine_enabled("voxcpm") and _server_config.voxcpm.verbalize_numbers:
+        with _logged_startup_step("number_modes", device=_server_config.pipertts.text_preprocessor_device):
+            await _load_speech_engine("aligner", _number_modes_client())
+
+
 _ENGINE_LOADERS: dict[str, Callable[[], Awaitable[None]]] = {
     "pipertts": _load_sparrow_engine,
     "voxcpm": _load_voxcpm_engine,
     "seed_vc": _load_seed_vc_engine,
+    "aligner": _load_aligner_engine,
     "transcribe": _load_transcribe_engine,
     "media": _load_media_engine,
 }
@@ -5575,29 +5678,52 @@ async def _run_engine_loader(engine: str, loader: Callable[[], Awaitable[None]])
             )
 
 
-async def _residency_load(engine: str) -> None:
-    """On-demand mode: load one swappable engine (raises when it fails to load)."""
-    _mark_engine_loading(engine)
-    await _run_engine_loader(engine, _ENGINE_LOADERS[engine])
-    state = _engine_state(engine)
-    if state.status != "ready":
-        raise RuntimeError(state.error or f"{engine} backend failed to load")
+async def _residency_load(group: str) -> None:
+    """On-demand mode: load one residency group's engines (raises when one fails to load).
+
+    Engines whose model sets are still downloading are skipped; the first job that needs one
+    once they are in loads it into the group (``_await_engine_ready``).
+    """
+    for engine in _group_engines(group):
+        if engine in _deferred_engines:
+            continue
+        _mark_engine_loading(engine)
+        await _run_engine_loader(engine, _ENGINE_LOADERS[engine])
+        state = _engine_state(engine)
+        if state.status != "ready":
+            raise RuntimeError(state.error or f"{engine} backend failed to load")
 
 
-async def _residency_unload(engine: str) -> None:
-    """On-demand mode: stop one swappable engine's process(es) so its VRAM goes back to the driver."""
+# What unloads each group in the speech process (EngineClient engine names); the process stays.
+_SPEECH_PROCESS_GROUPS = {"speech": ("sparrow", "seed_vc"), "aligner": ("ctc", "numbers")}
+
+
+async def _residency_unload(group: str) -> None:
+    """On-demand mode: free one residency group's VRAM: stop its process(es), or unload its
+    engines in the speech process (whose bare CUDA context stays, outside the budget)."""
     global _voxcpm_runtime
-    _mark_engine_unloaded(engine)
-    if engine == "voxcpm":
+    for engine in _group_engines(group):
+        if engine not in _deferred_engines:
+            _mark_engine_unloaded(engine)
+    if group == "voxcpm":
         runtime, _voxcpm_runtime = _voxcpm_runtime, None
         if runtime is not None:
             await runtime.stop()
-    elif engine == "transcribe":
+    elif group == "transcribe":
         if _transcribe_worker is not None:
             await asyncio.to_thread(_transcribe_worker.stop)
-    elif engine == "media":
+    elif group == "media":
         if _media_runtime is not None:
             await asyncio.to_thread(_media_runtime.stop)
+    elif group in _SPEECH_PROCESS_GROUPS:
+        worker = _speech_worker
+        # A dead process holds nothing (and ``call`` would respawn it).
+        if worker is not None and worker.process is not None and worker.process.is_alive():
+            try:
+                for name in _SPEECH_PROCESS_GROUPS[group]:
+                    await asyncio.to_thread(EngineClient(worker, name).call, "unload")
+            except ChildWorkerDied as exc:
+                _mark_engine_failed_from_child(exc.name, exc)
     await asyncio.to_thread(_release_gpu_cache)
 
 
@@ -5606,14 +5732,30 @@ def residency_snapshot() -> ResidencySnapshot | None:
     return _residency.snapshot() if _residency is not None else None
 
 
+async def _reload_pinned_engine(engine: str) -> None:
+    try:
+        async with _residency.hold(engine):
+            pass
+        _LOGGER.info("Pinned %s backend reloaded", engine)
+    except Exception:
+        _LOGGER.exception("Pinned %s backend failed to reload; the next job that needs it retries", engine)
+
+
 def _schedule_engine_reload(engine: str) -> None:
     """Reload one backend, at most one reload in flight per engine."""
-    if _residency is not None and engine in SWAPPABLE_ENGINES:
-        # On demand, a dead engine is just unloaded: the next job that needs it loads it
-        # within the budget (a reload here would bypass the budget).
-        _LOGGER.warning("%s backend is gone; marking it unloaded", engine)
-        _mark_engine_unloaded(engine)
-        _residency.forget(engine)
+    group = _residency_group(engine)
+    if _residency is not None and group in SWAPPABLE_ENGINES:
+        # On demand, a dead engine's group is just unloaded: the next job that needs it loads
+        # it within the budget (a reload here would bypass the budget).
+        _LOGGER.warning("%s backend is gone; marking %s unloaded", engine, group)
+        for member in _group_engines(group):
+            if member not in _deferred_engines:
+                _mark_engine_unloaded(member)
+        _residency.forget(group)
+        task = _engine_reload_tasks.get(group)
+        if group in _residency.pinned and (task is None or task.done()):
+            # Its memory stays reserved, so the reload never waits for another engine to unload.
+            _engine_reload_tasks[group] = asyncio.get_running_loop().create_task(_reload_pinned_engine(group))
         return
     task = _engine_reload_tasks.get(engine)
     if task is not None and not task.done():
@@ -5670,22 +5812,25 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
             EngineResidency(
                 budget_gb=float(config.load.budget_gb or 0),
                 footprints_gb={
-                    engine: config.load.footprints_gb.get(engine, float(config.load.budget_gb or 0))
+                    engine: config.load.footprints_gb.get(engine)
                     for engine in SWAPPABLE_ENGINES
                     if _engine_enabled(engine)  # type: ignore[arg-type]
                 },
                 load=_residency_load,
                 unload=_residency_unload,
+                pinned=[engine for engine in config.load.pinned if _engine_enabled(engine)],
+                claims=_OPERATION_CLAIMS.values(),
             )
             if on_demand
             else None
         )
         if on_demand:
             _LOGGER.info(
-                "Load mode on-demand budget=%.1f GB footprints=%s preload=%s",
+                "Load mode on-demand budget=%.1f GB footprints=%s preload=%s pinned=%s",
                 config.load.budget_gb,
                 _residency.footprints,
                 config.load.preload,
+                sorted(_residency.pinned),
             )
         for engine in _engine_load_states:
             if _engine_enabled(engine):  # type: ignore[arg-type]
@@ -5694,7 +5839,7 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
                 if pending:
                     _LOGGER.info("Deferring %s backend until model sets download: %s", engine, sorted(pending))
                     _deferred_engines.add(engine)
-                elif on_demand and engine in SWAPPABLE_ENGINES:
+                elif on_demand and _residency_group(engine) in SWAPPABLE_ENGINES:
                     _mark_engine_unloaded(engine)
             else:
                 _mark_engine_disabled(engine)
@@ -5709,7 +5854,7 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
                     "pipertts",
                     RuntimeError("PiperTTS is enabled but no Sparrow models are configured or available"),
                 )
-            else:
+            elif _residency is None:
                 startup_tasks.append(asyncio.create_task(_run_engine_loader("pipertts", _load_sparrow_engine)))
         else:
             _LOGGER.info("PiperTTS backend disabled")
@@ -5733,17 +5878,21 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
             _LOGGER.info("Media runtime disabled")
 
         if _engine_enabled("seed_vc"):
-            if "seed_vc" not in _deferred_engines:
+            if "seed_vc" not in _deferred_engines and _residency is None:
                 startup_tasks.append(asyncio.create_task(_run_engine_loader("seed_vc", _load_seed_vc_engine)))
         else:
             _LOGGER.info("Seed-VC backend disabled")
 
+        if _residency is None:
+            startup_tasks.append(asyncio.create_task(_run_engine_loader("aligner", _load_aligner_engine)))
+
         if startup_tasks:
             await asyncio.gather(*startup_tasks)
         if _residency is not None:
-            for engine in dict.fromkeys(_server_config.load.preload):
-                if _engine_state(engine).status == "unloaded":
-                    async with _residency.hold(engine):
+            for group in dict.fromkeys([*sorted(_residency.pinned), *_server_config.load.preload]):
+                loadable = [engine for engine in _group_engines(group) if engine not in _deferred_engines]
+                if group in _residency.footprints and loadable and not _residency.is_resident(group):
+                    async with _residency.hold(group):
                         pass
 
         failed_engines = {
@@ -5757,20 +5906,6 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
                 for name, error in failed_engines.items()
             )
             raise RuntimeError(f"Configured inference engines failed to load: {details}")
-
-        with _logged_startup_step(
-            "ctc_aligner",
-            model=_server_config.aligner.model,
-            device=_server_config.aligner.device,
-            dtype=_server_config.aligner.dtype,
-        ):
-            await asyncio.to_thread(_aligner_client().call, "load")
-        if _engine_enabled("voxcpm") and _server_config.voxcpm.verbalize_numbers:
-            with _logged_startup_step(
-                "number_modes",
-                device=_server_config.pipertts.text_preprocessor_device,
-            ):
-                await asyncio.to_thread(_number_modes_client().call, "load")
         _LOGGER.info("Loaded inference runtime models elapsed=%.2fs", time.perf_counter() - load_started)
 
     if _engine_enabled("pipertts"):
@@ -5813,10 +5948,23 @@ async def _load_deferred_engines() -> None:
             await asyncio.sleep(_DEFERRED_POLL_SECONDS)
             continue
         engine = ready[0]
-        if _residency is not None and engine in SWAPPABLE_ENGINES:
-            _LOGGER.info("Model sets for %s backend downloaded; it loads when a job needs it", engine)
+        group = _residency_group(engine)
+        if _residency is not None and group in SWAPPABLE_ENGINES:
             _mark_engine_unloaded(engine)
             _deferred_engines.discard(engine)
+            if group not in _residency.pinned:
+                # A resident group gets it loaded by the first job that needs it.
+                _LOGGER.info("Model sets for %s backend downloaded; it loads when a job needs it", engine)
+                continue
+            _LOGGER.info("Model sets for pinned %s backend downloaded; loading it", engine)
+            try:
+                async with _residency.hold(group):
+                    if _engine_state(engine).status == "unloaded":
+                        await _load_group_member(engine)
+            except Exception as exc:
+                hard_exit(f"deferred pinned {engine} backend failed to load: {exc}")
+            if _engine_state(engine).status != "ready":
+                hard_exit(f"deferred pinned {engine} backend failed to load: {_engine_state(engine).error}")
             continue
         _LOGGER.info("Model sets for %s backend downloaded; loading it", engine)
         await _run_engine_loader(engine, _ENGINE_LOADERS[engine])
@@ -6223,7 +6371,8 @@ class LzTtsInferenceSession:
         )
 
         for plan in plans:
-            async with _engine_hold_scope():
+            claim = _OPERATION_CLAIMS["synthesize"] if plan.pipeline == "voxcpm" else ("speech", "aligner")
+            async with _engine_hold_scope(claim):
                 line_encoders: list[StreamingMp3Encoder | None] | None = None
                 try:
                     if plan.pipeline == "voxcpm":
@@ -6290,7 +6439,7 @@ class LzTtsInferenceSession:
 
         if voice_design_requests:
             try:
-                async with _engine_hold_scope():
+                async with _engine_hold_scope(_OPERATION_CLAIMS["voice-design"]):
                     voice_designs = await synthesize_voice_designs(voice_design_requests)
             except HTTPException as error:
                 voice_designs = [InferenceOperationError(error.status_code, error.detail)] * len(
@@ -6345,7 +6494,7 @@ class LzTtsInferenceSession:
         }
         _LOGGER.info("Inference operation started: %s", json.dumps(context, default=str))
         try:
-            async with _engine_hold_scope():
+            async with _engine_hold_scope(_OPERATION_CLAIMS.get(operation, ())):
                 result = await self._dispatch(operation, request_data)
         except ValidationError as exc:
             _LOGGER.warning("Inference input rejected context=%s errors=%s", context, exc.errors())

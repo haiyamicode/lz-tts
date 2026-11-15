@@ -83,11 +83,13 @@ def ready_task_types(task_types: tuple[str, ...], deferred: frozenset[str]) -> t
     return tuple(t for t in task_types if not deferred.intersection(_TYPE_ENGINES.get(t, ())))
 
 
-# load.mode on-demand: the swappable engine each task type needs. tts-synthesis may route to
-# Sparrow, but counts as VoxCPM work here; the other types run on the always-loaded engines.
+# load.mode on-demand: the swappable engine each task type mainly runs on. tts-synthesis may
+# route to Sparrow, but counts as VoxCPM work here; force-align is the aligner; voice-enhance
+# (ffmpeg) and the detect-* types need none (CPU).
 _TYPE_SWAP_ENGINE = {
     "tts-synthesis": "voxcpm",
     "voice-design": "voxcpm",
+    "force-align": "aligner",
     "transcribe": "transcribe",
     **{task_type: "media" for task_type in _MEDIA_TASK_TYPES},
 }
@@ -98,6 +100,7 @@ def on_demand_task_types(
     resident: frozenset[str],
     waiting_for: str | None,
     sticky: bool,
+    pinned: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
     """What an on-demand worker pulls.
 
@@ -105,12 +108,13 @@ def on_demand_task_types(
     types needing no swappable engine): anything else would run on an engine about to be
     unloaded. While ``sticky``, the loaded engines' types, so a mixed queue does not swap
     models on every job; the caller drops stickiness after an empty pull or a while after
-    the last swap, so the other types still get pulled.
+    the last swap, so the other types still get pulled. ``pinned`` engines never unload:
+    their types are always pulled, and they alone make nothing sticky.
     """
     if waiting_for is not None:
-        allowed = {waiting_for}
-    elif sticky and resident:
-        allowed = set(resident)
+        allowed = {waiting_for} | pinned
+    elif sticky and resident - pinned:
+        allowed = set(resident) | pinned
     else:
         return task_types
     return tuple(t for t in task_types if t not in _TYPE_SWAP_ENGINE or _TYPE_SWAP_ENGINE[t] in allowed)
@@ -1164,7 +1168,7 @@ def _update_pull_task_types(taskflow: TaskflowWorker) -> None:
             taskflow.resident_since = now
         sticky = not taskflow.sticky_missed and now - taskflow.resident_since < taskflow.sticky_seconds
         taskflow.sticky_missed = False  # one full pull per empty sticky pull
-        narrowed = on_demand_task_types(ready, snapshot.resident, snapshot.waiting_for, sticky)
+        narrowed = on_demand_task_types(ready, snapshot.resident, snapshot.waiting_for, sticky, snapshot.pinned)
         if narrowed != ready:
             taskflow.pull_sticky = snapshot.waiting_for is None
             note += (
