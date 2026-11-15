@@ -91,6 +91,7 @@ from .transcribe import (
 )
 from .residency import SWAPPABLE_ENGINES, EngineResidency, ResidencyJob, ResidencySnapshot
 from .face_detection import FaceDetector, FaceDetectRequest, FaceInputError
+from .job_progress import ProgressSink, listening as listening_for_progress
 from .nudity_detection import NudityDetectRequest, NudityDetector, NudityInputError
 from .voice_anchor import ANCHOR_SEED, LANGUAGE_ANCHORS, VoiceAnchorRequest, anchor_language
 from .voice_enhance import VoiceEnhanceRequest, VoiceEnhancer
@@ -6282,20 +6283,26 @@ class LzTtsInferenceSession:
         self,
         operations: list[tuple[str, dict[str, Any]]],
         mp3_sinks: list[Callable[[bytes], None] | None] | None = None,
+        progress_sinks: list[ProgressSink | None] | None = None,
     ) -> list[InferenceResult | BaseException]:
         """Plan compatible synthesis operations into real backend batches.
 
         An operation with a sink in ``mp3_sinks`` hands it its MP3 as it is
         encoded, when its backend generates live (VoxCPM); the sink gets
         nothing from other operations, whose result is complete at once.
+
+        An operation with a sink in ``progress_sinks`` tells it where it has
+        got to as it goes, for the media work that runs for minutes or hours;
+        the quick operations never report.
         """
         with self._heap_trimmer.busy():
-            return await self._execute_many(operations, mp3_sinks)
+            return await self._execute_many(operations, mp3_sinks, progress_sinks)
 
     async def _execute_many(
         self,
         operations: list[tuple[str, dict[str, Any]]],
         mp3_sinks: list[Callable[[bytes], None] | None] | None = None,
+        progress_sinks: list[ProgressSink | None] | None = None,
     ) -> list[InferenceResult | BaseException]:
         if not self._started:
             raise RuntimeError("Inference session has not been started")
@@ -6457,7 +6464,9 @@ class LzTtsInferenceSession:
         for operation_index in singleton_indices:
             operation, request_data = operations[operation_index]
             try:
-                outcomes[operation_index] = await self.execute(operation, request_data)
+                outcomes[operation_index] = await self.execute(
+                    operation, request_data, progress_sinks[operation_index] if progress_sinks else None
+                )
             except ChildWorkerDied:
                 # Backend subprocess died -- propagate so the worker surfaces
                 # ``error`` instead of retrying leases against a dead process.
@@ -6469,11 +6478,15 @@ class LzTtsInferenceSession:
             raise RuntimeError("internal inference batch result ordering error")
         return [outcome for outcome in outcomes if outcome is not None]
 
-    async def execute(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
+    async def execute(
+        self, operation: str, request_data: dict[str, Any], progress: ProgressSink | None = None
+    ) -> InferenceResult:
         with self._heap_trimmer.busy():
-            return await self._execute(operation, request_data)
+            return await self._execute(operation, request_data, progress)
 
-    async def _execute(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
+    async def _execute(
+        self, operation: str, request_data: dict[str, Any], progress: ProgressSink | None = None
+    ) -> InferenceResult:
         if not self._started:
             raise RuntimeError("Inference session has not been started")
         started = time.perf_counter()
@@ -6495,7 +6508,7 @@ class LzTtsInferenceSession:
         _LOGGER.info("Inference operation started: %s", json.dumps(context, default=str))
         try:
             async with _engine_hold_scope(_OPERATION_CLAIMS.get(operation, ())):
-                result = await self._dispatch(operation, request_data)
+                result = await self._dispatch(operation, request_data, progress)
         except ValidationError as exc:
             _LOGGER.warning("Inference input rejected context=%s errors=%s", context, exc.errors())
             raise InferenceOperationError(400, jsonable_encoder(exc.errors())) from exc
@@ -6526,7 +6539,9 @@ class LzTtsInferenceSession:
         )
         return result
 
-    async def _dispatch(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
+    async def _dispatch(
+        self, operation: str, request_data: dict[str, Any], progress: ProgressSink | None = None
+    ) -> InferenceResult:
         if operation == "synthesize":
             request = SynthesizeRequest.model_validate(request_data)
             response = await _synthesize(request, model=_resolve_api_model(request.model))
@@ -6564,7 +6579,7 @@ class LzTtsInferenceSession:
         elif operation in ("transcribe", "force-align"):
             try:
                 if operation == "transcribe":
-                    result = await self._transcribe(request_data)
+                    result = await self._transcribe(request_data, progress)
                 else:
                     result = await self._force_align(request_data)
             except TranscribeInputError as exc:
@@ -6572,9 +6587,9 @@ class LzTtsInferenceSession:
         elif operation in ("generate-music", "videogen", "lipsync", "imagegen"):
             try:
                 if operation == "generate-music":
-                    result = await self._generate_music(request_data)
+                    result = await self._generate_music(request_data, progress)
                 else:
-                    result = await self._render_h3(operation, request_data)
+                    result = await self._render_h3(operation, request_data, progress)
             except MediaInputError as exc:
                 raise InferenceOperationError(400, str(exc)) from exc
         else:
@@ -6693,12 +6708,20 @@ class LzTtsInferenceSession:
             raise InferenceOperationError(400, "Provide 'audio_url' or 'audio_base64'")
         return await asyncio.to_thread(decode_transcribe_audio, audio_bytes)
 
-    async def _transcribe(self, request_data: dict[str, Any]) -> InferenceResult:
+    async def _transcribe(
+        self, request_data: dict[str, Any], progress: ProgressSink | None = None
+    ) -> InferenceResult:
         if not _server_config.transcribe.enabled:
             raise InferenceOperationError(503, "transcribe is not enabled on this worker")
         request = TranscribeRequest.model_validate(request_data)
+        # Qwen reads the whole clip in one pass, so the stages are all there is to say about it:
+        # fetching and decoding the audio, reading it, then timing the words of what it heard.
+        if progress is not None:
+            progress("preparing", None, None)
         audio = await self._request_audio(request)
         await _await_engine_ready("transcribe")
+        if progress is not None:
+            progress("rendering", None, None)
         response = await asyncio.to_thread(
             _ensure_transcribe_worker().call,
             "transcribe",
@@ -6713,6 +6736,8 @@ class LzTtsInferenceSession:
             "languageCode": transcript.get("languageCode"),
         }
         if request.timestamps:
+            if progress is not None:
+                progress("finishing", None, None)
             data["timestamps"] = await self._transcript_timestamps(text, audio, language)
         return InferenceResult(kind="json", data=data)
 
@@ -6762,19 +6787,26 @@ class LzTtsInferenceSession:
         """Word timings of a transcript, read in the language it was heard in."""
         return await _timed_words(text, audio, TRANSCRIBE_SAMPLE_RATE, language, language, None)
 
-    async def _generate_music(self, request_data: dict[str, Any]) -> InferenceResult:
+    async def _generate_music(
+        self, request_data: dict[str, Any], progress: ProgressSink | None = None
+    ) -> InferenceResult:
         """YuE2 song from the style and lyrics; with ``reference_url``, the vocal is re-voiced by YingMusic-SVC."""
         config = _server_config.media
         if not config.music:
             raise InferenceOperationError(503, "generate-music is not enabled on this worker")
         request = MusicRequest.model_validate(request_data)
         body: dict[str, Any] = request.model_dump(exclude={"reference_url"}, exclude_none=True)
+        job_id = f"generate-music-{uuid.uuid4().hex}"
+        body["job_id"] = job_id
         with tempfile.TemporaryDirectory(prefix="generate-music-") as scratch:
             body["output_dir"] = scratch
+            if progress is not None:
+                progress("preparing", None, None)
             if request.reference_url:
                 body["reference_path"] = str(await fetch_reference(request.reference_url, Path(scratch) / "reference"))
             await _await_engine_ready("media")
-            produced = await _ensure_media_runtime().post("/generate", body, config.music_timeout_seconds)
+            with listening_for_progress(job_id, progress):
+                produced = await _ensure_media_runtime().post("/generate", body, config.music_timeout_seconds)
             audio = await asyncio.to_thread(Path(produced["path"]).read_bytes)
         return InferenceResult(
             kind="audio",
@@ -6783,7 +6815,9 @@ class LzTtsInferenceSession:
             data={"seed": produced["seed"], "mode": produced["mode"]},
         )
 
-    async def _render_h3(self, operation: str, request_data: dict[str, Any]) -> InferenceResult:
+    async def _render_h3(
+        self, operation: str, request_data: dict[str, Any], progress: ProgressSink | None = None
+    ) -> InferenceResult:
         """H3 ``videogen`` (image to video) / ``lipsync`` (image + speech to video), an mp4, or
         ``imagegen`` (a still), a PNG.
 
@@ -6803,8 +6837,11 @@ class LzTtsInferenceSession:
                 "payload": request.model_dump(exclude_none=True),
                 "output_dir": scratch,
             }
+            if progress is not None:
+                progress("preparing", None, None)
             await _await_engine_ready("media")
-            produced = await _ensure_media_runtime().post(f"/{operation}", body, timeout)
+            with listening_for_progress(body["job_id"], progress):
+                produced = await _ensure_media_runtime().post(f"/{operation}", body, timeout)
             output = await asyncio.to_thread(Path(produced["path"]).read_bytes)
             # A continuable videogen clip's restored last frame: the next clip's image_url.
             last_frame = (

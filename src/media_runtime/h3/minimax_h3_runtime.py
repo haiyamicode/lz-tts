@@ -51,6 +51,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import progress
+
 from .compat import log_event
 from .compat import COMFYUI_DIR, data_dir, project_path
 
@@ -1245,17 +1247,31 @@ def build_lipsync_graph(
 
 
 class _ProgressSink:
+    """The executor's "server": there is none here, so its messages go nowhere.
+
+    Where the render has got to comes from the sampler's own progress bar instead
+    (:func:`_report_sampling_progress`).
+    """
+
     client_id = None
     last_node_id = None
     last_prompt_id = None
     sockets_metadata: dict = {}
 
     def send_sync(self, event: Any, data: Any, sid: Any = None) -> None:
-        if event == "progress" and isinstance(data, dict):
-            value = data.get("value")
-            maximum = data.get("max")
-            if maximum and value in (1, maximum):
-                log_event("minimax_h3_sampling_progress", value=value, max=maximum)
+        return
+
+
+def _report_sampling_progress(value, total, preview_image=None, prompt_id=None, node_id=None) -> None:
+    """One sampler step, as the job's progress: a clip is rendered in one window, step by step.
+
+    ComfyUI's own server installs a hook like this one in its main; headless, we install ours.
+    """
+    if not total:
+        return
+    if value in (1, total):
+        log_event("minimax_h3_sampling_progress", value=value, max=total)
+    progress.step(int(value), int(total))
 
 
 @dataclass
@@ -1361,6 +1377,9 @@ def _retained_runtime(
                     f"{comfy_root / 'custom_nodes'} to have loaded "
                     "(check the ComfyUI 'IMPORT FAILED' lines in the worker log)."
                 )
+            import comfy.utils
+
+            comfy.utils.set_progress_bar_global_hook(_report_sampling_progress)
             executor = comfy_execution.PromptExecutor(
                 _ProgressSink(),
                 cache_type=comfy_execution.CacheType.CLASSIC,

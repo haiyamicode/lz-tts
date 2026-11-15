@@ -36,6 +36,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 import paths  # noqa: F401  (sets the offline Hugging Face cache before model imports)
+import progress
 
 FEATURES = ("music", "videogen", "lipsync", "imagegen")
 H3_FEATURES = ("videogen", "lipsync", "imagegen")
@@ -59,6 +60,8 @@ class GenerateBody(BaseModel):
     semantic_sampling: dict | None = None
     reference_path: str | None = None
     output_dir: str
+    #: What the job's progress is reported under; without one it is not reported.
+    job_id: str | None = None
 
 
 class H3Body(BaseModel):
@@ -123,7 +126,7 @@ def generate(body: GenerateBody):
         abc_sampling=body.abc_sampling,
         semantic_sampling=body.semantic_sampling,
     )
-    with _gpu_lock:
+    with _gpu_lock, progress.job(body.job_id):
         _release_h3()
         try:
             result = _pipeline.render(request, Path(body.output_dir), reference_path=reference)
@@ -145,12 +148,13 @@ def _run_h3(feature: str, body: H3Body) -> dict[str, Any]:
 
     output_dir = Path(body.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    with _gpu_lock:
+    with _gpu_lock, progress.job(body.job_id):
         if _pipeline is not None:
             _pipeline.release()
         _h3_resident = True
         try:
             result = run({"id": body.job_id, "payload": body.payload})
+            progress.report("finishing")
             final = output_dir / f"{feature}-{result['seed']}{Path(result['path']).suffix}"
             shutil.move(result["path"], final)
             last_frame = None

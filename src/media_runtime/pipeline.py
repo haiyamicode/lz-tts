@@ -21,6 +21,7 @@ import numpy as np
 import soundfile as sf
 import torch
 
+import progress
 from separation import SAMPLE_RATE, VocalSeparator
 from song import SongRequest, YuE2Song
 from voice_convert import YingMusicConverter
@@ -111,10 +112,14 @@ class MusicPipeline:
         output_dir.mkdir(parents=True, exist_ok=True)
         with self._lock, tempfile.TemporaryDirectory(prefix="music-", dir=output_dir) as work_dir:
             work = Path(work_dir)
+            progress.report("preparing")
             self._activate("song")
             started = time.monotonic()
+            # YuE2 writes the whole song in one pass, so the stages are the progress there is.
+            progress.report("rendering")
             song_path, seed = self.song.generate(request, work / "song.wav")
             print(f"[timing] yue2 generate: {time.monotonic() - started:.1f}s", flush=True)
+            progress.report("finishing")
             if reference_path is None:
                 final = output_dir / f"song-{seed}.wav"
                 shutil.move(str(song_path), final)

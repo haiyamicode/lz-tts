@@ -100,6 +100,8 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+import progress
+
 from .lipsync_prompt import render_prompt_template
 from .compat import log_event
 from .compat import job_dir
@@ -822,6 +824,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     scratch_dir = job_dir(job_id)
     work_dir = scratch_dir / "lipsync"
     began = time.perf_counter()
+    progress.report("preparing")
     image_path = download_job_input(job, payload, "image", scratch_dir, ".png")
     audio_path = download_job_input(job, payload, "audio", scratch_dir, ".wav")
     custom_instructions = payload.get("custom_instructions") or []
@@ -861,6 +864,9 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     try:
         for chunk in chunks:
             began = time.perf_counter()
+            # The chunks are what a long clip is made of, and the only honest measure of how far
+            # along it is: one goes up as each one lands, however many minutes the clip runs to.
+            progress.report("rendering", chunk.index, len(chunks))
             chunk_dir = work_dir / f"chunk{chunk.index:03d}"
             audio_slice = extract_audio_slice(
                 voice_path,
@@ -944,6 +950,8 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     finally:
         cleanup_h3_job_files(job_id)
 
+    # Every chunk is rendered; joining them, interpolating and muxing is the rest.
+    progress.report("finishing", len(chunks), len(chunks))
     output_dimensions = payload.get("output_dimensions")
     bounding_box = (
         (int(output_dimensions["width"]), int(output_dimensions["height"]))

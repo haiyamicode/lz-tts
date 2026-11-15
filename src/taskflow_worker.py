@@ -50,6 +50,9 @@ TASK_TYPES = (
 )
 # Media runtime task types: advertised only when the worker's server.json ``media`` enables them.
 _MEDIA_TASK_TYPES = {"generate-music": "music", "videogen": "videogen", "lipsync": "lipsync", "imagegen": "imagegen"}
+# Task types whose work runs long enough that the person waiting needs to see it moving. The rest
+# answer in seconds, where a report would land after the result it was about.
+_REPORTED_TASK_TYPES = frozenset({*_MEDIA_TASK_TYPES, "transcribe"})
 
 # Task types whose payload carries no operation field: the task type implies
 # exactly one operation. Everything else (tts-synthesis) reads payload["operation"].
@@ -137,6 +140,14 @@ _CALLBACK_MAX_ATTEMPTS = 3
 _RECONNECT_BASE_DELAY = 2.0
 # Length of the segments a streamed take is uploaded in.
 _SEGMENT_SECONDS = 1.0
+# The least time between two progress reports of one job.
+_PROGRESS_INTERVAL_SECONDS = 1.0
+# Where each stage sits in the whole of a job: the render is the long one.
+_PROGRESS_STAGE_SPANS = {
+    "preparing": (0.0, 0.05),
+    "rendering": (0.05, 0.95),
+    "finishing": (0.95, 1.0),
+}
 _RECONNECT_MAX_DELAY = 60.0
 
 
@@ -424,6 +435,23 @@ class TaskflowWorker:
     def artifact_base_url(self) -> str:
         return self.base_url.removesuffix("/taskflow/v1") + "/tts-artifacts/v1"
 
+    async def report_progress(self, lease: dict[str, Any], progress: dict[str, Any]) -> None:
+        """Tell the API where the job of ``lease`` has got to, for it to pass to the person
+        waiting. It goes on the run itself, over the Taskflow protocol this worker already speaks:
+        the lease is the authority, and the API knows from the run which job it is for.
+
+        A report that fails is dropped: the progress is only shown, and a job must never fail over
+        one."""
+        try:
+            await self._request(
+                "POST",
+                f"/leases/{lease['id']}/progress",
+                token=lease["leaseToken"],
+                json=progress,
+            )
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            _LOGGER.debug("Progress report dropped lease=%s: %s", lease["id"], error)
+
     async def upload_segment(
         self,
         lease: dict[str, Any],
@@ -579,6 +607,63 @@ class _SegmentUploads:
     def cancel(self) -> None:
         if self._chain is not None:
             self._chain.cancel()
+
+
+class _ProgressReports:
+    """Tells the API where a long job has got to, so the person waiting on it sees it moving.
+
+    Reports go one at a time, at most one a second, each of them the latest: progress overtaken
+    while the one before it was in flight was never worth sending. Nothing waits on a report, and
+    one that fails is dropped.
+    """
+
+    def __init__(self, taskflow: TaskflowWorker, lease: dict[str, Any]):
+        self._taskflow = taskflow
+        self._lease = lease
+        self._next: dict[str, Any] | None = None
+        self._sending = False
+
+    def report(self, stage: str, done: int | None = None, total: int | None = None) -> None:
+        counts = done is not None and total is not None
+        # The run keeps both: how far along the whole job is, and where it is in its own terms.
+        self._next = {
+            "progress": _progress_fraction(stage, done, total),
+            "state": {"stage": stage, **({"done": done, "total": total} if counts else {})},
+        }
+        if not self._sending:
+            self._sending = True
+            asyncio.create_task(self._send())
+
+    async def _send(self) -> None:
+        try:
+            while self._next is not None:
+                progress, self._next = self._next, None
+                started = time.monotonic()
+                await self._taskflow.report_progress(self._lease, progress)
+                await asyncio.sleep(
+                    max(0.0, _PROGRESS_INTERVAL_SECONDS - (time.monotonic() - started))
+                )
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            # Nobody awaits this task, so what it raises would only be logged as an error of its
+            # own at the end of the job. The progress is shown and nothing more; it is dropped.
+            _LOGGER.debug("Progress reporting stopped lease=%s: %s", self._lease["id"], error)
+        finally:
+            self._sending = False
+
+
+def _progress_fraction(stage: str, done: int | None, total: int | None) -> float:
+    """How far the whole job has got, 0 to 1, from how far one of its stages has."""
+    start, end = _PROGRESS_STAGE_SPANS.get(stage, (0.0, 1.0))
+    if not total or done is None:
+        return start
+    return start + (end - start) * min(1.0, done / total)
+
+
+def _progress_reports(taskflow: TaskflowWorker, work: _LeaseWork) -> _ProgressReports | None:
+    """Reports for a lease whose work runs long enough to be worth watching."""
+    if work.task_type not in _REPORTED_TASK_TYPES:
+        return None
+    return _ProgressReports(taskflow, work.lease)
 
 
 def _segment_uploads(taskflow: TaskflowWorker, work: _LeaseWork) -> _SegmentUploads | None:
@@ -1095,10 +1180,12 @@ async def _process_leases(
     if not works:
         return
     uploads = [_segment_uploads(taskflow, work) for work in works]
+    reports = [_progress_reports(taskflow, work) for work in works]
     try:
         outcomes = await inference.execute_many(
             [(work.operation, work.request) for work in works],
             mp3_sinks=[upload.write if upload is not None else None for upload in uploads],
+            progress_sinks=[report.report if report is not None else None for report in reports],
         )
         if len(outcomes) != len(works):
             raise RuntimeError(

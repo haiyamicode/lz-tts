@@ -46,6 +46,8 @@ import random
 import time
 from typing import Any
 
+import progress
+
 from .compat import job_dir, log_event, project_path
 from .lipsync import _download_url, _probe, _run, download_job_input, extract_audio_slice, prepare_pin_image
 
@@ -131,6 +133,7 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     render_fps = interpolation_fps or H3_FPS
 
     scratch_dir = job_dir(job_id)
+    progress.report("preparing")
     image_path = download_job_input(job, payload, "image", scratch_dir, ".png", kind="videogen")
     pinned_audio = None
     if payload.get("pinned_audio_url") or payload.get("pinned_audio_path"):

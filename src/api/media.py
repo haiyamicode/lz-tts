@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Literal
@@ -22,11 +24,14 @@ import httpx
 from pydantic import BaseModel, Field, model_validator
 
 from ..process_guard import exit_with_parent
+from .job_progress import report as report_progress
 
 _LOGGER = logging.getLogger(__name__)
 
 MAX_REFERENCE_BYTES = 30 * 1024 * 1024
 REFERENCE_TIMEOUT_SECONDS = 60.0
+#: The write end of the progress pipe, as the child reads it (src/media_runtime/progress.py).
+PROGRESS_FD_VARIABLE = "LZAI_PROGRESS_FD"
 
 
 class MediaInputError(ValueError):
@@ -324,6 +329,8 @@ class MediaRuntime:
         self.features = list(features)
         self._process: subprocess.Popen | None = None
         self._start_lock = asyncio.Lock()
+        #: The loop the progress sinks belong to; the pipe is read on a thread of its own.
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def base_url(self) -> str:
@@ -336,29 +343,65 @@ class MediaRuntime:
             env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
             env["CUDA_VISIBLE_DEVICES"] = self.gpu
         _LOGGER.info("Starting media runtime on port %s (gpu=%s, features=%s)", self.port, self.gpu, self.features)
-        self._process = subprocess.Popen(
-            [
-                self.python,
-                "server.py",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(self.port),
-                "--device",
-                "cuda:0",
-                "--features",
-                ",".join(self.features),
-            ],
-            cwd=self.runtime_dir,
-            env=env,
-            start_new_session=True,
-            preexec_fn=exit_with_parent,
-        )
+        read_fd, write_fd = os.pipe()
+        env[PROGRESS_FD_VARIABLE] = str(write_fd)
+        try:
+            self._process = subprocess.Popen(
+                [
+                    self.python,
+                    "server.py",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(self.port),
+                    "--device",
+                    "cuda:0",
+                    "--features",
+                    ",".join(self.features),
+                ],
+                cwd=self.runtime_dir,
+                env=env,
+                start_new_session=True,
+                preexec_fn=exit_with_parent,
+                pass_fds=(write_fd,),
+            )
+        finally:
+            # The child holds the only write end now: the pipe ends when it does.
+            os.close(write_fd)
+        self._read_progress(read_fd)
+
+    def _read_progress(self, read_fd: int) -> None:
+        """Hands each report the child writes up the pipe to the job it belongs to.
+
+        One line of JSON a report, read on a thread of its own and handed to the loop the job is
+        waiting on. The thread ends with the pipe, which ends with the child.
+        """
+        loop = self._loop
+
+        def pump() -> None:
+            with os.fdopen(read_fd, "r", buffering=1) as pipe:
+                for line in pipe:
+                    try:
+                        body = json.loads(line)
+                        job_id, stage = body["jobId"], body["stage"]
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    try:
+                        loop.call_soon_threadsafe(report_progress, job_id, stage, body.get("done"), body.get("total"))
+                    except RuntimeError:
+                        # The loop is gone, so nobody is waiting on this job any more.
+                        return
+
+        if loop is None:
+            os.close(read_fd)
+            return
+        threading.Thread(target=pump, name=f"media-progress-{self.port}", daemon=True).start()
 
     async def ensure_ready(self) -> None:
         """Start the runtime if it is not running, then wait until its models are loaded."""
         async with self._start_lock:
             if self._process is None or self._process.poll() is not None:
+                self._loop = asyncio.get_running_loop()
                 await asyncio.to_thread(self._start)
             await self._wait_ready()
 
