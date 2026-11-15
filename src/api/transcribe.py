@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .language_id import LanguageInputError, decode_audio_16k_mono
 
@@ -80,13 +80,30 @@ class TranscribeRequest(BaseModel):
 
 
 class ForceAlignRequest(BaseModel):
-    """Input for the ``force-align`` operation: one audio clip and what it says."""
+    """Input for the ``force-align`` operation: one audio clip and what it says.
+
+    What it says is either plain ``text`` or the ``ssml`` it was synthesized
+    from, with the ``voice_id`` and ``language_override`` of that synthesis:
+    those pick how numbers are read, so a clip this worker spoke is timed the
+    same way whether its words are aligned now or were aligned as it was made.
+    """
 
     audio_url: str | None = None
     audio_base64: str | None = None
-    text: str = Field(min_length=1, max_length=100_000)
+    text: str | None = Field(default=None, min_length=1, max_length=100_000)
+    ssml: str | None = Field(default=None, min_length=1, max_length=100_000)
     # BCP-47 locale or language code; a hint for the aligner, omitted means detected from the text.
     language: str | None = None
+    # The voice that spoke it: its configured locale reads the numbers an unspecified language can't.
+    voice_id: str | None = None
+    # Whether ``language`` was the caller's own choice, as on a synthesis request.
+    language_override: bool = False
+
+    @model_validator(mode="after")
+    def _exactly_one_text(self) -> "ForceAlignRequest":
+        if (self.text is None) == (self.ssml is None):
+            raise ValueError("Provide exactly one of 'text' or 'ssml'")
+        return self
 
 
 def qwen_language(language: str | None) -> str | None:

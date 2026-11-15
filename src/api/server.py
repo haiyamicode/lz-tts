@@ -5365,6 +5365,42 @@ def _source_word_timestamps(
     return mapped
 
 
+async def _timed_words(
+    text: str,
+    audio: np.ndarray,
+    sample_rate: int,
+    language: str | None,
+    read_language: str | None,
+    forced_language: str | None,
+    voice_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """The words of ``text`` and when each one is said in ``audio``.
+
+    The one way this worker times words: synthesis times its own take with it
+    as the take is made, and ``force-align`` times a take that was made before
+    with the same inputs, so both answer with the same words.
+
+    ``language`` hints the aligner, ``read_language`` is the language the
+    numbers are read in (``None`` reads each language run in its own, falling
+    back to the voice's), and ``forced_language`` pins the aligner to one.
+    """
+    if not text.strip():
+        return []
+    # The aligner can't read digits: align the words the numbers were spoken as.
+    spoken = (
+        await asyncio.to_thread(
+            _verbalize_voxcpm_numbers,
+            [text],
+            [read_language],
+            _configured_voice_language(voice_id, language),
+        )
+    )[0]
+    words = await _align_words(spoken, audio, sample_rate, language, forced_language)
+    if spoken != text:
+        words = _source_word_timestamps(text, spoken, words)
+    return [_word_timestamp(text, word) for word in words]
+
+
 async def _add_word_timestamps(
     result: InferenceResult,
     request: SynthesizeRequest,
@@ -5374,30 +5410,21 @@ async def _add_word_timestamps(
         return result
     text = parse_ssml(request.ssml).text if request.ssml is not None else request.text or ""
     explicit_language = _explicit_language(request.language, request.language_override)
-    # The aligner can't read digits: align the words the numbers were spoken as.
-    spoken = (
-        await asyncio.to_thread(
-            _verbalize_voxcpm_numbers,
-            [text],
-            [explicit_language],
-            _configured_voice_language(request.voice_id, request.language),
-        )
-    )[0]
     audio, sample_rate = await asyncio.to_thread(_decode_wav_bytes, result.audio)
-    words = await _align_words(
-        spoken,
+    timestamps = await _timed_words(
+        text,
         audio,
         sample_rate,
         request.language,
         explicit_language,
+        explicit_language,
+        request.voice_id,
     )
-    if spoken != text:
-        words = _source_word_timestamps(text, spoken, words)
     return InferenceResult(
         kind="audio",
         content_type=result.content_type,
         audio=result.audio,
-        data={**(result.data or {}), "timestamps": [_word_timestamp(text, word) for word in words]},
+        data={**(result.data or {}), "timestamps": timestamps},
     )
 
 
@@ -6541,30 +6568,50 @@ class LzTtsInferenceSession:
         return InferenceResult(kind="json", data=data)
 
     async def _force_align(self, request_data: dict[str, Any]) -> InferenceResult:
-        """Word timings of the caller's text on the audio (CTC aligner only, no ASR)."""
-        request = ForceAlignRequest.model_validate(request_data)
-        audio = await self._request_audio(request)
+        """Word timings of the caller's text on the audio (CTC aligner only, no ASR).
+
+        Given ``ssml`` instead of ``text``, the clip is one this worker spoke:
+        it is timed exactly as synthesis would have timed it, from the same
+        SSML text, voice and language.
+        """
         try:
-            timestamps = await self._transcript_timestamps(request.text, audio, request.language)
+            request = ForceAlignRequest.model_validate(request_data)
+        except ValidationError as exc:
+            # A request this worker cannot read is the caller's to fix: fail it
+            # terminally (400) instead of letting it come back as a retry.
+            raise TranscribeInputError(f"Invalid force-align request: {exc}") from exc
+        try:
+            text = parse_ssml(request.ssml).text if request.ssml is not None else request.text or ""
+        except ValueError as exc:
+            raise TranscribeInputError(f"Invalid SSML: {exc}") from exc
+        audio = await self._request_audio(request)
+        explicit_language = _explicit_language(request.language, request.language_override)
+        try:
+            timestamps = (
+                await _timed_words(
+                    text,
+                    audio,
+                    TRANSCRIBE_SAMPLE_RATE,
+                    request.language,
+                    explicit_language,
+                    explicit_language,
+                    request.voice_id,
+                )
+                if request.ssml is not None
+                else await self._transcript_timestamps(text, audio, request.language)
+            )
         except ValueError as exc:
             raise TranscribeInputError(str(exc)) from exc
-        return InferenceResult(kind="json", data={"text": request.text, "timestamps": timestamps})
+        return InferenceResult(kind="json", data={"text": text, "timestamps": timestamps})
 
+    @staticmethod
     async def _transcript_timestamps(
-        self,
         text: str,
         audio: np.ndarray,
         language: str | None,
     ) -> list[dict[str, Any]]:
-        if not text.strip():
-            return []
-        # The aligner can't read digits: align the words the numbers were spoken as.
-        spoken = (await asyncio.to_thread(_verbalize_voxcpm_numbers, [text], [language], None))[0]
-        words = await _align_words(spoken, audio, TRANSCRIBE_SAMPLE_RATE, language, None)
-        if spoken != text:
-            words = _source_word_timestamps(text, spoken, words)
-        return [_word_timestamp(text, word) for word in words]
-
+        """Word timings of a transcript, read in the language it was heard in."""
+        return await _timed_words(text, audio, TRANSCRIBE_SAMPLE_RATE, language, language, None)
 
     async def _generate_music(self, request_data: dict[str, Any]) -> InferenceResult:
         """YuE2 song from the style and lyrics; with ``reference_url``, the vocal is re-voiced by YingMusic-SVC."""
