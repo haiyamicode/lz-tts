@@ -2,7 +2,7 @@
 
 Chained H3 renders drift: a clip that starts on another clip's last frame copies that frame's damage
 (speckle, blotchy colour, painterly skin) and adds its own, so the look degrades clip by clip. The fix,
-used by lipsync's ``continuous`` chunk boundaries and videogen's ``continuable`` clips:
+used by lipsync's continuous chunk boundaries (``pinned_frames`` mode ``none`` / ``timed_images``) and videogen's ``continuable`` clips:
 
 1. a preview of the clip's last frame: the same graph, sampled on a short schedule, only that frame's
    latent decoded (:func:`preview_graph`);

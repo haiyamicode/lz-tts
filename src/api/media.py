@@ -235,6 +235,51 @@ class LipsyncInstruction(BaseModel):
         return self
 
 
+class LipsyncPinnedFrame(BaseModel):
+    """An image pinned ``seconds`` into the video (``timed_images``)."""
+
+    model_config = {"extra": "forbid"}
+
+    image_url: str = Field(min_length=1)
+    seconds: float = Field(gt=0)
+
+
+class LipsyncPinnedFrames(BaseModel):
+    """What lipsync pins besides frame 0 (the job's image) and ``pin_chunk`` spans.
+
+    ``none``: nothing; every chunk boundary is pinned to the previous chunk's own last frame
+    restored toward the image last pinned, so the motion carries on. ``single_image``: one image
+    (``image_url``, else the job's image) on every chunk boundary and every 2.5-5 s at the pauses.
+    ``multi_image``: those pins, their images taken in turn from ``image_urls`` (``order``:
+    ``round_robin`` 1, 2, 3, 1, ..., or ``random``, seeded by the job's seed, never the same image
+    twice running). ``timed_images``: each of ``frames`` at its ``seconds`` and nothing else;
+    boundaries as with ``none``, but a cut with a pin in reach lands on it.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    mode: Literal["none", "single_image", "multi_image", "timed_images"] = "none"
+    image_url: str | None = Field(default=None, min_length=1)
+    image_urls: list[str] = Field(default_factory=list, max_length=16)
+    order: Literal["round_robin", "random"] | None = None
+    frames: list[LipsyncPinnedFrame] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def _fields_of_mode(self) -> "LipsyncPinnedFrames":
+        given = {"image_url": self.image_url, "image_urls": self.image_urls, "order": self.order,
+                 "frames": self.frames}
+        allowed = {"none": (), "single_image": ("image_url",), "multi_image": ("image_urls", "order"),
+                   "timed_images": ("frames",)}[self.mode]
+        extra = [key for key, value in given.items() if value and key not in allowed]
+        if extra:
+            raise ValueError(f"pinned_frames mode {self.mode} takes no {', '.join(extra)}")
+        if self.mode == "multi_image" and len(self.image_urls) < 2:
+            raise ValueError("multi_image takes at least two image_urls (one is single_image)")
+        if self.mode == "timed_images" and not self.frames:
+            raise ValueError("timed_images needs frames")
+        return self
+
+
 class OutputDimensions(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -299,10 +344,9 @@ class LipsyncRequest(H3Interpolation):
     detect_desync: bool = True
     detect_glitches: bool = True
     output_dimensions: OutputDimensions | None = None
-    chunk_boundaries: Literal["input_image", "continuous"] = Field(
-        default="input_image",
-        description="input_image: every chunk boundary and pause pins the input image; continuous: the "
-        "motion carries on, each boundary pinned to the previous chunk's last frame restored toward the image",
+    pinned_frames: LipsyncPinnedFrames = Field(
+        default_factory=LipsyncPinnedFrames,
+        description="What is pinned besides frame 0: none (default), single_image, multi_image or timed_images",
     )
 
 

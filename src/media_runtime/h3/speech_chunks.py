@@ -335,21 +335,35 @@ def _cheapest_n_steps(cost, steps: int, *, shortest: int, longest: int) -> list[
     return points[::-1]
 
 
-def quiet_cuts(loudness, *, shortest: int, longest: int) -> list[int]:
+#: How much cheaper a cut is on a ``preferred`` frame than anywhere else: more than any loudness, so a cut
+#: with one in reach lands on it.
+PREFERRED_CUT_BONUS = 1000.0
+
+
+def quiet_cuts(loudness, *, shortest: int, longest: int, preferred=()) -> list[int]:
     """Chunk cuts (each the last frame of one chunk and the first of the next)
     at the quietest frames: the fewest chunks, each ``shortest..longest`` frames
-    past its first, and one chunk more when that makes the loudest cut quieter."""
+    past its first, and one chunk more when that makes the loudest cut quieter.
+    A ``preferred`` frame (a caller's pin: a cut there joins on the caller's image
+    and needs no boundary frame of its own) beats any quiet frame in reach and
+    counts as silent."""
+    import numpy as np
+
     last = len(loudness) - 1
     if last <= longest:
         return []
     cost = _quiet_costs(loudness)
+    loud = np.asarray(loudness, dtype=np.float64).copy()
+    inner = sorted({int(frame) for frame in preferred if 0 < int(frame) < last})
+    cost[inner] -= PREFERRED_CUT_BONUS
+    loud[inner] = 0.0
     fewest = math.ceil(last / longest)
     best = _cheapest_n_steps(cost, fewest, shortest=shortest, longest=longest)
     if best is None:
         raise ValueError(f"{fewest} chunks of {shortest}..{longest} frames cannot cover {last} frames")
-    if max(loudness[c] for c in best[1:-1]) > 0:
+    if max(loud[c] for c in best[1:-1]) > 0:
         more = _cheapest_n_steps(cost, fewest + 1, shortest=shortest, longest=longest)
-        if more is not None and max(loudness[c] for c in more[1:-1]) < max(loudness[c] for c in best[1:-1]):
+        if more is not None and max(loud[c] for c in more[1:-1]) < max(loud[c] for c in best[1:-1]):
             best = more
     return best[1:-1]
 

@@ -11,15 +11,30 @@ hands and body all move with the speech and nothing is composited:
   its aspect kept;
 - the result carries ``path`` / ``item`` / ``metrics`` / ``seed``.
 
-**Freestyle.** The job's image (``image_url`` /
-``image_path``) is the only image the render sees. The chunks are cut
-at the quietest frames of the voice (:func:`h3.speech_chunks.quiet_cuts`),
-and the input image is pinned on every chunk's first and last frame and inside
-it every ``speech_chunks.PIN_GAP_SECONDS`` (2.5-5 s) at the quietest frames in
-reach (:func:`h3.speech_chunks.pause_pins`) - the middle of a pause where
-there is one, else the lowest speech energy. Motion and gestures between the
-pins come from the prompt and the pinned audio, and a pose or framing the model
-invents never outlasts the next pin.
+**Freestyle.** The job's image (``image_url`` / ``image_path``) is the first
+frame. The chunks are cut at the quietest frames of the voice
+(:func:`h3.speech_chunks.quiet_cuts`), and ``pinned_frames`` (:data:`PIN_MODES`,
+:class:`PinSettings`) says what else is pinned:
+
+- ``none`` (default): nothing. Every chunk boundary is pinned to the previous
+  chunk's own last frame, restored toward the image last pinned before it
+  (:mod:`h3.h3_restore`, vigen e9791cc), so the motion carries on; the last frame
+  is free.
+- ``single_image``: one image (the job's, or ``image_url``) on every chunk's
+  first and last frame and inside it every ``speech_chunks.PIN_GAP_SECONDS``
+  (2.5-5 s) at the quietest frames in reach (:func:`h3.speech_chunks.pause_pins`)
+  - the middle of a pause where there is one, else the lowest speech energy - so a
+  pose or framing the model invents never outlasts the next pin.
+- ``multi_image``: the same pins, their images taken in turn from ``image_urls``:
+  ``order`` ``round_robin`` (1, 2, 3, 1, 2, ...; the default) or ``random``
+  (seeded by the job's seed, never the same image twice running).
+- ``timed_images``: the caller's ``frames`` (``image_url`` at ``seconds``) and
+  nothing else; boundaries as with ``none``, except that a cut with a pin in reach lands
+  on it (it then joins on the caller's image, no restored frame needed).
+
+Every pinned image is fitted to the job's image's frame (cover scale, centre
+crop). Motion and gestures between the pins come from the prompt and the pinned
+audio.
 
 **Voice.** The render never hears the raw audio: room tone and noise make H3
 invent things (overlay graphics, punch-ins) and blur the pauses the pins go in.
@@ -97,6 +112,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import subprocess
 import time
 from dataclasses import dataclass
@@ -154,14 +170,68 @@ DEFAULT_MAX_SECONDS = 300.0
 #: Largest image / audio a job may fetch.
 MAX_INPUT_BYTES = 200 * 1024 * 1024
 
-#: Pins of the job's own image; a pinned chunk's ``pin_image_url`` names its image instead.
+#: Pins of the job's own image; every other pinned image is keyed by its URL.
 INPUT_IMAGE = "input"
-#: ``chunk_boundaries``: every chunk boundary and pause pins the input image (default), or the motion carries
-#: on through the boundaries, each pinned to the previous chunk's own last frame restored toward the input
-#: image (:mod:`h3.h3_restore`, vigen e9791cc).
-CHUNK_BOUNDARIES = ("input_image", "continuous")
+#: ``pinned_frames.mode`` (the module docstring): ``none`` (default), ``single_image``, ``multi_image``, ``timed_images``.
+PIN_MODES = ("none", "single_image", "multi_image", "timed_images")
+#: ``pinned_frames.order`` of a ``multi_image`` rotation.
+PIN_ORDERS = ("round_robin", "random")
+MAX_PIN_IMAGES = 16
+MAX_FRAME_PINS = 100
 #: Image key of a continuous boundary's restored frame: ``restored:<frame>``, filled in when rendered.
 RESTORED_IMAGE = "restored:"
+
+
+@dataclass(frozen=True)
+class PinSettings:
+    """A job's ``pinned_frames``: its ``mode``, the ``images`` its boundary and pause pins take
+    (``single_image``: one, :data:`INPUT_IMAGE` unless ``image_url``; ``multi_image``: the rotation, in
+    ``order``) and a ``timed_images`` job's ``frames`` as ``(seconds, image URL)``."""
+
+    mode: str = "none"
+    images: tuple[str, ...] = ()
+    order: str = PIN_ORDERS[0]
+    frames: tuple[tuple[float, str], ...] = ()
+
+    @property
+    def continuous(self) -> bool:
+        """No boundary or pause pins of the caller's: each boundary is the previous chunk's restored frame."""
+        return self.mode in ("none", "timed_images")
+
+    @property
+    def urls(self) -> list[str]:
+        """Every image URL these pins need, once each."""
+        return list(dict.fromkeys(image for image in (*self.images, *(url for _, url in self.frames))
+                                  if image != INPUT_IMAGE))
+
+    @classmethod
+    def from_payload(cls, value: dict[str, Any] | None) -> PinSettings:
+        value = dict(value or {})
+        mode = str(value.get("mode") or "none")
+        if mode not in PIN_MODES:
+            raise ValueError(f"pinned_frames.mode must be one of {', '.join(PIN_MODES)}, got {mode!r}")
+        given = {key: value.get(key) for key in ("image_url", "image_urls", "order", "frames")}
+        allowed = {"none": (), "single_image": ("image_url",), "multi_image": ("image_urls", "order"),
+                   "timed_images": ("frames",)}[mode]
+        extra = [key for key, item in given.items() if item and key not in allowed]
+        if extra:
+            raise ValueError(f"pinned_frames mode {mode} takes no {', '.join(extra)}")
+        if mode == "none":
+            return cls()
+        if mode == "single_image":
+            return cls(mode=mode, images=(str(given["image_url"] or INPUT_IMAGE),))
+        if mode == "multi_image":
+            images = tuple(str(url) for url in given["image_urls"] or [])
+            if not 2 <= len(images) <= MAX_PIN_IMAGES:
+                raise ValueError(f"multi_image pinned_frames takes 2 to {MAX_PIN_IMAGES} image_urls, got {len(images)}")
+            order = str(given["order"] or PIN_ORDERS[0])
+            if order not in PIN_ORDERS:
+                raise ValueError(f"pinned_frames.order must be one of {', '.join(PIN_ORDERS)}, got {order!r}")
+            return cls(mode=mode, images=images, order=order)
+        frames = list(given["frames"] or [])
+        if not 1 <= len(frames) <= MAX_FRAME_PINS:
+            raise ValueError(f"timed_images pinned_frames takes 1 to {MAX_FRAME_PINS} frames, got {len(frames)}")
+        return cls(mode=mode, frames=tuple((float(frame["seconds"]), str(frame["image_url"])) for frame in frames))
 
 
 @dataclass(frozen=True)
@@ -170,18 +240,25 @@ class Anchor:
 
     #: Output-timeline frame index.
     frame: int
-    #: ``start`` (frame 0), ``pin`` (an end of a pinned chunk), ``boundary`` (a continuous chunk boundary)
-    #: or ``pause`` (every other pin).
+    #: ``start`` (frame 0), ``pin`` (an end of a pinned chunk), ``frame`` (a ``timed_images`` pin), ``boundary`` (a
+    #: continuous chunk boundary) or ``pause`` (a ``single_image`` / ``multi_image`` boundary or pause pin).
     label: str
-    #: :data:`INPUT_IMAGE`, the ``pin_image_url`` of the pinned chunk this pin ends, or a continuous
-    #: boundary's ``restored:<frame>``.
+    #: :data:`INPUT_IMAGE`, an image URL, or a continuous boundary's ``restored:<frame>``.
     image: str = INPUT_IMAGE
+
+
+@dataclass(frozen=True)
+class FramePin:
+    """A ``timed_images`` pin: ``image`` (its URL) on output frame ``frame``."""
+
+    frame: int
+    image: str
 
 
 @dataclass(frozen=True)
 class PinnedSpan:
     """A caller's ``pin_chunk`` range: its own chunk, cut at exactly these frames,
-    pinned to ``image`` on both ends and nowhere inside."""
+    pinned to ``image`` on both ends and with no boundary or pause pins inside."""
 
     first: int
     last: int
@@ -223,8 +300,31 @@ def pinned_spans(items: list[dict[str, Any]], *, fps: float, total_frames: int, 
     return spans
 
 
+def frame_pins(settings: PinSettings, *, fps: float, total_frames: int, pinned: list[PinnedSpan] = ()) -> list[FramePin]:
+    """A ``timed_images`` job's ``frames`` on the nearest frames of the ``fps`` timeline, in time order. Frame 0 is
+    the job's own image and no two pins share a frame; a pin on a pinned chunk's end must pin that chunk's
+    image (it is then that end)."""
+    pins: dict[int, str] = {}
+    for index, (seconds, image) in enumerate(settings.frames):
+        # Rounded so a time on a frame boundary is that frame despite float error.
+        frame = round(seconds * fps)
+        where = f"pinned_frames.frames[{index}] at {seconds:g} s"
+        if frame < 1:
+            raise ValueError(f"{where} falls on frame 0, which is the job's image_url")
+        if frame > total_frames - 1:
+            raise ValueError(f"{where} is past the end of the {total_frames / fps:.2f} s audio")
+        if frame in pins:
+            raise ValueError(f"{where} falls on the same frame as another pin")
+        pins[frame] = image
+    ends = {frame: span.image for span in pinned for frame in (span.first, span.last)}
+    for frame, image in pins.items():
+        if frame in ends and ends[frame] != image:
+            raise ValueError(f"the pin at {frame / fps:.2f} s falls on a pinned chunk's end, which pins another image")
+    return [FramePin(frame=frame, image=image) for frame, image in sorted(pins.items()) if frame not in ends]
+
+
 def freestyle_plan(samples, *, total_frames: int, fps: float, chunk_cap: int,
-                   pinned: list[PinnedSpan] = (), continuous: bool = False,
+                   pinned: list[PinnedSpan] = (), continuous: bool = False, fixed: list[FramePin] = (),
                    model_fps: float | None = None) -> tuple[list[int], list[int]]:
     """Freestyle's chunk cuts and pins from the cleaned 16 kHz voice: the cuts at
     the quietest frames (:func:`h3.speech_chunks.quiet_cuts`, chunks of at
@@ -235,22 +335,25 @@ def freestyle_plan(samples, *, total_frames: int, fps: float, chunk_cap: int,
     chunk with no inner pins, and the quiet cuts fill the stretches between them.
     Returns ``(cut_frames, pins)``, the pins sorted and including frame 0 and the
     last frame. ``continuous`` boundaries pin only frame 0, the cuts and the pinned
-    spans' ends: no pauses, and the last frame is free."""
+    spans' ends: no pauses, and the last frame is free. The ``fixed`` pins (a
+    ``timed_images`` job's) are pins too, and a cut with one in reach lands on it."""
     loudness = frame_loudness(samples, fps=fps, frames=total_frames)
     shortest, longest = math.ceil(MIN_CHUNK_SECONDS * fps), longest_chunk(fps=model_fps or fps, chunk_cap=chunk_cap)
     last = total_frames - 1
+    fixed_frames = [pin.frame for pin in fixed]
     cuts: set[int] = set()
     free_start = 0
     for span in [*pinned, PinnedSpan(first=last, last=last)]:
         if span.first > free_start:
+            preferred = [frame - free_start for frame in fixed_frames if free_start < frame < span.first]
             cuts.update(free_start + cut for cut in quiet_cuts(loudness[free_start:span.first + 1],
-                                                               shortest=shortest, longest=longest))
+                                                               shortest=shortest, longest=longest, preferred=preferred))
         cuts.update((span.first, span.last))
         free_start = span.last
     cut_frames = sorted(cut for cut in cuts if 0 < cut < last)
     if continuous:
         ends = {frame for span in pinned for frame in (span.first, span.last)}
-        return cut_frames, sorted({0, *cut_frames, *ends})
+        return cut_frames, sorted({0, *cut_frames, *ends, *fixed_frames})
     bounds = [0, *cut_frames, last]
     inside_pinned = {(span.first, span.last) for span in pinned}
     pins = {0}
@@ -260,21 +363,35 @@ def freestyle_plan(samples, *, total_frames: int, fps: float, chunk_cap: int,
             continue
         pins.update(start + pin for pin in pause_pins(loudness[start:end + 1], shortest=int(round(PIN_GAP_SECONDS[0] * fps)),
                                                       longest=int(round(PIN_GAP_SECONDS[1] * fps))))
-    return cut_frames, sorted(pins)
+    return cut_frames, sorted({*pins, *fixed_frames})
 
 
-def plan_anchors(pins: list[int], pinned: list[PinnedSpan], *, continuous: bool = False) -> list[Anchor]:
-    """``pins`` as anchors: a pinned span's ends pin its image, every other pin the input image, or with
-    ``continuous`` boundaries the frame restored there when the chunk ending on it renders."""
+def plan_anchors(pins: list[int], pinned: list[PinnedSpan], *, continuous: bool = False, fixed: list[FramePin] = (),
+                 images: tuple[str, ...] = (INPUT_IMAGE,), order: str = PIN_ORDERS[0], seed: int = 0) -> list[Anchor]:
+    """``pins`` as anchors: frame 0 the input image, a pinned span's ends its image, a ``fixed`` pin its own,
+    and every other pin - with ``continuous`` boundaries the frame restored there when the chunk ending on it
+    renders - else the next of ``images`` in ``order``: ``round_robin``, or ``random`` (``seed``; never the
+    image the pin before took, when there is another)."""
     ends = {frame: span.image for span in pinned for frame in (span.first, span.last)}
+    own = {pin.frame: pin.image for pin in fixed}
+    rng = random.Random(seed)
+    turn, previous = 0, None
     anchors = []
     for pin in pins:
         if pin == 0 or pin in ends:
             anchors.append(Anchor(frame=pin, label="start" if pin == 0 else "pin", image=ends.get(pin, INPUT_IMAGE)))
+        elif pin in own:
+            anchors.append(Anchor(frame=pin, label="frame", image=own[pin]))
         elif continuous:
             anchors.append(Anchor(frame=pin, label="boundary", image=f"{RESTORED_IMAGE}{pin}"))
         else:
-            anchors.append(Anchor(frame=pin, label="pause", image=INPUT_IMAGE))
+            if order == "random":
+                image = rng.choice([candidate for candidate in images if candidate != previous] or list(images))
+            else:
+                image = images[turn % len(images)]
+                turn += 1
+            previous = image
+            anchors.append(Anchor(frame=pin, label="pause", image=image))
     return anchors
 
 
@@ -663,8 +780,8 @@ def _check(render: Path, audio: Path, chunk: LipsyncChunk, *, flicker: bool, des
         return {"error": f"{type(exc).__name__}: {exc}", "flagged": False, "badness": 0.0}
 
 
-def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, input_image: Path,
-              pin_images: int, fps: float, job_id: str, finish: Any) -> dict[str, Any]:
+def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, input_image: Path, pins: PinSettings,
+              pin_images: int, fps: float, seed: int, job_id: str, finish: Any) -> dict[str, Any]:
     """The job's plan: chunks, pins, prompts and per-chunk validators. Its frames run at ``fps``: the
     model's 24, or an interpolated job's ``interpolation_fps``, whose every chunk still renders on the
     model's own clock (:mod:`h3.h3_interpolation`)."""
@@ -689,17 +806,15 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
     source_width, source_height = image_size(input_image)
     canvas = resolve_canvas(image_path=input_image)
     chunk_cap = max_chunk_frames(canvas.width, canvas.height)
-    # The input image on both ends of every chunk and at the pauses between; a pinned
-    # chunk is cut on its own times and pinned on its ends only, to its own image if it has one.
+    # A pinned chunk is cut on its own times and pinned on its ends only, to its own image if it has
+    # one; the rest is pinned_frames' (the module docstring).
     pinned = pinned_spans(custom_instructions, fps=fps, total_frames=total_frames,
                           longest=longest_chunk(fps=H3_FPS, chunk_cap=chunk_cap))
-    boundaries = str(payload.get("chunk_boundaries") or CHUNK_BOUNDARIES[0])
-    if boundaries not in CHUNK_BOUNDARIES:
-        raise ValueError(f"chunk_boundaries must be one of {', '.join(CHUNK_BOUNDARIES)}, got {boundaries!r}")
-    continuous = boundaries == "continuous"
-    cut_frames, pins = freestyle_plan(samples, total_frames=total_frames, fps=fps, chunk_cap=chunk_cap, pinned=pinned,
-                                      continuous=continuous, model_fps=H3_FPS)
-    anchors = plan_anchors(pins, pinned, continuous=continuous)
+    fixed = frame_pins(pins, fps=fps, total_frames=total_frames, pinned=pinned)
+    cut_frames, pin_frames = freestyle_plan(samples, total_frames=total_frames, fps=fps, chunk_cap=chunk_cap,
+                                            pinned=pinned, continuous=pins.continuous, fixed=fixed, model_fps=H3_FPS)
+    anchors = plan_anchors(pin_frames, pinned, continuous=pins.continuous, fixed=fixed,
+                           images=pins.images or (INPUT_IMAGE,), order=pins.order, seed=seed)
     chunks = plan_chunks(total_frames, max_frames=chunk_cap, anchors=anchors, cut_frames=cut_frames)
     pinned_chunks = sorted(chunk.index for chunk in chunks
                            if any((chunk.start_frame, chunk.last_frame) == (span.first, span.last) for span in pinned))
@@ -728,6 +843,7 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
         job_id=job_id,
         audio_seconds=round(audio_duration, 3),
         output_frames=total_frames,
+        pin_mode=pins.mode,
         anchors=[anchor.frame for anchor in anchors],
         source_width=source_width,
         source_height=source_height,
@@ -748,7 +864,7 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
         "canvas": [canvas.width, canvas.height],
         "chunk_cap": chunk_cap,
         "cut_frames": list(cut_frames),
-        "chunk_boundaries": boundaries,
+        "pin_mode": pins.mode,
         "anchors": [[anchor.frame, anchor.label, anchor.image] for anchor in anchors],
         "pinned_chunks": pinned_chunks,
         "chunk_texts": chunk_texts,
@@ -761,10 +877,11 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
 
 
 def _restore_boundary(chunk: LipsyncChunk, end_anchor: Anchor, *, images: dict[str, Path], anchor_at: dict[int, Anchor],
-                      job_id: str, prompt: str, seed: int, width: int, height: int, audio_slice: Path, work_dir: Path,
-                      recipe: Any, sparse_attention: bool) -> dict[str, Any]:
+                      look: Path, job_id: str, prompt: str, seed: int, width: int, height: int, audio_slice: Path,
+                      work_dir: Path, recipe: Any, sparse_attention: bool) -> dict[str, Any]:
     """Fill ``images[end_anchor.image]``: this chunk's last kept frame, previewed on its own pins (the
-    recipe's preview schedule, that frame alone decoded), then restored toward the input image."""
+    recipe's preview schedule, that frame alone decoded), then restored toward ``look``, the image last
+    pinned before it."""
     from .h3_restore import FramePreview, restore_frame
     from .minimax_h3_runtime import run_lipsync_chunk
 
@@ -789,7 +906,7 @@ def _restore_boundary(chunk: LipsyncChunk, end_anchor: Anchor, *, images: dict[s
     )
     preview_seconds = time.perf_counter() - began
     restored = work_dir.parent / "anchors" / f"{end_anchor.image.replace(':', '_')}.png"
-    restore_frame(job_id=job_id, frame=preview_path, anchor=images[INPUT_IMAGE], output_path=restored,
+    restore_frame(job_id=job_id, frame=preview_path, anchor=look, output_path=restored,
                   width=width, height=height, seed=seed)
     images[end_anchor.image] = restored
     metrics = {"frame": end_anchor.frame, "preview_seconds": round(preview_seconds, 3),
@@ -842,13 +959,15 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     image_path = download_job_input(job, payload, "image", scratch_dir, ".png")
     audio_path = download_job_input(job, payload, "audio", scratch_dir, ".wav")
     custom_instructions = payload.get("custom_instructions") or []
-    # The pinned chunks' own images, each URL fetched once.
+    pins = PinSettings.from_payload(payload.get("pinned_frames"))
+    # Every pinned image - the pinned chunks' own, pinned_frames' - each URL fetched once.
+    pin_urls = {url: "pin_image_url" for item in custom_instructions
+                if item.get("pin_chunk") and (url := str(item.get("pin_image_url") or ""))}
+    pin_urls.update({url: "pinned_frames image" for url in pins.urls if url not in pin_urls})
     pin_downloads = {
         url: _download_url(job_id, url, scratch_dir / "inputs" / f"pin_image_{index}{Path(urlparse(url).path).suffix or '.png'}",
-                           input_name="pin_image_url")
-        for index, url in enumerate(dict.fromkeys(
-            str(item["pin_image_url"]) for item in custom_instructions if item.get("pin_chunk") and item.get("pin_image_url")
-        ))
+                           input_name=name)
+        for index, (url, name) in enumerate(pin_urls.items())
     }
     finish("input_download_seconds", began)
 
@@ -863,8 +982,8 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     began = time.perf_counter()
     voice_path = clean_voice(audio_path, work_dir / "voice.wav", job_id=job_id)
     finish("voice_cleanup_seconds", began)
-    plan = _new_plan(payload, voice_path=voice_path, audio_path=audio_path, input_image=input_image,
-                     pin_images=len(pin_downloads), fps=fps, job_id=job_id, finish=finish)
+    plan = _new_plan(payload, voice_path=voice_path, audio_path=audio_path, input_image=input_image, pins=pins,
+                     pin_images=len(pin_downloads), fps=fps, seed=seed, job_id=job_id, finish=finish)
     audio_duration = float(plan["audio_duration"])
     total_frames = int(plan["total_frames"])
     canvas_width, canvas_height = plan["canvas"]
@@ -893,18 +1012,20 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
                 audio_slice = speed_up(audio_slice, chunk_dir / "audio.wav", fps=interpolation_fps,
                                        duration_seconds=chunk.render_frames / H3_FPS)
             # A continuous boundary at this chunk's end: its own last frame, previewed and restored toward
-            # the input image, pinned there; the next chunk opens on it.
+            # the image last pinned before it, pinned there; the next chunk opens on it.
             end_anchor = anchor_at.get(chunk.last_frame)
             restore_metrics: dict[str, Any] | None = None
             if end_anchor is not None and end_anchor.image.startswith(RESTORED_IMAGE) and end_anchor.image not in images:
+                look = max((anchor for anchor in anchors if anchor.frame < end_anchor.frame
+                            and not anchor.image.startswith(RESTORED_IMAGE)), key=lambda anchor: anchor.frame)
                 restore_metrics = _restore_boundary(
-                    chunk, end_anchor, images=images, anchor_at=anchor_at, job_id=job_id, prompt=prompts[chunk.index],
+                    chunk, end_anchor, images=images, anchor_at=anchor_at, look=images[look.image], job_id=job_id,
+                    prompt=prompts[chunk.index],
                     seed=seed + chunk.index, width=canvas_width, height=canvas_height, audio_slice=audio_slice,
                     work_dir=chunk_dir, recipe=recipe, sparse_attention=sparse_attention)
                 stage_timings[f"chunk_{chunk.index}_boundary_seconds"] = restore_metrics["seconds"]
-            # Every chunk opens on a pin and ends on one at its last kept frame (not the
-            # grid surplus past it): the input image, a pinned chunk's own image, or a
-            # continuous boundary's restored frame.
+            # Every chunk opens on a pin: the input image, a pinned image, or a continuous
+            # boundary's restored frame (it ends on one too, unless it is the last and free).
             first_image = images[anchor_at[chunk.start_frame].image]
             guides = [(position, images[anchor.image]) for position, anchor in chunk.guides]
             guide_labels = [f"{position}:{anchor.label}" for position, anchor in chunk.guides]
@@ -1011,7 +1132,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
         "frames": streamed["output_frames"] if streamed else total_frames,
         "duration_seconds": round(audio_duration, 3),
         "source": "freestyle",
-        "chunk_boundaries": plan["chunk_boundaries"],
+        "pin_mode": plan["pin_mode"],
         "anchors": len(anchors),
         "pinned_chunks": len(pinned_chunks),
         "canvas_width": canvas_width,
