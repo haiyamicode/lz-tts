@@ -27,6 +27,9 @@ SPAN_UPSCALE_MODEL_PATH = DATA_DIR / "span-upscale" / "2xNomosUni_span_multijpg_
 #: imagegen ``rest_frame``: MediaPipe FaceLandmarker (Apache-2.0, float16 v1; data/face-landmarks, S3-baked),
 #: measures how open a rest still's mouth is (h3.rest_stills).
 FACE_LANDMARKER_PATH = DATA_DIR / "face-landmarks" / "face_landmarker.task"
+#: imagegen ``rest_frame``: InsightFace buffalo_l ArcFace (w600k_r50; data/face-identity, S3-baked), checks a rest
+#: still keeps the person's face (h3.rest_stills).
+FACE_IDENTITY_PATH = DATA_DIR / "face-identity" / "w600k_r50.onnx"
 
 
 def data_dir() -> Path:

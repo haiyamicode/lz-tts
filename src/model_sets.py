@@ -34,9 +34,9 @@ MODEL_SETS: dict[str, tuple[str, ...]] = {
     "falcon": ("lzspeech-falcon-*", "voxcpm2-*", "voxcpm-lora"),
     "seed-vc": ("seed-vc",),
     "music": ("yue2-3b", "yingmusic-svc"),
-    "imagegen": ("comfyui", "face-landmarks"),
+    "imagegen": ("comfyui", "face-landmarks", "face-identity"),
     "videogen": ("comfyui", "rife-*", "span-upscale"),
-    "lipsync": ("comfyui", "lipsync", "rife-*", "span-upscale"),
+    "lipsync": ("comfyui", "lipsync", "rife-*", "span-upscale", "face-landmarks", "face-identity"),
 }
 MEDIA_SETS = ("music", "videogen", "lipsync", "imagegen")
 # Worker engine -> the sets it loads from (media: the enabled media features).

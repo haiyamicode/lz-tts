@@ -19,7 +19,9 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
 - ``rest_frame`` (``k`` >= 0): rest still ``k`` of the person in the one
   reference image, for lipsync frame pins (:mod:`h3.rest_stills`). No
   ``prompt``: the still's prompt is written here. Rendered on ``seed + k``
-  at the native area, an open mouth retaken; delivered at the image's size
+  at the native area; a take that lost the person's face (ArcFace) or opened
+  the mouth is retaken, at most ``max_retries`` (0..5, default 2) times, and
+  the job fails when no take kept the face; delivered at the image's size
   (long side <= 2048) unless ``width``/``height`` are given.
 
 The result is ``{"path", "item", "metrics", "seed"}`` like :mod:`h3.videogen`.
@@ -60,7 +62,7 @@ def _references(job: dict[str, Any], payload: dict[str, Any], scratch_dir: Path)
 
 
 def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
-    from PIL import Image, ImageOps  # type: ignore
+    from PIL import Image  # type: ignore
 
     from . import h3_still, rest_stills
     from .lipsync import prepare_input_image
@@ -78,6 +80,13 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("rest_frame writes its own prompt; send no prompt")
         if len(payload.get("image_urls") or payload.get("image_paths") or []) != 1:
             raise ValueError("rest_frame takes exactly one image (the person)")
+    retries = payload.get("max_retries")
+    if retries is not None and rest_frame is None:
+        raise ValueError("max_retries goes with rest_frame")
+    retries = rest_stills.DEFAULT_RETRIES if retries is None else int(retries)
+    if not 0 <= retries <= rest_stills.MAX_RETRIES:
+        raise ValueError(f"max_retries must be within 0..{rest_stills.MAX_RETRIES}")
+    if rest_frame is not None:
         prompt = rest_stills.rest_prompt(rest_frame)
     if not prompt:
         raise ValueError("imagegen requires a prompt")
@@ -123,10 +132,19 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
     log_event("imagegen_started", job_id=job_id, preset=preset, seed=seed, references=len(references),
               render=[render_width, render_height], delivered=[width, height])
     inference_started = time.perf_counter()
-    takes: list[dict[str, Any]] = []
-    for attempt in range(rest_stills.MAX_ATTEMPTS if rest_frame is not None else 1):
-        take_seed = seed if rest_frame is None else rest_stills.attempt_seed(seed, rest_frame, attempt)
-        render_path = scratch_dir / "outputs" / f"h3_still_{attempt}.png"
+    still = None
+    if rest_frame is not None:
+        reference_face = rest_stills.measure_face(references[0])
+        still = rest_stills.render_still(job_id=job_id, image=references[0], index=rest_frame, seed=seed,
+                                         retries=retries, out_dir=scratch_dir / "outputs", reference=reference_face,
+                                         preset=preset)
+        if still.kept is None:
+            raise ValueError(f"rest_frame {rest_frame}: no take kept the person's face after {len(still.takes)} "
+                             f"takes (identity {[t.report()['identity'] for t in still.takes]}, minimum "
+                             f"{rest_stills.MIN_IDENTITY})")
+        render_path, render_metrics = still.kept.path, still.metrics
+    else:
+        render_path = scratch_dir / "outputs" / "h3_still.png"
         render_metrics = run_minimax_h3_still(
             job_id=job_id,
             prompt=h3_still.picture_tags(prompt),
@@ -134,24 +152,10 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
             output_path=render_path,
             width=render_width,
             height=render_height,
-            seed=take_seed,
+            seed=seed,
             preset=preset,
         )
-        take: dict[str, Any] = {"seed": take_seed, "path": render_path}
-        takes.append(take)
-        if rest_frame is None:
-            break
-        take["mouth"] = rest_stills.mouth_opening(render_path)
-        log_event("imagegen_rest_take", job_id=job_id, rest_frame=rest_frame, attempt=attempt, seed=take_seed,
-                  mouth=take["mouth"])
-        if take["mouth"] is None or take["mouth"] <= rest_stills.MOUTH_CLOSED:
-            break
-    kept = min(takes, key=lambda t: t.get("mouth") or 0.0)
-    with Image.open(kept["path"]) as rendered:
-        image = rendered.convert("RGB")
-        if image.size != (width, height):
-            image = ImageOps.fit(image, (width, height), method=Image.Resampling.LANCZOS)
-        image.save(output_path)
+    rest_stills.save_fitted(render_path, output_path, (width, height))
     inference_seconds = time.perf_counter() - inference_started
     wall_seconds = time.perf_counter() - started
     log_event("imagegen_complete", job_id=job_id, wall_seconds=round(wall_seconds, 3))
@@ -166,11 +170,9 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
             "references": len(references),
             "preset": preset,
             "steps": spec["steps"],
-            **({"rest_frame": rest_frame, "still_seed": kept["seed"],
-                "variation": rest_stills.REST_VARIATIONS[rest_frame % len(rest_stills.REST_VARIATIONS)],
-                "mouth": None if kept["mouth"] is None else round(kept["mouth"], 4),
-                "takes": [{"seed": t["seed"], "mouth": None if t["mouth"] is None else round(t["mouth"], 4)}
-                          for t in takes]} if rest_frame is not None else {}),
+            **({"rest_frame": rest_frame, "max_retries": retries, "reference_face": reference_face is not None,
+                **{("still_seed" if key == "seed" else key): value for key, value in still.report().items()
+                   if key not in ("index", "kept")}} if still is not None else {}),
         },
         "metrics": {
             "wall_seconds": round(wall_seconds, 3),

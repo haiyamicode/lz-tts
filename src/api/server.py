@@ -6913,7 +6913,8 @@ class LzTtsInferenceSession:
 
         The result travels like audio (``kind`` "audio", ``audioBase64`` on /task/sync) with
         ``content_type`` video/mp4 or image/png; its data carries the seed, size and render metrics.
-        A continuable videogen clip also returns its restored last frame as the ``lastFrame`` file.
+        A continuable videogen clip also returns its restored last frame as the ``lastFrame`` file, a
+        ``generate`` lipsync its kept rest stills as ``still<k>`` files.
         """
         config = _server_config.media
         if not getattr(config, operation):
@@ -6938,8 +6939,12 @@ class LzTtsInferenceSession:
             shutil.rmtree(scratch, ignore_errors=True)
             raise
         content_type = "image/png" if operation == "imagegen" else "video/mp4"
-        # A continuable videogen clip's restored last frame: the next clip's image_url.
+        # A continuable videogen clip's restored last frame: the next clip's image_url; a generate
+        # lipsync's rest stills (still<k>, PNG).
         last_frame = produced.get("last_frame_path")
+        files = {name: ResultFile("image/png", path=Path(path)) for name, path in (produced.get("files") or {}).items()}
+        if last_frame:
+            files["lastFrame"] = ResultFile("image/jpeg", path=Path(last_frame))
         return InferenceResult(
             kind="audio",
             content_type=content_type,
@@ -6949,7 +6954,7 @@ class LzTtsInferenceSession:
                 "seed": produced["seed"],
                 "wallSeconds": produced["metrics"].get("wall_seconds"),
             },
-            files={"lastFrame": ResultFile("image/jpeg", path=Path(last_frame))} if last_frame else None,
+            files=files or None,
             scratch=scratch,
         )
 

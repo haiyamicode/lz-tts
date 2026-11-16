@@ -31,6 +31,12 @@ frame. The chunks are cut at the quietest frames of the voice
 - ``timed_images``: the caller's ``frames`` (``image_url`` at ``seconds``) and
   nothing else; boundaries as with ``none``, except that a cut with a pin in reach lands
   on it (it then joins on the caller's image, no restored frame needed).
+- ``generate`` (vigen 9ff3052): the job first renders ``count`` (2-12, default 6) rest
+  stills of the person from its own image (:func:`h3.rest_stills.render_still`, the
+  imagegen ``rest_frame`` stills: still k on ``seed + k``, retaken at most ``max_retries``
+  times on a lost face or open mouth) and pins them like ``multi_image`` (``order``). A
+  still whose every take lost the face is left out (none left: the job's image is pinned);
+  the kept ones are delivered with the video as the result's ``still<k>`` files.
 
 Every pinned image is fitted to the job's image's frame (cover scale, centre
 crop). Motion and gestures between the pins come from the prompt and the pinned
@@ -172,12 +178,18 @@ MAX_INPUT_BYTES = 200 * 1024 * 1024
 
 #: Pins of the job's own image; every other pinned image is keyed by its URL.
 INPUT_IMAGE = "input"
-#: ``pinned_frames.mode`` (the module docstring): ``none`` (default), ``single_image``, ``multi_image``, ``timed_images``.
-PIN_MODES = ("none", "single_image", "multi_image", "timed_images")
-#: ``pinned_frames.order`` of a ``multi_image`` rotation.
+#: ``pinned_frames.mode`` (the module docstring): ``none`` (default), ``single_image``, ``multi_image``,
+#: ``timed_images``, ``generate``.
+PIN_MODES = ("none", "single_image", "multi_image", "timed_images", "generate")
+#: ``pinned_frames.order`` of a ``multi_image`` / ``generate`` rotation.
 PIN_ORDERS = ("round_robin", "random")
 MAX_PIN_IMAGES = 16
 MAX_FRAME_PINS = 100
+#: ``generate``: rest stills the job renders, by default and at most (vigen's ``pinned_frames`` ``generate``).
+DEFAULT_GENERATED_STILLS = 6
+MAX_GENERATED_STILLS = 12
+#: Image key of a ``generate`` rest still: ``generated:<k>``.
+GENERATED_IMAGE = "generated:"
 #: Image key of a continuous boundary's restored frame: ``restored:<frame>``, filled in when rendered.
 RESTORED_IMAGE = "restored:"
 
@@ -186,12 +198,14 @@ RESTORED_IMAGE = "restored:"
 class PinSettings:
     """A job's ``pinned_frames``: its ``mode``, the ``images`` its boundary and pause pins take
     (``single_image``: one, :data:`INPUT_IMAGE` unless ``image_url``; ``multi_image``: the rotation, in
-    ``order``) and a ``timed_images`` job's ``frames`` as ``(seconds, image URL)``."""
+    ``order``; ``generate``: its ``count`` rest stills, :data:`GENERATED_IMAGE` keys, rendered with at most
+    ``max_retries`` retakes each) and a ``timed_images`` job's ``frames`` as ``(seconds, image URL)``."""
 
     mode: str = "none"
     images: tuple[str, ...] = ()
     order: str = PIN_ORDERS[0]
     frames: tuple[tuple[float, str], ...] = ()
+    max_retries: int = 0
 
     @property
     def continuous(self) -> bool:
@@ -202,7 +216,7 @@ class PinSettings:
     def urls(self) -> list[str]:
         """Every image URL these pins need, once each."""
         return list(dict.fromkeys(image for image in (*self.images, *(url for _, url in self.frames))
-                                  if image != INPUT_IMAGE))
+                                  if image != INPUT_IMAGE and not image.startswith(GENERATED_IMAGE)))
 
     @classmethod
     def from_payload(cls, value: dict[str, Any] | None) -> PinSettings:
@@ -210,24 +224,36 @@ class PinSettings:
         mode = str(value.get("mode") or "none")
         if mode not in PIN_MODES:
             raise ValueError(f"pinned_frames.mode must be one of {', '.join(PIN_MODES)}, got {mode!r}")
-        given = {key: value.get(key) for key in ("image_url", "image_urls", "order", "frames")}
+        given = {key: value.get(key) for key in ("image_url", "image_urls", "order", "frames", "count", "max_retries")}
         allowed = {"none": (), "single_image": ("image_url",), "multi_image": ("image_urls", "order"),
-                   "timed_images": ("frames",)}[mode]
-        extra = [key for key, item in given.items() if item and key not in allowed]
+                   "timed_images": ("frames",), "generate": ("count", "order", "max_retries")}[mode]
+        extra = [key for key, item in given.items() if item not in (None, "", []) and key not in allowed]
         if extra:
             raise ValueError(f"pinned_frames mode {mode} takes no {', '.join(extra)}")
         if mode == "none":
             return cls()
         if mode == "single_image":
             return cls(mode=mode, images=(str(given["image_url"] or INPUT_IMAGE),))
+        if mode in ("multi_image", "generate"):
+            order = str(given["order"] or PIN_ORDERS[0])
+            if order not in PIN_ORDERS:
+                raise ValueError(f"pinned_frames.order must be one of {', '.join(PIN_ORDERS)}, got {order!r}")
         if mode == "multi_image":
             images = tuple(str(url) for url in given["image_urls"] or [])
             if not 2 <= len(images) <= MAX_PIN_IMAGES:
                 raise ValueError(f"multi_image pinned_frames takes 2 to {MAX_PIN_IMAGES} image_urls, got {len(images)}")
-            order = str(given["order"] or PIN_ORDERS[0])
-            if order not in PIN_ORDERS:
-                raise ValueError(f"pinned_frames.order must be one of {', '.join(PIN_ORDERS)}, got {order!r}")
             return cls(mode=mode, images=images, order=order)
+        if mode == "generate":
+            from .rest_stills import DEFAULT_RETRIES, MAX_RETRIES
+
+            count = DEFAULT_GENERATED_STILLS if given["count"] is None else int(given["count"])
+            if not 2 <= count <= MAX_GENERATED_STILLS:
+                raise ValueError(f"generate pinned_frames takes a count of 2 to {MAX_GENERATED_STILLS}, got {count}")
+            retries = DEFAULT_RETRIES if given["max_retries"] is None else int(given["max_retries"])
+            if not 0 <= retries <= MAX_RETRIES:
+                raise ValueError(f"pinned_frames.max_retries must be within 0..{MAX_RETRIES}, got {retries}")
+            return cls(mode=mode, images=tuple(f"{GENERATED_IMAGE}{k}" for k in range(count)), order=order,
+                       max_retries=retries)
         frames = list(given["frames"] or [])
         if not 1 <= len(frames) <= MAX_FRAME_PINS:
             raise ValueError(f"timed_images pinned_frames takes 1 to {MAX_FRAME_PINS} frames, got {len(frames)}")
@@ -978,6 +1004,36 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
         url: prepare_pin_image(path, work_dir / "anchors" / f"pin{index}.png", size=(source_width, source_height))
         for index, (url, path) in enumerate(pin_downloads.items())
     }}
+    # generate: rest stills of the person, rendered from the job's image and pinned like multi_image's
+    # images; a still whose every take lost the face is left out, and with none left the job's image is pinned.
+    generated: list[dict[str, Any]] = []
+    still_files: dict[str, str] = {}
+    if pins.mode == "generate":
+        from dataclasses import replace
+
+        from . import rest_stills
+
+        began = time.perf_counter()
+        reference = rest_stills.measure_face(input_image)
+        delivered = rest_stills.delivered_size(source_width, source_height)
+        kept_keys = []
+        for key in pins.images:
+            index = int(key[len(GENERATED_IMAGE):])
+            progress.report("preparing", index, len(pins.images))
+            still = rest_stills.render_still(job_id=job_id, image=input_image, index=index, seed=seed,
+                                             retries=pins.max_retries, out_dir=work_dir / "stills",
+                                             reference=reference)
+            generated.append(still.report())
+            if still.kept is None:
+                continue
+            path = rest_stills.save_fitted(still.kept.path, scratch_dir / "outputs" / f"still_{index}.png", delivered)
+            images[key] = prepare_pin_image(path, work_dir / "anchors" / f"generated_{index}.png",
+                                            size=(source_width, source_height))
+            still_files[f"still{index}"] = str(path)
+            kept_keys.append(key)
+        pins = replace(pins, images=tuple(kept_keys) or (INPUT_IMAGE,))
+        finish("generate_stills_seconds", began)
+        log_event("lipsync_stills", job_id=job_id, kept=len(kept_keys), stills=generated)
     # The voice alone - no music, no noise - is what the rest of the job hears.
     began = time.perf_counter()
     voice_path = clean_voice(audio_path, work_dir / "voice.wav", job_id=job_id)
@@ -1133,6 +1189,9 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
         "duration_seconds": round(audio_duration, 3),
         "source": "freestyle",
         "pin_mode": plan["pin_mode"],
+        # generate: each rest still (its seed, variation, identity, mouth and takes); the kept ones are
+        # the result's still<k> files.
+        **({"generated_stills": generated} if generated else {}),
         "anchors": len(anchors),
         "pinned_chunks": len(pinned_chunks),
         "canvas_width": canvas_width,
@@ -1186,4 +1245,6 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
             "chunks": chunk_metrics,
         },
         "seed": seed,
+        # generate: the kept rest stills, by result file name.
+        **({"files": still_files} if still_files else {}),
     }

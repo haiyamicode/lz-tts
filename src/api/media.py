@@ -253,24 +253,30 @@ class LipsyncPinnedFrames(BaseModel):
     ``multi_image``: those pins, their images taken in turn from ``image_urls`` (``order``:
     ``round_robin`` 1, 2, 3, 1, ..., or ``random``, seeded by the job's seed, never the same image
     twice running). ``timed_images``: each of ``frames`` at its ``seconds`` and nothing else;
-    boundaries as with ``none``, but a cut with a pin in reach lands on it.
+    boundaries as with ``none``, but a cut with a pin in reach lands on it. ``generate``: the job
+    first renders ``count`` rest stills of the person from its image (imagegen ``rest_frame``
+    stills, each retaken at most ``max_retries`` times on a lost face or open mouth) and pins them
+    like ``multi_image``; the kept stills come back as the result's ``still<k>`` files (PNG), so
+    the lease payload needs ``artifactIds`` for ``still0`` .. ``still<count-1>``.
     """
 
     model_config = {"extra": "forbid"}
 
-    mode: Literal["none", "single_image", "multi_image", "timed_images"] = "none"
+    mode: Literal["none", "single_image", "multi_image", "timed_images", "generate"] = "none"
     image_url: str | None = Field(default=None, min_length=1)
     image_urls: list[str] = Field(default_factory=list, max_length=16)
     order: Literal["round_robin", "random"] | None = None
     frames: list[LipsyncPinnedFrame] = Field(default_factory=list, max_length=100)
+    count: int | None = Field(default=None, ge=2, le=12)
+    max_retries: int | None = Field(default=None, ge=0, le=5)
 
     @model_validator(mode="after")
     def _fields_of_mode(self) -> "LipsyncPinnedFrames":
         given = {"image_url": self.image_url, "image_urls": self.image_urls, "order": self.order,
-                 "frames": self.frames}
+                 "frames": self.frames, "count": self.count, "max_retries": self.max_retries}
         allowed = {"none": (), "single_image": ("image_url",), "multi_image": ("image_urls", "order"),
-                   "timed_images": ("frames",)}[self.mode]
-        extra = [key for key, value in given.items() if value and key not in allowed]
+                   "timed_images": ("frames",), "generate": ("count", "order", "max_retries")}[self.mode]
+        extra = [key for key, value in given.items() if value not in (None, "", []) and key not in allowed]
         if extra:
             raise ValueError(f"pinned_frames mode {self.mode} takes no {', '.join(extra)}")
         if self.mode == "multi_image" and len(self.image_urls) < 2:
@@ -301,8 +307,10 @@ class ImagegenRequest(BaseModel):
     ``rest_frame`` ``k`` (no ``prompt``, exactly one image, the person): rest still ``k`` of them for
     lipsync ``pinned_frames`` ``multi_image`` (vigen's avatar stills, ``h3/rest_stills.py``): same shot a
     few seconds later in a pause, hands at rest, mouth closed, eyes on the lens, head/posture variation
-    ``k % 6``; rendered on ``seed + k`` (an open mouth retaken on ``+100``, ``+200``); delivered at the
-    image's size, long side <= 2048, unless ``width``/``height`` are given. Fan out ``k = 0..n-1`` on one seed.
+    ``k % 6``; rendered on ``seed + k``. A take that lost the person's face (ArcFace) or opened the mouth is
+    retaken on ``+100``, ``+200``, ... at most ``max_retries`` (0..5, default 2) times; when no take keeps the
+    face the job fails. Delivered at the image's size, long side <= 2048, unless ``width``/``height`` are
+    given. Fan out ``k = 0..n-1`` on one seed.
     """
 
     model_config = {"extra": "forbid"}
@@ -314,6 +322,7 @@ class ImagegenRequest(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
     preset: H3VideoPreset = "standard"
     rest_frame: int | None = Field(default=None, ge=0, le=1000)
+    max_retries: int | None = Field(default=None, ge=0, le=5)
 
     @model_validator(mode="after")
     def _size_pair(self) -> "ImagegenRequest":
@@ -323,6 +332,8 @@ class ImagegenRequest(BaseModel):
             raise ValueError("prompt is required (only rest_frame writes its own)")
         if self.rest_frame is not None and self.prompt is not None:
             raise ValueError("rest_frame writes its own prompt; send no prompt")
+        if self.max_retries is not None and self.rest_frame is None:
+            raise ValueError("max_retries goes with rest_frame")
         if self.rest_frame is not None and len(self.image_urls) != 1:
             raise ValueError("rest_frame takes exactly one image_urls entry (the person)")
         return self

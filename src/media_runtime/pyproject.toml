@@ -66,6 +66,7 @@ dependencies = [
     "yarl>=1.18.0",
     "vector-quantize-pytorch>=1.27.15",
     "mediapipe>=1.2.3",
+    "onnxruntime>=1.26.0",
 ]
 
 [tool.uv]

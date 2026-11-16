@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from h3.lipsync import (
+    GENERATED_IMAGE,
     INPUT_IMAGE,
     RESTORED_IMAGE,
     FramePin,
@@ -76,6 +77,18 @@ def test_multi_image_random_is_seeded_and_never_repeats_an_image_twice_running()
     assert set(picks) == set(payload["image_urls"])
 
 
+def test_generate_pins_its_stills_like_multi_image():
+    settings = PinSettings.from_payload({"mode": "generate", "count": 4, "order": "random", "max_retries": 0})
+    assert settings.images == tuple(f"{GENERATED_IMAGE}{k}" for k in range(4))
+    assert (settings.order, settings.max_retries, settings.urls) == ("random", 0, [])
+    _, single = _plan(PinSettings.from_payload({"mode": "single_image"}))
+    _, anchors = _plan(settings, seed=7)
+    assert [a.frame for a in anchors] == [a.frame for a in single]
+    assert {a.image for a in anchors[1:]} == set(settings.images)
+    default = PinSettings.from_payload({"mode": "generate"})
+    assert (len(default.images), default.order, default.max_retries) == (6, "round_robin", 2)
+
+
 def test_timed_images_pin_only_the_callers_frames_and_cuts_land_on_them():
     # 7.0 s and 16.0 s are mid-speech (the quiet gaps are 1.7-2.0 s into every 2 s): the quietest cut
     # would be in a gap, but a cut in reach of a pin goes onto it.
@@ -134,6 +147,11 @@ def test_timed_images_reject_two_pins_on_one_frame_and_a_clash_with_a_pinned_chu
     ({"mode": "multi_image", "image_urls": ["a", "b"], "order": "shuffle"}, "order must be"),
     ({"mode": "timed_images"}, "1 to 100"),
     ({"mode": "timed_images", "frames": [{"image_url": "a", "seconds": 1}], "order": "random"}, "takes no order"),
+    ({"mode": "generate", "count": 1}, "count of 2 to 12"),
+    ({"mode": "generate", "count": 13}, "count of 2 to 12"),
+    ({"mode": "generate", "max_retries": 6}, "max_retries"),
+    ({"mode": "generate", "image_urls": ["a", "b"]}, "takes no image_urls"),
+    ({"mode": "multi_image", "image_urls": ["a", "b"], "count": 3}, "takes no count"),
 ])
 def test_pin_settings_reject_what_their_mode_does_not_take(payload, error):
     with pytest.raises(ValueError, match=error):

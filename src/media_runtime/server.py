@@ -18,7 +18,7 @@ generate  -> {"path", "seed", "mode": "prompt" | "clone"}
            "abc_sampling"?, "semantic_sampling"?, "reference_path"?, "output_dir"}
 videogen  -> {"path", "seed", "item", "metrics", "last_frame_path"?}
     body: {"job_id", "payload": h3.videogen payload, "output_dir"}
-lipsync   -> {"path", "seed", "item", "metrics"}
+lipsync   -> {"path", "seed", "item", "metrics", "files"?: {"still<k>": path}}
     body: {"job_id", "payload": h3.lipsync payload, "output_dir"}
 imagegen  -> {"path", "seed", "item", "metrics"}  (a PNG)
     body: {"job_id", "payload": h3.imagegen payload, "output_dir"}
@@ -156,6 +156,11 @@ def _run_h3(feature: str, body: H3Body) -> dict[str, Any]:
                 # A continuable videogen clip's restored last frame: the next job opens on it.
                 last_frame = output_dir / f"{feature}-{result['seed']}-last-frame{Path(result['last_frame_path']).suffix}"
                 shutil.move(result["last_frame_path"], last_frame)
+            # Further result files by name (a generate lipsync's rest stills), out of the job's scratch.
+            files = {}
+            for name, path in (result.get("files") or {}).items():
+                files[name] = str(output_dir / f"{feature}-{result['seed']}-{name}{Path(path).suffix}")
+                shutil.move(path, files[name])
         except (ValueError, FileNotFoundError) as exc:
             # Bad payload or an input that could not be fetched / read.
             raise RequestError(str(exc)) from exc
@@ -167,6 +172,7 @@ def _run_h3(feature: str, body: H3Body) -> dict[str, Any]:
         "item": result["item"],
         "metrics": result["metrics"],
         **({"last_frame_path": str(last_frame)} if last_frame else {}),
+        **({"files": files} if files else {}),
     }
 
 
@@ -217,8 +223,11 @@ def _check_h3_assets(features: list[str]) -> None:
     missing = [str(path) for path in (comfy_root / "models" / "loras" / name for name in sorted(lora_names)) if not path.exists()]
     if missing:
         raise FileNotFoundError("H3 preset LoRAs are missing: " + ", ".join(missing))
-    if "imagegen" in features and not compat.FACE_LANDMARKER_PATH.exists():
-        raise FileNotFoundError(f"the rest_frame face landmarker is missing: {compat.FACE_LANDMARKER_PATH}")
+    # Rest stills (imagegen rest_frame, lipsync pinned_frames generate) check the face of every take.
+    if "imagegen" in features or "lipsync" in features:
+        for path in (compat.FACE_LANDMARKER_PATH, compat.FACE_IDENTITY_PATH):
+            if not path.exists():
+                raise FileNotFoundError(f"the rest still face model is missing: {path}")
     if ("videogen" in features or "lipsync" in features) and not compat.SPAN_UPSCALE_MODEL_PATH.exists():
         raise FileNotFoundError(f"the SPAN upscale model is missing: {compat.SPAN_UPSCALE_MODEL_PATH}")
     if "lipsync" in features:
