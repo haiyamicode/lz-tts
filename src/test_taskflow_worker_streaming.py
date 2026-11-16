@@ -9,7 +9,10 @@ from .taskflow_worker import (
     ProtocolError,
     SynthesisAckClient,
     TaskflowWorker,
+    TASK_TYPES,
+    TaskGroup,
     _pull_leases,
+    task_groups,
     _SegmentUploads,
 )
 
@@ -103,16 +106,51 @@ def test_lost_lease_is_not_retried_whole():
 def test_pull_fills_free_slots_only():
     taskflow = FakeTaskflow()
     taskflow.concurrency, taskflow.low_priority_batch_size = 8, 3
+    taskflow.task_types = ("tts-synthesis", "voice-design")
 
     async def run():
-        await _pull_leases(taskflow, busy=2, background=0)
-        await _pull_leases(taskflow, busy=5, background=3)
-        assert await _pull_leases(taskflow, busy=8, background=0) == []
+        await _pull_leases(taskflow, {"tts-synthesis": 2}, background=0)
+        await _pull_leases(taskflow, {"tts-synthesis": 3, "voice-design": 2}, background=3)
+        assert await _pull_leases(taskflow, {"tts-synthesis": 8}, background=0) is None
 
     asyncio.run(run())
+    types = ("tts-synthesis", "voice-design")
     assert taskflow.pulls == [
-        {"max_tasks": 6, "priority_bands": [{"below": 0, "maxTasks": 3}]},
-        {"max_tasks": 3, "min_priority": 0},
+        {"max_tasks": 6, "priority_bands": [{"below": 0, "maxTasks": 3}], "task_types": types},
+        {"max_tasks": 3, "min_priority": 0, "task_types": types},
+    ]
+
+
+def test_only_voxcpm_types_run_several_at_once():
+    groups = task_groups(TASK_TYPES, 8)
+    assert {g.task_types: g.concurrency for g in groups} == {
+        ("tts-synthesis", "voice-design"): 8,
+        ("generate-music", "videogen", "lipsync", "imagegen"): 1,
+        **{(t,): 1 for t in ("voice-enhance", "nudity-detect", "face-detect", "language-detect",
+                             "transcribe", "force-align")},
+    }
+    # Only served types, and no empty groups.
+    assert task_groups(("transcribe", "lipsync"), 8) == (TaskGroup(("lipsync",), 1), TaskGroup(("transcribe",), 1))
+
+
+def test_pull_skips_full_groups():
+    taskflow = FakeTaskflow()
+    taskflow.concurrency, taskflow.low_priority_batch_size = 8, 3
+    taskflow.task_types = ("tts-synthesis", "voice-design", "transcribe", "videogen", "lipsync")
+    taskflow.pull_task_types = ("tts-synthesis", "transcribe", "videogen", "lipsync")  # on-demand narrowing
+
+    async def run():
+        # A lipsync running fills the media group; one transcribe fills its own.
+        await _pull_leases(taskflow, {"lipsync": 1, "transcribe": 1, "tts-synthesis": 2}, background=0)
+        # Only one-at-a-time types ready: no more than their free slots.
+        taskflow.pull_task_types = ("transcribe", "videogen")
+        await _pull_leases(taskflow, {}, background=0)
+        assert await _pull_leases(taskflow, {"transcribe": 1, "videogen": 1}, background=0) is None
+
+    asyncio.run(run())
+    assert [(pull["task_types"], pull["max_tasks"]) for pull in taskflow.pulls] == [
+        (("tts-synthesis",), 4),  # 6 free VoxCPM slots, but 4 left under the box concurrency
+        (("transcribe", "videogen"), 2),
     ]
 
 

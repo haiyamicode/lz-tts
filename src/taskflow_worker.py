@@ -13,7 +13,8 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections import Counter
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,47 @@ _TYPE_ENGINES = {
     "transcribe": ("transcribe",),
     **{task_type: ("media",) for task_type in _MEDIA_TASK_TYPES},
 }
+
+
+# Leases a worker runs at once, per group of task types (Taskflow join ``capabilities.taskGroups``).
+# Only VoxCPM work batches (nano-vLLM batches across the leases in flight), so its two types share
+# the box concurrency (TASKFLOW_WORKER_CONCURRENCY). The media types share one GPU lock in the
+# media runtime, so one at a time between them. Every other type is a single call that gains
+# nothing from company: one at a time each.
+_BATCHED_TASK_TYPES = ("tts-synthesis", "voice-design")
+
+
+@dataclass(frozen=True)
+class TaskGroup:
+    task_types: tuple[str, ...]
+    concurrency: int
+
+
+def task_groups(task_types: tuple[str, ...], concurrency: int) -> tuple[TaskGroup, ...]:
+    """The groups of the served ``task_types``; types outside the batched and media groups run alone."""
+    shared = (
+        TaskGroup(tuple(t for t in _BATCHED_TASK_TYPES if t in task_types), concurrency),
+        TaskGroup(tuple(t for t in _MEDIA_TASK_TYPES if t in task_types), 1),
+    )
+    grouped = {t for group in shared for t in group.task_types}
+    alone = tuple(TaskGroup((t,), 1) for t in task_types if t not in grouped)
+    return tuple(group for group in (*shared, *alone) if group.task_types)
+
+
+def open_task_types(
+    groups: tuple[TaskGroup, ...], in_flight: Mapping[str, int], task_types: tuple[str, ...]
+) -> tuple[tuple[str, ...], int]:
+    """The ``task_types`` whose group has a free slot beside the leases ``in_flight`` (by type),
+    and how many leases those free slots take together."""
+    open_types: set[str] = set()
+    room = 0
+    for group in groups:
+        free = group.concurrency - sum(in_flight.get(t, 0) for t in group.task_types)
+        wanted = [t for t in group.task_types if t in task_types]
+        if free > 0 and wanted:
+            open_types.update(wanted)
+            room += free
+    return tuple(t for t in task_types if t in open_types), room
 
 
 def ready_task_types(task_types: tuple[str, ...], deferred: frozenset[str]) -> tuple[str, ...]:
@@ -245,6 +287,10 @@ class TaskflowWorker:
         self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
 
     @property
+    def task_groups(self) -> tuple[TaskGroup, ...]:
+        return task_groups(self.task_types, self.concurrency)
+
+    @property
     def client(self) -> httpx.AsyncClient:
         return self._client
 
@@ -311,6 +357,11 @@ class TaskflowWorker:
                 "capabilities": {
                     "taskTypes": list(self.task_types),
                     "concurrency": self.concurrency,
+                    # A Taskflow server without per-group limits ignores this.
+                    "taskGroups": [
+                        {"taskTypes": list(group.task_types), "concurrency": group.concurrency}
+                        for group in self.task_groups
+                    ],
                 },
             },
         )
@@ -374,13 +425,16 @@ class TaskflowWorker:
         wait_ms: int = 1000,
         min_priority: int | None = None,
         priority_bands: list[dict[str, int]] | None = None,
+        task_types: tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         if not self.session_token:
             raise ProtocolError("Worker has not joined Taskflow")
+        if task_types is None:
+            task_types = self.task_types if self.pull_task_types is None else self.pull_task_types
         body: dict[str, Any] = {
             "maxTasks": max_tasks or self.concurrency,
             "waitMs": wait_ms,
-            "taskTypes": list(self.task_types if self.pull_task_types is None else self.pull_task_types),
+            "taskTypes": list(task_types),
         }
         # A Taskflow server older than these pull filters ignores them.
         if min_priority is not None:
@@ -1318,24 +1372,28 @@ def _update_pull_task_types(taskflow: TaskflowWorker) -> None:
 
 
 async def _pull_leases(
-    taskflow: TaskflowWorker, busy: int, background: int
-) -> list[dict[str, Any]]:
-    """Pull what fits beside the ``busy`` leases in flight (``background`` of them
-    negative-priority).
+    taskflow: TaskflowWorker, in_flight: Mapping[str, int], background: int
+) -> list[dict[str, Any]] | None:
+    """Pull what fits beside the leases in flight (counted by task type, ``background`` of
+    them negative-priority); None when nothing fits, so nothing was asked for.
 
-    Taskflow's highest-priority ready task picks the band for the whole pull.
-    Negative priority (background work) only runs when nothing >= 0 is ready,
-    and never more than ``low_priority_batch_size`` at once.
+    Only the types whose group (``task_groups``) has a free slot are asked for, at most as
+    many as those slots and the box concurrency take. Taskflow's highest-priority ready task
+    picks the band for the whole pull. Negative priority (background work) only runs when
+    nothing >= 0 is ready, and never more than ``low_priority_batch_size`` at once.
     """
-    free = taskflow.concurrency - busy
+    ready = taskflow.task_types if taskflow.pull_task_types is None else taskflow.pull_task_types
+    task_types, room = open_task_types(taskflow.task_groups, in_flight, ready)
+    free = min(taskflow.concurrency - sum(in_flight.values()), room)
     if free <= 0:
-        return []
+        return None
     background_room = taskflow.low_priority_batch_size - background
     if background_room <= 0:
-        return await taskflow.pull(max_tasks=free, min_priority=0)
+        return await taskflow.pull(max_tasks=free, min_priority=0, task_types=task_types)
     return await taskflow.pull(
         max_tasks=free,
         priority_bands=[{"below": 0, "maxTasks": min(free, background_room)}],
+        task_types=task_types,
     )
 
 
@@ -1393,8 +1451,8 @@ async def _serve_taskflow(
             heartbeat_task: asyncio.Task[None] | None = None
             reason = "taskflow connection lost"
             reconnect = True
-            # Leases in flight -> (1, 1 if negative-priority else 0).
-            running: dict[asyncio.Task[None], tuple[int, int]] = {}
+            # Leases in flight -> (task type, 1 if negative-priority else 0).
+            running: dict[asyncio.Task[None], tuple[str, int]] = {}
             try:
                 if taskflow.session_token:
                     await taskflow.heartbeat()
@@ -1422,22 +1480,27 @@ async def _serve_taskflow(
                             reason = f"inference runtime failed: {error}"
                             set_status("error", reason=reason)
                             raise error
-                    busy = sum(count for count, _ in running.values())
+                    in_flight = Counter(task_type for task_type, _ in running.values())
                     background = sum(count for _, count in running.values())
                     _update_pull_task_types(taskflow)
-                    leases = await _pull_leases(taskflow, busy, background)
+                    leases = await _pull_leases(taskflow, in_flight, background)
+                    if leases is None:
+                        # Every group with work to pull is full: wait for a lease to finish.
+                        if running:
+                            await asyncio.wait(
+                                running, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
+                            )
+                        else:
+                            await asyncio.sleep(1.0)
+                        continue
                     if taskflow.pull_sticky:
                         # Nothing ready for the loaded engines: let the next pull take any type.
-                        taskflow.sticky_missed = not leases and busy < taskflow.concurrency
+                        taskflow.sticky_missed = not leases
                     for lease in leases:
                         task = asyncio.create_task(
                             _process_lease(taskflow, inference, lease, acks)
                         )
-                        running[task] = (1, int(lease.get("priority", 0) < 0))
-                    if not leases and busy >= taskflow.concurrency:
-                        await asyncio.wait(
-                            running, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
-                        )
+                        running[task] = (lease.get("type", "unknown"), int(lease.get("priority", 0) < 0))
             except ProtocolError as error:
                 if error.loses_lease:
                     # A lease-level rejection (cancelled run, expired lease) says
