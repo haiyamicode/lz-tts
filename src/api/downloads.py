@@ -15,6 +15,8 @@ import httpx
 
 #: A voice reference is one clean take of someone speaking; nothing that long needs more.
 MAX_REFERENCE_BYTES = 30 * 1024 * 1024
+#: An image to look at or audio to read: generous for either, and a bound where there was none.
+MAX_MEDIA_BYTES = 100 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 60.0
 
 CHUNK_BYTES = 1 << 20

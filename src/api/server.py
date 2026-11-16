@@ -21,7 +21,6 @@ import uuid
 import threading
 import time
 import contextvars
-import httpx
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -60,7 +59,13 @@ from .audio_adjustments import AudioEffect, adjust_audio
 from .take_stream import OrderedChunkAudio, StreamingMp3Encoder
 from .locale_utils import normalize_locale as _normalize_locale_with_region
 from .model_workers import speech_worker_main, transcribe_worker_main
-from .downloads import MAX_REFERENCE_BYTES, DownloadError, fetch_bytes, fetch_to_file
+from .downloads import (
+    MAX_MEDIA_BYTES,
+    MAX_REFERENCE_BYTES,
+    DownloadError,
+    fetch_bytes,
+    fetch_to_file,
+)
 from .media import (
     ImagegenRequest,
     LipsyncRequest,
@@ -4558,6 +4563,14 @@ async def _fetch_reference_file(reference_url: str, dest: Path) -> Path:
         raise InferenceOperationError(400, str(exc)) from exc
 
 
+async def _fetch_media_bytes(url: str, url_name: str) -> bytes:
+    """An image to look at or audio to read, for the models that take the bytes themselves."""
+    try:
+        return await fetch_bytes(url, MAX_MEDIA_BYTES, url_name=url_name)
+    except DownloadError as exc:
+        raise InferenceOperationError(400, str(exc)) from exc
+
+
 def _voxcpm_reference_format(reference_url: str) -> str:
     return Path(urlsplit(reference_url).path).suffix.lower().lstrip(".") or "wav"
 
@@ -6738,10 +6751,8 @@ class LzTtsInferenceSession:
         if request.image_base64:
             return base64.b64decode(request.image_base64)
         if request.image_url:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-                response = await client.get(request.image_url)
-                response.raise_for_status()
-            return response.content
+            # The detector reads these bytes, so they are held — but only up to a size.
+            return await _fetch_media_bytes(request.image_url, "image_url")
         raise InferenceOperationError(400, "Provide 'image_url' or 'image_base64'")
 
     async def _detect_nudity(self, request_data: dict[str, Any]) -> InferenceResult:
@@ -6761,10 +6772,7 @@ class LzTtsInferenceSession:
         if request.audio_base64:
             audio = base64.b64decode(request.audio_base64)
         elif request.audio_url:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-                response = await client.get(request.audio_url)
-                response.raise_for_status()
-            audio = response.content
+            audio = await _fetch_media_bytes(request.audio_url, "audio_url")
         else:
             raise InferenceOperationError(400, "Provide 'audio_url' or 'audio_base64'")
         data = await asyncio.to_thread(self.language_identifier.identify, audio, request.top_k)
@@ -6779,10 +6787,8 @@ class LzTtsInferenceSession:
             except ValueError as exc:
                 raise TranscribeInputError("audio_base64 is not valid base64") from exc
         elif request.audio_url:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-                response = await client.get(request.audio_url)
-                response.raise_for_status()
-            audio_bytes = response.content
+            # The decoder reads these bytes, so they are held — but only up to a size.
+            audio_bytes = await _fetch_media_bytes(request.audio_url, "audio_url")
         else:
             raise InferenceOperationError(400, "Provide 'audio_url' or 'audio_base64'")
         return await asyncio.to_thread(decode_transcribe_audio, audio_bytes)
