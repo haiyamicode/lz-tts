@@ -479,7 +479,11 @@ def test_non_english_voxcpm_ipa_keeps_native_visible_text_as_guide(
     language: str,
     ssml: str,
     visible_text: str,
+    monkeypatch,
 ) -> None:
+    # The adapter path: without the IPA-text LoRA the visible text is the guide. Said here rather
+    # than taken from local/server.json, which has the LoRA on and writes /ipa/ instead.
+    monkeypatch.setattr(server._server_config.voxcpm, "ipa_text_lora", None)
     document = parse_ssml(ssml)
 
     controlled_text, detected_language, controls = _prepare_voxcpm_ipa_text(

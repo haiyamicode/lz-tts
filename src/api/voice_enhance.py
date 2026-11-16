@@ -35,17 +35,24 @@ class VoiceEnhancer:
                 f"Voice enhancement command failed ({command[0]}): {stderr[-2000:]}"
             ) from exc
 
-    def enhance(self, input_audio: bytes) -> bytes:
-        if not input_audio:
+    def workspace(self) -> tempfile.TemporaryDirectory:
+        """Where the sample is fetched and worked on; it goes when the enhancement is done."""
+        return tempfile.TemporaryDirectory(prefix="voice-enhance-", dir=self.temp_dir)
+
+    def enhance(self, raw_path: Path) -> bytes:
+        """The normalized 320 kbps MP3 of the sample at ``raw_path`` — at most two minutes of it.
+
+        The sample is read by ffmpeg from where it was fetched; only the enhanced take comes back
+        as bytes, because that is what the language identifier reads and what the task returns.
+        """
+        if not raw_path.is_file() or not raw_path.stat().st_size:
             raise ValueError("Voice enhancement input is empty")
 
         with tempfile.TemporaryDirectory(prefix="voice-enhance-", dir=self.temp_dir) as workspace:
             workspace_path = Path(workspace)
-            raw_path = workspace_path / "sample_raw.input"
             wav_path = workspace_path / "sample_raw.wav"
             normalized_path = workspace_path / "sample.wav"
             output_path = workspace_path / "sample.mp3"
-            raw_path.write_bytes(input_audio)
 
             self._run(["ffmpeg", "-i", str(raw_path), "-t", "120", str(wav_path), "-y"])
             self._run(

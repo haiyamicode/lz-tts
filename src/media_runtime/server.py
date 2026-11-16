@@ -1,9 +1,10 @@
-"""Media runtime: a localhost HTTP process for the music, videogen, lipsync and imagegen tasks.
+"""Media runtime: the child process that runs the music, videogen, lipsync and imagegen tasks.
 
 Runs from its own venv (src/media_runtime/.venv, Python 3.11, torch 2.14, cu130) so the
-YuE2, YingMusic and ComfyUI/H3 dependencies stay apart from lzai. The lzai API
-starts it as a child with ``python server.py --port N --features ...``, polls
-GET /health until it reports ``ok``, and sends one POST per task.
+YuE2, YingMusic and ComfyUI/H3 dependencies stay apart from lzai — the one reason this is a
+process of its own and not a worker thread. The lzai API spawns it with a channel of two pipes
+(``channel.py``), waits for the ``state`` message its models are loaded, and sends one request
+per task. Nothing listens on a port; the channel ends with either process.
 
 One model group holds the GPU at a time: YuE2 ("song"), BS-RoFormer +
 YingMusic-SVC ("voice"), or H3 (the retained ComfyUI executor + the helper
@@ -11,15 +12,15 @@ models its jobs keep: ZipEnhancer, CTC, SyncNet/S3FD, glitch, RIFE). Videogen,
 lipsync and imagegen share the H3 group, so nothing unloads between them; only
 a music job releases it. Requests run one at a time.
 
-GET  /health    -> {"status": "starting" | "ok" | "error", "reason": str, "features": [...]}
-POST /generate  -> {"path", "seed", "mode": "prompt" | "clone"}
+state (sent, not asked for) -> {"status": "starting" | "ok" | "error", "reason": str, "features": [...]}
+generate  -> {"path", "seed", "mode": "prompt" | "clone"}
     body: {"style", "lyrics", "cot"?, "cfg_scale"?, "seed"?, "abc"?, "ode_steps"?,
            "abc_sampling"?, "semantic_sampling"?, "reference_path"?, "output_dir"}
-POST /videogen  -> {"path", "seed", "item", "metrics", "last_frame_path"?}
+videogen  -> {"path", "seed", "item", "metrics", "last_frame_path"?}
     body: {"job_id", "payload": h3.videogen payload, "output_dir"}
-POST /lipsync   -> {"path", "seed", "item", "metrics"}
+lipsync   -> {"path", "seed", "item", "metrics"}
     body: {"job_id", "payload": h3.lipsync payload, "output_dir"}
-POST /imagegen  -> {"path", "seed", "item", "metrics"}  (a PNG)
+imagegen  -> {"path", "seed", "item", "metrics"}  (a PNG)
     body: {"job_id", "payload": h3.imagegen payload, "output_dir"}
 """
 
@@ -31,17 +32,16 @@ import threading
 from pathlib import Path
 from typing import Any
 
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
+import channel
 import paths  # noqa: F401  (sets the offline Hugging Face cache before model imports)
 import progress
+from channel import RequestError
 
 FEATURES = ("music", "videogen", "lipsync", "imagegen")
 H3_FEATURES = ("videogen", "lipsync", "imagegen")
 
-app = FastAPI(title="lzai media runtime")
 _state: dict = {"status": "starting", "reason": "loading models", "features": []}
 _pipeline = None  # MusicPipeline when music is enabled
 _gpu_lock = threading.Lock()
@@ -70,16 +70,11 @@ class H3Body(BaseModel):
     output_dir: str
 
 
-@app.get("/health")
-def health():
-    return dict(_state)
-
-
 def _require(feature: str) -> None:
     if feature not in _state["features"]:
-        raise HTTPException(status_code=404, detail=f"{feature} is not enabled in this runtime")
+        raise RequestError(f"{feature} is not enabled in this runtime")
     if _state["status"] != "ok":
-        raise HTTPException(status_code=503, detail=_state["reason"])
+        raise RequestError(_state["reason"], kind="runtime")
 
 
 def _release_h3() -> None:
@@ -105,8 +100,7 @@ def _release_h3() -> None:
         _h3_resident = False
 
 
-@app.post("/generate")
-def generate(body: GenerateBody):
+def generate(body: GenerateBody) -> dict[str, Any]:
     _require("music")
     from song import SongRequest
 
@@ -114,7 +108,7 @@ def generate(body: GenerateBody):
     if body.reference_path is not None:
         reference = Path(body.reference_path)
         if not reference.is_file():
-            raise HTTPException(status_code=400, detail="reference_path is not a file")
+            raise RequestError("reference_path is not a file")
     request = SongRequest(
         style=body.style,
         lyrics=body.lyrics,
@@ -131,7 +125,7 @@ def generate(body: GenerateBody):
         try:
             result = _pipeline.render(request, Path(body.output_dir), reference_path=reference)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise RequestError(str(exc)) from exc
     return {"path": str(result.path), "seed": result.seed, "mode": result.mode}
 
 
@@ -164,7 +158,7 @@ def _run_h3(feature: str, body: H3Body) -> dict[str, Any]:
                 shutil.move(result["last_frame_path"], last_frame)
         except (ValueError, FileNotFoundError) as exc:
             # Bad payload or an input that could not be fetched / read.
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise RequestError(str(exc)) from exc
         finally:
             shutil.rmtree(job_dir(body.job_id), ignore_errors=True)
     return {
@@ -176,19 +170,25 @@ def _run_h3(feature: str, body: H3Body) -> dict[str, Any]:
     }
 
 
-@app.post("/videogen")
-def videogen(body: H3Body):
-    return _run_h3("videogen", body)
+def _operation(model: type[BaseModel], run) -> channel.Operation:
+    """One operation of the channel: its body validated, then run."""
+
+    def operation(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            validated = model.model_validate(body)
+        except ValidationError as error:
+            raise RequestError(str(error)) from error
+        return run(validated)
+
+    return operation
 
 
-@app.post("/lipsync")
-def lipsync(body: H3Body):
-    return _run_h3("lipsync", body)
-
-
-@app.post("/imagegen")
-def imagegen(body: H3Body):
-    return _run_h3("imagegen", body)
+OPERATIONS: dict[str, channel.Operation] = {
+    "generate": _operation(GenerateBody, generate),
+    "videogen": _operation(H3Body, lambda body: _run_h3("videogen", body)),
+    "lipsync": _operation(H3Body, lambda body: _run_h3("lipsync", body)),
+    "imagegen": _operation(H3Body, lambda body: _run_h3("imagegen", body)),
+}
 
 
 def _check_h3_assets(features: list[str]) -> None:
@@ -244,16 +244,16 @@ def _load(features: list[str], device: str, fp16: bool) -> None:
 
             _pipeline = MusicPipeline(device=device, fp16=fp16)
             _pipeline.load()
-    except Exception as exc:  # reported through /health, never silently dropped
+    except Exception as exc:  # told to the parent, never silently dropped
         _state.update(status="error", reason=f"model load failed: {exc}")
+        channel.send({"state": dict(_state)})
         return
     _state.update(status="ok", reason="ready")
+    channel.send({"state": dict(_state)})
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--device", default="cuda:0", help="needs bf16 (Ampere or newer) for YuE2 and H3")
     parser.add_argument("--no-fp16", dest="fp16", action="store_false")
     parser.add_argument("--features", default=",".join(FEATURES), help="comma list of " + ", ".join(FEATURES))
@@ -265,8 +265,10 @@ def main() -> None:
     if unknown or not features:
         parser.error(f"--features takes a non-empty subset of {FEATURES}, got {args.features!r}")
     _state["features"] = features
+    # The channel first: a load that finishes before the first request still has somewhere to report.
+    channel.connect()
     threading.Thread(target=_load, args=(features, args.device, args.fp16), daemon=True).start()
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    channel.serve(OPERATIONS)
 
 
 if __name__ == "__main__":

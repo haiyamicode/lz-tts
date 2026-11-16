@@ -11,7 +11,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-import httpx
 import numpy as np
 from pydantic import BaseModel, Field
 
@@ -23,6 +22,7 @@ from .audio_utils import (
     _safe_file_stem,
     _temporary_cwd,
 )
+from .downloads import MAX_REFERENCE_BYTES, fetch_to_file
 
 _LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -247,11 +247,10 @@ class SeedVCBackend:
         if not request.reference_url:
             raise ValueError(f"No cached sample for voice {request.id!r} and no reference_url provided")
         _LOGGER.info("Fetching Seed-VC reference sample: id=%s url=%s", request.id, request.reference_url)
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            resp = await client.get(request.reference_url)
-            resp.raise_for_status()
-            sample_path.write_bytes(resp.content)
-        return sample_path
+        # Straight to the cache file it is read from later; nothing here reads the sample's bytes.
+        return await fetch_to_file(
+            request.reference_url, sample_path, MAX_REFERENCE_BYTES, url_name="reference_url"
+        )
 
     @staticmethod
     def _embedding_key(voice_id: str, style: str, intensity: float) -> str:

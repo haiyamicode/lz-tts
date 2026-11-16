@@ -1,12 +1,11 @@
 """Where the job being rendered has got to, told to the process that launched this runtime.
 
-A render holds the GPU for minutes, and a long lipsync for an hour or more; until its POST answers,
-nothing at all reaches the person waiting for it. Each chunk finished is written as one line to the
-pipe the parent opened before it spawned us (``LZAI_PROGRESS_FD``), and the parent hands it to the
-lease's own sink and on to LazyBird. A giant job is then visibly moving rather than apparently
-stuck.
+A render holds the GPU for minutes, and a long lipsync for an hour or more; until its reply goes
+back, nothing at all reaches the person waiting for it. Each chunk finished is sent up the channel
+the parent spawned us with (``channel.py``) as a message answering nothing, and the parent hands it
+to the lease's own sink and on to LazyBird. A giant job is then visibly moving rather than
+apparently stuck.
 
-The pipe is the parent's own: no port, no service, nothing that can be down while the render runs.
 Reports go from a thread of their own, at most one a second, latest wins: a render never waits on
 one, and one that fails is dropped — the progress is only shown, and losing it costs nothing.
 
@@ -16,24 +15,20 @@ One job renders at a time (the runtime's GPU lock), so the job being reported is
 from __future__ import annotations
 
 import contextlib
-import json
-import os
 import threading
 from collections.abc import Iterator
 from typing import Any, Literal
+
+import channel
 
 #: The stages a job is reported in; they are LazyBird's own ``MediaJobStage``.
 Stage = Literal["preparing", "rendering", "finishing"]
 
 #: The least time between two reports of one job, seconds.
 INTERVAL_SECONDS = 1.0
-#: The inherited write end of the parent's progress pipe, as the parent named it.
-PROGRESS_FD_VARIABLE = "LZAI_PROGRESS_FD"
 
 _LOCK = threading.Lock()
 _CURRENT: "_Job | None" = None
-#: Set once the pipe has gone (the parent closed it, or it was never there).
-_closed_pipe = False
 
 
 class _Job:
@@ -78,20 +73,11 @@ class _Job:
 
 
 def _send(job_id: str, stage: Stage, done: int | None, total: int | None) -> None:
-    """Writes one report up the pipe, as a line of JSON. One write, so lines never interleave."""
-    global _closed_pipe  # pylint: disable=global-statement
-    fd = os.environ.get(PROGRESS_FD_VARIABLE)
-    if not fd or _closed_pipe:
-        return
+    """Sends one report to the parent, as a message of the channel that carries the job itself."""
     body: dict[str, Any] = {"jobId": job_id, "stage": stage}
     if done is not None and total is not None:
         body["done"], body["total"] = int(done), int(total)
-    line = f"{json.dumps(body)}\n".encode()
-    try:
-        os.write(int(fd), line)
-    except Exception:  # pylint: disable=broad-exception-caught
-        # The parent is gone or no longer listening; the render carries on without reporting.
-        _closed_pipe = True
+    channel.send({"progress": body})
 
 
 @contextlib.contextmanager

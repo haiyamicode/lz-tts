@@ -2,36 +2,39 @@
 
 YuE2, YingMusic-SVC and ComfyUI/H3 run from their own venv (Python 3.11, torch 2.14, cu130), so
 the runtime cannot be a multiprocessing child like the speech and transcribe workers. The API
-starts it as ``server.py --port N --features ...``, polls GET /health until it reports ``ok``, and
-sends each task as one POST on 127.0.0.1 (/generate, /videogen, /lipsync, /imagegen).
+spawns it with two pipes it opens first — one line of JSON per message — and talks to it over
+those: one request per task (``generate``, ``videogen``, ``lipsync``, ``imagegen``), its reply,
+the state it reports once its models are loaded, and the progress of the job it is rendering.
+Nothing listens on a port; the channel ends when either process does
+(``src/media_runtime/channel.py`` is the other end).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import os
 import signal
 import subprocess
 import threading
-import time
 from pathlib import Path
 from typing import Any, Literal
 
-import httpx
 from pydantic import BaseModel, Field, model_validator
 
 from ..process_guard import exit_with_parent
+from .downloads import MAX_REFERENCE_BYTES, DownloadError, fetch_to_file
 from .job_progress import report as report_progress
 
 _LOGGER = logging.getLogger(__name__)
 
-MAX_REFERENCE_BYTES = 30 * 1024 * 1024
 REFERENCE_TIMEOUT_SECONDS = 60.0
-#: The write end of the progress pipe, as the child reads it (src/media_runtime/progress.py).
-PROGRESS_FD_VARIABLE = "LZAI_PROGRESS_FD"
+#: The inherited pipe ends, as the child reads them (src/media_runtime/channel.py).
+REQUEST_FD_VARIABLE = "LZAI_REQUEST_FD"
+REPLY_FD_VARIABLE = "LZAI_REPLY_FD"
 
 
 class MediaInputError(ValueError):
@@ -292,29 +295,30 @@ class LipsyncRequest(H3Interpolation):
 async def fetch_reference(url: str, dest: Path) -> Path:
     """Download the clone reference to ``dest``; a fetch failure is the caller's bad input."""
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=REFERENCE_TIMEOUT_SECONDS) as client:
-            async with client.stream("GET", url) as response:
-                response.raise_for_status()
-                written = 0
-                with dest.open("wb") as handle:
-                    async for chunk in response.aiter_bytes():
-                        written += len(chunk)
-                        if written > MAX_REFERENCE_BYTES:
-                            raise MediaInputError("reference_url is larger than 30 MB")
-                        handle.write(chunk)
-    except httpx.HTTPError as exc:
-        raise MediaInputError(f"reference_url could not be fetched: {exc}") from exc
-    return dest
+        return await fetch_to_file(
+            url,
+            dest,
+            MAX_REFERENCE_BYTES,
+            url_name="reference_url",
+            timeout_seconds=REFERENCE_TIMEOUT_SECONDS,
+        )
+    except DownloadError as exc:
+        raise MediaInputError(str(exc)) from exc
 
 
 class MediaRuntime:
-    """The media runtime child process and its HTTP client; one instance per API process."""
+    """The media runtime child process and the channel it was spawned with; one per API process.
+
+    A request goes down one pipe and its reply comes back up the other, matched by id. The child
+    answers each on a thread of its own, so a reply never waits behind the render in front of it,
+    and the two messages that answer nothing — the state of its models, the progress of the job
+    it is rendering — arrive on the same pipe.
+    """
 
     def __init__(
         self,
         python: str,
         runtime_dir: str,
-        port: int,
         gpu: str | None,
         ready_timeout_seconds: float,
         features: list[str],
@@ -323,18 +327,22 @@ class MediaRuntime:
         repo_dir = Path(__file__).resolve().parents[2]
         self.python = str(repo_dir / python) if not Path(python).is_absolute() and "/" in python else python
         self.runtime_dir = repo_dir / runtime_dir
-        self.port = port
         self.gpu = gpu
         self.ready_timeout_seconds = ready_timeout_seconds
         self.features = list(features)
         self._process: subprocess.Popen | None = None
         self._start_lock = asyncio.Lock()
-        #: The loop the progress sinks belong to; the pipe is read on a thread of its own.
+        #: The loop the requests and the progress sinks belong to; replies are read on a thread.
         self._loop: asyncio.AbstractEventLoop | None = None
-
-    @property
-    def base_url(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
+        #: The write end of the request pipe, and the lock that keeps two lines from interleaving.
+        self._request_fd: int | None = None
+        self._write_lock = threading.Lock()
+        #: The requests waiting for a reply, by id.
+        self._pending: dict[int, asyncio.Future] = {}
+        self._ids = itertools.count(1)
+        #: What the child last said about its models, and the wait for it to say anything at all.
+        self._state: dict[str, Any] = {"status": "starting", "reason": "spawning"}
+        self._settled: asyncio.Future | None = None
 
     def _start(self) -> None:
         self.stop()
@@ -342,18 +350,16 @@ class MediaRuntime:
         if self.gpu is not None:
             env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
             env["CUDA_VISIBLE_DEVICES"] = self.gpu
-        _LOGGER.info("Starting media runtime on port %s (gpu=%s, features=%s)", self.port, self.gpu, self.features)
-        read_fd, write_fd = os.pipe()
-        env[PROGRESS_FD_VARIABLE] = str(write_fd)
+        _LOGGER.info("Starting media runtime (gpu=%s, features=%s)", self.gpu, self.features)
+        request_read, request_write = os.pipe()
+        reply_read, reply_write = os.pipe()
+        env[REQUEST_FD_VARIABLE] = str(request_read)
+        env[REPLY_FD_VARIABLE] = str(reply_write)
         try:
             self._process = subprocess.Popen(
                 [
                     self.python,
                     "server.py",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(self.port),
                     "--device",
                     "cuda:0",
                     "--features",
@@ -363,85 +369,151 @@ class MediaRuntime:
                 env=env,
                 start_new_session=True,
                 preexec_fn=exit_with_parent,
-                pass_fds=(write_fd,),
+                pass_fds=(request_read, reply_write),
             )
+        except BaseException:
+            os.close(request_write)
+            os.close(reply_read)
+            raise
         finally:
-            # The child holds the only write end now: the pipe ends when it does.
-            os.close(write_fd)
-        self._read_progress(read_fd)
+            # The child holds the ends it was given now: each pipe ends when it does.
+            os.close(request_read)
+            os.close(reply_write)
+        self._request_fd = request_write
+        self._read_replies(reply_read)
 
-    def _read_progress(self, read_fd: int) -> None:
-        """Hands each report the child writes up the pipe to the job it belongs to.
+    def _read_replies(self, reply_fd: int) -> None:
+        """Hands each line the child sends to the loop: a reply, its state, or a job's progress.
 
-        One line of JSON a report, read on a thread of its own and handed to the loop the job is
-        waiting on. The thread ends with the pipe, which ends with the child.
+        Read on a thread of its own, because the pipe blocks between messages. The thread ends
+        with the pipe, which ends with the child.
         """
         loop = self._loop
+        if loop is None:
+            os.close(reply_fd)
+            return
 
         def pump() -> None:
-            with os.fdopen(read_fd, "r", buffering=1) as pipe:
-                for line in pipe:
-                    try:
-                        body = json.loads(line)
-                        job_id, stage = body["jobId"], body["stage"]
-                    except (ValueError, KeyError, TypeError):
-                        continue
-                    try:
-                        loop.call_soon_threadsafe(report_progress, job_id, stage, body.get("done"), body.get("total"))
-                    except RuntimeError:
-                        # The loop is gone, so nobody is waiting on this job any more.
-                        return
+            try:
+                with os.fdopen(reply_fd, "r", buffering=1) as replies:
+                    for line in replies:
+                        try:
+                            message = json.loads(line)
+                        except ValueError:
+                            continue
+                        if not isinstance(message, dict):
+                            continue
+                        try:
+                            loop.call_soon_threadsafe(self._deliver, message)
+                        except RuntimeError:
+                            # The loop is gone, so nobody is waiting on any of this.
+                            return
+            finally:
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(self._channel_closed)
 
-        if loop is None:
-            os.close(read_fd)
+        threading.Thread(target=pump, name="media-runtime-replies", daemon=True).start()
+
+    def _deliver(self, message: dict[str, Any]) -> None:
+        """One message from the child, on the loop."""
+        if "progress" in message:
+            body = message["progress"]
+            if isinstance(body, dict) and "jobId" in body and "stage" in body:
+                report_progress(body["jobId"], body["stage"], body.get("done"), body.get("total"))
             return
-        threading.Thread(target=pump, name=f"media-progress-{self.port}", daemon=True).start()
+        if "state" in message:
+            if isinstance(message["state"], dict):
+                self._state = message["state"]
+            self._settle()
+            return
+        request = self._pending.pop(message.get("id"), None)
+        if request is None or request.done():
+            # Nobody is waiting: the request timed out, or this is a reply to a dead generation.
+            return
+        error = message.get("error")
+        if error:
+            kind = error.get("kind") if isinstance(error, dict) else None
+            text = (error.get("message") if isinstance(error, dict) else str(error)) or "media runtime failed"
+            failure = MediaInputError(text) if kind == "input" else MediaRuntimeError(text)
+            request.set_exception(failure)
+            return
+        result = message.get("result")
+        request.set_result(result if isinstance(result, dict) else {})
+
+    def _channel_closed(self) -> None:
+        """The child's pipe ended: it has exited, and nothing it was asked is coming back."""
+        if self._state.get("status") != "error":
+            self._state = {"status": "error", "reason": "media runtime exited"}
+        self._settle()
+        pending, self._pending = self._pending, {}
+        for request in pending.values():
+            if not request.done():
+                request.set_exception(MediaRuntimeError("media runtime exited"))
+
+    def _settle(self) -> None:
+        """Wakes whoever is waiting for the child to have loaded, or failed to."""
+        if self._settled is not None and not self._settled.done():
+            self._settled.set_result(None)
 
     async def ensure_ready(self) -> None:
         """Start the runtime if it is not running, then wait until its models are loaded."""
         async with self._start_lock:
             if self._process is None or self._process.poll() is not None:
                 self._loop = asyncio.get_running_loop()
+                self._state = {"status": "starting", "reason": "loading models"}
+                self._settled = self._loop.create_future()
                 await asyncio.to_thread(self._start)
-            await self._wait_ready()
-
-    async def _wait_ready(self) -> None:
-        deadline = time.monotonic() + self.ready_timeout_seconds
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=5.0) as client:
-            while True:
-                if self._process is None or self._process.poll() is not None:
-                    raise MediaRuntimeError("media runtime exited before it was ready")
+            settled = self._settled
+            if settled is not None and not settled.done():
                 try:
-                    health = (await client.get("/health")).json()
-                except (httpx.HTTPError, ValueError):
-                    health = {"status": "starting", "reason": "not listening yet"}
-                status = health.get("status")
-                if status == "ok":
-                    return
-                if status == "error":
-                    raise MediaRuntimeError(f"media runtime failed: {health.get('reason')}")
-                if time.monotonic() >= deadline:
-                    raise MediaRuntimeError(f"media runtime not ready after {self.ready_timeout_seconds:.0f} s")
-                await asyncio.sleep(2.0)
+                    await asyncio.wait_for(asyncio.shield(settled), self.ready_timeout_seconds)
+                except asyncio.TimeoutError:
+                    raise MediaRuntimeError(
+                        f"media runtime not ready after {self.ready_timeout_seconds:.0f} s"
+                    ) from None
+            if self._state.get("status") != "ok":
+                raise MediaRuntimeError(f"media runtime failed: {self._state.get('reason')}")
 
-    async def post(self, path: str, body: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
-        """POST one task to the runtime; a 400 is the caller's bad input, anything else a runtime failure."""
+    async def request(self, op: str, body: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+        """Run one task on the runtime and wait for its reply; an ``input`` error is the caller's."""
         await self.ensure_ready()
-        timeout = httpx.Timeout(connect=10.0, read=timeout_seconds, write=60.0, pool=10.0)
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=timeout) as client:
+        loop = asyncio.get_running_loop()
+        request_id = next(self._ids)
+        reply: asyncio.Future = loop.create_future()
+        self._pending[request_id] = reply
+        try:
+            await asyncio.to_thread(self._send, {"id": request_id, "op": op, "body": body})
+            return await asyncio.wait_for(asyncio.shield(reply), timeout_seconds)
+        except asyncio.TimeoutError:
+            raise MediaRuntimeError(f"media runtime {op} timed out after {timeout_seconds:.0f} s") from None
+        finally:
+            self._pending.pop(request_id, None)
+
+    def _send(self, message: dict[str, Any]) -> None:
+        """Writes one request down the pipe, under the lock so two lines never interleave.
+
+        A write to a pipe is whole only up to ``PIPE_BUF``, and a lipsync request carries its
+        transcript and its instructions, so the rest of a long line is written in the loop.
+        """
+        fd = self._request_fd
+        if fd is None:
+            raise MediaRuntimeError("media runtime is not running")
+        line = memoryview(f"{json.dumps(message)}\n".encode())
+        with self._write_lock:
             try:
-                response = await client.post(path, json=body)
-            except httpx.HTTPError as exc:
-                raise MediaRuntimeError(f"media runtime request failed: {exc}") from exc
-        if response.status_code == 400:
-            raise MediaInputError(str(response.json().get("detail", "invalid media request")))
-        if response.status_code >= 400:
-            raise MediaRuntimeError(f"media runtime returned {response.status_code}: {response.text[:500]}")
-        return response.json()
+                while line:
+                    line = line[os.write(fd, line) :]
+            except OSError as exc:
+                raise MediaRuntimeError(f"media runtime request could not be sent: {exc}") from exc
 
     def stop(self) -> None:
         process = self._process
         self._process = None
+        fd, self._request_fd = self._request_fd, None
+        if fd is not None:
+            # Closing the request pipe is how the child is told there is no more work.
+            with contextlib.suppress(OSError):
+                os.close(fd)
         if process is None or process.poll() is not None:
             return
         with contextlib.suppress(ProcessLookupError):

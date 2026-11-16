@@ -60,6 +60,7 @@ from .audio_adjustments import AudioEffect, adjust_audio
 from .take_stream import OrderedChunkAudio, StreamingMp3Encoder
 from .locale_utils import normalize_locale as _normalize_locale_with_region
 from .model_workers import speech_worker_main, transcribe_worker_main
+from .downloads import MAX_REFERENCE_BYTES, DownloadError, fetch_bytes, fetch_to_file
 from .media import (
     ImagegenRequest,
     LipsyncRequest,
@@ -483,7 +484,10 @@ class MediaConfig(BaseModel):
     imagegen: bool = False
     python: str = "src/media_runtime/.venv/bin/python"
     runtime_dir: str = "src/media_runtime"
-    port: int = 8270
+    # Where a finished render waits to be uploaded. Keep it on the filesystem the runtime renders
+    # on (``H3_DATA_DIR``, else ``<runtime_dir>/.cache/h3``): the runtime moves the file here, and
+    # across filesystems a move is a copy of every byte of a gigabyte video.
+    scratch_dir: str = "src/media_runtime/.cache/results"
     # CUDA_VISIBLE_DEVICES for the runtime (PCI-order index or UUID). One GPU, Ampere or newer
     # (YuE2 and H3 need bf16; H3 wants a 24 GB card); the runtime holds one model group at a time.
     gpu: str | None = None
@@ -1584,6 +1588,25 @@ def _ensure_transcribe_worker() -> WorkerProcessClient:
     return _transcribe_worker
 
 
+def _media_scratch_root() -> Path:
+    root = Path(_server_config.media.scratch_dir)
+    return root if root.is_absolute() else PROJECT_ROOT / root
+
+
+def _media_scratch_dir(prefix: str) -> Path:
+    """A directory of its own for one job's result, on the filesystem the runtime renders on."""
+    root = _media_scratch_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"{prefix}-", dir=root))
+
+
+def _clear_media_scratch() -> None:
+    """Drops what the runtime rendered before this one. Called with the child stopped, so nothing
+    is rendering and nothing is waiting to be uploaded; a render the API died on is a whole video
+    that would otherwise sit on the disk for good."""
+    shutil.rmtree(_media_scratch_root(), ignore_errors=True)
+
+
 def _ensure_media_runtime() -> MediaRuntime:
     """YuE2 / YingMusic-SVC / ComfyUI-H3 in their own venv and process (music, videogen, lipsync)."""
     global _media_runtime
@@ -1592,7 +1615,6 @@ def _ensure_media_runtime() -> MediaRuntime:
         _media_runtime = MediaRuntime(
             python=config.python,
             runtime_dir=config.runtime_dir,
-            port=config.port,
             gpu=config.gpu,
             ready_timeout_seconds=config.ready_timeout_seconds,
             features=config.features(),
@@ -4517,17 +4539,23 @@ async def _fetch_voxcpm_reference(reference_url: str) -> tuple[bytes, str]:
     if parsed.scheme not in {"http", "https"}:
         raise HTTPException(status_code=400, detail="reference_url must use http or https")
 
+    # The bytes are the model's input and the cache's entry, so they are held — within the size a
+    # voice reference has.
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            response = await client.get(reference_url)
-            response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=400, detail=f"Could not fetch reference_url: {exc}") from exc
-
-    audio = response.content
-    if not audio:
-        raise HTTPException(status_code=400, detail="reference_url returned an empty response")
+        audio = await fetch_bytes(
+            reference_url, MAX_REFERENCE_BYTES, url_name="reference_url", timeout_seconds=30.0
+        )
+    except DownloadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return audio, _voxcpm_reference_format(reference_url)
+
+
+async def _fetch_reference_file(reference_url: str, dest: Path) -> Path:
+    """A caller's reference, fetched to ``dest`` for the tools that read a file rather than bytes."""
+    try:
+        return await fetch_to_file(reference_url, dest, MAX_REFERENCE_BYTES, url_name="reference_url")
+    except DownloadError as exc:
+        raise InferenceOperationError(400, str(exc)) from exc
 
 
 def _voxcpm_reference_format(reference_url: str) -> str:
@@ -5649,10 +5677,12 @@ async def _load_transcribe_engine() -> None:
 
 async def _load_media_engine() -> None:
     config = _server_config.media
-    with _logged_startup_step("media_runtime", runtime_dir=config.runtime_dir, port=config.port):
+    with _logged_startup_step("media_runtime", runtime_dir=config.runtime_dir, features=config.features()):
         runtime = _ensure_media_runtime()
         # A reload replaces the child: stop the old one, then wait for the new one's models to load.
-        runtime.stop()
+        # Stopping waits for it to leave, which is not the event loop's to wait for.
+        await asyncio.to_thread(runtime.stop)
+        await asyncio.to_thread(_clear_media_scratch)
         await runtime.ensure_ready()
 
 
@@ -6682,10 +6712,11 @@ class LzTtsInferenceSession:
         )
 
     async def _enhance(self, request: VoiceEnhanceRequest) -> InferenceResult:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.get(request.reference_url)
-            response.raise_for_status()
-        audio = await asyncio.to_thread(self.voice_enhancer.enhance, response.content)
+        # The sample is fetched to a file: ffmpeg reads it from there, and nothing here has a use
+        # for the bytes of someone's raw recording.
+        with self.voice_enhancer.workspace() as workspace:
+            sample = await _fetch_reference_file(request.reference_url, Path(workspace) / "sample_raw.input")
+            audio = await asyncio.to_thread(self.voice_enhancer.enhance, sample)
         try:
             detection = await asyncio.to_thread(self.language_identifier.identify, audio)
         except Exception:
@@ -6847,7 +6878,7 @@ class LzTtsInferenceSession:
         job_id = f"generate-music-{uuid.uuid4().hex}"
         body["job_id"] = job_id
         # The song stays the file the runtime wrote; the scratch goes when the result is released.
-        scratch = Path(tempfile.mkdtemp(prefix="generate-music-"))
+        scratch = _media_scratch_dir("generate-music")
         try:
             body["output_dir"] = str(scratch)
             if progress is not None:
@@ -6856,7 +6887,7 @@ class LzTtsInferenceSession:
                 body["reference_path"] = str(await fetch_reference(request.reference_url, scratch / "reference"))
             await _await_engine_ready("media")
             with listening_for_progress(job_id, progress):
-                produced = await _ensure_media_runtime().post("/generate", body, config.music_timeout_seconds)
+                produced = await _ensure_media_runtime().request("generate", body, config.music_timeout_seconds)
         except BaseException:
             shutil.rmtree(scratch, ignore_errors=True)
             raise
@@ -6885,7 +6916,7 @@ class LzTtsInferenceSession:
         request = model.model_validate(request_data)
         timeout = getattr(config, f"{operation}_timeout_seconds")
         # The render stays the file the runtime wrote; the scratch goes when the result is released.
-        scratch = Path(tempfile.mkdtemp(prefix=f"{operation}-"))
+        scratch = _media_scratch_dir(operation)
         try:
             body = {
                 "job_id": f"{operation}-{uuid.uuid4().hex}",
@@ -6896,7 +6927,7 @@ class LzTtsInferenceSession:
                 progress("preparing", None, None)
             await _await_engine_ready("media")
             with listening_for_progress(body["job_id"], progress):
-                produced = await _ensure_media_runtime().post(f"/{operation}", body, timeout)
+                produced = await _ensure_media_runtime().request(operation, body, timeout)
         except BaseException:
             shutil.rmtree(scratch, ignore_errors=True)
             raise
