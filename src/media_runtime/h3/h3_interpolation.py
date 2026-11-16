@@ -12,18 +12,15 @@ of the compute; RIFE v4.26 (``rife``, weights ``data/rife-v4.26``) then makes th
 - **Without one** (videogen making its own soundtrack) nothing can be sped up, so the time axis itself is set to
   ``F`` frames a second (:func:`h3_time_axis`): the clip and the audio it generates last ``frames / F`` seconds.
 
-:func:`upsample_video` streams the low-rate frames through RIFE: an output frame on a rendered instant is that
-frame untouched, any other is one RIFE call at its exact timestep, and everything is encoded once.
+:func:`h3.h3_postprocess.stream_video` streams the low-rate frames through RIFE: an output frame on a rendered
+instant is that frame untouched, any other is one RIFE call at its exact timestep, and everything is encoded once.
 """
 from __future__ import annotations
 
-import math
 import subprocess
 import sys
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -123,105 +120,3 @@ def output_frames_ending_on_last(frames: int, fps: int) -> int:
     """24 fps frames for ``frames`` rendered at ``fps`` whose last one is the last rendered frame (a clip pinned on
     its last frame, or continued from it, ends on exactly that frame)."""
     return -(-(int(frames) - 1) * OUTPUT_FPS // int(fps)) + 1
-
-
-def _read_frames(process: subprocess.Popen, width: int, height: int) -> Iterator[Any]:
-    import numpy as np
-
-    size = width * height * 3
-    assert process.stdout is not None
-    while True:
-        data = process.stdout.read(size)
-        if len(data) < size:
-            return
-        yield np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)
-
-
-def upsample_video(source_args: list[str], output_args: list[str], *, width: int, height: int, source_fps: int,
-                   frames: int, output_fps: int = OUTPUT_FPS) -> dict[str, Any]:
-    """``frames`` frames at ``output_fps`` from the ``source_fps`` video ffmpeg makes of ``source_args`` (its inputs,
-    filters and maps; RGB ``width``x``height`` frames). Output frame ``n`` sits at ``n * source_fps / output_fps``
-    source frames: on a whole one it is that frame untouched, between two it is one RIFE call at that exact
-    timestep, past the last it holds the last. The frames go to ffmpeg as its first input (``-i`` raw video, then
-    ``output_args``: more inputs, maps, filters, codecs and the output path), the only encode."""
-    import numpy as np
-    import torch
-    import torch.nn.functional as F
-
-    from .minimax_h3_runtime import make_room_beside_h3
-
-    started = time.perf_counter()
-    make_room_beside_h3()
-    model = rife_model()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pad_h, pad_w = math.ceil(height / 128) * 128, math.ceil(width / 128) * 128
-
-    def tensor(frame: Any) -> Any:
-        t = torch.from_numpy(np.ascontiguousarray(frame.transpose(2, 0, 1))).to(device).unsqueeze(0).float() / 255.0
-        return F.pad(t, (0, pad_w - width, 0, pad_h - height))
-
-    reader = subprocess.Popen(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", *source_args, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-        stdout=subprocess.PIPE,
-    )
-    writer = subprocess.Popen(
-        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-         "-s", f"{width}x{height}", "-r", str(output_fps), "-i", "-", *output_args],
-        stdin=subprocess.PIPE,
-    )
-    assert writer.stdin is not None
-    source = _read_frames(reader, width, height)
-    # The two source frames around the current output frame, by index, and their tensors.
-    window: dict[int, Any] = {}
-    tensors: dict[int, Any] = {}
-    loaded = -1
-    exhausted = False
-    rife_calls = 0
-    try:
-        with torch.inference_mode():
-            for n in range(int(frames)):
-                position = Fraction(n * int(source_fps), int(output_fps))
-                index, offset = math.floor(position), position - math.floor(position)
-                while not exhausted and loaded < index + (1 if offset else 0):
-                    frame = next(source, None)
-                    if frame is None:
-                        exhausted = True
-                        break
-                    loaded += 1
-                    window[loaded] = frame
-                for stale in [key for key in window if key < min(index, loaded)]:
-                    window.pop(stale)
-                    tensors.pop(stale, None)
-                if loaded < 0:
-                    raise ValueError("the video to interpolate has no frames")
-                if index >= loaded or not offset:
-                    out = window[min(index, loaded)]
-                else:
-                    for key in (index, index + 1):
-                        if key not in tensors:
-                            tensors[key] = tensor(window[key])
-                    mid = model.inference(tensors[index], tensors[index + 1], timestep=float(offset), scale=1.0)
-                    out = (mid[0].clamp(0, 1) * 255).round().byte().permute(1, 2, 0)[:height, :width].cpu().numpy()
-                    rife_calls += 1
-                writer.stdin.write(np.ascontiguousarray(out).tobytes())
-        writer.stdin.close()
-        if writer.wait() != 0:
-            raise RuntimeError("ffmpeg could not encode the interpolated video")
-    finally:
-        if writer.poll() is None:
-            writer.kill()
-        if reader.stdout is not None:
-            reader.stdout.close()
-        reader.kill()
-        reader.wait()
-        tensors.clear()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    return {
-        "source_fps": int(source_fps),
-        "output_fps": int(output_fps),
-        "source_frames": loaded + 1,
-        "output_frames": int(frames),
-        "rife_frames": rife_calls,
-        "seconds": round(time.perf_counter() - started, 3),
-    }

@@ -34,6 +34,11 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
   H3's own 24 fps clock and the output carries it in real time; with none, H3's time
   axis itself runs at ``fps`` (the generated audio lasts the clip). Pins land on the
   nearest rendered frame; the clip still ends on its last rendered frame.
+- ``upscale`` (``true`` = 1.5x, or a factor above 1 and at most 2; vigen 43c32e7): the
+  delivered size (``width``/``height``, else the canvas) times the factor, longest
+  side at most 3840. The canvas render goes through SPAN 2x (loaded for this job
+  only, after RIFE when both are asked for) and lanczos lands on that size
+  (:mod:`h3.span_upscale`).
 
 The result is ``{"path", "item", "metrics", "seed"}`` like :mod:`h3.lipsync`, plus
 ``last_frame_path`` (a JPEG, quality 95) for a continuable clip.
@@ -99,6 +104,7 @@ def _pinned_frames(job: dict[str, Any], payload: dict[str, Any], scratch_dir, im
 
 def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     from .h3_interpolation import interpolated_render_frames, requested_fps, speed_up
+    from .span_upscale import requested_scale
     from .minimax_h3_runtime import (
         H3_FPS,
         cleanup_h3_job_files,
@@ -131,6 +137,8 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     # rest of the 24; lengths and pins below are in frames of the render.
     interpolation_fps = requested_fps(payload)
     render_fps = interpolation_fps or H3_FPS
+    # upscale: the delivered size times the factor, through SPAN 2x (loaded for this job only) then lanczos.
+    upscale = requested_scale(payload)
 
     scratch_dir = job_dir(job_id)
     progress.report("preparing")
@@ -193,7 +201,7 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     log_event("videogen_started", job_id=job_id, seed=seed, length=length, canvas=[canvas.width, canvas.height],
               delivered=list(delivery) if delivery else None, generate_audio=generate_audio,
               pinned_frames=[frame for frame, _ in guides], pinned_audio=pinned_audio is not None,
-              interpolation_fps=interpolation_fps)
+              interpolation_fps=interpolation_fps, upscale=upscale)
     started = time.perf_counter()
     continuation: dict[str, Any] | None = None
     try:
@@ -216,8 +224,9 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
             length=length,
             preset=preset,
             generate_audio=generate_audio,
-            output_width=delivery[0] if delivery else None,
-            output_height=delivery[1] if delivery else None,
+            # An upscaled clip keeps the canvas render: SPAN works on it, lanczos lands on the delivered size.
+            output_width=delivery[0] if delivery and not upscale else None,
+            output_height=delivery[1] if delivery and not upscale else None,
             guides=guides,
             pinned_audio_path=pinned_audio,
             fps=time_axis_fps,
@@ -226,11 +235,14 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
         cleanup_h3_job_files(job_id)
     if not output_path.is_file():
         raise RuntimeError(f"H3 did not write {output_path}")
-    interpolation: dict[str, Any] | None = None
-    if interpolation_fps:
-        interpolation = _interpolate(output_path, fps=interpolation_fps, grid_frames=grid_frames,
-                                     audio=soundtrack if generate_audio else None, voice=soundtrack is not None,
-                                     job_id=job_id)
+    postprocessed: dict[str, Any] = {}
+    if interpolation_fps or upscale:
+        postprocessed = _postprocess(
+            output_path, fps=interpolation_fps, grid_frames=grid_frames, upscale=upscale,
+            delivered=delivery or (canvas.width, canvas.height),
+            audio=(soundtrack or pinned_audio) if pinned_audio is not None and generate_audio else None,
+            voice=pinned_audio is not None, job_id=job_id,
+        )
     elif pinned_audio is not None and generate_audio:
         muxed = output_path.with_name("output.audio.mp4")
         _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(output_path), "-i", str(pinned_audio),
@@ -256,7 +268,7 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
         "pinned_audio": pinned_audio is not None,
         "continuable": continuable,
         **({"continuation": continuation} if continuation else {}),
-        **({"interpolation": interpolation} if interpolation else {}),
+        **postprocessed,
     }
     log_event("videogen_complete", job_id=job_id, wall_seconds=round(wall_seconds, 3))
     result = {
@@ -274,30 +286,49 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _interpolate(output_path, *, fps: int, grid_frames: int, audio, voice: bool, job_id: str) -> dict[str, Any]:
-    """The ``fps`` render at ``output_path`` brought up to 24 fps in place: RIFE makes the frames in between
-    (:func:`h3.h3_interpolation.upsample_video`), the clip still ends on its last rendered frame (a pinned last
-    frame, a continuable clip's restored one), and it carries ``audio`` (the caller's pinned audio in real time)
-    or else whatever audio H3 generated on its ``fps`` time axis."""
-    from .h3_interpolation import OUTPUT_FPS, output_frames_ending_on_last, upsample_video
+def _postprocess(output_path, *, fps: int | None, grid_frames: int, upscale: float | None,
+                 delivered: tuple[int, int], audio, voice: bool, job_id: str) -> dict[str, Any]:
+    """The render at ``output_path`` finished in place (:func:`h3.h3_postprocess.stream_video`): an ``fps`` render
+    brought up to 24 fps by RIFE, still ending on its last rendered frame (a pinned last frame, a continuable
+    clip's restored one); an ``upscale`` clip through SPAN 2x, then lanczos to ``delivered`` (the size it is
+    delivered at without it) times the factor. It carries ``audio`` (the caller's pinned audio in real time) or
+    else whatever audio H3 generated. Returns the item's ``interpolation`` / ``upscale`` entries."""
+    from .h3_interpolation import OUTPUT_FPS, output_frames_ending_on_last
+    from .h3_postprocess import stream_video
     from .lipsync import image_size
+    from .span_upscale import SPAN_MODEL_NAME, target_size
 
-    rendered = output_path.with_name(f"{output_path.stem}.{fps}fps.mp4")
+    rendered = output_path.with_name(f"{output_path.stem}.render.mp4")
     os.replace(output_path, rendered)
-    frames = output_frames_ending_on_last(grid_frames, fps)
+    if fps:
+        source_fps, frames = fps, output_frames_ending_on_last(grid_frames, fps)
+    else:
+        source_fps, frames = OUTPUT_FPS, grid_frames
     width, height = image_size(rendered)
-    metrics = upsample_video(
+    size = target_size(delivered[0], delivered[1], upscale) if upscale else None
+    resize = (["-vf", f"scale={size[0]}:{size[1]}:force_original_aspect_ratio=increase:flags=lanczos,"
+                      f"crop={size[0]}:{size[1]},setsar=1"] if size else [])
+    metrics = stream_video(
         ["-i", str(rendered)],
-        ["-i", str(audio or rendered), "-map", "0:v", "-map", "1:a:0?", "-c:v", "libx264", "-preset", "fast",
+        ["-i", str(audio or rendered), "-map", "0:v", "-map", "1:a:0?", *resize, "-c:v", "libx264", "-preset", "fast",
          "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-t", f"{frames / OUTPUT_FPS:.6f}",
          "-movflags", "+faststart", str(output_path)],
-        width=width, height=height, source_fps=fps, frames=frames,
+        width=width, height=height, source_fps=source_fps, frames=frames, upscale=bool(upscale), job_id=job_id,
     )
     rendered.unlink(missing_ok=True)
     mode = "voice" if voice else "time_axis"
-    log_event("videogen_interpolated", job_id=job_id, mode=mode, **metrics)
-    return {"fps": fps, "mode": mode, "rendered_frames": metrics["source_frames"],
-            "rife_frames": metrics["rife_frames"], "seconds": metrics["seconds"]}
+    log_event("videogen_postprocessed", job_id=job_id, interpolation_fps=fps, mode=mode if fps else None,
+              upscale=upscale, **metrics)
+    span_seconds = float((metrics.get("span") or {}).get("seconds", 0.0))
+    out: dict[str, Any] = {}
+    if fps:
+        out["interpolation"] = {"fps": fps, "mode": mode, "rendered_frames": metrics["source_frames"],
+                                "rife_frames": metrics["rife_frames"],
+                                "seconds": round(metrics["seconds"] - span_seconds, 3)}
+    if size:
+        out["upscale"] = {"scale": upscale, "method": "span2x_lanczos", "model": SPAN_MODEL_NAME,
+                          "span_seconds": span_seconds}
+    return out
 
 
 def _restore_end(*, job_id: str, prompt: str, image_path, seed: int, width, height, length: int, grid_frames: int,

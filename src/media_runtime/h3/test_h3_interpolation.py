@@ -1,5 +1,5 @@
 """Interpolated H3 renders (vigen 7280e2f): the frame maths, the lipsync plan on the model's clock, and RIFE's
-pass-through of rendered frames (GPU)."""
+pass-through of rendered frames (GPU, :func:`h3.h3_postprocess.stream_video`)."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from h3.h3_interpolation import (
     interpolated_render_frames,
     output_frames_ending_on_last,
     requested_fps,
-    upsample_video,
 )
+from h3.h3_postprocess import stream_video
 from h3.lipsync import chunk_instructions, freestyle_plan, plan_anchors, plan_chunks
 from h3.speech_chunks import MAX_CHUNK_SECONDS
 from h3.test_h3_restore import _speech
@@ -87,7 +87,7 @@ def test_rendered_frames_pass_through_untouched(tmp_path):
                     "-frames:v", str(rendered), "-c:v", "ffv1", str(source)], check=True)
     out = tmp_path / "out.mkv"
     frames = output_frames_ending_on_last(rendered, 16)
-    metrics = upsample_video(["-i", str(source)], ["-c:v", "ffv1", str(out)], width=width, height=height,
+    metrics = stream_video(["-i", str(source)], ["-c:v", "ffv1", str(out)], width=width, height=height,
                              source_fps=16, frames=frames)
     src, got = _frames(source, width, height), _frames(out, width, height)
     assert len(got) == frames == 13

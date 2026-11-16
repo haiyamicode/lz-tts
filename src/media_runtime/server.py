@@ -217,6 +217,8 @@ def _check_h3_assets(features: list[str]) -> None:
     missing = [str(path) for path in (comfy_root / "models" / "loras" / name for name in sorted(lora_names)) if not path.exists()]
     if missing:
         raise FileNotFoundError("H3 preset LoRAs are missing: " + ", ".join(missing))
+    if ("videogen" in features or "lipsync" in features) and not compat.SPAN_UPSCALE_MODEL_PATH.exists():
+        raise FileNotFoundError(f"the SPAN upscale model is missing: {compat.SPAN_UPSCALE_MODEL_PATH}")
     if "lipsync" in features:
         required = [
             compat.CTC_ROOT / "model.safetensors",

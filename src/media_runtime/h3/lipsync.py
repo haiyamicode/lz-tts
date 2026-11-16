@@ -83,6 +83,12 @@ sped up ``24/interpolation_fps`` (so a chunk covers that much more of the audio)
 its validators judge that render, and RIFE brings the joined video up to 24 fps
 (:mod:`h3.h3_interpolation`).
 
+**Upscale** (vigen 43c32e7). ``upscale`` (``true`` = 1.5x, or a factor above 1 and
+at most 2) delivers the image's size times the factor (longest side at most 3840,
+``output_dimensions`` still bounds it): the joined frames go through a 2x SPAN
+model, loaded for that job only, and lanczos resamples them to that size
+(:mod:`h3.span_upscale`, after RIFE when both are asked for).
+
 Output frames are H3's native 24 fps; the caller's audio is muxed back
 unmodified (the model never decodes audio in this mode).
 """
@@ -520,6 +526,8 @@ def assemble_output(
     height: int | None,
     bounding_box: tuple[int, int] | None,
     output_fps: int | None = None,
+    upscale: bool = False,
+    job_id: str = "",
 ) -> dict[str, Any] | None:
     """Join the chunks - ``(render, frames kept)``, dropping each shared boundary
     frame and every chunk's grid surplus - trim to the audio's length, scale,
@@ -529,8 +537,9 @@ def assemble_output(
     never a squeeze); ``bounding_box`` instead fits the frame inside it.
 
     ``output_fps`` above ``fps`` (an interpolated job): the joined ``fps`` frames
-    stream through RIFE up to it (:func:`h3.h3_interpolation.upsample_video`)
-    before the scale and the one encode; returns the interpolation's metrics.
+    stream through RIFE up to it, and ``upscale`` sends them through SPAN 2x
+    (:func:`h3.h3_postprocess.stream_video`) before the scale, then lanczos, and
+    the one encode; returns that stream's metrics.
     """
     inputs: list[str] = []
     parts: list[str] = []
@@ -538,29 +547,31 @@ def assemble_output(
         inputs += ["-i", str(path)]
         parts.append(f"[{index}:v]select=between(n\\,{1 if index else 0}\\,{int(frames) - 1}),setpts=N/({fps}*TB)[v{index}]")
     joined = "".join(f"[v{index}]" for index in range(len(chunks)))
+    flags = ":flags=lanczos" if upscale else ""
     if bounding_box is not None:
         scale = (
             f"scale={bounding_box[0]}:{bounding_box[1]}:force_original_aspect_ratio=decrease"
-            ":force_divisible_by=2,setsar=1"
+            f":force_divisible_by=2{flags},setsar=1"
         )
     elif width and height:
-        scale = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1"
+        scale = f"scale={width}:{height}:force_original_aspect_ratio=increase{flags},crop={width}:{height},setsar=1"
     else:
         scale = "setsar=1"
     audio_index = len(chunks)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     encode = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
               "-c:a", "aac", "-b:a", "192k", "-t", f"{duration_seconds:.6f}", "-movflags", "+faststart", str(output_path)]
-    if output_fps and output_fps != fps:
-        from .h3_interpolation import upsample_video
+    if upscale or (output_fps and output_fps != fps):
+        from .h3_postprocess import stream_video
 
+        output_fps = int(output_fps or fps)
         width_in, height_in = image_size(chunks[0][0])
         join = ";".join(parts) + f";{joined}concat=n={len(chunks)}:v=1:a=0[out]"
-        return upsample_video(
+        return stream_video(
             [*inputs, "-filter_complex", join, "-map", "[out]", "-frames:v", str(int(total_frames))],
             ["-i", str(audio_path), "-map", "0:v", "-map", "1:a:0", "-vf", scale, *encode],
-            width=width_in, height=height_in, source_fps=int(fps), output_fps=int(output_fps),
-            frames=max(1, round(duration_seconds * output_fps)),
+            width=width_in, height=height_in, source_fps=int(fps), output_fps=output_fps,
+            frames=max(1, round(duration_seconds * output_fps)), upscale=upscale, job_id=job_id,
         )
     graph = ";".join(parts) + f";{joined}concat=n={len(chunks)}:v=1:a=0,{scale}[out]"
     _run(
@@ -791,6 +802,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     """Run one ``lipsync`` job; returns the result.
     """
     from .h3_interpolation import requested_fps, speed_up
+    from .span_upscale import SPAN_MODEL_NAME, requested_scale, target_size
     from .minimax_h3_runtime import (
         DEFAULT_LIPSYNC_PRESET,
         H3_FPS,
@@ -816,6 +828,8 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     # 24 fps clock from its voice sped up to match, and RIFE brings the joined video up to 24 fps.
     interpolation_fps = requested_fps(payload)
     fps = float(interpolation_fps or H3_FPS)
+    # upscale: the frames go through SPAN 2x, then lanczos to the delivered size times the factor.
+    upscale = requested_scale(payload)
     stage_timings: dict[str, float] = {}
 
     def finish(name: str, began: float) -> None:
@@ -960,10 +974,15 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     )
     delivered_width = source_width - source_width % 2
     delivered_height = source_height - source_height % 2
+    if upscale:
+        # The image's size times the factor, then fitted inside output_dimensions (and 4K).
+        delivered_width, delivered_height = target_size(delivered_width, delivered_height, upscale,
+                                                        bounding_box=bounding_box)
+        bounding_box = None
     began = time.perf_counter()
     output_name = "output.mp4"
     output_path = scratch_dir / "outputs" / output_name
-    interpolation = assemble_output(
+    streamed = assemble_output(
         chunk_paths,
         audio_path=audio_path,
         total_frames=total_frames,
@@ -974,6 +993,8 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
         height=None if bounding_box else delivered_height,
         bounding_box=bounding_box,
         output_fps=int(H3_FPS) if interpolation_fps else None,
+        upscale=bool(upscale),
+        job_id=job_id,
     )
     finish("assemble_seconds", began)
     if bounding_box is not None:
@@ -987,7 +1008,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
         "fps": float(H3_FPS),
         "width": delivered_width,
         "height": delivered_height,
-        "frames": interpolation["output_frames"] if interpolation else total_frames,
+        "frames": streamed["output_frames"] if streamed else total_frames,
         "duration_seconds": round(audio_duration, 3),
         "source": "freestyle",
         "chunk_boundaries": plan["chunk_boundaries"],
@@ -1016,11 +1037,18 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     }
     if bounding_box is not None:
         item["output_dimensions"] = {"width": bounding_box[0], "height": bounding_box[1]}
-    if interpolation:
+    span_seconds = float(((streamed or {}).get("span") or {}).get("seconds", 0.0))
+    if streamed and interpolation_fps:
         # Rendered at interpolation_fps; RIFE made the rest of the 24 fps frames.
+        rife_seconds = round(streamed["seconds"] - span_seconds, 3)
         item["interpolation"] = {"fps": interpolation_fps, "rendered_frames": total_frames,
-                                 "rife_frames": interpolation["rife_frames"], "seconds": interpolation["seconds"]}
-        stage_timings["interpolation_seconds"] = interpolation["seconds"]
+                                 "rife_frames": streamed["rife_frames"], "seconds": rife_seconds}
+        stage_timings["interpolation_seconds"] = rife_seconds
+    if streamed and upscale:
+        # SPAN 2x on the joined render, then lanczos to width x height.
+        item["upscale"] = {"scale": upscale, "method": "span2x_lanczos", "model": SPAN_MODEL_NAME,
+                           "span_seconds": span_seconds}
+        stage_timings["upscale_span_seconds"] = span_seconds
     log_event("lipsync_complete", job_id=job_id, wall_seconds=round(total_seconds, 3), **{
         key: item[key] for key in ("frames", "chunks", "anchors", "width", "height")
     })

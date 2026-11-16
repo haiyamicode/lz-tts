@@ -51,6 +51,7 @@ def test_dirs_map_to_sets_and_unclaimed_dirs_are_core():
     assert model_sets.set_of_dir("lzspeech-falcon-v1.2") == {"falcon"}
     assert model_sets.set_of_dir("voxcpm2-stable") == {"falcon"}
     assert model_sets.set_of_dir("comfyui") == {"imagegen", "videogen", "lipsync"}
+    assert model_sets.set_of_dir("span-upscale") == {"videogen", "lipsync"}
     assert model_sets.set_of_dir("qwen3-asr-0.6b") == {"transcribe"}
     for core in ("lzspeech-sparrow", "lzspeech-starling", "runtime-wheels", "number-modes", "voice-presets.json"):
         assert model_sets.set_of_dir(core) == set()

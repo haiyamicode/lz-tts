@@ -35,8 +35,8 @@ MODEL_SETS: dict[str, tuple[str, ...]] = {
     "seed-vc": ("seed-vc",),
     "music": ("yue2-3b", "yingmusic-svc"),
     "imagegen": ("comfyui",),
-    "videogen": ("comfyui", "rife-*"),
-    "lipsync": ("comfyui", "lipsync", "rife-*"),
+    "videogen": ("comfyui", "rife-*", "span-upscale"),
+    "lipsync": ("comfyui", "lipsync", "rife-*", "span-upscale"),
 }
 MEDIA_SETS = ("music", "videogen", "lipsync", "imagegen")
 # Worker engine -> the sets it loads from (media: the enabled media features).

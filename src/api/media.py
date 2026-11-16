@@ -23,7 +23,7 @@ import threading
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ..process_guard import exit_with_parent
 from .downloads import MAX_REFERENCE_BYTES, DownloadError, fetch_to_file
@@ -106,8 +106,10 @@ H3VideoPreset = Literal["standard", "turbo-8", "turbo-6", "turbo-4"]
 
 
 class H3Interpolation(BaseModel):
-    """``use_interpolation`` (vigen 7280e2f, ``h3/h3_interpolation.py``): H3 renders ``interpolation_fps``
-    frames a second and RIFE v4.26 makes the rest of the 24 fps output."""
+    """Postprocessing of an H3 clip. ``use_interpolation`` (vigen 7280e2f, ``h3/h3_interpolation.py``): H3
+    renders ``interpolation_fps`` frames a second and RIFE v4.26 makes the rest of the 24 fps output.
+    ``upscale`` (vigen 43c32e7, ``h3/span_upscale.py``): SPAN 2x, then lanczos to the delivered size times the
+    factor (longest side at most 3840)."""
 
     use_interpolation: bool = Field(
         default=False, description="Render at interpolation_fps and RIFE-interpolate up to 24 fps (faster)"
@@ -115,6 +117,18 @@ class H3Interpolation(BaseModel):
     interpolation_fps: int | None = Field(
         default=None, ge=12, le=23, description="Frames H3 renders a second under use_interpolation (default 16)"
     )
+
+    upscale: bool | float = Field(
+        default=False,
+        description="SPAN 2x then lanczos to the delivered size times this factor: true = 1.5, or above 1 and at most 2",
+    )
+
+    @field_validator("upscale")
+    @classmethod
+    def _upscale_factor(cls, value: bool | float) -> bool | float:
+        if not isinstance(value, bool) and not 1.0 < value <= 2.0:
+            raise ValueError("upscale must be true or a factor above 1 and at most 2")
+        return value
 
     @model_validator(mode="after")
     def _fps_needs_flag(self):

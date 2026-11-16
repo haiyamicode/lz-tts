@@ -22,6 +22,8 @@ SPEECH_CLEANUP_ZIPENHANCER_CONFIG_PATH = LIPSYNC_DIR / "speech-cleanup/zipenhanc
 SYNCNET_EVAL_SYNCNET_PATH = LIPSYNC_DIR / "syncnet-eval/syncnet_v2.model"
 SYNCNET_EVAL_S3FD_PATH = LIPSYNC_DIR / "syncnet-eval/sfd_face.pth"
 GLITCH_DETECTOR_PATH = LIPSYNC_DIR / "glitch-detector/glitch_detector_v1.pt"
+#: H3 ``upscale``: the 2x SPAN model (data/span-upscale, S3-baked; vigen 43c32e7), see h3.span_upscale.
+SPAN_UPSCALE_MODEL_PATH = DATA_DIR / "span-upscale" / "2xNomosUni_span_multijpg_ldl.safetensors"
 
 
 def data_dir() -> Path:
