@@ -24,6 +24,9 @@ SYNCNET_EVAL_S3FD_PATH = LIPSYNC_DIR / "syncnet-eval/sfd_face.pth"
 GLITCH_DETECTOR_PATH = LIPSYNC_DIR / "glitch-detector/glitch_detector_v1.pt"
 #: H3 ``upscale``: the 2x SPAN model (data/span-upscale, S3-baked; vigen 43c32e7), see h3.span_upscale.
 SPAN_UPSCALE_MODEL_PATH = DATA_DIR / "span-upscale" / "2xNomosUni_span_multijpg_ldl.safetensors"
+#: imagegen ``rest_frame``: MediaPipe FaceLandmarker (Apache-2.0, float16 v1; data/face-landmarks, S3-baked),
+#: measures how open a rest still's mouth is (h3.rest_stills).
+FACE_LANDMARKER_PATH = DATA_DIR / "face-landmarks" / "face_landmarker.task"
 
 
 def data_dir() -> Path:

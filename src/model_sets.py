@@ -34,7 +34,7 @@ MODEL_SETS: dict[str, tuple[str, ...]] = {
     "falcon": ("lzspeech-falcon-*", "voxcpm2-*", "voxcpm-lora"),
     "seed-vc": ("seed-vc",),
     "music": ("yue2-3b", "yingmusic-svc"),
-    "imagegen": ("comfyui",),
+    "imagegen": ("comfyui", "face-landmarks"),
     "videogen": ("comfyui", "rife-*", "span-upscale"),
     "lipsync": ("comfyui", "lipsync", "rife-*", "span-upscale"),
 }

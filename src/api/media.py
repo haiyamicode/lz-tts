@@ -297,21 +297,34 @@ class ImagegenRequest(BaseModel):
     ``image_urls`` are ``<Picture 1>``..``<Picture N>`` (the prompt may say "image 1" / "picture 2").
     ``width``/``height`` (both or neither) are the delivered size; the render is H3's ~1 MP canvas
     with that aspect, resized. Omitted: an edit follows picture 1's shape, text-only is 768x1024.
+
+    ``rest_frame`` ``k`` (no ``prompt``, exactly one image, the person): rest still ``k`` of them for
+    lipsync ``pinned_frames`` ``multi_image`` (vigen's avatar stills, ``h3/rest_stills.py``): same shot a
+    few seconds later in a pause, hands at rest, mouth closed, eyes on the lens, head/posture variation
+    ``k % 6``; rendered on ``seed + k`` (an open mouth retaken on ``+100``, ``+200``); delivered at the
+    image's size, long side <= 2048, unless ``width``/``height`` are given. Fan out ``k = 0..n-1`` on one seed.
     """
 
     model_config = {"extra": "forbid"}
 
-    prompt: str = Field(min_length=1, max_length=4000)
+    prompt: str | None = Field(default=None, min_length=1, max_length=4000)
     image_urls: list[str] = Field(default_factory=list, max_length=9)
     width: int | None = Field(default=None, ge=64, le=4096)
     height: int | None = Field(default=None, ge=64, le=4096)
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
     preset: H3VideoPreset = "standard"
+    rest_frame: int | None = Field(default=None, ge=0, le=1000)
 
     @model_validator(mode="after")
     def _size_pair(self) -> "ImagegenRequest":
         if (self.width is None) != (self.height is None):
             raise ValueError("width and height go together")
+        if self.rest_frame is None and self.prompt is None:
+            raise ValueError("prompt is required (only rest_frame writes its own)")
+        if self.rest_frame is not None and self.prompt is not None:
+            raise ValueError("rest_frame writes its own prompt; send no prompt")
+        if self.rest_frame is not None and len(self.image_urls) != 1:
+            raise ValueError("rest_frame takes exactly one image_urls entry (the person)")
         return self
 
 

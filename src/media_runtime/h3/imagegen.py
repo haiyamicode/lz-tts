@@ -15,7 +15,12 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
   text-only image is 768x1024;
 - ``seed`` (random when omitted);
 - ``preset``: ``standard`` (default; plain base, 50 steps), ``turbo-8`` (8-step
-  Turbo LoRA) or ``turbo-4`` (videogen's 4-step Turbo LoRA).
+  Turbo LoRA) or ``turbo-4`` (videogen's 4-step Turbo LoRA);
+- ``rest_frame`` (``k`` >= 0): rest still ``k`` of the person in the one
+  reference image, for lipsync frame pins (:mod:`h3.rest_stills`). No
+  ``prompt``: the still's prompt is written here. Rendered on ``seed + k``
+  at the native area, an open mouth retaken; delivered at the image's size
+  (long side <= 2048) unless ``width``/``height`` are given.
 
 The result is ``{"path", "item", "metrics", "seed"}`` like :mod:`h3.videogen`.
 """
@@ -55,15 +60,25 @@ def _references(job: dict[str, Any], payload: dict[str, Any], scratch_dir: Path)
 
 
 def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
-    from PIL import Image  # type: ignore
+    from PIL import Image, ImageOps  # type: ignore
 
-    from . import h3_still
+    from . import h3_still, rest_stills
     from .lipsync import prepare_input_image
     from .minimax_h3_runtime import run_minimax_h3_still
 
     payload = job["payload"]
     job_id = str(job["id"])
+    rest_frame = payload.get("rest_frame")
     prompt = str(payload.get("prompt") or "").strip()
+    if rest_frame is not None:
+        rest_frame = int(rest_frame)
+        if rest_frame < 0:
+            raise ValueError("rest_frame must be >= 0")
+        if prompt:
+            raise ValueError("rest_frame writes its own prompt; send no prompt")
+        if len(payload.get("image_urls") or payload.get("image_paths") or []) != 1:
+            raise ValueError("rest_frame takes exactly one image (the person)")
+        prompt = rest_stills.rest_prompt(rest_frame)
     if not prompt:
         raise ValueError("imagegen requires a prompt")
     width, height = payload.get("width"), payload.get("height")
@@ -86,36 +101,56 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
     ]
     input_seconds = time.perf_counter() - started
 
-    if width is None:
+    if rest_frame is not None:
+        with Image.open(references[0]) as first:
+            source_size = first.size
+        if width is None:
+            width, height = rest_stills.delivered_size(*source_size)
+        render_width, render_height = h3_still.fit_canvas(*source_size)
+    elif width is None:
         if references:
             with Image.open(references[0]) as first:
                 aspect_w, aspect_h = first.size
             width, height = h3_still.fit_canvas(aspect_w, aspect_h)
         else:
             width, height = h3_still.DEFAULT_WIDTH, h3_still.DEFAULT_HEIGHT
-    # Small requests still render at the native area, then scale down.
-    render_width, render_height = h3_still.fit_canvas(
-        width, height, pixels=max(width * height, h3_still.DEFAULT_CANVAS_PIXELS)
-    )
-    render_path = scratch_dir / "outputs" / "h3_still.png"
+    if rest_frame is None:
+        # Small requests still render at the native area, then scale down.
+        render_width, render_height = h3_still.fit_canvas(
+            width, height, pixels=max(width * height, h3_still.DEFAULT_CANVAS_PIXELS)
+        )
     output_path = scratch_dir / "outputs" / "output.png"
     log_event("imagegen_started", job_id=job_id, preset=preset, seed=seed, references=len(references),
               render=[render_width, render_height], delivered=[width, height])
     inference_started = time.perf_counter()
-    render_metrics = run_minimax_h3_still(
-        job_id=job_id,
-        prompt=h3_still.picture_tags(prompt),
-        reference_paths=references,
-        output_path=render_path,
-        width=render_width,
-        height=render_height,
-        seed=seed,
-        preset=preset,
-    )
-    with Image.open(render_path) as rendered:
+    takes: list[dict[str, Any]] = []
+    for attempt in range(rest_stills.MAX_ATTEMPTS if rest_frame is not None else 1):
+        take_seed = seed if rest_frame is None else rest_stills.attempt_seed(seed, rest_frame, attempt)
+        render_path = scratch_dir / "outputs" / f"h3_still_{attempt}.png"
+        render_metrics = run_minimax_h3_still(
+            job_id=job_id,
+            prompt=h3_still.picture_tags(prompt),
+            reference_paths=references,
+            output_path=render_path,
+            width=render_width,
+            height=render_height,
+            seed=take_seed,
+            preset=preset,
+        )
+        take: dict[str, Any] = {"seed": take_seed, "path": render_path}
+        takes.append(take)
+        if rest_frame is None:
+            break
+        take["mouth"] = rest_stills.mouth_opening(render_path)
+        log_event("imagegen_rest_take", job_id=job_id, rest_frame=rest_frame, attempt=attempt, seed=take_seed,
+                  mouth=take["mouth"])
+        if take["mouth"] is None or take["mouth"] <= rest_stills.MOUTH_CLOSED:
+            break
+    kept = min(takes, key=lambda t: t.get("mouth") or 0.0)
+    with Image.open(kept["path"]) as rendered:
         image = rendered.convert("RGB")
         if image.size != (width, height):
-            image = image.resize((width, height), Image.Resampling.LANCZOS)
+            image = ImageOps.fit(image, (width, height), method=Image.Resampling.LANCZOS)
         image.save(output_path)
     inference_seconds = time.perf_counter() - inference_started
     wall_seconds = time.perf_counter() - started
@@ -131,6 +166,11 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
             "references": len(references),
             "preset": preset,
             "steps": spec["steps"],
+            **({"rest_frame": rest_frame, "still_seed": kept["seed"],
+                "variation": rest_stills.REST_VARIATIONS[rest_frame % len(rest_stills.REST_VARIATIONS)],
+                "mouth": None if kept["mouth"] is None else round(kept["mouth"], 4),
+                "takes": [{"seed": t["seed"], "mouth": None if t["mouth"] is None else round(t["mouth"], 4)}
+                          for t in takes]} if rest_frame is not None else {}),
         },
         "metrics": {
             "wall_seconds": round(wall_seconds, 3),

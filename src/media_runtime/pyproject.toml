@@ -65,11 +65,12 @@ dependencies = [
     "torchvision==0.29.1",
     "yarl>=1.18.0",
     "vector-quantize-pytorch>=1.27.15",
+    "mediapipe>=1.2.3",
 ]
 
 [tool.uv]
 # yue2-infer pins numpy 2.2.6 / safetensors 0.7.0; the voice stack needs numpy 1.26
-override-dependencies = ["huggingface-hub>=1.31", "torch==2.14.1", "torchaudio==2.11.0", "torchvision==0.29.1", "numpy==1.26.4", "safetensors>=0.7.0", "transformers>=5.0"]
+override-dependencies = ["huggingface-hub>=1.31", "torch==2.14.1", "torchaudio==2.11.0", "torchvision==0.29.1", "numpy==1.26.4", "safetensors>=0.7.0", "transformers>=5.0", "opencv-contrib-python; sys_platform == 'never'"]
 
 [tool.uv.sources]
 yue2-infer = { path = "../../data/runtime-wheels/yue2_infer-0.1.5-py3-none-any.whl" }
