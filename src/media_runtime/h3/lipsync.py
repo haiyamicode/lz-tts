@@ -1006,15 +1006,17 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     }}
     # generate: rest stills of the person, rendered from the job's image and pinned like multi_image's
     # images; a still whose every take lost the face is left out, and with none left the job's image is pinned.
+    # A non-realistic character (cartoon, anime, 3D animation, painting) or a faceless image is not checked.
     generated: list[dict[str, Any]] = []
     still_files: dict[str, str] = {}
+    stills_item: dict[str, Any] = {}
     if pins.mode == "generate":
         from dataclasses import replace
 
         from . import rest_stills
 
         began = time.perf_counter()
-        reference = rest_stills.measure_face(input_image)
+        reference, stylized = rest_stills.reference_face(input_image)
         delivered = rest_stills.delivered_size(source_width, source_height)
         kept_keys = []
         for key in pins.images:
@@ -1033,7 +1035,9 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
             kept_keys.append(key)
         pins = replace(pins, images=tuple(kept_keys) or (INPUT_IMAGE,))
         finish("generate_stills_seconds", began)
-        log_event("lipsync_stills", job_id=job_id, kept=len(kept_keys), stills=generated)
+        stills_item = {"generated_stills": generated, "stills_face_checked": reference is not None,
+                       "stylized": round(stylized, 3)}
+        log_event("lipsync_stills", job_id=job_id, kept=len(kept_keys), **stills_item)
     # The voice alone - no music, no noise - is what the rest of the job hears.
     began = time.perf_counter()
     voice_path = clean_voice(audio_path, work_dir / "voice.wav", job_id=job_id)
@@ -1191,7 +1195,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
         "pin_mode": plan["pin_mode"],
         # generate: each rest still (its seed, variation, identity, mouth and takes); the kept ones are
         # the result's still<k> files.
-        **({"generated_stills": generated} if generated else {}),
+        **stills_item,
         "anchors": len(anchors),
         "pinned_chunks": len(pinned_chunks),
         "canvas_width": canvas_width,

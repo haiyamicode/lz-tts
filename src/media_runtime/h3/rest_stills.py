@@ -14,8 +14,10 @@ FaceLandmarker, then ArcFace on the aligned face) and retaken on ``seed + k + 10
 - lost the person: ArcFace cosine below :data:`MIN_IDENTITY`, or no face at all;
 - opened the mouth: inner-lip gap over face height above :data:`MOUTH_CLOSED` (vigen's own run had 2 of 6
   stills open on one avatar, and an open-mouth rest pin holds the mouth open at a pause).
-Out of retakes, the least open take that kept the person is delivered; none kept it, the job fails. An image
-with no face found is not checked.
+Out of retakes, the least open take that kept the person is delivered; none kept it, the job fails. No take is
+checked when the image has no face found, or shows a cartoon or other non-realistic character (anime, 2D/3D
+animation, drawing, painting, clay, game render: :func:`stylized_score` at least :data:`MAX_STYLIZED`), whose
+face ArcFace and FaceLandmarker are not made for.
 
 Pinned as a lipsync's rest frames (``pinned_frames`` ``multi_image``, ``order: random``), the stills
 replace one stale image with varied rest poses, lower a hand the image catches mid-gesture, and keep the
@@ -59,6 +61,18 @@ MOUTH_CLOSED = 0.012
 #: small face; prompted strangers -0.05 and 0.44; different real people <= 0.30. Look-alike drift (0.58)
 #: overlaps the low-res stills, so only the clearly lost face is retaken.
 MIN_IDENTITY = 0.45
+#: CLIP ViT-L/14 zero-shot prompts: the image is a real photo, or a non-realistic picture.
+REAL_PROMPTS = ("a photo", "a photograph of a real person", "a webcam video frame", "a smartphone selfie")
+STYLIZED_PROMPTS = (
+    "a cartoon", "a 2D cartoon drawing", "an anime drawing", "a 3D animated movie still", "a digital illustration",
+    "a painting", "a sketch", "a comic", "a claymation", "a video game render", "a vector art avatar",
+)
+#: Softmax share of :data:`STYLIZED_PROMPTS` from which the image's character is not realistic and no take is
+#: checked. 2026-11-17: 37 photos and real-person stills (B&W, filtered, dim webcam, clown makeup, cosplay, news
+#: overlay, 8 avatars + their H3 stills) <= 0.12; 19 non-realistic characters (2D/anime/chibi/Disney-style/comic,
+#: Pixar-style/clay/low-poly/bitmoji/VTuber 3D, oil/watercolor/pencil, pixel art) >= 0.52, but a robot 0.04 (it
+#: has no face to check). More prompts ("avatar", "doll", "robot") lift real avatars to 0.56-0.83.
+MAX_STYLIZED = 0.3
 #: Retakes after the first take (``max_retries``), by default and at most.
 DEFAULT_RETRIES = 2
 MAX_RETRIES = 5
@@ -193,11 +207,22 @@ class Face:
 
 
 def _model(name: str):
-    from .compat import FACE_IDENTITY_PATH, FACE_LANDMARKER_PATH
+    from .compat import FACE_IDENTITY_PATH, FACE_LANDMARKER_PATH, REALISM_CLIP_DIR
 
     with _models_lock:
         if name not in _models:
-            if name == "landmarker":
+            if name == "realism":
+                import torch
+                from transformers import CLIPModel, CLIPProcessor  # type: ignore
+
+                model = CLIPModel.from_pretrained(REALISM_CLIP_DIR, dtype=torch.float32).eval()
+                processor = CLIPProcessor.from_pretrained(REALISM_CLIP_DIR)
+                with torch.no_grad():
+                    text = model.get_text_features(**processor(text=list(REAL_PROMPTS + STYLIZED_PROMPTS),
+                                                               return_tensors="pt", padding=True))
+                text = getattr(text, "pooler_output", text)
+                _models[name] = (model, processor, text / text.norm(dim=-1, keepdim=True))
+            elif name == "landmarker":
                 from mediapipe.tasks.python import BaseOptions, vision  # type: ignore
 
                 _models[name] = vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
@@ -208,6 +233,28 @@ def _model(name: str):
                 _models[name] = onnxruntime.InferenceSession(str(FACE_IDENTITY_PATH),
                                                              providers=["CPUExecutionProvider"])
         return _models[name]
+
+
+def stylized_score(path: Path) -> float:
+    """How surely the image at ``path`` is not a real photo (cartoon, anime, 3D animation, drawing, painting):
+    the share of :data:`STYLIZED_PROMPTS` in CLIP's softmax over both prompt sets (CPU, ~1.2 s)."""
+    import torch
+    from PIL import Image  # type: ignore
+
+    model, processor, text = _model("realism")
+    with Image.open(path) as opened, _models_lock, torch.no_grad():
+        image = model.get_image_features(**processor(images=opened.convert("RGB"), return_tensors="pt"))
+        image = getattr(image, "pooler_output", image)
+        image = image / image.norm(dim=-1, keepdim=True)
+        shares = (model.logit_scale.exp() * image @ text.T).softmax(-1)[0]
+    return float(shares[len(REAL_PROMPTS):].sum())
+
+
+def reference_face(path: Path) -> tuple[Face | None, float]:
+    """The face takes of the image at ``path`` are held to, and its :func:`stylized_score`; the face is None
+    (no take checked) for a non-realistic character or an image with no face found."""
+    stylized = stylized_score(path)
+    return (None if stylized >= MAX_STYLIZED else measure_face(path)), stylized
 
 
 def measure_face(path: Path) -> Face | None:

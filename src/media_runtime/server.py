@@ -225,7 +225,8 @@ def _check_h3_assets(features: list[str]) -> None:
         raise FileNotFoundError("H3 preset LoRAs are missing: " + ", ".join(missing))
     # Rest stills (imagegen rest_frame, lipsync pinned_frames generate) check the face of every take.
     if "imagegen" in features or "lipsync" in features:
-        for path in (compat.FACE_LANDMARKER_PATH, compat.FACE_IDENTITY_PATH):
+        realism = compat.REALISM_CLIP_DIR / "model.safetensors"
+        for path in (compat.FACE_LANDMARKER_PATH, compat.FACE_IDENTITY_PATH, realism):
             if not path.exists():
                 raise FileNotFoundError(f"the rest still face model is missing: {path}")
     if ("videogen" in features or "lipsync" in features) and not compat.SPAN_UPSCALE_MODEL_PATH.exists():

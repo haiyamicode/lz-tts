@@ -30,6 +30,9 @@ FACE_LANDMARKER_PATH = DATA_DIR / "face-landmarks" / "face_landmarker.task"
 #: imagegen ``rest_frame``: InsightFace buffalo_l ArcFace (w600k_r50; data/face-identity, S3-baked), checks a rest
 #: still keeps the person's face (h3.rest_stills).
 FACE_IDENTITY_PATH = DATA_DIR / "face-identity" / "w600k_r50.onnx"
+#: Rest stills: OpenAI CLIP ViT-L/14 (MIT, fp16; data/realism-clip, S3-baked), zero-shot photo vs cartoon/drawn/3D
+#: look of the image, whose face checks a non-realistic character skips (h3.rest_stills).
+REALISM_CLIP_DIR = DATA_DIR / "realism-clip"
 
 
 def data_dir() -> Path:

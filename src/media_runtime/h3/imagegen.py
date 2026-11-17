@@ -134,7 +134,7 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
     inference_started = time.perf_counter()
     still = None
     if rest_frame is not None:
-        reference_face = rest_stills.measure_face(references[0])
+        reference_face, stylized = rest_stills.reference_face(references[0])
         still = rest_stills.render_still(job_id=job_id, image=references[0], index=rest_frame, seed=seed,
                                          retries=retries, out_dir=scratch_dir / "outputs", reference=reference_face,
                                          preset=preset)
@@ -171,6 +171,7 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
             "preset": preset,
             "steps": spec["steps"],
             **({"rest_frame": rest_frame, "max_retries": retries, "reference_face": reference_face is not None,
+                "stylized": round(stylized, 3),
                 **{("still_seed" if key == "seed" else key): value for key, value in still.report().items()
                    if key not in ("index", "kept")}} if still is not None else {}),
         },
