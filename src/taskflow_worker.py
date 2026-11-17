@@ -52,7 +52,7 @@ TASK_TYPES = (
     "lipsync",
     "imagegen",
 )
-# Media runtime task types: advertised only when the worker's server.json ``media`` enables them.
+# Media runtime task types: advertised only when the worker's server config ``media`` enables them.
 _MEDIA_TASK_TYPES = {"generate-music": "music", "videogen": "videogen", "lipsync": "lipsync", "imagegen": "imagegen"}
 # Task types whose work runs long enough that the person waiting needs to see it moving. The rest
 # answer in seconds, where a report would land after the result it was about.

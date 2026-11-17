@@ -1,7 +1,7 @@
 """Model sessions that load, unload and share device memory least-recently-used.
 
 One mechanism serves pinned and opportunistic models. A session is configured
-(server.json) with the device it runs on, the memory it needs while resident
+(server config) with the device it runs on, the memory it needs while resident
 (``vram_mib``) and whether it is ``pinned``:
 
 - a pinned session is loaded at startup and never evicted;
@@ -53,14 +53,14 @@ class DeviceResourceConfig(BaseModel):
 
 
 class ResourcesConfig(BaseModel):
-    """``resources`` in server.json."""
+    """``resources`` in the server config."""
 
     devices: dict[str, DeviceResourceConfig] = Field(default_factory=dict)
     acquire_timeout_seconds: float = Field(300.0, gt=0)
 
 
 class ResidencyConfig(BaseModel):
-    """Per-session ``residency`` in server.json."""
+    """Per-session ``residency`` in the server config."""
 
     device: str
     vram_mib: int = Field(gt=0)

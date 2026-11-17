@@ -141,7 +141,7 @@ def _path_filter(stage: str) -> tuple[Callable[[str], bool], list[str]]:
     """Which data files a stage downloads, and the deferred sets (for markers).
 
     ``all``: core + LZAI_MODELS. ``required``: core + LZAI_REQUIRED_MODELS. Files claimed only by
-    sets outside LZAI_MODELS (or Falcon files the server.json doesn't serve) never download.
+    sets outside LZAI_MODELS (or Falcon files the server config doesn't serve) never download.
     """
     models = model_sets.selected_sets()
     required = model_sets.required_sets()

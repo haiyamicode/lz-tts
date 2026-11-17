@@ -56,13 +56,14 @@ COPY --from=ffmpeg-static /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/loca
 
 WORKDIR /app
 
-# Source only. local/server.json is baked in (no secrets); credentials and
+# Source only. local/server.yml (the default server config, extending
+# configs/server/base.yml) is baked in (no secrets); credentials and
 # runtime settings come from the deployment platform's env vars.
 COPY pyproject.toml uv.lock .python-version README.md ./
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY configs/ ./configs/
-COPY local/server.json ./local/server.json
+COPY local/server.yml ./local/server.yml
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh \

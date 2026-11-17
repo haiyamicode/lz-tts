@@ -1,0 +1,681 @@
+# Shared server config: every lzai worker extends this (LZAI_SERVER_CONFIG, src/server_config.py).
+# Machine settings (which engines and media ops run, GPUs, load mode) go in the worker's own fragment.
+engines:
+  pipertts: true
+  voxcpm: true
+  seed_vc: true
+chunking:
+  enabled: true
+  soft_text_token_limit: 100
+  hard_text_token_limit: 150
+pipertts:
+  default_model: lzspeech-sparrow
+  max_models_in_cache: 1
+  text_preprocessor_device: cuda:0
+  models: [lzspeech-sparrow]
+  preload_models: [lzspeech-sparrow]
+  model_priority: [lzspeech-sparrow]
+  voice_adapter_cache_size: 1
+  voice_adapters:
+    goran:
+      path: data/lzspeech-sparrow/voice-adapters/goran-epoch20.safetensors
+      model: lzspeech-sparrow
+  lang_speaker_map:
+    en-US: en
+    en-GB: en
+    zh-CN: zh
+    ja-JP: ja
+    ko-KR: ko
+    vi-VN: vi
+    hi-IN: hi
+    ta-IN: ta
+    te-IN: te
+    ur-PK: ur
+    sw-KE: sw
+    sw-TZ: sw
+    jv-ID: jv
+    ar-AR: ar
+    bn-BD: bn
+    de-DE: de
+    es-ES: es
+    fr-FR: fr
+    id-ID: id
+    it-IT: it
+    pt-PT: pt
+    ru-RU: ru
+    tr-TR: tr
+    ar-SA: ar-SA
+    ar: ar-SA
+    pt-BR: pt-BR
+    pt: pt-BR
+    pa-IN: pa-IN
+    pa: pa-IN
+    fa-IR: fa-IR
+    fa: fa-IR
+    mr-IN: mr-IN
+    mr: mr-IN
+    fil-PH: fil-PH
+    fil: fil-PH
+    ms-MY: ms-MY
+    ms: ms-MY
+    th-TH: th-TH
+    th: th-TH
+    gu-IN: gu-IN
+    gu: gu-IN
+    am-ET: am-ET
+    am: am-ET
+    kn-IN: kn-IN
+    kn: kn-IN
+    ps-AF: ps-AF
+    ps: ps-AF
+    pl-PL: pl-PL
+    pl: pl-PL
+    my-MM: my-MM
+    my: my-MM
+    uk-UA: uk-UA
+    uk: uk-UA
+    ml-IN: ml-IN
+    ml: ml-IN
+    uz-UZ: uz-UZ
+    uz: uz-UZ
+    or-IN: or-IN
+    or: or-IN
+    su-ID: su-ID
+    su: su-ID
+    ro-RO: ro-RO
+    ro: ro-RO
+    az-AZ: az-AZ
+    az: az-AZ
+    nl-NL: nl-NL
+    nl: nl-NL
+    ne-NP: ne-NP
+    ne: ne-NP
+    so-SO: so-SO
+    so: so-SO
+    af-ZA: af-ZA
+    af: af-ZA
+    km-KH: km-KH
+    km: km-KH
+    kk-KZ: kk-KZ
+    kk: kk-KZ
+    si-LK: si-LK
+    si: si-LK
+    as-IN: as-IN
+    as: as-IN
+    zu-ZA: zu-ZA
+    zu: zu-ZA
+    el-GR: el-GR
+    el: el-GR
+    hu-HU: hu-HU
+    hu: hu-HU
+    sv-SE: sv-SE
+    sv: sv-SE
+    cs-CZ: cs-CZ
+    cs: cs-CZ
+    sr-RS: sr-RS
+    sr: sr-RS
+    ca-ES: ca-ES
+    ca: ca-ES
+    he-IL: he-IL
+    he: he-IL
+    sq-AL: sq-AL
+    sq: sq-AL
+    bg-BG: bg-BG
+    bg: bg-BG
+    lo-LA: lo-LA
+    lo: lo-LA
+    hy-AM: hy-AM
+    hy: hy-AM
+    da-DK: da-DK
+    da: da-DK
+    fi-FI: fi-FI
+    fi: fi-FI
+    mn-MN: mn-MN
+    mn: mn-MN
+    hr-HR: hr-HR
+    hr: hr-HR
+    nb-NO: nb-NO
+    nb: nb-NO
+    sk-SK: sk-SK
+    sk: sk-SK
+    ka-GE: ka-GE
+    ka: ka-GE
+    bs-BA: bs-BA
+    bs: bs-BA
+    lt-LT: lt-LT
+    lt: lt-LT
+    sl-SI: sl-SI
+    sl: sl-SI
+    gl-ES: gl-ES
+    gl: gl-ES
+    ga-IE: ga-IE
+    ga: ga-IE
+    lv-LV: lv-LV
+    lv: lv-LV
+    mk-MK: mk-MK
+    mk: mk-MK
+    et-EE: et-EE
+    et: et-EE
+    cy-GB: cy-GB
+    cy: cy-GB
+    eu-ES: eu-ES
+    eu: eu-ES
+    mt-MT: mt-MT
+    mt: mt-MT
+    is-IS: is-IS
+    is: is-IS
+    ar-EG: ar-EG
+    bn-IN: bn-IN
+    de-AT: de-AT
+    de-CH: de-CH
+    en-AU: en-AU
+    en-CA: en-CA
+    en-IE: en-IE
+    en-IN: en-IN
+    es-MX: es-MX
+    fr-BE: fr-BE
+    fr-CA: fr-CA
+    fr-CH: fr-CH
+    nl-BE: nl-BE
+    ta-LK: ta
+    ta-MY: ta
+    ta-SG: ta
+    ur-IN: ur
+    zh-HK: zh-HK
+    zh-TW: zh-TW
+  root_voices:
+    sparrow:
+      voice_id: msa.en-US.AvaMultilingual
+      model: lzspeech-sparrow
+      languages: [en, ja, zh, fr, es, tr, hi, id, pt, vi, it, de, ru, ko, ar, bn, ur, ta, sw, jv, te]
+    andrew_sparrow:
+      voice_id: msa.en-US.AndrewMultilingual
+      model: lzspeech-sparrow
+      speaker: en
+      languages: [en-US]
+    andrew_sparrow_en_us:
+      voice_id: msa.en-US.Andrew
+      model: lzspeech-sparrow
+      speaker: en
+      languages: [en-US]
+    sparrow_en_gb:
+      voice_id: msa.en-GB.AdaMultilingual
+      model: lzspeech-sparrow
+      speaker: en
+      languages: [en-GB]
+    sparrow_de_de:
+      voice_id: msa.de-DE.SeraphinaMultilingual
+      model: lzspeech-sparrow
+      speaker: de
+      languages: [de]
+    sparrow_de_de_seraphina:
+      voice_id: msa.de-DE.Seraphina
+      model: lzspeech-sparrow
+      speaker: de
+      languages: [de]
+    sparrow_it_it:
+      voice_id: msa.it-IT.IsabellaMultilingual
+      model: lzspeech-sparrow
+      speaker: it
+      languages: [it]
+    sparrow_it_it_isabella:
+      voice_id: msa.it-IT.Isabella
+      model: lzspeech-sparrow
+      speaker: it
+      languages: [it]
+    sparrow_ar_sa:
+      voice_id: msa.ar-SA.Zariyah
+      model: lzspeech-sparrow
+      speaker: ar-SA
+      languages: [ar-SA]
+    sparrow_pt_br:
+      voice_id: msa.pt-BR.Thalita
+      model: lzspeech-sparrow
+      speaker: pt-BR
+      languages: [pt-BR]
+    sparrow_pa_in:
+      voice_id: msa.pa-IN.Ojas
+      model: lzspeech-sparrow
+      speaker: pa-IN
+      languages: [pa-IN]
+    sparrow_fa_ir:
+      voice_id: msa.fa-IR.Dilara
+      model: lzspeech-sparrow
+      speaker: fa-IR
+      languages: [fa-IR]
+    sparrow_mr_in:
+      voice_id: msa.mr-IN.Aarohi
+      model: lzspeech-sparrow
+      speaker: mr-IN
+      languages: [mr-IN]
+    sparrow_fil_ph:
+      voice_id: msa.fil-PH.Blessica
+      model: lzspeech-sparrow
+      speaker: fil-PH
+      languages: [fil-PH]
+    sparrow_ms_my:
+      voice_id: msa.ms-MY.Yasmin
+      model: lzspeech-sparrow
+      speaker: ms-MY
+      languages: [ms-MY]
+    sparrow_th_th:
+      voice_id: msa.th-TH.Premwadee
+      model: lzspeech-sparrow
+      speaker: th-TH
+      languages: [th-TH]
+    sparrow_gu_in:
+      voice_id: msa.gu-IN.Dhwani
+      model: lzspeech-sparrow
+      speaker: gu-IN
+      languages: [gu-IN]
+    sparrow_am_et:
+      voice_id: msa.am-ET.Mekdes
+      model: lzspeech-sparrow
+      speaker: am-ET
+      languages: [am-ET]
+    sparrow_kn_in:
+      voice_id: msa.kn-IN.Sapna
+      model: lzspeech-sparrow
+      speaker: kn-IN
+      languages: [kn-IN]
+    sparrow_ps_af:
+      voice_id: msa.ps-AF.Latifa
+      model: lzspeech-sparrow
+      speaker: ps-AF
+      languages: [ps-AF]
+    sparrow_pl_pl:
+      voice_id: msa.pl-PL.Agnieszka
+      model: lzspeech-sparrow
+      speaker: pl-PL
+      languages: [pl-PL]
+    sparrow_my_mm:
+      voice_id: msa.my-MM.Nilar
+      model: lzspeech-sparrow
+      speaker: my-MM
+      languages: [my-MM]
+    sparrow_uk_ua:
+      voice_id: msa.uk-UA.Polina
+      model: lzspeech-sparrow
+      speaker: uk-UA
+      languages: [uk-UA]
+    sparrow_ml_in:
+      voice_id: msa.ml-IN.Sobhana
+      model: lzspeech-sparrow
+      speaker: ml-IN
+      languages: [ml-IN]
+    sparrow_uz_uz:
+      voice_id: msa.uz-UZ.Madina
+      model: lzspeech-sparrow
+      speaker: uz-UZ
+      languages: [uz-UZ]
+    sparrow_or_in:
+      voice_id: msa.or-IN.Subhasini
+      model: lzspeech-sparrow
+      speaker: or-IN
+      languages: [or-IN]
+    sparrow_su_id:
+      voice_id: msa.su-ID.Tuti
+      model: lzspeech-sparrow
+      speaker: su-ID
+      languages: [su-ID]
+    sparrow_ro_ro:
+      voice_id: msa.ro-RO.Alina
+      model: lzspeech-sparrow
+      speaker: ro-RO
+      languages: [ro-RO]
+    sparrow_az_az:
+      voice_id: msa.az-AZ.Banu
+      model: lzspeech-sparrow
+      speaker: az-AZ
+      languages: [az-AZ]
+    sparrow_nl_nl:
+      voice_id: msa.nl-NL.Fenna
+      model: lzspeech-sparrow
+      speaker: nl-NL
+      languages: [nl-NL]
+    sparrow_ne_np:
+      voice_id: msa.ne-NP.Hemkala
+      model: lzspeech-sparrow
+      speaker: ne-NP
+      languages: [ne-NP]
+    sparrow_so_so:
+      voice_id: msa.so-SO.Ubax
+      model: lzspeech-sparrow
+      speaker: so-SO
+      languages: [so-SO]
+    sparrow_af_za:
+      voice_id: msa.af-ZA.Adri
+      model: lzspeech-sparrow
+      speaker: af-ZA
+      languages: [af-ZA]
+    sparrow_km_kh:
+      voice_id: msa.km-KH.Sreymom
+      model: lzspeech-sparrow
+      speaker: km-KH
+      languages: [km-KH]
+    sparrow_kk_kz:
+      voice_id: msa.kk-KZ.Aigul
+      model: lzspeech-sparrow
+      speaker: kk-KZ
+      languages: [kk-KZ]
+    sparrow_si_lk:
+      voice_id: msa.si-LK.Thilini
+      model: lzspeech-sparrow
+      speaker: si-LK
+      languages: [si-LK]
+    sparrow_as_in:
+      voice_id: msa.as-IN.Yashica
+      model: lzspeech-sparrow
+      speaker: as-IN
+      languages: [as-IN]
+    sparrow_zu_za:
+      voice_id: msa.zu-ZA.Thando
+      model: lzspeech-sparrow
+      speaker: zu-ZA
+      languages: [zu-ZA]
+    sparrow_el_gr:
+      voice_id: msa.el-GR.Athina
+      model: lzspeech-sparrow
+      speaker: el-GR
+      languages: [el-GR]
+    sparrow_hu_hu:
+      voice_id: msa.hu-HU.Noemi
+      model: lzspeech-sparrow
+      speaker: hu-HU
+      languages: [hu-HU]
+    sparrow_sv_se:
+      voice_id: msa.sv-SE.Sofie
+      model: lzspeech-sparrow
+      speaker: sv-SE
+      languages: [sv-SE]
+    sparrow_cs_cz:
+      voice_id: msa.cs-CZ.Vlasta
+      model: lzspeech-sparrow
+      speaker: cs-CZ
+      languages: [cs-CZ]
+    sparrow_sr_rs:
+      voice_id: msa.sr-RS.Sophie
+      model: lzspeech-sparrow
+      speaker: sr-RS
+      languages: [sr-RS]
+    sparrow_ca_es:
+      voice_id: msa.ca-ES.Joana
+      model: lzspeech-sparrow
+      speaker: ca-ES
+      languages: [ca-ES]
+    sparrow_he_il:
+      voice_id: msa.he-IL.Hila
+      model: lzspeech-sparrow
+      speaker: he-IL
+      languages: [he-IL]
+    sparrow_sq_al:
+      voice_id: msa.sq-AL.Anila
+      model: lzspeech-sparrow
+      speaker: sq-AL
+      languages: [sq-AL]
+    sparrow_bg_bg:
+      voice_id: msa.bg-BG.Kalina
+      model: lzspeech-sparrow
+      speaker: bg-BG
+      languages: [bg-BG]
+    sparrow_lo_la:
+      voice_id: msa.lo-LA.Keomany
+      model: lzspeech-sparrow
+      speaker: lo-LA
+      languages: [lo-LA]
+    sparrow_hy_am:
+      voice_id: msa.hy-AM.Anahit
+      model: lzspeech-sparrow
+      speaker: hy-AM
+      languages: [hy-AM]
+    sparrow_da_dk:
+      voice_id: msa.da-DK.Christel
+      model: lzspeech-sparrow
+      speaker: da-DK
+      languages: [da-DK]
+    sparrow_fi_fi:
+      voice_id: msa.fi-FI.Selma
+      model: lzspeech-sparrow
+      speaker: fi-FI
+      languages: [fi-FI]
+    sparrow_mn_mn:
+      voice_id: msa.mn-MN.Yesui
+      model: lzspeech-sparrow
+      speaker: mn-MN
+      languages: [mn-MN]
+    sparrow_hr_hr:
+      voice_id: msa.hr-HR.Gabrijela
+      model: lzspeech-sparrow
+      speaker: hr-HR
+      languages: [hr-HR]
+    sparrow_nb_no:
+      voice_id: msa.nb-NO.Pernille
+      model: lzspeech-sparrow
+      speaker: nb-NO
+      languages: [nb-NO]
+    sparrow_sk_sk:
+      voice_id: msa.sk-SK.Viktoria
+      model: lzspeech-sparrow
+      speaker: sk-SK
+      languages: [sk-SK]
+    sparrow_ka_ge:
+      voice_id: msa.ka-GE.Eka
+      model: lzspeech-sparrow
+      speaker: ka-GE
+      languages: [ka-GE]
+    sparrow_bs_ba:
+      voice_id: msa.bs-BA.Vesna
+      model: lzspeech-sparrow
+      speaker: bs-BA
+      languages: [bs-BA]
+    sparrow_bs_ba_goran:
+      voice_id: msa.bs-BA.Goran
+      model: lzspeech-sparrow
+      speaker: bs-BA
+      languages: [bs-BA]
+      adapter: goran
+    sparrow_lt_lt:
+      voice_id: msa.lt-LT.Ona
+      model: lzspeech-sparrow
+      speaker: lt-LT
+      languages: [lt-LT]
+    sparrow_sl_si:
+      voice_id: msa.sl-SI.Petra
+      model: lzspeech-sparrow
+      speaker: sl-SI
+      languages: [sl-SI]
+    sparrow_gl_es:
+      voice_id: msa.gl-ES.Sabela
+      model: lzspeech-sparrow
+      speaker: gl-ES
+      languages: [gl-ES]
+    sparrow_ga_ie:
+      voice_id: msa.ga-IE.Orla
+      model: lzspeech-sparrow
+      speaker: ga-IE
+      languages: [ga-IE]
+    sparrow_lv_lv:
+      voice_id: msa.lv-LV.Everita
+      model: lzspeech-sparrow
+      speaker: lv-LV
+      languages: [lv-LV]
+    sparrow_mk_mk:
+      voice_id: msa.mk-MK.Marija
+      model: lzspeech-sparrow
+      speaker: mk-MK
+      languages: [mk-MK]
+    sparrow_et_ee:
+      voice_id: msa.et-EE.Anu
+      model: lzspeech-sparrow
+      speaker: et-EE
+      languages: [et-EE]
+    sparrow_cy_gb:
+      voice_id: msa.cy-GB.Nia
+      model: lzspeech-sparrow
+      speaker: cy-GB
+      languages: [cy-GB]
+    sparrow_eu_es:
+      voice_id: msa.eu-ES.Ainhoa
+      model: lzspeech-sparrow
+      speaker: eu-ES
+      languages: [eu-ES]
+    sparrow_mt_mt:
+      voice_id: msa.mt-MT.Grace
+      model: lzspeech-sparrow
+      speaker: mt-MT
+      languages: [mt-MT]
+    sparrow_is_is:
+      voice_id: msa.is-IS.Gudrun
+      model: lzspeech-sparrow
+      speaker: is-IS
+      languages: [is-IS]
+    sparrow_ar_eg:
+      voice_id: msa.ar-EG.Salma
+      model: lzspeech-sparrow
+      speaker: ar-EG
+      languages: [ar-EG]
+    sparrow_bn_in:
+      voice_id: msa.bn-IN.Bashkar
+      model: lzspeech-sparrow
+      speaker: bn-IN
+      languages: [bn-IN]
+    sparrow_de_at:
+      voice_id: msa.de-AT.Ingrid
+      model: lzspeech-sparrow
+      speaker: de-AT
+      languages: [de-AT]
+    sparrow_de_ch:
+      voice_id: msa.de-CH.Jan
+      model: lzspeech-sparrow
+      speaker: de-CH
+      languages: [de-CH]
+    sparrow_en_au:
+      voice_id: msa.en-AU.Annette
+      model: lzspeech-sparrow
+      speaker: en-AU
+      languages: [en-AU]
+    sparrow_en_ca:
+      voice_id: msa.en-CA.Clara
+      model: lzspeech-sparrow
+      speaker: en-CA
+      languages: [en-CA]
+    sparrow_en_ie:
+      voice_id: msa.en-IE.Connor
+      model: lzspeech-sparrow
+      speaker: en-IE
+      languages: [en-IE]
+    sparrow_en_in:
+      voice_id: msa.en-IN.Neerja
+      model: lzspeech-sparrow
+      speaker: en-IN
+      languages: [en-IN]
+    sparrow_es_mx:
+      voice_id: msa.es-MX.Beatriz
+      model: lzspeech-sparrow
+      speaker: es-MX
+      languages: [es-MX]
+    sparrow_fr_be:
+      voice_id: msa.fr-BE.Charline
+      model: lzspeech-sparrow
+      speaker: fr-BE
+      languages: [fr-BE]
+    sparrow_fr_ca:
+      voice_id: msa.fr-CA.Antoine
+      model: lzspeech-sparrow
+      speaker: fr-CA
+      languages: [fr-CA]
+    sparrow_fr_ch:
+      voice_id: msa.fr-CH.Ariane
+      model: lzspeech-sparrow
+      speaker: fr-CH
+      languages: [fr-CH]
+    sparrow_nl_be:
+      voice_id: msa.nl-BE.Arnaud
+      model: lzspeech-sparrow
+      speaker: nl-BE
+      languages: [nl-BE]
+    sparrow_zh_hk:
+      voice_id: msa.zh-HK.HiuMaan
+      model: lzspeech-sparrow
+      speaker: zh-HK
+      languages: [zh-HK]
+    sparrow_zh_tw:
+      voice_id: msa.zh-TW.HsiaoChen
+      model: lzspeech-sparrow
+      speaker: zh-TW
+      languages: [zh-TW]
+voxcpm:
+  enabled: true
+  preload: true
+  model_id: voxcpm
+  model_path: data/lzspeech-falcon-v1.2
+  device: 0
+  dtype: auto
+  inference_timesteps: 16
+  guidance_folded: true
+  max_num_batched_tokens: 8192
+  max_num_seqs: 8
+  max_model_len: 4096
+  gpu_memory_utilization: 0.4
+  num_kvcache_blocks: 16
+  enforce_eager: false
+  ipa_adapter_path: null
+  duration_budget:
+    enabled: true
+    preload: true
+    use_bert: false
+    checkpoint: data/lzspeech-sparrow/model.ckpt
+    config_path: data/lzspeech-sparrow/config.json
+    device: auto
+    language: multilingual
+    length_scale: 1
+    token_rate: 6.25
+    min_margin: 1
+    max_margin: 1.35
+    min_extra_tokens: 0
+    max_extra_tokens: 38
+    soft_text_token_limit: 64
+    hard_text_token_limit: 80
+    include_word_spans: false
+  temperature: 1
+  cfg_value: 2
+  max_reference_seconds: 25
+  default_locales: [ar-SA, da-DK, de-DE, el-GR, en-HK, es-ES, fi-FI, fil-PH, fr-FR, he-IL, hi-IN, id-ID, it-IT, ja-JP, km-KH,
+    ko-KR, lo-LA, ms-MY, my-MM, nb-NO, nl-NL, pl-PL, pt-PT, ru-RU, sv-SE, sw-KE, th-TH, tr-TR, ur-IN, ur-PK, vi-VN, yue-CN,
+    zh-CN, zh-HK]
+  locale_loras:
+    en-US: accent-en-US
+    en-GB: accent-en-GB
+  applicable_loras:
+    accent-en-US: data/voxcpm-lora/accent/accent-en-US-falcon
+    accent-en-GB: data/voxcpm-lora/accent/accent-en-GB-falcon
+    ipa-text: data/voxcpm-lora/ipa/ipa-text-falcon
+  max_concurrent_loras: 3
+  max_loras_per_request: 2
+  lora_composition_cache_path: cache/voxcpm-lora-compositions
+  ipa_text_lora: ipa-text
+seed_vc:
+  preload: true
+  device: cuda:0
+  runtime_root: src/seed_vc_runtime
+  root: data/seed-vc
+  embeddings_hdf5_path: data/seed-vc/embeddings/vtts_embeddings_sparrow_fallback.h5
+  tmp_dir: data/seed-vc/tmp
+  output_dir: data/seed-vc/output
+  voice_samples_dir: data/seed-vc/voice-samples
+  fp16: true
+  embedding_cache_size: 64
+ssml:
+  enabled: true
+  voxcpm_ipa_stop_cushion_patches: 1
+  voxcpm_ipa_max_length_cushion_patches: 12
+  voxcpm_ipa_alignment_tolerance_patches: 2
+  voxcpm_ipa_refinement_passes: 1
+aligner:
+  model: MahmoudAshraf/mms-300m-1130-forced-aligner
+  device: cuda:0
+  dtype: float16
+transcribe:
+  model: data/qwen3-asr-0.6b
+  device: cuda:0
+  dtype: float16

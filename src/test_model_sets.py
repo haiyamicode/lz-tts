@@ -74,7 +74,6 @@ def test_types_wait_for_their_deferred_engines():
 def test_lzai_models_turns_engines_and_their_types_off(server_json, monkeypatch):
     from src.api import server
 
-    monkeypatch.setattr(server, "CONFIG_PATH", server_json)
     monkeypatch.setenv("LZAI_MODELS", "falcon")
     config = server._load_config()
     assert config.engines.voxcpm and not config.engines.seed_vc

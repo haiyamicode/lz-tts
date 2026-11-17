@@ -405,7 +405,7 @@ class MediaRuntime:
         ready_timeout_seconds: float,
         features: list[str],
     ):
-        # Relative paths are the repo's (server.json), not the runtime dir the child starts in.
+        # Relative paths are the repo's (server config), not the runtime dir the child starts in.
         repo_dir = Path(__file__).resolve().parents[2]
         self.python = str(repo_dir / python) if not Path(python).is_absolute() and "/" in python else python
         self.runtime_dir = repo_dir / runtime_dir

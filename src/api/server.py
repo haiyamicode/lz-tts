@@ -43,7 +43,7 @@ from ..multilingual_splitter.multilingual_splitter import CLD2_LANGUAGE_CODES
 from ..piper import PiperInference
 from ..piper.ipa_symbols import sparrow_ipa_symbols
 from ..heap_trim import IdleHeapTrimmer
-from .. import model_sets
+from .. import model_sets, server_config
 from ..process_guard import hard_exit
 from ..ctc_forced_alignment import CtcLanguageSpan
 from ..aligned_pauses import ResolvedPause, insert_resolved_pauses
@@ -138,7 +138,6 @@ def _binary_response(content: bytes, media_type: str, headers: dict[str, str] | 
 
 # Default paths
 DATA_DIR = Path("data")
-CONFIG_PATH = Path(os.environ.get("LZAI_SERVER_CONFIG", "local/server.json"))
 DEFAULT_MODEL = "lzspeech-sparrow"
 PUBLIC_SPARROW_MODEL = "sparrow"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -534,13 +533,13 @@ class LoadConfig(BaseModel):
 
     mode: Literal["all", "on-demand"] = "all"
     budget_gb: float | None = Field(default=None, gt=0)
-    # Peak VRAM of each engine, GB, measured on the 3090 with the server.json defaults: voxcpm
+    # Peak VRAM of each engine, GB, measured on the 3090 with the server config defaults: voxcpm
     # preallocates gpu_memory_utilization x the GPU (0.4 x 24 GB), transcribe 2.2 GB, speech
     # 2.0 loaded (Sparrow 1.0 + Seed-VC 1.1) and aligner 1.2 (CTC 0.7 + numbers 0.6), plus room
     # to run. An engine left out uses the whole budget less the pinned engines: media (ComfyUI
     # keeps models cached in whatever is free, 20.4 GB measured), so it shares the GPU only with
     # pinned engines.
-    # A server.json value overrides these per engine (the others keep their defaults).
+    # A server config value overrides these per engine (the others keep their defaults).
     footprints_gb: dict[str, float] = Field(default_factory=lambda: dict(_DEFAULT_FOOTPRINTS_GB))
     # Engines to load at startup in on-demand mode (the rest load when a job needs them;
     # "speech" brings "aligner" along, as in ``pinned``).
@@ -1225,16 +1224,30 @@ def _get_base_language(speaker_or_locale: str) -> str:
 
 
 def _load_config() -> ServerConfig:
-    """Load server configuration from local/server.json."""
-    if not CONFIG_PATH.exists():
-        return _apply_load_env(ServerConfig())
-    with CONFIG_PATH.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+    """The server config ``LZAI_SERVER_CONFIG`` composes (``src/server_config.py``), env overrides applied."""
+    data, files = server_config.load()
+    _LOGGER.info("Server config from %s", ", ".join(map(str, files)) or "no file (code defaults)")
+    for key in _unknown_config_keys(ServerConfig, data):
+        _LOGGER.warning("Server config key %s is not a setting; ignored", key)
     return _apply_load_env(_restrict_to_model_sets(ServerConfig(**data)))
 
 
+def _unknown_config_keys(model: type[BaseModel], data: dict, prefix: str = "") -> list[str]:
+    """Keys of ``data`` that no field of ``model`` (or of its nested config models) takes."""
+    fields = {(field.alias or name): field for name, field in model.model_fields.items()}
+    fields.update(model.model_fields)
+    unknown = []
+    for key, value in data.items():
+        field = fields.get(key)
+        if field is None:
+            unknown.append(f"{prefix}{key}")
+        elif isinstance(value, dict) and isinstance(field.annotation, type) and issubclass(field.annotation, BaseModel):
+            unknown += _unknown_config_keys(field.annotation, value, f"{prefix}{key}.")
+    return unknown
+
+
 def _apply_load_env(config: ServerConfig) -> ServerConfig:
-    """``LZAI_LOAD_MODE`` / ``LZAI_VRAM_BUDGET_GB`` override server.json ``load``."""
+    """``LZAI_LOAD_MODE`` / ``LZAI_VRAM_BUDGET_GB`` override the server config ``load``."""
     mode = os.environ.get("LZAI_LOAD_MODE", "").strip()
     budget = os.environ.get("LZAI_VRAM_BUDGET_GB", "").strip()
     if mode or budget:
@@ -5880,7 +5893,7 @@ async def _start_inference_runtime(config: ServerConfig) -> None:
 
     _server_config = config
     startup_started = time.perf_counter()
-    _LOGGER.info("Scheduling inference runtime startup config=%s", CONFIG_PATH)
+    _LOGGER.info("Scheduling inference runtime startup config=%s", ",".join(map(str, server_config.config_paths())))
     with _logged_startup_step("reset_runtime_state"):
         if _startup_loader_task is not None and not _startup_loader_task.done():
             _startup_loader_task.cancel()

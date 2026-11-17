@@ -1,8 +1,8 @@
 # Never bake secrets or local state into the image
-# (local/server.json is re-included below: no secrets, baked into the image)
+# (local/server.yml is re-included below: no secrets, baked into the image)
 .env
 local/*
-!local/server.json
+!local/server.yml
 data/
 checkpoints/
 output/

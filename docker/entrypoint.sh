@@ -11,7 +11,7 @@ cd /app
 #    Must run BEFORE uv sync: uv.lock resolves flash-attn from
 #    data/runtime-wheels/. Per-file ETag checks make re-runs cheap.
 #    Model sets (src/model_sets.py): LZAI_MODELS picks what downloads and is
-#    served (unset = what server.json enables, "all" = everything);
+#    served (unset = what the server config enables, "all" = everything);
 #    LZAI_REQUIRED_MODELS (unset = all of LZAI_MODELS) is what must be on disk
 #    before the worker starts and joins Taskflow. The rest is marked in
 #    data/.pending/ and downloads in the background (step 4); the worker loads
@@ -22,7 +22,7 @@ if [ "${LZAI_SKIP_DATA_DOWNLOAD:-0}" = "1" ]; then
     echo "[bootstrap] LZAI_SKIP_DATA_DOWNLOAD=1 — skipping S3 data sync"
 else
     echo "[bootstrap] Syncing core + required model sets from S3..."
-    uv run --no-project --with boto3 --with python-dotenv \
+    uv run --no-project --with boto3 --with python-dotenv --with pyyaml \
         python scripts/download_data.py --stage required
 fi
 
@@ -63,7 +63,7 @@ sync_media_venv() {
     fi
 }
 
-MEDIA_STAGE="$(uv run --no-project python -m src.model_sets media-stage)"
+MEDIA_STAGE="$(uv run --no-project --with pyyaml python -m src.model_sets media-stage)"
 case "$MEDIA_STAGE" in
     none) echo "[bootstrap] no media model set — no media runtime venv" ;;
     required) sync_media_venv ;;
@@ -80,7 +80,7 @@ esac
 # ---------------------------------------------------------------------------
 if [ "${LZAI_SKIP_DATA_DOWNLOAD:-0}" != "1" ] && [ -n "$(ls data/.pending 2>/dev/null | grep -v '^media-venv$')" ]; then
     echo "[bootstrap] Downloading deferred model sets in the background: $(ls data/.pending | grep -v '^media-venv$' | tr '\n' ' ')"
-    (until uv run --no-project --with boto3 --with python-dotenv \
+    (until uv run --no-project --with boto3 --with python-dotenv --with pyyaml \
             python scripts/download_data.py --stage deferred; do
         echo "[bootstrap] deferred download failed; retrying in 30s"; sleep 30
      done) &

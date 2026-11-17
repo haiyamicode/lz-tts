@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import h5py
 
+from src import server_config
 from src.api.seed_vc_backend import SeedVCBackend
 
 
@@ -18,13 +18,13 @@ def main() -> None:
     parser.add_argument("--voice-id", required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--server-config", type=Path, default=Path("local/server.json"))
+    parser.add_argument("--server-config", help="Server config files, comma-separated (default: LZAI_SERVER_CONFIG, else local/server.yml)")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
     if not args.reference.is_file():
         raise FileNotFoundError(args.reference)
-    config = json.loads(args.server_config.read_text(encoding="utf-8"))["seed_vc"]
+    config = server_config.load(args.server_config)[0]["seed_vc"]
     settings = SimpleNamespace(
         runtime_root=config["runtime_root"],
         root=config["root"],

@@ -9,6 +9,8 @@ from pathlib import Path
 
 import h5py
 
+from src import server_config
+
 
 # VoxCPM2's advertised language set, normalized to the base codes used by the
 # serving configuration. Chinese dialect codes are included because they are
@@ -24,11 +26,11 @@ def _base_language(locale: str) -> str:
     return locale.strip().lower().split("-", maxsplit=1)[0]
 
 
-def _fallback_languages(server_config_path: Path) -> set[str]:
-    config = json.loads(server_config_path.read_text(encoding="utf-8"))
+def _fallback_languages(config_files: str | None) -> set[str]:
+    config, files = server_config.load(config_files)
     language_map = config.get("pipertts", {}).get("lang_speaker_map")
     if not isinstance(language_map, dict):
-        raise ValueError(f"{server_config_path} has no pipertts.lang_speaker_map")
+        raise ValueError(f"server config {', '.join(map(str, files))} has no pipertts.lang_speaker_map")
     sparrow_languages = {
         _base_language(language)
         for language in (*language_map.keys(), *language_map.values())
@@ -43,7 +45,7 @@ def main() -> None:
     parser.add_argument("--supplemental-source", type=Path, action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--catalog", type=Path, default=Path("local/voices.json"))
-    parser.add_argument("--server-config", type=Path, default=Path("local/server.json"))
+    parser.add_argument("--server-config", help="Server config files, comma-separated (default: LZAI_SERVER_CONFIG, else local/server.yml)")
     parser.add_argument(
         "--languages",
         nargs="+",

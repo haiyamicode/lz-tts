@@ -15,6 +15,7 @@ import numpy as np
 import soundfile as sf
 from dotenv import load_dotenv
 
+from src import server_config
 from src.aligned_pauses import insert_aligned_pauses, parse_pause_markers
 
 
@@ -46,7 +47,7 @@ def _parse_args() -> argparse.Namespace:
         default="MahmoudAshraf/mms-300m-1130-forced-aligner",
     )
     parser.add_argument("--ctc-dtype", choices=("float16", "float32"), default="float16")
-    parser.add_argument("--server-config", type=Path, default=Path("local/server.json"))
+    parser.add_argument("--server-config", help="Server config files, comma-separated (default: LZAI_SERVER_CONFIG, else local/server.yml)")
     parser.add_argument("--voice-catalog", type=Path, default=Path("data/voice-presets.json"))
     return parser.parse_args()
 
@@ -69,10 +70,9 @@ def _preset_language(voice_id: str, catalog_path: Path) -> str:
     raise ValueError(f"Voice preset {voice_id!r} was not found in {catalog_path}")
 
 
-def _alignment_checkpoint_for_language(language: str, server_config_path: Path) -> Path:
+def _alignment_checkpoint_for_language(language: str, config_files: str | None) -> Path:
     """Follow the production Sparrow speaker/model priority for a locale."""
-    server_config = json.loads(server_config_path.read_text(encoding="utf-8"))
-    piper_config = server_config.get("pipertts") or {}
+    piper_config = server_config.load(config_files)[0].get("pipertts") or {}
     aliases = {
         _normalized_locale(str(locale)): str(speaker)
         for locale, speaker in (piper_config.get("lang_speaker_map") or {}).items()
