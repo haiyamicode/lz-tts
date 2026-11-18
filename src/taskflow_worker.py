@@ -175,6 +175,8 @@ def served_task_types(config: Any) -> tuple[str, ...]:
         off.add("transcribe")
     if not config.engines.voxcpm:
         off.add("voice-design")
+        if not config.engines.pipertts:
+            off.add("tts-synthesis")
     return tuple(task_type for task_type in TASK_TYPES if task_type not in off)
 _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
 # Join, heartbeat, pull, settle and leave are small requests (pulls long-poll

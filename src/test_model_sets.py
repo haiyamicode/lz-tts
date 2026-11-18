@@ -83,6 +83,27 @@ def test_lzai_models_turns_engines_and_their_types_off(server_json, monkeypatch)
     assert "force-align" in served and "tts-synthesis" in served
 
 
+def test_media_only_worker_serves_no_tts(monkeypatch):
+    from src.api import server
+
+    # The Salad pilot's worker: tracked base + the manifest's inline settings.
+    monkeypatch.setenv("LZAI_SERVER_CONFIG", "configs/server/base.yml")
+    monkeypatch.setenv(
+        "LZAI_SERVER_CONFIG_YAML",
+        "{engines: {pipertts: false, voxcpm: false, seed_vc: false}, voxcpm: {enabled: false},"
+        " transcribe: {enabled: false}, media: {music: false, videogen: true, lipsync: true, imagegen: true},"
+        " load: {mode: on-demand, budget_gb: 22, pinned: [aligner], preload: [media]}}",
+    )
+    monkeypatch.setenv("LZAI_MODELS", "videogen,lipsync,imagegen")
+    monkeypatch.delenv("LZAI_LOAD_MODE", raising=False)
+    monkeypatch.delenv("LZAI_VRAM_BUDGET_GB", raising=False)
+    config = server._load_config()
+    assert config.media.gpu is None and config.media.features() == ["videogen", "lipsync", "imagegen"]
+    served = served_task_types(config)
+    assert not {"tts-synthesis", "voice-design", "transcribe", "generate-music"} & set(served)
+    assert {"videogen", "lipsync", "imagegen", "force-align"} <= set(served)
+
+
 def test_falcon_downloads_only_what_server_json_serves(server_json, monkeypatch):
     monkeypatch.delenv("VOXCPM_MODEL_PATH", raising=False)
     assert model_sets.falcon_paths() == [model_sets.DEFAULT_FALCON_MODEL.removeprefix("data/")]

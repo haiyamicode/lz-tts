@@ -5,6 +5,9 @@
   or no file at all (code defaults). A file named here that does not exist is an error.
 - ``extends:`` in a file (a path or a list, relative to that file) names its bases: they merge first, in order,
   then the file itself. A base may extend others; a cycle is an error.
+- ``LZAI_SERVER_CONFIG_YAML``: an inline YAML mapping merged last, on top of those files (no ``extends``). A
+  deployment keeps its own settings in its manifest this way (``{media: {music: false}, load: {mode: on-demand}}``);
+  only tracked bases ship in the image.
 - Merge: a mapping merges into a mapping key by key, recursively; anything else (lists, scalars, ``null``)
   replaces. A mapping tagged ``!replace`` replaces the base's mapping instead of merging into it.
 
@@ -23,6 +26,7 @@ from pathlib import Path
 import yaml
 
 ENV = "LZAI_SERVER_CONFIG"
+INLINE_ENV = "LZAI_SERVER_CONFIG_YAML"
 DEFAULT_PATH = Path("local/server.yml")
 LEGACY_PATH = Path("local/server.json")
 EXTENDS = "extends"
@@ -72,13 +76,17 @@ def _plain(value):
     return value
 
 
-def _read(path: Path) -> dict:
-    data = yaml.load(path.read_text(encoding="utf-8"), Loader=_Loader)
+def _parse(text: str, source: str) -> dict:
+    data = yaml.load(text, Loader=_Loader)
     if data is None:
         return {}
     if not isinstance(data, dict):
-        raise ValueError(f"server config {path}: the top level must be a mapping, got {type(data).__name__}")
+        raise ValueError(f"server config {source}: the top level must be a mapping, got {type(data).__name__}")
     return data
+
+
+def _read(path: Path) -> dict:
+    return _parse(path.read_text(encoding="utf-8"), str(path))
 
 
 def _compose(path: Path, stack: tuple[Path, ...], files: list[Path]) -> dict:
@@ -102,11 +110,19 @@ def _compose(path: Path, stack: tuple[Path, ...], files: list[Path]) -> dict:
 
 
 def load(value: str | os.PathLike | list | None = None) -> tuple[dict, list[Path]]:
-    """The composed config of ``value`` (see :func:`config_paths`) and every file read, in merge order."""
+    """The composed config of ``value`` (see :func:`config_paths`) and every file read, in merge order. With no
+    ``value`` (the environment's config), ``LZAI_SERVER_CONFIG_YAML`` merges last, listed as ``$LZAI_SERVER_CONFIG_YAML``."""
     merged: dict = {}
     files: list[Path] = []
     for path in config_paths(value):
         merged = merge(merged, _compose(path, (), files))
+    inline = os.environ.get(INLINE_ENV, "").strip() if value is None else ""
+    if inline:
+        data = _parse(inline, f"${INLINE_ENV}")
+        if EXTENDS in data:
+            raise ValueError(f"${INLINE_ENV} cannot use {EXTENDS}: name the bases in ${ENV}")
+        merged = merge(merged, data)
+        files.append(Path(f"${INLINE_ENV}"))
     return merged, files
 
 

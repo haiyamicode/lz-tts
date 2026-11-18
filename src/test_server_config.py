@@ -61,6 +61,19 @@ def test_a_comma_list_merges_left_to_right(prod, monkeypatch):
     assert data["load"] == {"mode": "on-demand", "budget_gb": 20, "pinned": ["aligner"]}
 
 
+def test_inline_yaml_merges_last(prod, monkeypatch):
+    monkeypatch.setenv("LZAI_SERVER_CONFIG", str(prod / "base.yml"))
+    monkeypatch.setenv("LZAI_SERVER_CONFIG_YAML", "{engines: {voxcpm: false}, load: {mode: on-demand, pinned: [aligner]}}")
+    data, files = server_config.load()
+    assert [str(f) for f in files] == [str(prod / "base.yml"), "$LZAI_SERVER_CONFIG_YAML"]
+    assert data["engines"] == {"pipertts": True, "voxcpm": False, "seed_vc": True}
+    assert data["load"] == {"mode": "on-demand", "pinned": ["aligner"]}
+    assert server_config.load(str(prod / "base.yml"))[0]["engines"]["voxcpm"] is True  # explicit files only
+    monkeypatch.setenv("LZAI_SERVER_CONFIG_YAML", "extends: base.yml")
+    with pytest.raises(ValueError, match="cannot use extends"):
+        server_config.load()
+
+
 def test_replace_tag_drops_the_bases_mapping(prod):
     _write(prod / "v100.yml", "extends: base.yml\nvoxcpm:\n  applicable_loras: !replace {ipa-text: data/c}\n")
     data, _ = server_config.load(str(prod / "v100.yml"))
