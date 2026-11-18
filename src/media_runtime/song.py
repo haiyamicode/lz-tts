@@ -16,6 +16,7 @@ from pathlib import Path
 import soundfile as sf
 import torch
 
+import cancel
 from paths import YUE2_DIR
 
 MIN_COMPUTE_CAPABILITY = (8, 0)
@@ -87,6 +88,8 @@ class YuE2Song:
             abc=request.abc,
             abc_sampling=request.abc_sampling,
             semantic_sampling=request.semantic_sampling,
+            # Checked on every token and ODE step; YuE2 raises InterruptedError.
+            cancelled=cancel.is_cancelled,
         )
         out_path = Path(out_path)
         sf.write(str(out_path), song.audio, song.sample_rate, subtype="PCM_16")

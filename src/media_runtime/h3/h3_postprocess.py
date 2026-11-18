@@ -17,6 +17,8 @@ from contextlib import nullcontext
 from fractions import Fraction
 from typing import Any
 
+import cancel
+
 from .h3_interpolation import OUTPUT_FPS
 
 
@@ -99,6 +101,8 @@ def stream_video(source_args: list[str], output_args: list[str], *, width: int, 
                 pending.clear()
 
             for n in range(int(frames)):
+                # The writer and reader are killed below, so a cancel stops the encode too.
+                cancel.check()
                 position = Fraction(n * int(source_fps), int(output_fps))
                 index, offset = math.floor(position), position - math.floor(position)
                 while not exhausted and loaded < index + (1 if offset else 0):

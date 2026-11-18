@@ -51,6 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import cancel
 import progress
 
 from .compat import log_event
@@ -211,12 +212,13 @@ TURBO_PREVIEW_SIGMAS = "1.0, 0.8575, 0.7064, 0.0"
 
 #: ``preset`` values of videogen jobs. ``standard`` is the plain base on the
 #: CFG-distilled checkpoint's benchmarked recipe (res_multistep, 10 steps, no LoRA);
-#: ``turbo-N`` are the Turbo LoRAs: ema850 at 4 (the served default) or 6 steps (vigen's
+#: ``turbo-N`` are the Turbo LoRAs: ema850 at 4 (the worker's own default), 5 (what the API sends) or 6 steps (vigen's
 #: production recipe), the upstream 8-step LoRA at 8.
 VIDEO_PRESETS: dict[str, H3Recipe] = {
     "standard": H3Recipe(steps=NVFP4_VANILLA_STEPS, sampler=NVFP4_VANILLA_SAMPLER),
     "turbo-8": H3Recipe(steps=8, sampler="res_multistep", lora_name=TURBO8_LORA_NAME, lora_loader="LoraLoaderModelOnly"),
     "turbo-6": H3Recipe(steps=6, lora_name=DEFAULT_TURBO_LORA_NAME, preview_sigmas=TURBO_PREVIEW_SIGMAS),
+    "turbo-5": H3Recipe(steps=5, lora_name=DEFAULT_TURBO_LORA_NAME, preview_sigmas=TURBO_PREVIEW_SIGMAS),
     "turbo-4": H3Recipe(steps=4, lora_name=DEFAULT_TURBO_LORA_NAME, preview_sigmas=TURBO_PREVIEW_SIGMAS),
 }
 #: ``preset`` values of lipsync jobs: the video presets plus ``turbo-3``, the lipsync
@@ -635,7 +637,7 @@ def _fit_canvas(width: int, height: int) -> tuple[int, int]:
 
 def resolve_output_dimensions(
     *,
-    image_path: Path,
+    image_path: Path | None,
     requested_width: int | None,
     requested_height: int | None,
 ) -> tuple[int, int]:
@@ -653,7 +655,15 @@ def resolve_output_dimensions(
 
     Downscaling happens only when the resulting canvas exceeds the H3 1 MP
     ceiling, which the model cannot encode.
+
+    ``image_path`` is ``None`` for t2va, where the prompt alone makes the clip:
+    there is no shape to inherit, so the caller names both axes (2 and 3 have
+    nothing to read).
     """
+    if image_path is None:
+        if not (requested_width and requested_height):
+            raise ValueError("a clip made from the prompt alone needs both width and height")
+        return _grid_pair(int(requested_width), int(requested_height))
     src_w, src_h = probe_image_dimensions(image_path)
     if requested_width and requested_height:
         return _grid_pair(int(requested_width), int(requested_height))
@@ -662,6 +672,36 @@ def resolve_output_dimensions(
     if requested_height:
         return _fit_canvas(int(round(int(requested_height) * src_w / src_h)), int(requested_height))
     return _fit_canvas(src_w, src_h)
+
+
+def short_side_canvas(
+    image_path: Path | None, short_side: int | None, *, aspect: tuple[int, int] | None = None
+) -> "H3Canvas":
+    """The render canvas for an ``output_short_side`` job: the image's usual canvas, or, when the target's short
+    side is below it, the smallest lattice canvas in the image's aspect that still holds it (as a requested
+    ``width``/``height``), so the fit is always a downscale: 480p of 16:9 renders 832x480 instead of ~1 MP
+    fitted down; 720p still renders 1312x736 (720 is between lattice steps).
+
+    A clip made from the prompt alone has no image to read a shape off, so ``aspect`` states it."""
+    from .span_upscale import short_side_size
+
+    if image_path is None and aspect is None:
+        raise ValueError("a short-side canvas needs a first frame or an aspect")
+    if image_path is not None:
+        aspect = probe_image_dimensions(image_path)
+        canvas = resolve_canvas(image_path=image_path)
+    else:
+        canvas = resolve_canvas(image_path=None, requested_width=aspect[0], requested_height=aspect[1])
+    if short_side is None or short_side >= min(canvas.width, canvas.height):
+        return canvas
+
+    for short in range(-(-short_side // H3_CANVAS_MULTIPLE) * H3_CANVAS_MULTIPLE, min(canvas.width, canvas.height),
+                       H3_CANVAS_MULTIPLE):
+        width, height = short_side_size(aspect, short)
+        found = resolve_canvas(image_path=image_path, requested_width=width, requested_height=height)
+        if min(found.width, found.height) >= short_side:
+            return found
+    return canvas
 
 
 class H3Canvas(NamedTuple):
@@ -687,7 +727,7 @@ class H3Canvas(NamedTuple):
 
 def resolve_canvas(
     *,
-    image_path: Path,
+    image_path: Path | None,
     requested_width: int | None = None,
     requested_height: int | None = None,
 ) -> H3Canvas:
@@ -708,8 +748,12 @@ def resolve_canvas(
         requested_width=requested_width,
         requested_height=requested_height,
     )
-    source_width, source_height = probe_image_dimensions(image_path)
-    if requested_width and requested_height:
+    source_width, source_height = (
+        probe_image_dimensions(image_path) if image_path is not None else (width, height)
+    )
+    if image_path is None:
+        source = "prompt"
+    elif requested_width and requested_height:
         source = "requested"
     elif requested_width or requested_height:
         source = "requested_axis+image_aspect"
@@ -983,7 +1027,7 @@ def build_h3_graph(
     width: int,
     height: int,
     length: int,
-    first_frame_input: str,
+    first_frame_input: str | None,
     last_frame_input: str | None,
     filename_prefix: str,
     recipe: H3Recipe | None = None,
@@ -1006,7 +1050,9 @@ def build_h3_graph(
 
     ``first_frame_input``/``last_frame_input`` are LoadImage input values
     (relative to the ComfyUI input directory); pass ``None`` for
-    ``last_frame_input`` to omit the last-frame keyframe.
+    ``last_frame_input`` to omit the last-frame keyframe. ``None`` for
+    ``first_frame_input`` too is t2va: the node takes no keyframe at all and
+    the prompt alone makes the clip, on the canvas ``width``/``height`` name.
     ``filename_prefix`` is the SaveVideo output prefix.
     Set ``generate_audio=False`` to drop the audio VAE decoder (no audio track);
     the FL2VA latent always carries the audio stream, so the default keeps it.
@@ -1019,10 +1065,11 @@ def build_h3_graph(
     scheduler_name = scheduler or h3_scheduler()
     graph: dict[str, dict[str, Any]] = {}
 
-    graph["1"] = {
-        "class_type": "LoadImage",
-        "inputs": {"image": first_frame_input},
-    }
+    if first_frame_input is not None:
+        graph["1"] = {
+            "class_type": "LoadImage",
+            "inputs": {"image": first_frame_input},
+        }
     graph["2"] = {
         "class_type": "UNETLoader",
         "inputs": {"unet_name": unet_name(), "weight_dtype": "default"},
@@ -1065,8 +1112,9 @@ def build_h3_graph(
         "width": width,
         "height": height,
         "length": length,
-        "first_frame": ["1", 0],
     }
+    if first_frame_input is not None:
+        h3_inputs["first_frame"] = ["1", 0]
     if last_frame_input is not None:
         graph["7"] = {
             "class_type": "LoadImage",
@@ -1267,6 +1315,12 @@ def _report_sampling_progress(value, total, preview_image=None, prompt_id=None, 
 
     ComfyUI's own server installs a hook like this one in its main; headless, we install ours.
     """
+    if cancel.is_cancelled():
+        # ComfyUI's own interrupt, which its executor is written to catch; the graph runner turns the
+        # failed prompt into the cancel (nothing of ours may unwind through the executor).
+        from comfy.model_management import InterruptProcessingException
+
+        raise InterruptProcessingException()
     if not total:
         return
     if value in (1, total):
@@ -1482,6 +1536,8 @@ def _execute_graph(
     """
     import torch
 
+    # A cancelled job starts no graph (ComfyUI clears its interrupt flag as each prompt starts).
+    cancel.check()
     prompt_id = str(uuid.uuid4())
 
     async def _execute() -> dict[str, Any]:
@@ -1503,6 +1559,8 @@ def _execute_graph(
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - inference_started
         if not retained.executor.success:
+            # ComfyUI catches its interrupt and only reports the prompt failed.
+            cancel.check()
             raise RuntimeError(f"MiniMax H3 ComfyUI execution failed: job_id={job_id}")
         # SaveVideo emits a PreviewVideo UI with key "images" (a list of SavedResult
         # dicts with filename/subfolder/type), as SaveImage does. See comfy_api/latest/_ui.py.
@@ -1523,7 +1581,7 @@ def run_minimax_h3_inference(
     *,
     job_id: str,
     prompt: str,
-    image_path: Path,
+    image_path: Path | None,
     last_frame_path: Path | None,
     output_path: Path,
     seed: int,
@@ -1603,19 +1661,25 @@ def run_minimax_h3_inference(
     # Distinct node-side names: the same upload used for both keyframes (the
     # normal FL2VA-off-by-default case) and two different files that happen to
     # share a basename must both survive the copy.
-    first_frame_input = f"jobs/{job_id}/first_frame{image_path.suffix}"
-    shutil.copyfile(image_path, comfy_root / "input" / first_frame_input)
+    first_frame_input: str | None = None
+    if image_path is not None:
+        first_frame_input = f"jobs/{job_id}/first_frame{image_path.suffix}"
+        shutil.copyfile(image_path, comfy_root / "input" / first_frame_input)
     last_frame_input: str | None = None
     if last_frame_path is not None:
         last_frame_input = f"jobs/{job_id}/last_frame{last_frame_path.suffix}"
         shutil.copyfile(last_frame_path, comfy_root / "input" / last_frame_input)
 
     filename_prefix = f"jobs/{job_id}/output"
-    geometry = keyframe_geometry_report(
-        image_path=image_path, last_frame_path=last_frame_path, canvas=canvas
+    # A clip made from the prompt alone has no keyframe to sit badly against the canvas.
+    geometry = (
+        keyframe_geometry_report(image_path=image_path, last_frame_path=last_frame_path, canvas=canvas)
+        if image_path is not None
+        else None
     )
-    log_event("minimax_h3_keyframe_geometry", job_id=job_id, **geometry)
-    pair_error = geometry["keyframe_pair_aspect_error"]
+    if geometry is not None:
+        log_event("minimax_h3_keyframe_geometry", job_id=job_id, **geometry)
+    pair_error = geometry["keyframe_pair_aspect_error"] if geometry is not None else None
     if pair_error is not None and pair_error > H3_KEYFRAME_ASPECT_WARN:
         # Not fatal - the node crops both frames the same way - but this is the
         # case where "the last frame looks zoomed/shifted" has an answer in the
@@ -1735,7 +1799,8 @@ def run_minimax_h3_inference(
         "delivered_width": delivered_width,
         "delivered_height": delivered_height,
         "output_resize": resize_metrics,
-        **geometry,
+        # A clip made from the prompt alone has no keyframe, so there is no keyframe geometry to report.
+        **(geometry or {}),
         "fps": float(time_axis_fps),
         "preset": preset,
         "steps": recipe.steps,

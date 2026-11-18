@@ -14,7 +14,8 @@ FaceLandmarker, then ArcFace on the aligned face) and retaken on ``seed + k + 10
 - lost the person: ArcFace cosine below :data:`MIN_IDENTITY`, or no face at all;
 - opened the mouth: inner-lip gap over face height above :data:`MOUTH_CLOSED` (vigen's own run had 2 of 6
   stills open on one avatar, and an open-mouth rest pin holds the mouth open at a pause).
-Out of retakes, the least open take that kept the person is delivered; none kept it, the job fails. No take is
+Out of retakes, the best take is delivered all the same (:func:`keep`): a failed likeness check is an expected
+outcome, never a failed job; the result's ``likeness`` says which take won and whether it passed. No take is
 checked when the image has no face found, or shows a cartoon or other non-realistic character (anime, 2D/3D
 animation, drawing, painting, clay, game render: :func:`stylized_score` at least :data:`MAX_STYLIZED`), whose
 face ArcFace and FaceLandmarker are not made for.
@@ -73,8 +74,8 @@ STYLIZED_PROMPTS = (
 #: Pixar-style/clay/low-poly/bitmoji/VTuber 3D, oil/watercolor/pencil, pixel art) >= 0.52, but a robot 0.04 (it
 #: has no face to check). More prompts ("avatar", "doll", "robot") lift real avatars to 0.56-0.83.
 MAX_STYLIZED = 0.3
-#: Retakes after the first take (``max_retries``), by default and at most.
-DEFAULT_RETRIES = 2
+#: Retakes after the first take (``max_retries``), by default and at most. Default: two takes in all.
+DEFAULT_RETRIES = 1
 MAX_RETRIES = 5
 #: Seed step between the takes of one still.
 ATTEMPT_SEED_STEP = 100
@@ -129,29 +130,44 @@ def judge(take: Take, face: "Face | None", reference: "Face | None") -> Take:
     return take
 
 
-def keep(takes: list[Take]) -> Take | None:
-    """The take to deliver: the first without a problem, else the least open mouth among those that keep the
-    person; None when every take lost the face."""
-    usable = [take for take in takes if take.problem in (None, "mouth")]
-    return min(usable, key=lambda take: take.mouth or 0.0) if usable else None
+def keep(takes: list[Take]) -> Take:
+    """The take to deliver, ranked by the gate's own measures: the first without a problem, else the least open
+    mouth among those that kept the person, else the most similar face (a take with no face last; ties go to
+    the earlier take)."""
+    clean = [take for take in takes if take.problem is None]
+    if clean:
+        return clean[0]
+    kept_person = [take for take in takes if take.problem == "mouth"]
+    if kept_person:
+        return min(kept_person, key=lambda take: take.mouth)
+    return max(takes, key=lambda take: -2.0 if take.identity is None else take.identity)
 
 
 @dataclass
 class Still:
-    """Rest still ``index``: every take rendered and the one to deliver (None: none kept the face)."""
+    """Rest still ``index``: every take rendered and the one to deliver (:func:`keep`)."""
 
     index: int
     takes: list[Take]
-    kept: Take | None
+    kept: Take
     render_size: tuple[int, int]
     #: The last take's render metrics.
     metrics: dict
+    #: Whether the takes were held to the image's face (False: no face there, or a non-realistic character).
+    checked: bool
+
+    def likeness(self) -> dict:
+        """Which take won and how it scored: ``score`` is its ArcFace cosine to the image's face, ``passed``
+        whether it cleared every check (None: nothing was checked), ``problem`` what it failed."""
+        return {"checked": self.checked, "takes": len(self.takes), "chosen": self.takes.index(self.kept),
+                "score": self.kept.report()["identity"], "passed": (self.kept.problem is None) if self.checked else None,
+                "problem": self.kept.problem}
 
     def report(self) -> dict:
-        kept = self.kept.report() if self.kept else {}
+        kept = self.kept.report()
         return {"index": self.index, "variation": REST_VARIATIONS[self.index % len(REST_VARIATIONS)],
-                "seed": kept.get("seed"), "identity": kept.get("identity"), "mouth": kept.get("mouth"),
-                "kept": self.kept is not None, "takes": [take.report() for take in self.takes]}
+                "seed": kept["seed"], "identity": kept["identity"], "mouth": kept["mouth"],
+                "likeness": self.likeness(), "takes": [take.report() for take in self.takes]}
 
 
 def render_still(*, job_id: str, image: Path, index: int, seed: int, retries: int, out_dir: Path,
@@ -182,7 +198,8 @@ def render_still(*, job_id: str, image: Path, index: int, seed: int, retries: in
         log_event("rest_still_take", job_id=job_id, index=index, attempt=attempt, **take.report())
         if take.problem is None:
             break
-    return Still(index=index, takes=takes, kept=keep(takes), render_size=render_size, metrics=metrics)
+    return Still(index=index, takes=takes, kept=keep(takes), render_size=render_size, metrics=metrics,
+                 checked=reference is not None)
 
 
 def save_fitted(source: Path, target: Path, size: tuple[int, int]) -> Path:

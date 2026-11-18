@@ -1,9 +1,13 @@
-"""H3 image-to-video (``videogen``): one 4-step Turbo render with its own audio.
+"""H3 video (``videogen``): one 4-step Turbo render with its own audio.
+
+The clip is made from a prompt, optionally opening on a frame the caller gives
+(the node takes ``first_frame`` either way).
 
 A job is ``{"id": ..., "payload": {...}}``; the payload takes:
 
 - ``prompt`` (required): what happens in the clip, H3's FL2VA prompt;
-- ``image_url`` / ``image_path`` (required): the first frame;
+- ``image_url`` / ``image_path``: the first frame. Without one the clip is made
+  from the prompt alone, and ``width``/``height`` then say what shape it is;
 - ``last_frame_url`` / ``last_frame_path``: an optional last frame (first-last
   frame to video);
 - ``duration_seconds`` (default 3): clip length at 24 fps, snapped up by the
@@ -36,9 +40,14 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
   nearest rendered frame; the clip still ends on its last rendered frame.
 - ``upscale`` (``true`` = 1.5x, or a factor above 1 and at most 2; vigen 43c32e7): the
   delivered size (``width``/``height``, else the canvas) times the factor, longest
-  side at most 3840. The canvas render goes through SPAN 2x (loaded for this job
-  only, after RIFE when both are asked for) and lanczos lands on that size
+  side at most 3840, fitted inside ``output_dimensions`` (``{width, height}``, with upscale
+  or ``output_short_side`` only, aspect kept; as lipsync's). The canvas render goes through SPAN 2x
+  (loaded for this job only, after RIFE when both are asked for) and lanczos lands on that size
   (:mod:`h3.span_upscale`).
+- ``output_short_side`` (64..2160; not with ``width``/``height`` or ``upscale``): the clip is delivered in
+  the image's aspect with exactly that short side (480p, 720p, 1080p): above the canvas's short side
+  through SPAN 2x then lanczos (:func:`h3.span_upscale.short_side_scale`), else lanczos from the render
+  (:func:`h3.span_upscale.short_side_size`).
 
 The result is ``{"path", "item", "metrics", "seed"}`` like :mod:`h3.lipsync`, plus
 ``last_frame_path`` (a JPEG, quality 95) for a continuable clip.
@@ -68,9 +77,11 @@ def max_seconds() -> float:
 
 
 def _pinned_frames(job: dict[str, Any], payload: dict[str, Any], scratch_dir, image_path, length: int,
-                   fps: float) -> list[tuple[int, Any]]:
+                   fps: float, *, canvas_size: tuple[int, int]) -> list[tuple[int, Any]]:
     """``(frame index, prepared image)`` for each ``pinned_frames`` entry, in time order, on the ``fps`` render's
-    frames (an interpolated job's pins land on the nearest frame it renders)."""
+    frames (an interpolated job's pins land on the nearest frame it renders).
+
+    Pins are cover-fit to the first frame's size, or to the canvas when the clip has no first frame."""
     from PIL import Image, ImageOps  # type: ignore
 
     entries = list(payload.get("pinned_frames") or [])
@@ -78,8 +89,11 @@ def _pinned_frames(job: dict[str, Any], payload: dict[str, Any], scratch_dir, im
         raise ValueError(f"at most {MAX_PINNED_FRAMES} pinned_frames")
     if not entries:
         return []
-    with Image.open(image_path) as first:
-        size = ImageOps.exif_transpose(first).size
+    if image_path is not None:
+        with Image.open(image_path) as first:
+            size = ImageOps.exif_transpose(first).size
+    else:
+        size = canvas_size
     guides = []
     for index, entry in enumerate(entries):
         seconds = float(entry["seconds"])
@@ -104,7 +118,7 @@ def _pinned_frames(job: dict[str, Any], payload: dict[str, Any], scratch_dir, im
 
 def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     from .h3_interpolation import interpolated_render_frames, requested_fps, speed_up
-    from .span_upscale import requested_scale
+    from .span_upscale import requested_scale, requested_short_side, short_side_scale, short_side_size, target_size
     from .minimax_h3_runtime import (
         H3_FPS,
         cleanup_h3_job_files,
@@ -114,6 +128,7 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
         h3_preset,
         probe_image_dimensions,
         resolve_canvas,
+        short_side_canvas,
         run_minimax_h3_inference,
     )
 
@@ -139,10 +154,32 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     render_fps = interpolation_fps or H3_FPS
     # upscale: the delivered size times the factor, through SPAN 2x (loaded for this job only) then lanczos.
     upscale = requested_scale(payload)
+    output_dimensions = payload.get("output_dimensions")
+    short_side = requested_short_side(payload)
+    if output_dimensions is not None and not (upscale or short_side):
+        raise ValueError("output_dimensions goes with upscale or output_short_side; else width/height are the delivered size")
+    bounding_box = ((int(output_dimensions["width"]), int(output_dimensions["height"]))
+                    if output_dimensions is not None else None)
+    # The first frame is the caller's option: with one the clip opens on it and takes its shape from
+    # it, without one the prompt alone makes it and width/height say what shape it comes out, since
+    # nothing else states that. Alongside output_short_side they say only the shape — it says the
+    # delivered size — and on their own they are the delivered size, as they are with a frame.
+    has_first_frame = bool(payload.get("image_url") or payload.get("image_path"))
+    aspect: tuple[int, int] | None = None
+    if has_first_frame:
+        if short_side is not None and width is not None:
+            raise ValueError("output_short_side sizes the clip from the image's aspect; send it or width/height")
+    else:
+        if width is None:
+            raise ValueError("a clip made from the prompt alone needs width and height")
+        aspect = (width, height)
+        if short_side is not None:
+            width = height = None
 
     scratch_dir = job_dir(job_id)
     progress.report("preparing")
-    image_path = download_job_input(job, payload, "image", scratch_dir, ".png", kind="videogen")
+    image_path = (download_job_input(job, payload, "image", scratch_dir, ".png", kind="videogen")
+                  if has_first_frame else None)
     pinned_audio = None
     if payload.get("pinned_audio_url") or payload.get("pinned_audio_path"):
         pinned_audio = download_job_input(job, payload, "pinned_audio", scratch_dir, ".wav", kind="videogen")
@@ -171,17 +208,41 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("continuable clips end on their own restored frame; drop last_frame")
         if payload.get("anchor_url") or payload.get("anchor_path"):
             anchor_path = download_job_input(job, payload, "anchor", scratch_dir, ".png", kind="videogen")
-        else:
+        elif image_path is not None:
             anchor_path = image_path
+        else:
+            # Restoring the end frame needs a look to hold it to, and a prompt-only clip has none of
+            # its own yet; the first clip of a chain opens on an image, or the chain names its anchor.
+            raise ValueError("a continuable clip needs a first frame or an anchor to restore toward")
 
-    canvas = resolve_canvas(image_path=image_path, requested_width=width, requested_height=height)
-    delivery = delivery_dimensions(canvas, width, height, source_aspect=probe_image_dimensions(image_path))
+    # The shape everything is sized from: the first frame's, or the one a prompt-only clip stated.
+    source_aspect = probe_image_dimensions(image_path) if image_path is not None else aspect
+    # An output_short_side below the usual canvas renders on the target's own canvas, not ~1 MP fitted down.
+    canvas = (short_side_canvas(image_path, short_side, aspect=aspect) if short_side is not None
+              else resolve_canvas(image_path=image_path, requested_width=width, requested_height=height))
+    delivery = delivery_dimensions(canvas, width, height, source_aspect=source_aspect)
+    # The shape the render sits on. With a first frame the render takes it from the frame, as it always
+    # has; with none, and the delivered size left to output_short_side, the canvas has to say it — it is
+    # on the lattice already, so naming it leaves the render exactly where it would have been.
+    render_width, render_height = width, height
+    if image_path is None and render_width is None:
+        render_width, render_height = canvas.width, canvas.height
+    # The size the clip leaves at: H3 resizes to delivery itself; an upscaled clip goes to final_size after SPAN.
+    final_size = None
+    if short_side is not None:
+        final_size = short_side_size(source_aspect, short_side, bounding_box=bounding_box)
+        upscale = short_side_scale(final_size, (canvas.width, canvas.height))
+        if not upscale:
+            delivery = final_size
+    elif upscale:
+        final_size = target_size(*(delivery or (canvas.width, canvas.height)), upscale, bounding_box=bounding_box)
     length = max(1, round(duration * H3_FPS))
     if interpolation_fps:
         length = interpolated_render_frames(length, interpolation_fps)
     # The node snaps the clip up to the 17k+5 grid; pins and the pinned audio cover that clip.
     grid_frames = 5 + 17 * -(-max(0, length - 5) // 17)
-    guides = _pinned_frames(job, payload, scratch_dir, image_path, length, render_fps)
+    guides = _pinned_frames(job, payload, scratch_dir, image_path, length, render_fps,
+                            canvas_size=(canvas.width, canvas.height))
     if continuable and guides and guides[-1][0] >= grid_frames - 1:
         raise ValueError("a continuable clip's last frame is its restored frame; pin frames before it")
     soundtrack = None
@@ -207,7 +268,8 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     try:
         if continuable:
             last_frame_path, continuation = _restore_end(
-                job_id=job_id, prompt=prompt, image_path=image_path, seed=seed, width=width, height=height,
+                job_id=job_id, prompt=prompt, image_path=image_path, seed=seed, width=render_width,
+                height=render_height,
                 length=length, grid_frames=grid_frames, preset=preset, recipe=recipe, generate_audio=generate_audio,
                 guides=guides, pinned_audio=pinned_audio, anchor_path=anchor_path,
                 work_dir=scratch_dir / "continuation", fps=time_axis_fps,
@@ -219,8 +281,8 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
             last_frame_path=last_frame_path,
             output_path=output_path,
             seed=seed,
-            width=width,
-            height=height,
+            width=render_width,
+            height=render_height,
             length=length,
             preset=preset,
             generate_audio=generate_audio,
@@ -239,7 +301,7 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     if interpolation_fps or upscale:
         postprocessed = _postprocess(
             output_path, fps=interpolation_fps, grid_frames=grid_frames, upscale=upscale,
-            delivered=delivery or (canvas.width, canvas.height),
+            size=final_size if upscale else None, bounding_box=bounding_box,
             audio=(soundtrack or pinned_audio) if pinned_audio is not None and generate_audio else None,
             voice=pinned_audio is not None, job_id=job_id,
         )
@@ -287,16 +349,16 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def _postprocess(output_path, *, fps: int | None, grid_frames: int, upscale: float | None,
-                 delivered: tuple[int, int], audio, voice: bool, job_id: str) -> dict[str, Any]:
+                 size: tuple[int, int] | None, bounding_box: tuple[int, int] | None = None, audio, voice: bool,
+                 job_id: str) -> dict[str, Any]:
     """The render at ``output_path`` finished in place (:func:`h3.h3_postprocess.stream_video`): an ``fps`` render
     brought up to 24 fps by RIFE, still ending on its last rendered frame (a pinned last frame, a continuable
-    clip's restored one); an ``upscale`` clip through SPAN 2x, then lanczos to ``delivered`` (the size it is
-    delivered at without it) times the factor. It carries ``audio`` (the caller's pinned audio in real time) or
+    clip's restored one); an ``upscale`` clip through SPAN 2x, then lanczos to ``size``. It carries ``audio`` (the caller's pinned audio in real time) or
     else whatever audio H3 generated. Returns the item's ``interpolation`` / ``upscale`` entries."""
     from .h3_interpolation import OUTPUT_FPS, output_frames_ending_on_last
     from .h3_postprocess import stream_video
     from .lipsync import image_size
-    from .span_upscale import SPAN_MODEL_NAME, target_size
+    from .span_upscale import SPAN_MODEL_NAME
 
     rendered = output_path.with_name(f"{output_path.stem}.render.mp4")
     os.replace(output_path, rendered)
@@ -305,7 +367,6 @@ def _postprocess(output_path, *, fps: int | None, grid_frames: int, upscale: flo
     else:
         source_fps, frames = OUTPUT_FPS, grid_frames
     width, height = image_size(rendered)
-    size = target_size(delivered[0], delivered[1], upscale) if upscale else None
     resize = (["-vf", f"scale={size[0]}:{size[1]}:force_original_aspect_ratio=increase:flags=lanczos,"
                       f"crop={size[0]}:{size[1]},setsar=1"] if size else [])
     metrics = stream_video(
@@ -327,6 +388,8 @@ def _postprocess(output_path, *, fps: int | None, grid_frames: int, upscale: flo
                                 "seconds": round(metrics["seconds"] - span_seconds, 3)}
     if size:
         out["upscale"] = {"scale": upscale, "method": "span2x_lanczos", "model": SPAN_MODEL_NAME,
+                          **({"output_dimensions": {"width": bounding_box[0], "height": bounding_box[1]}}
+                             if bounding_box else {}),
                           "span_seconds": span_seconds}
     return out
 

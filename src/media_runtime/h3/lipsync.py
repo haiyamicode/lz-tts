@@ -11,6 +11,22 @@ hands and body all move with the speech and nothing is composited:
   its aspect kept;
 - the result carries ``path`` / ``item`` / ``metrics`` / ``seed``.
 
+**Auto** (``auto``, the default; :func:`auto_payload`): the avatar render. The caller
+sends the person's canonical image, the audio and the avatar's rest ``stills`` (its
+imagegen ``rest_frame`` stills, any number; none = the image itself), and the job
+runs on our setup, the same for every length and every audio: the default preset
+(``turbo-3``) with sparse attention, every validator on, the built-in prompt, and
+H3's native 24 fps (no interpolation: an interpolated lipsync renders its frames
+from a sped-up voice, so every motion the voice does not drive - blinks, head
+turns, hands - plays back ``24/interpolation_fps`` times slow). Pins: a clip of
+``AUTO_SHORT_SECONDS`` (3 s) or more pins the stills as ``multi_image`` ``random``
+(one still: ``single_image``); a shorter clip is too short to travel between two
+pins (an end pin froze it) and pins frame 0 alone (``none``). ``seed``,
+``transcript``, ``custom_instructions`` (``pin_chunk`` spans and per-instruction
+validator switches included), ``output_dimensions`` and ``upscale`` work as
+always; the knobs auto chooses (:data:`AUTO_CHOSEN`) are an error with it -
+``auto: false`` (manual) takes them, and every mode below, instead of ``stills``.
+
 **Freestyle.** The job's image (``image_url`` / ``image_path``) is the first
 frame. The chunks are cut at the quietest frames of the voice
 (:func:`h3.speech_chunks.quiet_cuts`), and ``pinned_frames`` (:data:`PIN_MODES`,
@@ -34,9 +50,9 @@ frame. The chunks are cut at the quietest frames of the voice
 - ``generate`` (vigen 9ff3052): the job first renders ``count`` (2-12, default 6) rest
   stills of the person from its own image (:func:`h3.rest_stills.render_still`, the
   imagegen ``rest_frame`` stills: still k on ``seed + k``, retaken at most ``max_retries``
-  times on a lost face or open mouth) and pins them like ``multi_image`` (``order``). A
-  still whose every take lost the face is left out (none left: the job's image is pinned);
-  the kept ones are delivered with the video as the result's ``still<k>`` files.
+  times on a lost face or open mouth, the best take kept either way) and pins them like
+  ``multi_image`` (``order``); they are delivered with the video as the result's
+  ``still<k>`` files.
 
 Every pinned image is fitted to the job's image's frame (cover scale, centre
 crop). Motion and gestures between the pins come from the prompt and the pinned
@@ -128,6 +144,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+import cancel
 import progress
 
 from .lipsync_prompt import render_prompt_template
@@ -190,6 +207,11 @@ DEFAULT_GENERATED_STILLS = 6
 MAX_GENERATED_STILLS = 12
 #: Image key of a ``generate`` rest still: ``generated:<k>``.
 GENERATED_IMAGE = "generated:"
+#: ``auto``: the request fields auto mode sets itself; a caller who sets one turns ``auto`` off.
+AUTO_CHOSEN = ("pinned_frames", "preset", "use_interpolation", "interpolation_fps", "sparse_attention",
+               "detect_flicker", "detect_desync", "detect_glitches", "prompt")
+#: ``auto``: a clip shorter than this pins frame 0 alone (too short to travel between two pins).
+AUTO_SHORT_SECONDS = 3.0
 #: Image key of a continuous boundary's restored frame: ``restored:<frame>``, filled in when rendered.
 RESTORED_IMAGE = "restored:"
 
@@ -347,6 +369,31 @@ def frame_pins(settings: PinSettings, *, fps: float, total_frames: int, pinned: 
         if frame in ends and ends[frame] != image:
             raise ValueError(f"the pin at {frame / fps:.2f} s falls on a pinned chunk's end, which pins another image")
     return [FramePin(frame=frame, image=image) for frame, image in sorted(pins.items()) if frame not in ends]
+
+
+def auto_payload(payload: dict[str, Any], *, seconds: float) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The manual payload an ``auto`` job (the default) runs as, for audio ``seconds`` long, and what auto
+    chose (``None`` for a manual job, which is returned as it is). Raises ``ValueError`` for an auto job
+    that sets a field auto chooses (:data:`AUTO_CHOSEN`), or a manual one that sends ``stills``."""
+    if payload.get("auto", True) is False:
+        if payload.get("stills"):
+            raise ValueError("stills go with auto; with auto false, pin them with pinned_frames")
+        return {key: value for key, value in payload.items() if key != "auto"}, None
+    chosen = [key for key in AUTO_CHOSEN if key in payload]
+    if chosen:
+        raise ValueError(f"auto chooses {', '.join(chosen)}; send auto: false to set them")
+    stills = list(dict.fromkeys(str(url) for url in payload.get("stills") or []))
+    if len(stills) > MAX_PIN_IMAGES:
+        raise ValueError(f"auto takes at most {MAX_PIN_IMAGES} stills, got {len(stills)}")
+    resolved = {key: value for key, value in payload.items() if key not in ("auto", "stills")}
+    if seconds < AUTO_SHORT_SECONDS:
+        pinned = {"mode": "none"}
+    elif len(stills) > 1:
+        pinned = {"mode": "multi_image", "image_urls": stills, "order": "random"}
+    else:
+        pinned = {"mode": "single_image", **({"image_url": stills[0]} if stills else {})}
+    resolved["pinned_frames"] = pinned
+    return resolved, {"stills": len(stills), "pin_mode": pinned["mode"], "short": seconds < AUTO_SHORT_SECONDS}
 
 
 def freestyle_plan(samples, *, total_frames: int, fps: float, chunk_cap: int,
@@ -596,7 +643,21 @@ def plan_chunks(total_frames: int, *, max_frames: int, anchors: list[Anchor], cu
 
 
 def _run(command: list[str]) -> None:
-    subprocess.run(command, check=True)
+    """Runs ffmpeg (an assembly encode takes tens of seconds); a cancelled job kills it."""
+    process = subprocess.Popen(command)
+    try:
+        while True:
+            try:
+                returncode = process.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                cancel.check()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, command)
 
 
 def _probe(path: Path) -> dict[str, Any]:
@@ -811,7 +872,8 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
     """The job's plan: chunks, pins, prompts and per-chunk validators. Its frames run at ``fps``: the
     model's 24, or an interpolated job's ``interpolation_fps``, whose every chunk still renders on the
     model's own clock (:mod:`h3.h3_interpolation`)."""
-    from .minimax_h3_runtime import H3_FPS, resolve_canvas
+    from .minimax_h3_runtime import H3_FPS, short_side_canvas
+    from .span_upscale import requested_short_side
 
     # Timing: the caller's timed transcript, else the CTC words.
     began = time.perf_counter()
@@ -830,7 +892,8 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
         raise ValueError(f"audio is {audio_duration:.1f} s; lipsync takes at most {max_seconds:g} s")
     total_frames = max(1, int(round(audio_duration * fps)))
     source_width, source_height = image_size(input_image)
-    canvas = resolve_canvas(image_path=input_image)
+    # An output_short_side below the image's canvas renders on the target's own canvas (480p at ~854x480).
+    canvas = short_side_canvas(input_image, requested_short_side(payload))
     chunk_cap = max_chunk_frames(canvas.width, canvas.height)
     # A pinned chunk is cut on its own times and pinned on its ends only, to its own image if it has
     # one; the rest is pinned_frames' (the module docstring).
@@ -945,7 +1008,8 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     """Run one ``lipsync`` job; returns the result.
     """
     from .h3_interpolation import requested_fps, speed_up
-    from .span_upscale import SPAN_MODEL_NAME, requested_scale, target_size
+    from .span_upscale import (SPAN_MODEL_NAME, requested_scale, requested_short_side, short_side_scale,
+                               short_side_size, target_size)
     from .minimax_h3_runtime import (
         DEFAULT_LIPSYNC_PRESET,
         H3_FPS,
@@ -956,8 +1020,21 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     )
 
     job_started = time.perf_counter()
-    payload = job["payload"]
     job_id = str(job["id"])
+    stage_timings: dict[str, float] = {}
+
+    def finish(name: str, began: float) -> None:
+        stage_timings[name] = round(time.perf_counter() - began, 3)
+
+    scratch_dir = job_dir(job_id)
+    work_dir = scratch_dir / "lipsync"
+    began = time.perf_counter()
+    progress.report("preparing")
+    image_path = download_job_input(job, job["payload"], "image", scratch_dir, ".png")
+    audio_path = download_job_input(job, job["payload"], "audio", scratch_dir, ".wav")
+    # auto (the default): the avatar render's own setup, and its pins for this audio's length.
+    payload, auto = auto_payload(job["payload"], seconds=media_duration(audio_path))
+    log_event("lipsync_mode", job_id=job_id, auto=auto is not None, **(auto or {}))
     seed = int(payload["seed"]) if payload.get("seed") is not None else DEFAULT_SEED
     preset = str(payload.get("preset") or DEFAULT_LIPSYNC_PRESET)
     recipe = h3_preset(preset, LIPSYNC_PRESETS)
@@ -973,17 +1050,6 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     fps = float(interpolation_fps or H3_FPS)
     # upscale: the frames go through SPAN 2x, then lanczos to the delivered size times the factor.
     upscale = requested_scale(payload)
-    stage_timings: dict[str, float] = {}
-
-    def finish(name: str, began: float) -> None:
-        stage_timings[name] = round(time.perf_counter() - began, 3)
-
-    scratch_dir = job_dir(job_id)
-    work_dir = scratch_dir / "lipsync"
-    began = time.perf_counter()
-    progress.report("preparing")
-    image_path = download_job_input(job, payload, "image", scratch_dir, ".png")
-    audio_path = download_job_input(job, payload, "audio", scratch_dir, ".wav")
     custom_instructions = payload.get("custom_instructions") or []
     pins = PinSettings.from_payload(payload.get("pinned_frames"))
     # Every pinned image - the pinned chunks' own, pinned_frames' - each URL fetched once.
@@ -1026,14 +1092,12 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
                                              retries=pins.max_retries, out_dir=work_dir / "stills",
                                              reference=reference)
             generated.append(still.report())
-            if still.kept is None:
-                continue
             path = rest_stills.save_fitted(still.kept.path, scratch_dir / "outputs" / f"still_{index}.png", delivered)
             images[key] = prepare_pin_image(path, work_dir / "anchors" / f"generated_{index}.png",
                                             size=(source_width, source_height))
             still_files[f"still{index}"] = str(path)
             kept_keys.append(key)
-        pins = replace(pins, images=tuple(kept_keys) or (INPUT_IMAGE,))
+        pins = replace(pins, images=tuple(kept_keys))
         finish("generate_stills_seconds", began)
         stills_item = {"generated_stills": generated, "stills_face_checked": reference is not None,
                        "stylized": round(stylized, 3)}
@@ -1099,6 +1163,7 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
             chunk_checking = flicker or desync or glitches
             attempts: list[tuple[Path, dict[str, Any], dict[str, Any] | None]] = []
             for attempt in range(1 + (check_retries if chunk_checking else 0)):
+                cancel.check()
                 output = chunk_dir / ("render.mp4" if attempt == 0 else f"render_retry{attempt}.mp4")
                 metrics = run_lipsync_chunk(
                     job_id=job_id,
@@ -1155,7 +1220,14 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     )
     delivered_width = source_width - source_width % 2
     delivered_height = source_height - source_height % 2
-    if upscale:
+    short_side = requested_short_side(payload)
+    if short_side is not None:
+        # Exactly that short side in the image's aspect; SPAN first when it is above the render (H3's canvas).
+        delivered_width, delivered_height = short_side_size((source_width, source_height), short_side,
+                                                            bounding_box=bounding_box)
+        upscale = short_side_scale((delivered_width, delivered_height), (canvas_width, canvas_height))
+        bounding_box = None
+    elif upscale:
         # The image's size times the factor, then fitted inside output_dimensions (and 4K).
         delivered_width, delivered_height = target_size(delivered_width, delivered_height, upscale,
                                                         bounding_box=bounding_box)
@@ -1192,6 +1264,8 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
         "frames": streamed["output_frames"] if streamed else total_frames,
         "duration_seconds": round(audio_duration, 3),
         "source": "freestyle",
+        "auto": auto is not None,
+        **({"auto_choices": auto} if auto is not None else {}),
         "pin_mode": plan["pin_mode"],
         # generate: each rest still (its seed, variation, identity, mouth and takes); the kept ones are
         # the result's still<k> files.

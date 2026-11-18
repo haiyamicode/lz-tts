@@ -21,6 +21,7 @@ import numpy as np
 import soundfile as sf
 import torch
 
+import cancel
 import progress
 from separation import SAMPLE_RATE, VocalSeparator
 from song import SongRequest, YuE2Song
@@ -120,6 +121,7 @@ class MusicPipeline:
             song_path, seed = self.song.generate(request, work / "song.wav")
             print(f"[timing] yue2 generate: {time.monotonic() - started:.1f}s", flush=True)
             progress.report("finishing")
+            cancel.check()
             if reference_path is None:
                 final = output_dir / f"song-{seed}.wav"
                 shutil.move(str(song_path), final)
@@ -129,6 +131,7 @@ class MusicPipeline:
             started = time.monotonic()
             vocal, accompaniment = self.separator.split(song_path)
             print(f"[timing] separate: {time.monotonic() - started:.1f}s", flush=True)
+            cancel.check()
             started = time.monotonic()
             vocal_path = work / "vocal.wav"
             sf.write(str(vocal_path), vocal.T, SAMPLE_RATE, subtype="FLOAT")

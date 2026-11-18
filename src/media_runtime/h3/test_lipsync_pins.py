@@ -6,12 +6,14 @@ import numpy as np
 import pytest
 
 from h3.lipsync import (
+    AUTO_SHORT_SECONDS,
     GENERATED_IMAGE,
     INPUT_IMAGE,
     RESTORED_IMAGE,
     FramePin,
     PinnedSpan,
     PinSettings,
+    auto_payload,
     frame_pins,
     freestyle_plan,
     plan_anchors,
@@ -86,7 +88,7 @@ def test_generate_pins_its_stills_like_multi_image():
     assert [a.frame for a in anchors] == [a.frame for a in single]
     assert {a.image for a in anchors[1:]} == set(settings.images)
     default = PinSettings.from_payload({"mode": "generate"})
-    assert (len(default.images), default.order, default.max_retries) == (6, "round_robin", 2)
+    assert (len(default.images), default.order, default.max_retries) == (6, "round_robin", 1)
 
 
 def test_timed_images_pin_only_the_callers_frames_and_cuts_land_on_them():
@@ -156,3 +158,69 @@ def test_timed_images_reject_two_pins_on_one_frame_and_a_clash_with_a_pinned_chu
 def test_pin_settings_reject_what_their_mode_does_not_take(payload, error):
     with pytest.raises(ValueError, match=error):
         PinSettings.from_payload(payload)
+
+
+STILLS = ["http://x/still0.png", "http://x/still1.png", "http://x/still2.png"]
+
+
+def _auto_plan(payload: dict, seconds: float):
+    """An auto job's pins for ``seconds`` of speech, planned the way the job plans them."""
+    resolved, choices = auto_payload({"image_url": "http://x/me.png", "audio_url": "http://x/a.wav", **payload},
+                                     seconds=seconds)
+    settings = PinSettings.from_payload(resolved["pinned_frames"])
+    total = int(FPS * seconds)
+    fixed = frame_pins(settings, fps=FPS, total_frames=total, pinned=[])
+    _, pins = freestyle_plan(_speech(seconds), total_frames=total, fps=FPS, chunk_cap=226,
+                             continuous=settings.continuous, fixed=fixed)
+    anchors = plan_anchors(pins, [], continuous=settings.continuous, fixed=fixed,
+                           images=settings.images or (INPUT_IMAGE,), order=settings.order, seed=0)
+    return resolved, choices, anchors
+
+
+@pytest.mark.parametrize("seconds", [0.8, 2.0, AUTO_SHORT_SECONDS - 0.05])
+def test_auto_short_clip_pins_frame_zero_alone(seconds):
+    _, choices, anchors = _auto_plan({"stills": STILLS}, seconds)
+    assert choices["short"] and choices["pin_mode"] == "none"
+    assert [(a.frame, a.image) for a in anchors] == [(0, INPUT_IMAGE)]
+
+
+def test_auto_pins_the_stills_at_random_at_the_pauses_and_the_end():
+    resolved, _, anchors = _auto_plan({"stills": STILLS + [STILLS[0]]}, 20.0)
+    assert resolved["pinned_frames"] == {"mode": "multi_image", "image_urls": STILLS, "order": "random"}
+    assert anchors[0].image == INPUT_IMAGE and anchors[-1].frame == int(FPS * 20.0) - 1
+    picks = [a.image for a in anchors[1:]]
+    assert set(picks) == set(STILLS) and all(a != b for a, b in zip(picks, picks[1:]))
+
+
+@pytest.mark.parametrize("stills, image", [([], INPUT_IMAGE), (STILLS[:1], STILLS[0])])
+def test_auto_with_one_or_no_still_pins_that_or_the_image(stills, image):
+    _, choices, anchors = _auto_plan({"stills": stills}, AUTO_SHORT_SECONDS)
+    assert choices["pin_mode"] == "single_image"
+    assert len(anchors) >= 2 and {a.image for a in anchors[1:]} == {image}
+
+
+def test_auto_runs_on_our_setup_and_keeps_the_callers_content():
+    instructions = [{"instruction": "wave", "timestamp": 1.0}]
+    resolved, _ = auto_payload({"image_url": "i", "audio_url": "a", "seed": 3, "custom_instructions": instructions,
+                                "upscale": True}, seconds=10.0)
+    # Nothing manual reaches the job: preset, attention, validators, prompt and frame rate are the defaults.
+    assert resolved == {"image_url": "i", "audio_url": "a", "seed": 3, "custom_instructions": instructions,
+                        "upscale": True, "pinned_frames": {"mode": "single_image"}}
+
+
+@pytest.mark.parametrize("payload, error", [
+    ({"preset": "turbo-8"}, "auto chooses preset"),
+    ({"use_interpolation": True, "interpolation_fps": 16}, "auto chooses use_interpolation, interpolation_fps"),
+    ({"pinned_frames": {"mode": "none"}}, "auto chooses pinned_frames"),
+    ({"auto": False, "stills": STILLS}, "stills go with auto"),
+])
+def test_auto_and_manual_fields_do_not_mix(payload, error):
+    with pytest.raises(ValueError, match=error):
+        auto_payload({"image_url": "i", "audio_url": "a", **payload}, seconds=10.0)
+
+
+def test_manual_passes_through():
+    payload = {"image_url": "i", "audio_url": "a", "auto": False, "preset": "turbo-8",
+               "pinned_frames": {"mode": "single_image"}}
+    resolved, choices = auto_payload(payload, seconds=1.0)
+    assert choices is None and resolved == {key: value for key, value in payload.items() if key != "auto"}

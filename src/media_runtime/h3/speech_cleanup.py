@@ -27,6 +27,8 @@ import wave
 from pathlib import Path
 from typing import Any
 
+import cancel
+
 from .compat import log_event
 
 SAMPLE_RATE = 16000
@@ -123,7 +125,11 @@ def enhance(samples, model):
     device = _device()
     try:
         with torch.no_grad():
-            enhanced = torch.cat([_enhance_windows(windows[i:i + 1], model, device) for i in range(len(windows))])
+            parts = []
+            for i in range(len(windows)):
+                cancel.check()
+                parts.append(_enhance_windows(windows[i:i + 1], model, device))
+            enhanced = torch.cat(parts)
     finally:
         if device == "cuda":
             torch.cuda.empty_cache()  # the activations; the weights stay

@@ -45,6 +45,14 @@ class MediaRuntimeError(RuntimeError):
     """The media runtime failed to start, load, or render."""
 
 
+class MediaCancelled(MediaRuntimeError):
+    """The job was cancelled (its lease released) and the runtime stopped rendering it."""
+
+
+#: How long a cancelled job may take to stop: the runtime checks between model ops and sampler steps.
+CANCEL_GRACE_SECONDS = 60.0
+
+
 class SamplingOverrides(BaseModel):
     """Token sampling for one YuE2 pass; every field is optional and falls back to the model default."""
 
@@ -102,17 +110,29 @@ class VideogenPinnedFrame(BaseModel):
     seconds: float = Field(ge=0, le=10)
 
 
-H3VideoPreset = Literal["standard", "turbo-8", "turbo-6", "turbo-4"]
+H3VideoPreset = Literal["standard", "turbo-8", "turbo-6", "turbo-5", "turbo-4"]
+H3StillPreset = Literal["standard", "turbo-8", "turbo-6", "turbo-4"]  # h3_still.STILL_PRESETS
+
+
+#: ``use_interpolation`` is refused (400) while this is off; the runtime code stays for a fixed method.
+INTERPOLATION_ENABLED = False
 
 
 class H3Interpolation(BaseModel):
     """Postprocessing of an H3 clip. ``use_interpolation`` (vigen 7280e2f, ``h3/h3_interpolation.py``): H3
     renders ``interpolation_fps`` frames a second and RIFE v4.26 makes the rest of the 24 fps output.
+    Disabled for now (:data:`INTERPOLATION_ENABLED`): with a voice, motion the voice does not drive
+    (blinks, head, hands) plays back ``24/fps`` times slow, and the RIFE frames' softer mouths pulse at
+    8 Hz; a 19.9 s avatar clip ran blinks up to 2x long for a 1.5x shorter render.
     ``upscale`` (vigen 43c32e7, ``h3/span_upscale.py``): SPAN 2x, then lanczos to the delivered size times the
-    factor (longest side at most 3840)."""
+    factor (longest side at most 3840). ``output_short_side`` (480, 720, 1080; not with ``upscale``): the
+    delivered frame in the image's aspect with exactly that short side; above the render's (H3's canvas, at most
+    the picture's) it goes through SPAN 2x then lanczos, the result's ``upscale`` entry saying so;
+    ``output_dimensions`` then bounds it."""
 
     use_interpolation: bool = Field(
-        default=False, description="Render at interpolation_fps and RIFE-interpolate up to 24 fps (faster)"
+        default=False,
+        description="Render at interpolation_fps and RIFE-interpolate up to 24 fps (disabled for now: slow motion)",
     )
     interpolation_fps: int | None = Field(
         default=None, ge=12, le=23, description="Frames H3 renders a second under use_interpolation (default 16)"
@@ -121,6 +141,11 @@ class H3Interpolation(BaseModel):
     upscale: bool | float = Field(
         default=False,
         description="SPAN 2x then lanczos to the delivered size times this factor: true = 1.5, or above 1 and at most 2",
+    )
+
+    output_short_side: int | None = Field(
+        default=None, ge=64, le=2160,
+        description="Delivered short side (480, 720, 1080), image aspect kept, exactly; SPAN-upscaled when above the render",
     )
 
     @field_validator("upscale")
@@ -132,26 +157,38 @@ class H3Interpolation(BaseModel):
 
     @model_validator(mode="after")
     def _fps_needs_flag(self):
+        if self.use_interpolation and not INTERPOLATION_ENABLED:
+            raise ValueError("use_interpolation is disabled for now: 16 fps renders play motion the voice does not drive slow")
+        if self.output_short_side is not None and self.upscale:
+            raise ValueError("output_short_side picks the upscale itself (SPAN when it is above the render); drop upscale")
         if self.interpolation_fps is not None and not self.use_interpolation:
             raise ValueError("interpolation_fps needs use_interpolation")
         return self
 
 
 class VideogenRequest(H3Interpolation):
-    """The ``videogen`` request: H3 image-to-video, with H3's own audio track or a pinned one.
+    """The ``videogen`` request: an H3 clip from a first frame or from the prompt alone, with H3's
+    own audio track or a pinned one.
 
     ``preset``: ``standard`` (plain base, res_multistep 10 steps, slowest), ``turbo-8`` (8-step
-    Turbo LoRA), ``turbo-6`` (the 4-step LoRA at 6 steps) or ``turbo-4`` (4-step LoRA, fastest);
-    omitted, the worker's default recipe (``turbo-4``).
+    Turbo LoRA), ``turbo-6``/``turbo-5`` (the 4-step LoRA at 6 or 5 steps) or ``turbo-4``
+    (4-step LoRA, fastest); omitted, the worker's default recipe (``turbo-4``).
 
     ``width``/``height`` (both or neither) are the delivered frame size; omitted, the clip keeps
-    the image's aspect on H3's 32-px lattice (about 1 MP).
+    the image's aspect on H3's 32-px lattice (about 1 MP) — a clip made from the prompt alone has
+    no image to take its shape from, so it states them. ``upscale`` multiplies that size;
+    ``output_dimensions`` (with ``upscale`` only) bounds the result, aspect kept, as on lipsync:
+    ``width`` 1920, ``height`` 1080, ``upscale`` and ``output_dimensions`` 1920x1080 is a SPAN-detailed
+    1080p clip, not a 2880x1620 one.
     """
 
     model_config = {"extra": "forbid"}
 
     prompt: str = Field(min_length=1, max_length=4000, description="What happens in the clip")
-    image_url: str = Field(min_length=1, description="First frame")
+    image_url: str | None = Field(
+        default=None, min_length=1,
+        description="First frame; omitted, the clip is made from the prompt alone and states width/height",
+    )
     last_frame_url: str | None = Field(default=None, description="Optional last frame")
     duration_seconds: float | None = Field(
         default=None, gt=0, le=10,
@@ -180,13 +217,26 @@ class VideogenRequest(H3Interpolation):
         default=None, min_length=1,
         description="The chain's look (its first clip's image): a continued clip passes it with continuable",
     )
+    output_dimensions: OutputDimensions | None = Field(
+        default=None, description="With upscale: the box the upscaled clip fits inside, aspect kept"
+    )
 
     @model_validator(mode="after")
     def _size_pair(self) -> "VideogenRequest":
         if (self.width is None) != (self.height is None):
             raise ValueError("width and height go together")
+        if self.output_dimensions is not None and not (self.upscale or self.output_short_side):
+            raise ValueError("output_dimensions goes with upscale or output_short_side; else width/height are the delivered size")
+        if self.image_url is not None:
+            if self.output_short_side is not None and self.width is not None:
+                raise ValueError("output_short_side sizes the clip from the image's aspect; send it or width/height")
+        elif self.width is None:
+            # Nothing to take a shape from: a prompt-only clip says what it is.
+            raise ValueError("a clip made from the prompt alone needs width and height")
         if self.continuable and self.last_frame_url:
             raise ValueError("continuable clips end on their own restored frame; drop last_frame_url")
+        if self.continuable and not (self.image_url or self.anchor_url):
+            raise ValueError("a continuable clip needs a first frame or an anchor to restore toward")
         if self.anchor_url and not self.continuable:
             raise ValueError("anchor_url needs continuable")
         if self.duration_seconds is not None:
@@ -255,8 +305,8 @@ class LipsyncPinnedFrames(BaseModel):
     twice running). ``timed_images``: each of ``frames`` at its ``seconds`` and nothing else;
     boundaries as with ``none``, but a cut with a pin in reach lands on it. ``generate``: the job
     first renders ``count`` rest stills of the person from its image (imagegen ``rest_frame``
-    stills, each retaken at most ``max_retries`` times on a lost face or open mouth) and pins them
-    like ``multi_image``; the kept stills come back as the result's ``still<k>`` files (PNG), so
+    stills, each retaken at most ``max_retries`` times on a lost face or open mouth, the best take
+    kept either way) and pins them like ``multi_image``; the stills come back as the result's ``still<k>`` files (PNG), so
     the lease payload needs ``artifactIds`` for ``still0`` .. ``still<count-1>``.
     """
 
@@ -298,7 +348,7 @@ class ImagegenRequest(BaseModel):
 
     ``preset``: ``standard`` (plain base, 50 steps, best), ``turbo-8`` (8-step Turbo LoRA, close on
     edits, illustrated look text-only, ~2.5x faster), ``turbo-6`` (the 4-step Turbo LoRA at 6 steps) or
-    ``turbo-4`` (4-step Turbo LoRA, fastest, roughest).
+    ``turbo-4`` (4-step Turbo LoRA, fastest, roughest). No ``turbo-5`` for stills.
 
     ``image_urls`` are ``<Picture 1>``..``<Picture N>`` (the prompt may say "image 1" / "picture 2").
     ``width``/``height`` (both or neither) are the delivered size; the render is H3's ~1 MP canvas
@@ -308,8 +358,9 @@ class ImagegenRequest(BaseModel):
     lipsync ``pinned_frames`` ``multi_image`` (vigen's avatar stills, ``h3/rest_stills.py``): same shot a
     few seconds later in a pause, hands at rest, mouth closed, eyes on the lens, head/posture variation
     ``k % 6``; rendered on ``seed + k``. A take that lost the person's face (ArcFace) or opened the mouth is
-    retaken on ``+100``, ``+200``, ... at most ``max_retries`` (0..5, default 2) times; when no take keeps the
-    face the job fails. Delivered at the image's size, long side <= 2048, unless ``width``/``height`` are
+    retaken on ``+100``, ``+200``, ... at most ``max_retries`` (0..5, default 1) times; out of retakes the
+    best take is delivered, never a failure (``likeness {checked, takes, chosen, score, passed, problem}`` in
+    the result). Delivered at the image's size, long side <= 2048, unless ``width``/``height`` are
     given. Fan out ``k = 0..n-1`` on one seed.
     """
 
@@ -320,7 +371,7 @@ class ImagegenRequest(BaseModel):
     width: int | None = Field(default=None, ge=64, le=4096)
     height: int | None = Field(default=None, ge=64, le=4096)
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
-    preset: H3VideoPreset = "standard"
+    preset: H3StillPreset = "standard"
     rest_frame: int | None = Field(default=None, ge=0, le=1000)
     max_retries: int | None = Field(default=None, ge=0, le=5)
 
@@ -339,15 +390,37 @@ class ImagegenRequest(BaseModel):
         return self
 
 
+#: The lipsync fields ``auto`` sets itself (``h3/lipsync.py`` ``AUTO_CHOSEN``).
+LIPSYNC_AUTO_CHOSEN = (
+    "pinned_frames",
+    "preset",
+    "use_interpolation",
+    "interpolation_fps",
+    "sparse_attention",
+    "detect_flicker",
+    "detect_desync",
+    "detect_glitches",
+    "prompt",
+)
+
+
 class LipsyncRequest(H3Interpolation):
     """The ``lipsync`` request: the person in ``image_url`` speaks ``audio_url`` (H3 lipsync LoRA).
 
     The output lasts as long as the audio and carries it unmodified; it has the image's size, or
     fits inside ``output_dimensions`` with its aspect kept.
 
-    ``preset``: ``turbo-3`` (default: the 3-step lipsync student, trained for this mode with
-    sparse attention) or one of the videogen presets (``standard``, ``turbo-8``, ``turbo-6``,
-    ``turbo-4``) on the same pinned-audio graph.
+    ``auto`` (default true): the avatar render (``h3/lipsync.py`` docstring, **Auto**). Send the
+    person's canonical image, the audio and the avatar's rest ``stills`` (none: the image is
+    pinned); the preset, attention, validators, prompt, frame rate and pins are ours: 24 fps native,
+    the stills pinned at random at the pauses, and frame 0 alone for a clip under 3 s. ``seed``,
+    ``transcript``, ``custom_instructions``, ``output_dimensions`` and ``upscale`` still apply. The
+    fields auto chooses (:data:`LIPSYNC_AUTO_CHOSEN`) need ``auto: false`` (manual).
+
+    Manual only: ``preset`` ``turbo-3`` (default: the 3-step lipsync student, trained for this mode
+    with sparse attention) or one of the videogen presets (``standard``, ``turbo-8``, ``turbo-6``,
+    ``turbo-5``, ``turbo-4``) on the same pinned-audio graph; ``pinned_frames``; ``prompt``; the validator switches;
+    ``use_interpolation`` (disabled for now, see :class:`H3Interpolation`).
     """
 
     model_config = {"extra": "forbid"}
@@ -362,7 +435,7 @@ class LipsyncRequest(H3Interpolation):
         default=None, description="Timed words; omitted, Whisper transcribes the audio"
     )
     custom_instructions: list[LipsyncInstruction] = Field(default_factory=list, max_length=100)
-    preset: Literal["turbo-3", "standard", "turbo-8", "turbo-6", "turbo-4"] = "turbo-3"
+    preset: Literal["turbo-3", "standard", "turbo-8", "turbo-6", "turbo-5", "turbo-4"] = "turbo-3"
     sparse_attention: bool = True
     detect_flicker: bool = True
     detect_desync: bool = True
@@ -372,6 +445,25 @@ class LipsyncRequest(H3Interpolation):
         default_factory=LipsyncPinnedFrames,
         description="What is pinned besides frame 0: none (default), single_image, multi_image or timed_images",
     )
+    auto: bool = Field(default=True, description="The avatar render's own setup; false to set the manual fields")
+    stills: list[str] = Field(
+        default_factory=list, max_length=16, description="auto: the avatar's rest stills, pinned at the pauses"
+    )
+
+    @model_validator(mode="after")
+    def _auto_or_manual(self) -> "LipsyncRequest":
+        if not self.auto:
+            if self.stills:
+                raise ValueError("stills go with auto; with auto false, pin them with pinned_frames")
+            return self
+        chosen = [name for name in LIPSYNC_AUTO_CHOSEN if name in self.model_fields_set]
+        if chosen:
+            raise ValueError(f"auto chooses {', '.join(chosen)}; send auto: false to set them")
+        return self
+
+    def runtime_payload(self) -> dict[str, Any]:
+        """The payload the media runtime gets: an auto job leaves out the fields auto chooses."""
+        return self.model_dump(exclude_none=True, exclude=set(LIPSYNC_AUTO_CHOSEN) if self.auto else None)
 
 
 async def fetch_reference(url: str, dest: Path) -> Path:
@@ -516,7 +608,11 @@ class MediaRuntime:
         if error:
             kind = error.get("kind") if isinstance(error, dict) else None
             text = (error.get("message") if isinstance(error, dict) else str(error)) or "media runtime failed"
-            failure = MediaInputError(text) if kind == "input" else MediaRuntimeError(text)
+            failure = (
+                MediaInputError(text)
+                if kind == "input"
+                else MediaCancelled(text) if kind == "cancelled" else MediaRuntimeError(text)
+            )
             request.set_exception(failure)
             return
         result = message.get("result")
@@ -556,20 +652,79 @@ class MediaRuntime:
             if self._state.get("status") != "ok":
                 raise MediaRuntimeError(f"media runtime failed: {self._state.get('reason')}")
 
-    async def request(self, op: str, body: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
-        """Run one task on the runtime and wait for its reply; an ``input`` error is the caller's."""
+    async def request(
+        self,
+        op: str,
+        body: dict[str, Any],
+        timeout_seconds: float,
+        cancelled: asyncio.Event | None = None,
+    ) -> dict[str, Any]:
+        """Run one task on the runtime and wait for its reply; an ``input`` error is the caller's.
+
+        A job nobody waits for any more must not keep the GPU: when ``cancelled`` is set (its lease
+        was released), the request times out, or the caller is cancelled, the runtime is told to stop
+        the job (``body["job_id"]``). It answers with a ``cancelled`` error once it has, raised as
+        :class:`MediaCancelled`.
+        """
         await self.ensure_ready()
         loop = asyncio.get_running_loop()
         request_id = next(self._ids)
         reply: asyncio.Future = loop.create_future()
         self._pending[request_id] = reply
+        job_id = body.get("job_id")
         try:
             await asyncio.to_thread(self._send, {"id": request_id, "op": op, "body": body})
-            return await asyncio.wait_for(asyncio.shield(reply), timeout_seconds)
-        except asyncio.TimeoutError:
-            raise MediaRuntimeError(f"media runtime {op} timed out after {timeout_seconds:.0f} s") from None
+            try:
+                if await self._reply_or_cancel(reply, cancelled, timeout_seconds):
+                    return reply.result()
+            except asyncio.CancelledError:
+                self._cancel_job(job_id)
+                raise
+            if cancelled is not None and cancelled.is_set():
+                self._cancel_job(job_id)
+                await self._stopped(reply, job_id)
+                raise MediaCancelled(f"media job {job_id} was cancelled")
+            self._cancel_job(job_id)
+            await self._stopped(reply, job_id)
+            raise MediaRuntimeError(f"media runtime {op} timed out after {timeout_seconds:.0f} s")
         finally:
             self._pending.pop(request_id, None)
+
+    @staticmethod
+    async def _reply_or_cancel(
+        reply: asyncio.Future, cancelled: asyncio.Event | None, timeout_seconds: float
+    ) -> bool:
+        """Waits for the reply; False when ``cancelled`` was set or the time ran out first."""
+        waiter = asyncio.ensure_future(cancelled.wait()) if cancelled is not None else None
+        try:
+            await asyncio.wait(
+                [reply] if waiter is None else [reply, waiter],
+                timeout=timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            if waiter is not None:
+                waiter.cancel()
+        return reply.done()
+
+    def _cancel_job(self, job_id: Any) -> None:
+        """Tells the runtime to stop ``job_id``; its own reply is not waited for (nobody needs it)."""
+        if not isinstance(job_id, str):
+            return
+        _LOGGER.info("Cancelling media job %s", job_id)
+        with contextlib.suppress(MediaRuntimeError):
+            self._send({"id": next(self._ids), "op": "cancel", "body": {"job_id": job_id}})
+
+    @staticmethod
+    async def _stopped(reply: asyncio.Future, job_id: Any) -> None:
+        """Waits for the cancelled job's reply: until it comes, the runtime still holds the GPU."""
+        try:
+            await asyncio.wait_for(asyncio.shield(reply), CANCEL_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Media job %s not stopped %.0f s after its cancel", job_id, CANCEL_GRACE_SECONDS)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # The cancelled error, or the job failing on its own: either way it has stopped.
+            pass
 
     def _send(self, message: dict[str, Any]) -> None:
         """Writes one request down the pipe, under the lock so two lines never interleave.

@@ -23,6 +23,35 @@ def test_the_target_is_the_delivered_size_times_the_factor_within_4k_and_the_box
     assert span_upscale.target_size(640, 608, 1.5, bounding_box=(800, 800)) == (800, 760)
 
 
+
+def test_short_side_is_delivered_exactly_with_span_only_above_the_render():
+    size, scale = span_upscale.short_side_size, span_upscale.short_side_scale
+    # Video, a 16:9 image on its 1312x736 canvas: 480p and 720p come down from the render, 1080p goes through SPAN.
+    assert size((1920, 1080), 480) == (854, 480) and scale((854, 480), (1312, 736)) is None
+    assert size((1920, 1080), 720) == (1280, 720) and scale((1280, 720), (1312, 736)) is None
+    assert size((1920, 1080), 1080) == (1920, 1080) and scale((1920, 1080), (1312, 736)) == 1.467
+    # A 21:9 image renders 1504x640: even 720p is above it.
+    assert scale(size((2560, 1080), 720), (1504, 640)) == 1.125
+    # Avatars: the 720x1270 render copy (canvas 704x1248) and a 480x846 picture (canvas 480x832) at 1080p:
+    # exactly 1080, SPAN 2x then lanczos the rest of the way.
+    assert size((720, 1270), 1080) == (1080, 1904) and scale((1080, 1904), (704, 1248)) == 1.534
+    # ... and at 720p that render is 704 short: a 1.02x step is lanczos alone, no SPAN pass.
+    assert size((720, 1270), 720) == (720, 1270) and scale((720, 1270), (704, 1248)) is None
+    assert size((480, 846), 1080) == (1080, 1904) and scale((1080, 1904), (480, 832)) == 2.25
+    # The box bounds it afterwards, aspect kept; 4K long side at most.
+    assert size((1920, 1080), 1080, bounding_box=(1280, 1280)) == (1280, 720)
+    assert size((4000, 1000), 2160) == (3840, 960)
+
+
+def test_output_short_side_is_within_64_and_2160():
+    assert span_upscale.requested_short_side({"output_short_side": 720}) == 720
+    assert span_upscale.requested_short_side({}) is None
+    for value in (32, 4096):
+        with pytest.raises(ValueError, match="output_short_side"):
+            span_upscale.requested_short_side({"output_short_side": value})
+    with pytest.raises(ValueError, match="drop upscale"):  # the worker picks the upscale from the render
+        span_upscale.requested_short_side({"output_short_side": 1080, "upscale": True})
+
 def test_upscale_is_true_or_a_factor_up_to_2():
     assert span_upscale.requested_scale({"upscale": True}) == 1.5
     assert span_upscale.requested_scale({"upscale": 2}) == 2.0
@@ -63,3 +92,25 @@ def test_a_clip_goes_through_span_then_lanczos_to_the_target(tmp_path):
                            check=True, capture_output=True, text=True).stdout.strip().split(",")
     assert (int(probe[0]), int(probe[1]), int(probe[2])) == (*target, frames) == (240, 144, 6)
     assert metrics["rife_frames"] == 0 and metrics["span"]["frames"] == frames
+
+
+def test_a_short_side_below_the_canvas_renders_on_the_targets_own_canvas(tmp_path):
+    from PIL import Image
+
+    from h3.minimax_h3_runtime import short_side_canvas
+
+    def canvas(size, short_side):
+        path = tmp_path / f"{size[0]}x{size[1]}.png"
+        Image.new("RGB", size).save(path)
+        found = short_side_canvas(path, short_side)
+        return found.width, found.height
+
+    # 480p renders ~480 short, not the ~1 MP canvas fitted down; 1080p keeps the full canvas (SPAN does the rest).
+    assert canvas((1920, 1080), None) == canvas((1920, 1080), 1080) == (1312, 736)
+    assert canvas((1920, 1080), 480) == (832, 480)
+    assert canvas((1088, 1920), 480) == (480, 832)
+    # The smallest lattice canvas that still holds the target: the fit is a downscale, never a stretch.
+    assert canvas((1920, 1080), 720) == (1312, 736)
+    assert canvas((1024, 1024), 720) == (736, 736)
+    # A picture already under the target keeps its own canvas.
+    assert canvas((480, 846), 720) == (480, 832)

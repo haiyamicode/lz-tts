@@ -281,6 +281,8 @@ class TaskflowWorker:
     active_lease_ids: set[str] = field(default_factory=set)
     # lease id -> "cancelled" | "lost", as reported by the server heartbeat.
     dropped_lease_ids: dict[str, str] = field(default_factory=dict)
+    # lease id -> set when the heartbeat sees it released: a media render running for it stops.
+    lease_cancel_events: dict[str, asyncio.Event] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
@@ -403,6 +405,9 @@ class TaskflowWorker:
             self.dropped_lease_ids.setdefault(lease_id, "lost")
         for lease_id in (*cancelled, *lost):
             self.active_lease_ids.discard(lease_id)
+            event = self.lease_cancel_events.get(lease_id)
+            if event is not None:
+                event.set()
 
     async def heartbeat_loop(self, connection_lost: asyncio.Event) -> None:
         while True:
@@ -1283,11 +1288,17 @@ async def _process_leases(
         return
     uploads = [_segment_uploads(taskflow, work) for work in works]
     reports = [_progress_reports(taskflow, work) for work in works]
+    cancel_events = [asyncio.Event() for _ in works]
+    for work, event in zip(works, cancel_events, strict=True):
+        taskflow.lease_cancel_events[work.lease["id"]] = event
+        if work.lease["id"] not in taskflow.active_lease_ids:
+            event.set()  # released before it got here
     try:
         outcomes = await inference.execute_many(
             [(work.operation, work.request) for work in works],
             mp3_sinks=[upload.write if upload is not None else None for upload in uploads],
             progress_sinks=[report.report if report is not None else None for report in reports],
+            cancel_events=cancel_events,
         )
         if len(outcomes) != len(works):
             raise RuntimeError(
@@ -1326,6 +1337,7 @@ async def _process_leases(
         for work in works:
             taskflow.active_lease_ids.discard(work.lease["id"])
             taskflow.dropped_lease_ids.pop(work.lease["id"], None)
+            taskflow.lease_cancel_events.pop(work.lease["id"], None)
     for result in prepared:
         if isinstance(result, BaseException):
             # Let every lease finish cleaning up before the serve loop drops the

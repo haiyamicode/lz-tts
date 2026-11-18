@@ -20,8 +20,9 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
   reference image, for lipsync frame pins (:mod:`h3.rest_stills`). No
   ``prompt``: the still's prompt is written here. Rendered on ``seed + k``
   at the native area; a take that lost the person's face (ArcFace) or opened
-  the mouth is retaken, at most ``max_retries`` (0..5, default 2) times, and
-  the job fails when no take kept the face; delivered at the image's size
+  the mouth is retaken, at most ``max_retries`` (0..5, default 1) times, and
+  out of retakes the best take is delivered (``likeness`` in the item says
+  which and whether it passed); delivered at the image's size
   (long side <= 2048) unless ``width``/``height`` are given.
 
 The result is ``{"path", "item", "metrics", "seed"}`` like :mod:`h3.videogen`.
@@ -138,10 +139,6 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
         still = rest_stills.render_still(job_id=job_id, image=references[0], index=rest_frame, seed=seed,
                                          retries=retries, out_dir=scratch_dir / "outputs", reference=reference_face,
                                          preset=preset)
-        if still.kept is None:
-            raise ValueError(f"rest_frame {rest_frame}: no take kept the person's face after {len(still.takes)} "
-                             f"takes (identity {[t.report()['identity'] for t in still.takes]}, minimum "
-                             f"{rest_stills.MIN_IDENTITY})")
         render_path, render_metrics = still.kept.path, still.metrics
     else:
         render_path = scratch_dir / "outputs" / "h3_still.png"
@@ -173,7 +170,7 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
             **({"rest_frame": rest_frame, "max_retries": retries, "reference_face": reference_face is not None,
                 "stylized": round(stylized, 3),
                 **{("still_seed" if key == "seed" else key): value for key, value in still.report().items()
-                   if key not in ("index", "kept")}} if still is not None else {}),
+                   if key != "index"}} if still is not None else {}),
         },
         "metrics": {
             "wall_seconds": round(wall_seconds, 3),

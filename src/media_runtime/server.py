@@ -22,18 +22,24 @@ lipsync   -> {"path", "seed", "item", "metrics", "files"?: {"still<k>": path}}
     body: {"job_id", "payload": h3.lipsync payload, "output_dir"}
 imagegen  -> {"path", "seed", "item", "metrics"}  (a PNG)
     body: {"job_id", "payload": h3.imagegen payload, "output_dir"}
+cancel    -> {"running": bool}  (never waits for the GPU)
+    body: {"job_id"}: that job stops at its next check (``cancel.py``) and is answered with a
+    ``cancelled`` error; a job not started yet stops as it starts.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import shutil
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+import cancel
 import channel
 import paths  # noqa: F401  (sets the offline Hugging Face cache before model imports)
 import progress
@@ -68,6 +74,14 @@ class H3Body(BaseModel):
     job_id: str
     payload: dict[str, Any]
     output_dir: str
+
+
+class CancelBody(BaseModel):
+    job_id: str
+
+
+def cancel_job(body: CancelBody) -> dict[str, Any]:
+    return {"running": cancel.ask(body.job_id)}
 
 
 def _require(feature: str) -> None:
@@ -120,13 +134,32 @@ def generate(body: GenerateBody) -> dict[str, Any]:
         abc_sampling=body.abc_sampling,
         semantic_sampling=body.semantic_sampling,
     )
-    with _gpu_lock, progress.job(body.job_id):
+    with _gpu_lock, progress.job(body.job_id), _cancellable(body.job_id):
         _release_h3()
         try:
             result = _pipeline.render(request, Path(body.output_dir), reference_path=reference)
         except ValueError as exc:
             raise RequestError(str(exc)) from exc
     return {"path": str(result.path), "seed": result.seed, "mode": result.mode}
+
+
+@contextlib.contextmanager
+def _cancellable(job_id: str | None) -> Iterator[None]:
+    """Runs ``job_id`` under :mod:`cancel`; a cancelled job is answered as a ``cancelled`` error.
+
+    Whatever a cancelled job fails with counts as the cancel (YuE2's hook raises ``InterruptedError``,
+    an interrupted ComfyUI graph only fails).
+    """
+    try:
+        with cancel.job(job_id):
+            try:
+                yield
+            except BaseException as exc:
+                if cancel.is_cancelled() and not isinstance(exc, cancel.Cancelled):
+                    raise cancel.Cancelled(f"job {job_id} was cancelled") from exc
+                raise
+    except cancel.Cancelled as exc:
+        raise RequestError(str(exc), kind="cancelled") from exc
 
 
 def _run_h3(feature: str, body: H3Body) -> dict[str, Any]:
@@ -142,7 +175,7 @@ def _run_h3(feature: str, body: H3Body) -> dict[str, Any]:
 
     output_dir = Path(body.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    with _gpu_lock, progress.job(body.job_id):
+    with _gpu_lock, progress.job(body.job_id), _cancellable(body.job_id):
         if _pipeline is not None:
             _pipeline.release()
         _h3_resident = True
@@ -194,6 +227,7 @@ OPERATIONS: dict[str, channel.Operation] = {
     "videogen": _operation(H3Body, lambda body: _run_h3("videogen", body)),
     "lipsync": _operation(H3Body, lambda body: _run_h3("lipsync", body)),
     "imagegen": _operation(H3Body, lambda body: _run_h3("imagegen", body)),
+    "cancel": _operation(CancelBody, cancel_job),
 }
 
 

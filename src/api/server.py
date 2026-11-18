@@ -69,6 +69,7 @@ from .downloads import (
 from .media import (
     ImagegenRequest,
     LipsyncRequest,
+    MediaCancelled,
     MediaInputError,
     MediaRuntime,
     MusicRequest,
@@ -477,7 +478,7 @@ class TranscribeConfig(BaseModel):
 class MediaConfig(BaseModel):
     """The media runtime (src/media_runtime): its own venv and process, one GPU, one model group at a time.
 
-    ``music`` = YuE2 + YingMusic-SVC (``generate-music``), ``videogen`` = H3 image-to-video,
+    ``music`` = YuE2 + YingMusic-SVC (``generate-music``), ``videogen`` = H3 video,
     ``lipsync`` = H3 lipsync, ``imagegen`` = H3 stills. Each enabled operation's task type is
     advertised to Taskflow.
     """
@@ -6388,6 +6389,7 @@ class LzTtsInferenceSession:
         operations: list[tuple[str, dict[str, Any]]],
         mp3_sinks: list[Callable[[bytes], None] | None] | None = None,
         progress_sinks: list[ProgressSink | None] | None = None,
+        cancel_events: list[asyncio.Event | None] | None = None,
     ) -> list[InferenceResult | BaseException]:
         """Plan compatible synthesis operations into real backend batches.
 
@@ -6398,15 +6400,20 @@ class LzTtsInferenceSession:
         An operation with a sink in ``progress_sinks`` tells it where it has
         got to as it goes, for the media work that runs for minutes or hours;
         the quick operations never report.
+
+        An operation whose event in ``cancel_events`` is set (its lease was released) is not
+        started, and a media render running when it is set is stopped (``MediaRuntime.request``);
+        either ends as :class:`MediaCancelled`. The quick operations run to the end.
         """
         with self._heap_trimmer.busy():
-            return await self._execute_many(operations, mp3_sinks, progress_sinks)
+            return await self._execute_many(operations, mp3_sinks, progress_sinks, cancel_events)
 
     async def _execute_many(
         self,
         operations: list[tuple[str, dict[str, Any]]],
         mp3_sinks: list[Callable[[bytes], None] | None] | None = None,
         progress_sinks: list[ProgressSink | None] | None = None,
+        cancel_events: list[asyncio.Event | None] | None = None,
     ) -> list[InferenceResult | BaseException]:
         if not self._started:
             raise RuntimeError("Inference session has not been started")
@@ -6567,9 +6574,17 @@ class LzTtsInferenceSession:
 
         for operation_index in singleton_indices:
             operation, request_data = operations[operation_index]
+            cancelled = cancel_events[operation_index] if cancel_events else None
+            if cancelled is not None and cancelled.is_set():
+                # Released while it waited behind the operations before it (a media job runs for minutes).
+                outcomes[operation_index] = MediaCancelled(f"{operation} was cancelled before it started")
+                continue
             try:
                 outcomes[operation_index] = await self.execute(
-                    operation, request_data, progress_sinks[operation_index] if progress_sinks else None
+                    operation,
+                    request_data,
+                    progress_sinks[operation_index] if progress_sinks else None,
+                    cancelled,
                 )
             except ChildWorkerDied:
                 # Backend subprocess died -- propagate so the worker surfaces
@@ -6583,13 +6598,21 @@ class LzTtsInferenceSession:
         return [outcome for outcome in outcomes if outcome is not None]
 
     async def execute(
-        self, operation: str, request_data: dict[str, Any], progress: ProgressSink | None = None
+        self,
+        operation: str,
+        request_data: dict[str, Any],
+        progress: ProgressSink | None = None,
+        cancelled: asyncio.Event | None = None,
     ) -> InferenceResult:
         with self._heap_trimmer.busy():
-            return await self._execute(operation, request_data, progress)
+            return await self._execute(operation, request_data, progress, cancelled)
 
     async def _execute(
-        self, operation: str, request_data: dict[str, Any], progress: ProgressSink | None = None
+        self,
+        operation: str,
+        request_data: dict[str, Any],
+        progress: ProgressSink | None = None,
+        cancelled: asyncio.Event | None = None,
     ) -> InferenceResult:
         if not self._started:
             raise RuntimeError("Inference session has not been started")
@@ -6612,7 +6635,7 @@ class LzTtsInferenceSession:
         _LOGGER.info("Inference operation started: %s", json.dumps(context, default=str))
         try:
             async with _engine_hold_scope(_OPERATION_CLAIMS.get(operation, ())):
-                result = await self._dispatch(operation, request_data, progress)
+                result = await self._dispatch(operation, request_data, progress, cancelled)
         except ValidationError as exc:
             _LOGGER.warning("Inference input rejected context=%s errors=%s", context, exc.errors())
             raise InferenceOperationError(400, jsonable_encoder(exc.errors())) from exc
@@ -6630,6 +6653,11 @@ class LzTtsInferenceSession:
             # spinning this lease on retries against a dead process.
             _mark_engine_failed_from_child(exc.name, exc)
             raise
+        except MediaCancelled:
+            _LOGGER.info(
+                "Inference operation cancelled context=%s wall_seconds=%.3f", context, time.perf_counter() - started
+            )
+            raise
         except Exception:
             _LOGGER.exception("Inference operation failed context=%s", context)
             raise
@@ -6644,7 +6672,11 @@ class LzTtsInferenceSession:
         return result
 
     async def _dispatch(
-        self, operation: str, request_data: dict[str, Any], progress: ProgressSink | None = None
+        self,
+        operation: str,
+        request_data: dict[str, Any],
+        progress: ProgressSink | None = None,
+        cancelled: asyncio.Event | None = None,
     ) -> InferenceResult:
         if operation == "synthesize":
             request = SynthesizeRequest.model_validate(request_data)
@@ -6691,9 +6723,9 @@ class LzTtsInferenceSession:
         elif operation in ("generate-music", "videogen", "lipsync", "imagegen"):
             try:
                 if operation == "generate-music":
-                    result = await self._generate_music(request_data, progress)
+                    result = await self._generate_music(request_data, progress, cancelled)
                 else:
-                    result = await self._render_h3(operation, request_data, progress)
+                    result = await self._render_h3(operation, request_data, progress, cancelled)
             except MediaInputError as exc:
                 raise InferenceOperationError(400, str(exc)) from exc
         else:
@@ -6886,7 +6918,10 @@ class LzTtsInferenceSession:
         return await _timed_words(text, audio, TRANSCRIBE_SAMPLE_RATE, language, language, None)
 
     async def _generate_music(
-        self, request_data: dict[str, Any], progress: ProgressSink | None = None
+        self,
+        request_data: dict[str, Any],
+        progress: ProgressSink | None = None,
+        cancelled: asyncio.Event | None = None,
     ) -> InferenceResult:
         """YuE2 song from the style and lyrics; with ``reference_url``, the vocal is re-voiced by YingMusic-SVC."""
         config = _server_config.media
@@ -6906,7 +6941,9 @@ class LzTtsInferenceSession:
                 body["reference_path"] = str(await fetch_reference(request.reference_url, scratch / "reference"))
             await _await_engine_ready("media")
             with listening_for_progress(job_id, progress):
-                produced = await _ensure_media_runtime().request("generate", body, config.music_timeout_seconds)
+                produced = await _ensure_media_runtime().request(
+                    "generate", body, config.music_timeout_seconds, cancelled
+                )
         except BaseException:
             shutil.rmtree(scratch, ignore_errors=True)
             raise
@@ -6919,7 +6956,11 @@ class LzTtsInferenceSession:
         )
 
     async def _render_h3(
-        self, operation: str, request_data: dict[str, Any], progress: ProgressSink | None = None
+        self,
+        operation: str,
+        request_data: dict[str, Any],
+        progress: ProgressSink | None = None,
+        cancelled: asyncio.Event | None = None,
     ) -> InferenceResult:
         """H3 ``videogen`` (image to video) / ``lipsync`` (image + speech to video), an mp4, or
         ``imagegen`` (a still), a PNG.
@@ -6940,14 +6981,18 @@ class LzTtsInferenceSession:
         try:
             body = {
                 "job_id": f"{operation}-{uuid.uuid4().hex}",
-                "payload": request.model_dump(exclude_none=True),
+                "payload": (
+                    request.runtime_payload()
+                    if isinstance(request, LipsyncRequest)
+                    else request.model_dump(exclude_none=True)
+                ),
                 "output_dir": str(scratch),
             }
             if progress is not None:
                 progress("preparing", None, None)
             await _await_engine_ready("media")
             with listening_for_progress(body["job_id"], progress):
-                produced = await _ensure_media_runtime().request(operation, body, timeout)
+                produced = await _ensure_media_runtime().request(operation, body, timeout, cancelled)
         except BaseException:
             shutil.rmtree(scratch, ignore_errors=True)
             raise

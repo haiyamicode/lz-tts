@@ -60,6 +60,42 @@ def target_size(width: int, height: int, scale: float, *,
     return _even(w * ratio), _even(h * ratio)
 
 
+def short_side_size(aspect: tuple[int, int], short_side: int, *,
+                    bounding_box: tuple[int, int] | None = None) -> tuple[int, int]:
+    """The delivered size for ``output_short_side``, always: ``aspect``'s shape (the source image) with its short
+    side ``short_side``, inside ``bounding_box`` and :data:`MAX_LONG_SIDE`; even numbers."""
+    w, h = aspect[0] * short_side / min(aspect), aspect[1] * short_side / min(aspect)
+    ratio = min(1.0, MAX_LONG_SIDE / max(w, h))
+    if bounding_box is not None:
+        ratio = min(ratio, bounding_box[0] / w, bounding_box[1] / h)
+    return _even(w * ratio), _even(h * ratio)
+
+
+#: ``output_short_side`` runs SPAN only above this enlargement: a 720p avatar copy renders 704 short (the
+#: 32-px lattice), and a 1.02x SPAN pass on every such job buys nothing visible; lanczos alone covers it.
+SPAN_MIN_SCALE = 1.1
+
+
+def short_side_scale(size: tuple[int, int], render: tuple[int, int]) -> float | None:
+    """How far ``output_short_side``'s ``size`` enlarges the ``render`` (H3's canvas), the ``upscale`` it runs
+    with: SPAN 2x, then lanczos to ``size``, when that is above :data:`SPAN_MIN_SCALE`; ``None`` when lanczos
+    alone gets there (down, or up by at most that much)."""
+    scale = min(size) / min(render)
+    return round(scale, 3) if scale > SPAN_MIN_SCALE else None
+
+
+def requested_short_side(payload: dict[str, Any]) -> int | None:
+    """A job's ``output_short_side`` (64..2160), or ``None``."""
+    value = payload.get("output_short_side")
+    if value is None:
+        return None
+    if not 64 <= int(value) <= 2160:
+        raise ValueError(f"output_short_side must be within 64..2160, got {value}")
+    if payload.get("upscale"):
+        raise ValueError("output_short_side picks the upscale itself (SPAN when it is above the render); drop upscale")
+    return int(value)
+
+
 class SpanUpscaler:
     """One loaded SPAN model: RGB uint8 frames in, frames twice the size out, one frame at a time in strips."""
 
