@@ -1121,8 +1121,9 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     try:
         for chunk in chunks:
             began = time.perf_counter()
-            # The chunks are what a long clip is made of, and the only honest measure of how far
-            # along it is: one goes up as each one lands, however many minutes the clip runs to.
+            # The chunks are what a long clip is made of, and the measure of how far along it is; inside
+            # one, its render's sampler steps move it too (`progress.chunk_steps`), so a one-chunk clip
+            # is not stuck at 0% for minutes.
             progress.report("rendering", chunk.index, len(chunks))
             chunk_dir = work_dir / f"chunk{chunk.index:03d}"
             audio_slice = extract_audio_slice(
@@ -1165,22 +1166,23 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
             for attempt in range(1 + (check_retries if chunk_checking else 0)):
                 cancel.check()
                 output = chunk_dir / ("render.mp4" if attempt == 0 else f"render_retry{attempt}.mp4")
-                metrics = run_lipsync_chunk(
-                    job_id=job_id,
-                    chunk_index=chunk.index,
-                    prompt=prompts[chunk.index],
-                    seed=seed + chunk.index + attempt * RESEED_STRIDE,
-                    width=canvas_width,
-                    height=canvas_height,
-                    length=chunk.render_frames,
-                    first_frame_path=first_image,
-                    last_frame_path=None,
-                    guides=guides,
-                    audio_path=audio_slice,
-                    output_path=output,
-                    recipe=recipe,
-                    sparse_attention=sparse_attention,
-                )
+                with progress.chunk_steps():
+                    metrics = run_lipsync_chunk(
+                        job_id=job_id,
+                        chunk_index=chunk.index,
+                        prompt=prompts[chunk.index],
+                        seed=seed + chunk.index + attempt * RESEED_STRIDE,
+                        width=canvas_width,
+                        height=canvas_height,
+                        length=chunk.render_frames,
+                        first_frame_path=first_image,
+                        last_frame_path=None,
+                        guides=guides,
+                        audio_path=audio_slice,
+                        output_path=output,
+                        recipe=recipe,
+                        sparse_attention=sparse_attention,
+                    )
                 # Glitches are judged against the image the chunk opens on; a chunk moving into another
                 # pinned image drifts from it on purpose, so its flicker check judges sudden steps only.
                 verdict = _check(output, audio_slice, chunk, flicker=flicker, desync=desync,
