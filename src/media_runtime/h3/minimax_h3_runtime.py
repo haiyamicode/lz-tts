@@ -1341,6 +1341,18 @@ _RETAINED_H3_RUNTIME: _RetainedH3Runtime | None = None
 _RETAINED_H3_LOCK = threading.RLock()
 
 
+def pin_ram_headroom_gb() -> float:
+    """Host RAM (GB) ComfyUI leaves available when pinning weights: `H3_PIN_RAM_HEADROOM_GB`, else 20% of
+    the RAM the process may use (cgroup limit or host total), at least 8. Page cache counts as available,
+    so the mmap'd weights beyond the pins stay reclaimable."""
+    value = os.environ.get("H3_PIN_RAM_HEADROOM_GB")
+    if value:
+        return float(value)
+    import comfy.system_memory
+
+    return max(8.0, 0.2 * comfy.system_memory.virtual_memory_total() / 1024**3)
+
+
 def _load_comfy_modules(comfy_root: Path) -> None:
     """Import the ComfyUI runtime headlessly (mirrors the benchmark harness).
 
@@ -1434,10 +1446,14 @@ def _retained_runtime(
             import comfy.utils
 
             comfy.utils.set_progress_bar_global_hook(_report_sampling_progress)
+            # ComfyUI pins H3's weight pages into page-locked host buffers (they can't be swapped or
+            # reclaimed) until host RAM available drops to max(ram / 2, 2 GB) GB; classic cache mode has no
+            # RAM cache, so `ram` here only sets that floor. At 0 the pins took a 94 GB dev box down to the
+            # 2 GB floor and earlyoom killed the runtime at the VAE decode (RSS 43-45 GB, 2026-11-18).
             executor = comfy_execution.PromptExecutor(
                 _ProgressSink(),
                 cache_type=comfy_execution.CacheType.CLASSIC,
-                cache_args={"lru": 0, "ram": 0, "ram_inactive": 0},
+                cache_args={"lru": 0, "ram": 2 * pin_ram_headroom_gb(), "ram_inactive": 0},
             )
             _retained_runtime_state["executor"] = executor
 
