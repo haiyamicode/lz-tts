@@ -49,5 +49,35 @@ def job_dir(job_id: str) -> Path:
     return data_dir() / "jobs" / str(job_id)
 
 
+def _proc_fields(path: str, sep: str | None = None) -> dict[str, int]:
+    try:
+        with open(path) as f:
+            rows = (line.split(sep, 1) for line in f)
+            return {k.strip(): int(v.split()[0]) for k, v in rows if v.split() and v.split()[0].isdigit()}
+    except OSError:
+        return {}
+
+
+def host_memory() -> dict:
+    """Host RAM, swap and disk reads now (Linux /proc; {} elsewhere). The counters are cumulative: diff two events.
+    `read_gb` is this process's storage reads (mmap'd weight pages faulted back in count), `swap_in_gb` the host's."""
+    mem, vm, io = _proc_fields("/proc/meminfo", ":"), _proc_fields("/proc/vmstat", " "), _proc_fields("/proc/self/io", ":")
+    if not mem:
+        return {}
+    gib = 1024**2  # meminfo is kB
+    status = _proc_fields("/proc/self/status", ":")
+    return {
+        "avail_gb": round(mem.get("MemAvailable", 0) / gib, 1),
+        "cached_gb": round(mem.get("Cached", 0) / gib, 1),
+        "locked_gb": round(mem.get("Mlocked", 0) / gib, 1),
+        "swap_used_gb": round((mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)) / gib, 1),
+        "rss_gb": round(status.get("VmRSS", 0) / gib, 1),
+        "read_gb": round(io.get("read_bytes", 0) / 1024**3, 1),
+        "swap_in_gb": round(vm.get("pswpin", 0) * 4096 / 1024**3, 2),
+        "majflt": vm.get("pgmajfault", 0),
+    }
+
+
 def log_event(event: str, **fields) -> None:
+    fields.setdefault("host", host_memory())
     print(f"[h3] {json.dumps({'event': event, 't': round(time.time(), 3), **fields}, default=str)}", file=sys.stderr, flush=True)
