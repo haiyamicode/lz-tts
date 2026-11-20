@@ -38,8 +38,11 @@ ENV PYTHONUNBUFFERED=1 \
 #   g++ + libicu-dev — build toolchain so uv sync can compile sdist-only C
 #     extensions (pyicu, webrtcvad, pesq, monotonic-align) against THIS
 #     image's libicu — no prebuilt-wheel/system-library mismatch
+#   libegl1 + libgles2 — mediapipe's libmediapipe.so links libEGL.so.1/libGLESv2.so.2 even on CPU
+#     (media runtime FaceLandmarker: imagegen rest_frame, lipsync `generate` stills)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        libegl1 libgles2 \
         sox \
         gcc g++ \
         pkg-config \
