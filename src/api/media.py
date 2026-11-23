@@ -208,6 +208,16 @@ class VideogenRequest(H3Interpolation):
         description="Audio pinned in the latent: the video moves to it; it is the output's audio track",
     )
     preset: H3VideoPreset | None = None
+    sparse_attention: bool = Field(
+        default=True,
+        description="Lipsync's attention (Comfy Kitchen INT8 + SLA, 85% of key blocks skipped, step 2 dense): "
+        "~2x faster diffusion; false renders dense",
+    )
+    addons: list[Literal["motion", "dance"]] = Field(
+        default_factory=list, max_length=2,
+        description="Community LoRAs stacked on the preset at strength 1.0: motion (Better Human Motion H3, "
+        "civitai 2734359), dance (civitai 3056222)",
+    )
     continuable: bool = Field(
         default=False,
         description="End on a clean frame another clip can open on: the last frame is previewed, restored "
@@ -220,11 +230,19 @@ class VideogenRequest(H3Interpolation):
     output_dimensions: OutputDimensions | None = Field(
         default=None, description="With upscale: the box the upscaled clip fits inside, aspect kept"
     )
+    native: bool = Field(
+        default=False,
+        description="With output_short_side: render at that size itself, past H3's 1 MP canvas up to 1920x1088 "
+        "(native 1080p), instead of ~1 MP + SPAN; about 3x the render time, and at 1080p at most 8 s (the 3090's "
+        "VRAM; a longer duration is a 400)",
+    )
 
     @model_validator(mode="after")
     def _size_pair(self) -> "VideogenRequest":
         if (self.width is None) != (self.height is None):
             raise ValueError("width and height go together")
+        if self.native and self.output_short_side is None:
+            raise ValueError("native renders at output_short_side; send it")
         if self.output_dimensions is not None and not (self.upscale or self.output_short_side):
             raise ValueError("output_dimensions goes with upscale or output_short_side; else width/height are the delivered size")
         if self.image_url is not None:

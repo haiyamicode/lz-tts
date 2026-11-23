@@ -245,13 +245,14 @@ def _check_h3_assets(features: list[str]) -> None:
     _h3_resident = True
     # Every preset of every enabled op must be servable.
     from h3.h3_still import STILL_PRESETS
-    from h3.minimax_h3_runtime import LIPSYNC_PRESETS, VIDEO_PRESETS
+    from h3.minimax_h3_runtime import LIPSYNC_PRESETS, VIDEO_ADDON_LORAS, VIDEO_PRESETS
 
     lora_names = set()
     if "imagegen" in features:
         lora_names |= {spec["lora"]["name"] for spec in STILL_PRESETS.values() if spec["lora"]}
     if "videogen" in features:
         lora_names |= {recipe.lora_name for recipe in VIDEO_PRESETS.values() if recipe.lora_name}
+        lora_names |= set(VIDEO_ADDON_LORAS.values())
     if "lipsync" in features:
         lora_names |= {recipe.lora_name for recipe in LIPSYNC_PRESETS.values() if recipe.lora_name}
     missing = [str(path) for path in (comfy_root / "models" / "loras" / name for name in sorted(lora_names)) if not path.exists()]

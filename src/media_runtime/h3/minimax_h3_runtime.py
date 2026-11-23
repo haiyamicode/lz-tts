@@ -112,6 +112,16 @@ SLA_ATTENTION_INPUTS: dict[str, Any] = {
 # imported, i.e. unit tests without a provisioned runtime.
 H3_BASE_SHORT_EDGE = 768
 H3_MAX_PIXELS = 768 * 1344
+#: Videogen ``native``: the canvas is the delivered size itself (each side rounded up to the lattice, the
+#: sliver cropped off after), no SPAN, up to this area: 1920x1088, native 1080p of 16:9 or 9:16. Out of the
+#: model's 1 MP training range but clean on the spin test (local/exp/h3-1080p, 2026-11-23: turbo-8 SLA 5 s
+#: in 411 s on the 3090, ~80x RTF vs ~26x for 720p + SPAN; fits a 16 GB card at full speed, 11.5 GiB peak).
+H3_NATIVE_MAX_PIXELS = 1920 * 1088
+#: Videogen ``native``: the most canvas pixels x grid frames one job may render. 1920x1088 on the 192-frame grid
+#: (7.5-8 s) is the longest that fit the 24 GB 3090 (local/exp/h3-1080p, 2026-11-23: 7.5 s turbo-8 SLA 821 s,
+#: 17.5 GiB torch peak; 10 s OOMs in the SLA kernel and again dense, so does an 8 GB VRAM headroom). A 16 GB
+#: card fits only the 124-frame grid (5 s; 6 s, 7.5 s and 10 s OOM there).
+H3_NATIVE_MAX_PIXEL_FRAMES = 1920 * 1088 * 192
 H3_CANVAS_MULTIPLE = 32
 #: Aspect error we treat as free: 0.005 is 0.5% of scale, about 6 px on a
 #: 1280-tall canvas, far below what anyone sees in a moving image.
@@ -178,6 +188,15 @@ LIPSYNC_STEPS = 3
 #: The upstream 8-step FL2V Turbo LoRA (``diffusion_model.*`` keys, so the stock
 #: ``LoraLoaderModelOnly`` loads it), sampled ``res_multistep``.
 TURBO8_LORA_NAME = "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
+#: Videogen ``addons``: community LoRAs a request can stack on any preset, each at strength 1.0 through
+#: the stock ``LoraLoaderModelOnly`` after the recipe's own LoRA (local/exp/h3-motion-lora).
+#: ``motion``: Better Human Motion H3 (civitai 2734359 v1.0-MH3, rank 32, sha256 285f9ed3...); on the
+#: spin test it was the one clean turbo-8 arm at 1.0. ``dance``: civitai 3056222 (2400 steps, no trigger
+#: word, sha256 b671d0f9...); no reliable spin fix on turbo-8 or turbo-6. Neither was tested with SLA.
+VIDEO_ADDON_LORAS: dict[str, str] = {
+    "motion": "minimax_h3_addon_motion_civitai2734359_v1.0.safetensors",
+    "dance": "minimax_h3_addon_dance_civitai3056222.safetensors",
+}
 
 
 @dataclass(frozen=True)
@@ -623,7 +642,7 @@ def probe_image_dimensions(path: Path) -> tuple[int, int]:
         return H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT
 
 
-def _fit_canvas(width: int, height: int) -> tuple[int, int]:
+def _fit_canvas(width: int, height: int, max_pixels: int | None = None) -> tuple[int, int]:
     """Snap a nominal canvas onto H3's lattice without moving its aspect.
 
     Unlike :func:`adapt_canvas` this never upscales to the 768 short-edge
@@ -632,7 +651,7 @@ def _fit_canvas(width: int, height: int) -> tuple[int, int]:
     aspect-preserving lattice search in :func:`_grid_pair` also enforces the
     ``H3_MAX_PIXELS`` ceiling.
     """
-    return _grid_pair(width, height)
+    return _grid_pair(width, height, max_pixels=max_pixels)
 
 
 def resolve_output_dimensions(
@@ -640,6 +659,7 @@ def resolve_output_dimensions(
     image_path: Path | None,
     requested_width: int | None,
     requested_height: int | None,
+    max_pixels: int | None = None,
 ) -> tuple[int, int]:
     """Pick the (width, height) we render the H3 video at.
 
@@ -654,7 +674,7 @@ def resolve_output_dimensions(
        snapped to the grid. A 512x768 input renders at 512x768.
 
     Downscaling happens only when the resulting canvas exceeds the H3 1 MP
-    ceiling, which the model cannot encode.
+    ceiling, which the model cannot encode (``max_pixels`` raises it for one job: videogen ``native``).
 
     ``image_path`` is ``None`` for t2va, where the prompt alone makes the clip:
     there is no shape to inherit, so the caller names both axes (2 and 3 have
@@ -663,15 +683,15 @@ def resolve_output_dimensions(
     if image_path is None:
         if not (requested_width and requested_height):
             raise ValueError("a clip made from the prompt alone needs both width and height")
-        return _grid_pair(int(requested_width), int(requested_height))
+        return _grid_pair(int(requested_width), int(requested_height), max_pixels=max_pixels)
     src_w, src_h = probe_image_dimensions(image_path)
     if requested_width and requested_height:
-        return _grid_pair(int(requested_width), int(requested_height))
+        return _grid_pair(int(requested_width), int(requested_height), max_pixels=max_pixels)
     if requested_width:
-        return _fit_canvas(int(requested_width), int(round(int(requested_width) * src_h / src_w)))
+        return _fit_canvas(int(requested_width), int(round(int(requested_width) * src_h / src_w)), max_pixels)
     if requested_height:
-        return _fit_canvas(int(round(int(requested_height) * src_w / src_h)), int(requested_height))
-    return _fit_canvas(src_w, src_h)
+        return _fit_canvas(int(round(int(requested_height) * src_w / src_h)), int(requested_height), max_pixels)
+    return _fit_canvas(src_w, src_h, max_pixels)
 
 
 def short_side_canvas(
@@ -704,6 +724,19 @@ def short_side_canvas(
     return canvas
 
 
+def native_canvas(image_path: Path | None, size: tuple[int, int]) -> "H3Canvas":
+    """The render canvas for a videogen ``native`` job delivered at ``size``: each side rounded up to the
+    lattice (1920x1080 renders 1920x1088 and loses 8 rows to the centre crop, no rescale), past the 1 MP cap up
+    to :data:`H3_NATIVE_MAX_PIXELS`. A size whose rounded canvas is larger renders on the biggest lattice canvas
+    of its aspect under that ceiling and is scaled up to ``size``."""
+    block = _canvas_multiple()
+    width, height = (-(-int(side) // block) * block for side in size)
+    if width * height > H3_NATIVE_MAX_PIXELS:
+        width, height = _grid_pair(int(size[0]), int(size[1]), max_pixels=H3_NATIVE_MAX_PIXELS)
+    return resolve_canvas(image_path=image_path, requested_width=width, requested_height=height,
+                          max_pixels=max(H3_MAX_PIXELS, width * height))
+
+
 class H3Canvas(NamedTuple):
     """A render canvas plus the provenance needed to audit how it was chosen.
 
@@ -730,6 +763,7 @@ def resolve_canvas(
     image_path: Path | None,
     requested_width: int | None = None,
     requested_height: int | None = None,
+    max_pixels: int | None = None,
 ) -> H3Canvas:
     """Engine-facing canvas resolution: H3's 32-px lattice, aspect kept intact.
 
@@ -747,6 +781,7 @@ def resolve_canvas(
         image_path=image_path,
         requested_width=requested_width,
         requested_height=requested_height,
+        max_pixels=max_pixels,
     )
     source_width, source_height = (
         probe_image_dimensions(image_path) if image_path is not None else (width, height)
@@ -933,6 +968,7 @@ def ensure_minimax_h3_models(
     *,
     generate_audio: bool = True,
     recipe: H3Recipe | None = None,
+    addons: tuple[str, ...] = (),
 ) -> dict[str, Path]:
     comfy_root = comfy_root or ensure_comfyui_runtime()
     required = {
@@ -943,6 +979,8 @@ def ensure_minimax_h3_models(
     lora_name = (recipe or env_recipe()).lora_name
     if lora_name:
         required["turbo_lora"] = comfy_root / "models" / "loras" / lora_name
+    for addon in addons:
+        required[f"addon_{addon}"] = comfy_root / "models" / "loras" / VIDEO_ADDON_LORAS[addon]
     if generate_audio:
         required["audio_vae"] = comfy_root / "models" / "vae" / audio_vae_name()
     missing = [str(path) for path in required.values() if not path.exists()]
@@ -1034,8 +1072,11 @@ def build_h3_graph(
     scheduler: str | None = None,
     generate_audio: bool = True,
     fps: float = H3_FPS,
+    addons: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     """Build the headless MiniMax H3 FL2VA prompt graph.
+
+    ``addons`` (:data:`VIDEO_ADDON_LORAS` names) chain after the recipe's LoRA, strength 1.0.
 
     For the ``int8_turbo`` variant this is the reference Turbo graph, node for
     node: ``UNETLoader -> MiniMaxH3TurboLoRA -> {BasicGuider, BasicScheduler} ->
@@ -1092,6 +1133,13 @@ def build_h3_graph(
             "inputs": {"model": ["2", 0], "lora_name": recipe.lora_name, "strength_model": 1.0},
         }
         model_source = ["18", 0]
+    for index, addon in enumerate(addons):
+        node_id = str(70 + index)
+        graph[node_id] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": model_source, "lora_name": VIDEO_ADDON_LORAS[addon], "strength_model": 1.0},
+        }
+        model_source = [node_id, 0]
     graph["3"] = {
         "class_type": "CLIPLoader",
         "inputs": {
@@ -1612,6 +1660,9 @@ def run_minimax_h3_inference(
     pinned_audio_path: Path | None = None,
     preview: Any = None,
     fps: int | None = None,
+    sparse_attention: bool = True,
+    addons: tuple[str, ...] = (),
+    max_pixels: int | None = None,
 ) -> dict[str, Any]:
     """Run one H3 FL2VA/i2v generation; returns stage metrics.
 
@@ -1630,6 +1681,11 @@ def run_minimax_h3_inference(
     ``generate_audio`` defaults to ``True``: FL2VA carries a synchronized audio
     stream and the Turbo Sampler is what keeps it intelligible.
 
+    ``sparse_attention`` (default) samples with :func:`add_sparse_attention`, lipsync's
+    attention: on the spin test (local/exp/h3-motion-lora, turbo-8, 4 seeds) no seed broke
+    that dense got right, at 147 s a clip vs 315 s. Without the kernel it runs dense.
+    ``addons`` stack :data:`VIDEO_ADDON_LORAS` on the recipe.
+
     ``width``/``height`` are what the caller asked for, not necessarily what H3
     can render: :func:`resolve_canvas` owns the final canvas (off-lattice or
     oversized numbers move to the lattice pair that holds this aspect), and
@@ -1647,11 +1703,14 @@ def run_minimax_h3_inference(
     ``fps`` below 24 renders that many frames a second of the clip
     (:func:`h3.h3_interpolation.h3_time_axis`, an interpolated job with no pinned
     audio): the frames and the generated audio last ``length / fps`` seconds.
+
+    ``max_pixels`` lifts the canvas cap (:data:`H3_MAX_PIXELS`) for this job: videogen ``native``.
     """
     from .h3_interpolation import h3_time_axis
 
     time_axis_fps = int(fps or H3_FPS)
-    canvas = resolve_canvas(image_path=image_path, requested_width=width, requested_height=height)
+    canvas = resolve_canvas(image_path=image_path, requested_width=width, requested_height=height,
+                            max_pixels=max_pixels)
     width = canvas.width
     height = canvas.height
 
@@ -1664,7 +1723,11 @@ def run_minimax_h3_inference(
     retained = _retained_runtime(generate_audio=audio_vae, recipe=recipe)
     comfy_root = retained.comfy_root
     # The retained runtime may have been loaded for another recipe; check this one's LoRA.
-    ensure_minimax_h3_models(comfy_root, generate_audio=audio_vae, recipe=recipe)
+    ensure_minimax_h3_models(comfy_root, generate_audio=audio_vae, recipe=recipe, addons=addons)
+    if sparse_attention and (reason := sparse_attention_unavailable(comfy_root)) is not None:
+        # As for a lipsync chunk: the slower path, not a failure.
+        log_event("minimax_h3_sparse_attention_unavailable", job_id=job_id, reason=reason)
+        sparse_attention = False
     stage_timings: dict[str, float] = {"minimax_h3_runtime_init_seconds": retained.init_seconds}
 
     def finish_stage(name: str, began: float) -> None:
@@ -1720,6 +1783,7 @@ def run_minimax_h3_inference(
         recipe=recipe,
         generate_audio=audio_vae,
         fps=float(time_axis_fps),
+        addons=addons,
     )
     if guides:
         staged = []
@@ -1732,6 +1796,8 @@ def run_minimax_h3_inference(
         relative = f"jobs/{job_id}/pinned_audio{pinned_audio_path.suffix}"
         shutil.copyfile(pinned_audio_path, comfy_root / "input" / relative)
         pin_audio(graph, relative)
+    if sparse_attention:  # before a preview swaps in ManualSigmas, which takes no model
+        add_sparse_attention(graph)
     if preview is not None:
         # The node renders the length snapped up to its grid; the preview indexes those frames.
         try:
@@ -1758,6 +1824,8 @@ def run_minimax_h3_inference(
         preset=preset,
         steps=recipe.steps,
         lora=recipe.lora_name,
+        sparse_attention=sparse_attention,
+        addons=list(addons),
     )
 
     comfy_output_dir = comfy_root / "output"
@@ -1822,6 +1890,8 @@ def run_minimax_h3_inference(
         "steps": recipe.steps,
         "sampler": recipe.sampler_label,
         "scheduler": h3_scheduler(),
+        "sparse_attention": sparse_attention,
+        "addons": list(addons),
         "unet": unet_name(),
         "text_encoder": clip_name(),
         "h3_variant": h3_variant(),

@@ -16,6 +16,13 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
   sits on H3's 32-px lattice with the image's aspect, then is scaled and
   centre-cropped to that size. Omitted, the clip keeps the image's shape;
 - ``seed`` (random when omitted), ``generate_audio`` (default true);
+- ``sparse_attention`` (default true): lipsync's attention
+  (:func:`h3.minimax_h3_runtime.add_sparse_attention`: Comfy Kitchen INT8 + SLA, 85% of
+  key blocks skipped, step 2 dense), ~2x faster diffusion; ``false`` renders dense. A
+  worker without the kernel renders dense and the item says so;
+- ``addons`` (default none): community LoRAs stacked on the preset at strength 1.0
+  (:data:`h3.minimax_h3_runtime.VIDEO_ADDON_LORAS`): ``motion`` (Better Human Motion H3),
+  ``dance`` (civitai 3056222);
 - ``pinned_frames``: ``[{"image_url" | "image_path", "seconds"}]`` guide images
   pinned at those times (``MiniMaxH3AddGuide`` anchors, not overwrites), cover-fit
   to the first frame's size like lipsync's pins;
@@ -48,6 +55,10 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
   the image's aspect with exactly that short side (480p, 720p, 1080p): above the canvas's short side
   through SPAN 2x then lanczos (:func:`h3.span_upscale.short_side_scale`), else lanczos from the render
   (:func:`h3.span_upscale.short_side_size`).
+- ``native`` (default false; with ``output_short_side`` only): render at the delivered size itself
+  instead of ~1 MP + SPAN, past the model's 1 MP cap up to 1920x1088
+  (:func:`h3.minimax_h3_runtime.native_canvas`): 1080p of 16:9 renders 1920x1088 and the centre crop takes
+  8 rows, no rescale, no SPAN. About 3x the cost of the SPAN path (~80x RTF turbo-8 on the 3090).
 
 The result is ``{"path", "item", "metrics", "seed"}`` like :mod:`h3.lipsync`, plus
 ``last_frame_path`` (a JPEG, quality 95) for a continuable clip.
@@ -121,12 +132,15 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     from .span_upscale import requested_scale, requested_short_side, short_side_scale, short_side_size, target_size
     from .minimax_h3_runtime import (
         H3_FPS,
+        H3_NATIVE_MAX_PIXEL_FRAMES,
         cleanup_h3_job_files,
+        VIDEO_ADDON_LORAS,
         VIDEO_PRESETS,
         delivery_dimensions,
         env_recipe,
         h3_preset,
         probe_image_dimensions,
+        native_canvas,
         resolve_canvas,
         short_side_canvas,
         run_minimax_h3_inference,
@@ -148,6 +162,11 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     generate_audio = payload.get("generate_audio") is not False
     preset = payload.get("preset") or None
     recipe = h3_preset(str(preset), VIDEO_PRESETS) if preset else env_recipe()
+    # Lipsync's Kitchen INT8 + SLA 85% attention unless the caller asks for dense.
+    sparse_attention = payload.get("sparse_attention") is not False
+    addons = tuple(dict.fromkeys(str(name) for name in payload.get("addons") or ()))
+    if unknown := [name for name in addons if name not in VIDEO_ADDON_LORAS]:
+        raise ValueError(f"unknown addons {unknown}; available: {sorted(VIDEO_ADDON_LORAS)}")
     # use_interpolation: H3 renders interpolation_fps frames for every second of the clip and RIFE makes the
     # rest of the 24; lengths and pins below are in frames of the render.
     interpolation_fps = requested_fps(payload)
@@ -156,6 +175,9 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     upscale = requested_scale(payload)
     output_dimensions = payload.get("output_dimensions")
     short_side = requested_short_side(payload)
+    native = payload.get("native") is True
+    if native and short_side is None:
+        raise ValueError("native renders at output_short_side; send it")
     if output_dimensions is not None and not (upscale or short_side):
         raise ValueError("output_dimensions goes with upscale or output_short_side; else width/height are the delivered size")
     bounding_box = ((int(output_dimensions["width"]), int(output_dimensions["height"]))
@@ -229,9 +251,15 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
         render_width, render_height = canvas.width, canvas.height
     # The size the clip leaves at: H3 resizes to delivery itself; an upscaled clip goes to final_size after SPAN.
     final_size = None
+    max_pixels = None
     if short_side is not None:
         final_size = short_side_size(source_aspect, short_side, bounding_box=bounding_box)
-        upscale = short_side_scale(final_size, (canvas.width, canvas.height))
+        if native:
+            # The canvas is the delivered size on the lattice, past the 1 MP cap: no SPAN, H3 crops the sliver.
+            canvas = native_canvas(image_path, final_size)
+            render_width, render_height = canvas.width, canvas.height
+            max_pixels = canvas.width * canvas.height
+        upscale = None if native else short_side_scale(final_size, (canvas.width, canvas.height))
         if not upscale:
             delivery = final_size
     elif upscale:
@@ -241,6 +269,11 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
         length = interpolated_render_frames(length, interpolation_fps)
     # The node snaps the clip up to the 17k+5 grid; pins and the pinned audio cover that clip.
     grid_frames = 5 + 17 * -(-max(0, length - 5) // 17)
+    if native and canvas.width * canvas.height * grid_frames > H3_NATIVE_MAX_PIXEL_FRAMES:
+        frames = H3_NATIVE_MAX_PIXEL_FRAMES // (canvas.width * canvas.height)
+        limit = (5 + 17 * ((frames - 5) // 17)) / render_fps
+        raise ValueError(f"a native {canvas.width}x{canvas.height} clip fits the GPU up to {limit:g} s; send a shorter "
+                         "duration_seconds (or pinned audio) or drop native")
     guides = _pinned_frames(job, payload, scratch_dir, image_path, length, render_fps,
                             canvas_size=(canvas.width, canvas.height))
     if continuable and guides and guides[-1][0] >= grid_frames - 1:
@@ -272,7 +305,8 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
                 height=render_height,
                 length=length, grid_frames=grid_frames, preset=preset, recipe=recipe, generate_audio=generate_audio,
                 guides=guides, pinned_audio=pinned_audio, anchor_path=anchor_path,
-                work_dir=scratch_dir / "continuation", fps=time_axis_fps,
+                work_dir=scratch_dir / "continuation", fps=time_axis_fps, sparse_attention=sparse_attention,
+                addons=addons, max_pixels=max_pixels,
             )
         metrics = run_minimax_h3_inference(
             job_id=job_id,
@@ -292,6 +326,9 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
             guides=guides,
             pinned_audio_path=pinned_audio,
             fps=time_axis_fps,
+            sparse_attention=sparse_attention,
+            addons=addons,
+            max_pixels=max_pixels,
         )
     finally:
         cleanup_h3_job_files(job_id)
@@ -324,6 +361,9 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
         "duration_seconds": round(float(video.get("duration") or 0.0), 3),
         "preset": preset,
         "steps": recipe.steps,
+        "sparse_attention": bool(metrics.get("sparse_attention", sparse_attention)),
+        "addons": list(addons),
+        "native": native,
         "generate_audio": generate_audio,
         "last_frame": last_frame_path is not None and not continuable,
         "pinned_frames": [frame for frame, _ in guides],
@@ -395,7 +435,8 @@ def _postprocess(output_path, *, fps: int | None, grid_frames: int, upscale: flo
 
 
 def _restore_end(*, job_id: str, prompt: str, image_path, seed: int, width, height, length: int, grid_frames: int,
-                 preset, recipe, generate_audio: bool, guides, pinned_audio, anchor_path, work_dir, fps=None):
+                 preset, recipe, generate_audio: bool, guides, pinned_audio, anchor_path, work_dir, fps=None,
+                 sparse_attention: bool = True, addons: tuple[str, ...] = (), max_pixels: int | None = None):
     """A continuable clip's last frame: this clip's own last frame previewed (the recipe's preview
     schedule, that frame alone decoded), then restored toward ``anchor_path``. The render that follows
     pins it as its last frame, so the clip ends on it and the next job opens on it."""
@@ -420,6 +461,9 @@ def _restore_end(*, job_id: str, prompt: str, image_path, seed: int, width, heig
         pinned_audio_path=pinned_audio,
         preview=FramePreview(frame=grid_frames - 1, output_path=work_dir / "preview.png", sigmas=recipe.preview_sigmas),
         fps=fps,
+        sparse_attention=sparse_attention,
+        addons=addons,
+        max_pixels=max_pixels,
     )
     preview_seconds = round(time.perf_counter() - started, 3)
     started = time.perf_counter()
