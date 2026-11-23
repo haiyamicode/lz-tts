@@ -31,10 +31,10 @@ def _render_graph(recipe):
 
 
 def test_preview_graph_decodes_one_frame_on_the_preview_schedule():
-    graph = _render_graph(VIDEO_PRESETS["turbo-4"])
+    graph = _render_graph(VIDEO_PRESETS["turbo-5"])
     sampled_by = graph["13"]["inputs"]["sigmas"]
     save = h3_restore.preview_graph(graph, frame=72, length=73, filename_prefix="jobs/j/preview",
-                                    sigmas=VIDEO_PRESETS["turbo-4"].preview_sigmas)
+                                    sigmas=VIDEO_PRESETS["turbo-5"].preview_sigmas)
     assert "17" not in graph  # no video output: the full decode and the mp4 never run
     assert sampled_by == ["9", 0]
     assert graph["9"] == {"class_type": "ManualSigmas", "inputs": {"sigmas": "1.0, 0.8575, 0.7064, 0.0"}}
@@ -44,7 +44,7 @@ def test_preview_graph_decodes_one_frame_on_the_preview_schedule():
 
 
 def test_unmeasured_recipes_preview_on_their_own_schedule():
-    for name in ("standard", "turbo-8"):
+    for name in ("standard", "turbo-8", "turbo-4"):
         recipe = VIDEO_PRESETS[name]
         assert recipe.preview_sigmas is None
         graph = _render_graph(recipe)

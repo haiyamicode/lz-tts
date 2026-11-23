@@ -166,7 +166,7 @@ from .speech_chunks import (
     words_between,
 )
 
-#: H3 FL2VA's frame grid: the node snaps every length up to ``17k+5``.
+#: H3's frame grid: the node snaps every length up to ``17k+5``.
 H3_FRAME_GRID = 17
 H3_FRAME_GRID_OFFSET = 5
 #: Longest chunk, in frames: 226 frames (9.4 s) is the clip length the pinned

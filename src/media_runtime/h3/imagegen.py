@@ -1,7 +1,7 @@
 """H3 still images (``imagegen``): text-to-image and multi-reference editing.
 
 Ported from vigen's ``run_h3_image_generation``. The recipe is a
-:data:`h3.h3_still.STILL_PRESETS` entry on the FL2VA INT8 base, no CFG. The
+:data:`h3.h3_still.STILL_PRESETS` entry on the Ref2VA INT8 base, no CFG. The
 still renders on H3's native ~1 MP canvas with the delivered aspect and is then
 Lanczos-resized to the delivered size.
 

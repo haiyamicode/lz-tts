@@ -257,7 +257,7 @@ def _check_h3_assets(features: list[str]) -> None:
         lora_names |= {recipe.lora_name for recipe in LIPSYNC_PRESETS.values() if recipe.lora_name}
     missing = [str(path) for path in (comfy_root / "models" / "loras" / name for name in sorted(lora_names)) if not path.exists()]
     if missing:
-        raise FileNotFoundError("H3 preset LoRAs are missing: " + ", ".join(missing))
+        raise FileNotFoundError("H3 preset weights are missing: " + ", ".join(missing))
     # Rest stills (imagegen rest_frame, lipsync pinned_frames generate) check the face of every take.
     if "imagegen" in features or "lipsync" in features:
         realism = compat.REALISM_CLIP_DIR / "model.safetensors"

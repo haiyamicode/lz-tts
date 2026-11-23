@@ -1,11 +1,11 @@
 """H3 video (``videogen``): one 4-step Turbo render with its own audio.
 
 The clip is made from a prompt, optionally opening on a frame the caller gives
-(the node takes ``first_frame`` either way).
+(a ``MiniMaxH3AddGuide`` pin at frame 0 on the Ref2VA base).
 
 A job is ``{"id": ..., "payload": {...}}``; the payload takes:
 
-- ``prompt`` (required): what happens in the clip, H3's FL2VA prompt;
+- ``prompt`` (required): what happens in the clip, H3's prompt;
 - ``image_url`` / ``image_path``: the first frame. Without one the clip is made
   from the prompt alone, and ``width``/``height`` then say what shape it is;
 - ``last_frame_url`` / ``last_frame_path``: an optional last frame (first-last

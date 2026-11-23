@@ -1,12 +1,12 @@
-"""MiniMax H3 FL2VA video runtime (headless ComfyUI), for ``videogen`` and ``lipsync``.
+"""MiniMax H3 Ref2VA video runtime (headless ComfyUI), for ``videogen`` and ``lipsync``.
 
 Served recipe (``H3_VARIANT=int8_turbo``, the default): the pruned
-**int8_convrot** FL2VA base, the **int4_convrot** Qwen3-VL 32B text encoder,
+**int8_convrot** Ref2VA base, the **int4_convrot** Qwen3-VL 32B text encoder,
 fp16 video / fp32 audio VAEs, the ``MiniMaxH3TurboLoRA`` node (``strength=1.0``,
 ``low_vram=true``) and the ``MiniMaxH3TurboSampler``, 4 steps on ``simple``.
 Lipsync swaps the LoRA for our 3-step student (:data:`LIPSYNC_LORA_NAME`) and
-samples under SLA block-sparse attention. ``int8_dmd3`` and ``nvfp4_vanilla``
-are kept as alternative recipes; the env overrides (``H3_UNET_NAME``,
+samples under SLA block-sparse attention. ``int8_dmd3`` is kept as an
+alternative recipe; the env overrides (``H3_UNET_NAME``,
 ``H3_CLIP_NAME``, ``H3_TURBO_LORA_NAME``, ``H3_STEPS``...) still apply.
 
 The geometry is ours to choose, the grid is not. H3 encodes latents at 16x and
@@ -33,8 +33,13 @@ runtime does that only before it loads the music models). One executor serves
 every H3 graph (videogen with or without audio, lipsync, imagegen): each graph
 loads the VAEs it needs, so nothing is torn down between H3 jobs.
 
-FL2VA always decodes the audio VAE, so a videogen mp4 carries a synchronized
-audio track; the Turbo Sampler is what keeps that track intelligible.
+Ref2VA is the only base (FL2VA retired 2026-11-24): its node has no frame
+inputs, so every keyframe is a ``MiniMaxH3AddGuide`` pin (the first and last
+frame at 0 / -1, lipsync and videogen pins at their frames). The FL2VA-trained
+LoRAs (ckpt850, the DMD3 and lipsync students) load on it unchanged (same weight
+layout); turbo-4 and turbo-8 are the official Ref2V Turbo LoRAs. The AV latent
+always carries the audio stream, so a videogen mp4 carries a synchronized
+audio track.
 """
 
 from __future__ import annotations
@@ -59,9 +64,9 @@ from .compat import COMFYUI_DIR, data_dir, project_path
 
 H3_FPS = 24.0
 
-#: Pruned int8_convrot FL2VA base - the checkpoint the Turbo LoRA is validated
-#: against ("default pruned_int8_convrot model"), 21 GB, streamed by ComfyUI.
-DEFAULT_UNET_NAME = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+#: Pruned int8_convrot Ref2VA base (``MiniMaxH3ReferenceToVideo``), 21 GB, streamed by ComfyUI. The only
+#: backbone: the FL2VA one it replaced shares its weight layout, so the FL2VA-trained LoRAs load on it.
+DEFAULT_UNET_NAME = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
 #: int4 ConvRot Qwen3-VL 32B text encoder (15 GB; the nvfp4 one needs Blackwell).
 DEFAULT_CLIP_NAME = "qwen3vl_32b_minimax_h3_int4_convrot.safetensors"
 DEFAULT_VIDEO_VAE_NAME = "minimax_h3_video_vae_fp16.safetensors"
@@ -148,23 +153,17 @@ DEFAULT_SCHEDULER = "simple"
 #: Step count reported to the job record; :func:`h3_steps` is what the graph uses.
 H3_RECIPE_STEPS = DEFAULT_STEPS
 
-#: Sampling recipe for the H3 FL2VA backend, selected by the ``H3_VARIANT``
-#: worker env var. ``int8_turbo`` is the recipe above; ``nvfp4_vanilla`` is the
-#: plain pruned-NVFP4 checkpoint with the stock ComfyUI sampler chain (no
-#: Turbo LoRA), the setup benchmarked on one RTX 5090 (four files, 31.7 GB).
+#: Sampling recipe of the worker, selected by the ``H3_VARIANT`` env var:
+#: ``int8_turbo`` is the recipe above, ``int8_dmd3`` the DMD3 student below.
 DEFAULT_H3_VARIANT = "int8_turbo"
-NVFP4_VANILLA_VARIANT = "nvfp4_vanilla"
 INT8_DMD3_VARIANT = "int8_dmd3"
-H3_VARIANTS = (DEFAULT_H3_VARIANT, NVFP4_VANILLA_VARIANT, INT8_DMD3_VARIANT)
+H3_VARIANTS = (DEFAULT_H3_VARIANT, INT8_DMD3_VARIANT)
 
-#: Pruned NVFP4 FL2VA DiT provisioned beside the int8 base (the
-#: ``coolthor/MiniMax-H3-pruned-NVFP4`` file, 11.7 GB).
-NVFP4_VANILLA_UNET_NAME = "minimax_h3_fl2va_pruned_nvfp4.safetensors"
-#: The benchmarked recipe: 10 steps (20 -> 10 measured 324 s -> 172 s with no
-#: visible quality difference; the weights are CFG-distilled).
-NVFP4_VANILLA_STEPS = 10
-#: Stock ComfyUI ``KSamplerSelect`` sampler the reference run uses.
-NVFP4_VANILLA_SAMPLER = "res_multistep"
+#: The ``standard`` preset: the plain base, no LoRA, on the CFG-distilled checkpoint's
+#: benchmarked recipe (10 steps: 20 -> 10 measured 324 s -> 172 s with no visible quality
+#: difference), stock ``KSamplerSelect`` res_multistep.
+STANDARD_STEPS = 10
+STANDARD_SAMPLER = "res_multistep"
 
 #: The ``int8_dmd3`` recipe: a DMD2 student distilled from the Turbo recipe on
 #: talking-avatar clips, trained on the int8_convrot base. It is a drop-in for
@@ -185,9 +184,12 @@ LIPSYNC_LORA_NAME = "minimax_h3_foldfirst3_ff3sla2_ema_g00120.safetensors"
 LIPSYNC_SIGMAS = "1.0, 0.9230769276618958, 0.800000011920929, 0.0"
 LIPSYNC_STEPS = 3
 
-#: The upstream 8-step FL2V Turbo LoRA (``diffusion_model.*`` keys, so the stock
-#: ``LoraLoaderModelOnly`` loads it), sampled ``res_multistep``.
-TURBO8_LORA_NAME = "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
+#: The official Ref2V Turbo LoRAs (lightx2v/Minimax-h3-Turbo; ``diffusion_model.*`` keys, so the stock
+#: ``LoraLoaderModelOnly`` loads them), sampled as the official r2v template does with Turbo on:
+#: res_multistep, ``simple``, CFG 1. 4 steps (turbo-4) and 8 (turbo-8, card: "8-12 steps,
+#: er_sde/res_multistep, simple").
+REF2V_TURBO4_LORA_NAME = "minimax_h3_ref2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
+TURBO8_LORA_NAME = "minimax_h3_ref2v_turbo_8step_v1.1_768p_comfyui_bf16.safetensors"
 #: Videogen ``addons``: community LoRAs a request can stack on any preset, each at strength 1.0 through
 #: the stock ``LoraLoaderModelOnly`` after the recipe's own LoRA (local/exp/h3-motion-lora).
 #: ``motion``: Better Human Motion H3 (civitai 2734359 v1.0-MH3, rank 32, sha256 285f9ed3...); on the
@@ -229,16 +231,18 @@ class H3Recipe:
 LIPSYNC_PREVIEW_SIGMAS = "1.0, 0.0"
 TURBO_PREVIEW_SIGMAS = "1.0, 0.8575, 0.7064, 0.0"
 
-#: ``preset`` values of videogen jobs. ``standard`` is the plain base on the
-#: CFG-distilled checkpoint's benchmarked recipe (res_multistep, 10 steps, no LoRA);
-#: ``turbo-N`` are the Turbo LoRAs: ema850 at 4 (the worker's own default), 5 (what the API sends) or 6 steps (vigen's
-#: production recipe), the upstream 8-step LoRA at 8.
+#: ``preset`` values of videogen jobs. ``standard`` is the plain base (:data:`STANDARD_STEPS`, no LoRA);
+#: ``turbo-N`` are the Turbo LoRAs: ema850 at 5 (what the API sends) or 6 steps (vigen's production recipe),
+#: the official Ref2V 4- and 8-step LoRAs at 4 and 8 (previews unmeasured: full schedule). ``dmd-3`` is vigen's int8_dmd3 recipe: the 3-step DMD3 avatar
+#: student (:data:`DMD3_TURBO_LORA_NAME`) on ``simple`` 3 steps [1, .9601, .8575, 0]; its preview is unmeasured, so it
+#: previews on that full schedule.
 VIDEO_PRESETS: dict[str, H3Recipe] = {
-    "standard": H3Recipe(steps=NVFP4_VANILLA_STEPS, sampler=NVFP4_VANILLA_SAMPLER),
+    "standard": H3Recipe(steps=STANDARD_STEPS, sampler=STANDARD_SAMPLER),
     "turbo-8": H3Recipe(steps=8, sampler="res_multistep", lora_name=TURBO8_LORA_NAME, lora_loader="LoraLoaderModelOnly"),
     "turbo-6": H3Recipe(steps=6, lora_name=DEFAULT_TURBO_LORA_NAME, preview_sigmas=TURBO_PREVIEW_SIGMAS),
     "turbo-5": H3Recipe(steps=5, lora_name=DEFAULT_TURBO_LORA_NAME, preview_sigmas=TURBO_PREVIEW_SIGMAS),
-    "turbo-4": H3Recipe(steps=4, lora_name=DEFAULT_TURBO_LORA_NAME, preview_sigmas=TURBO_PREVIEW_SIGMAS),
+    "turbo-4": H3Recipe(steps=4, sampler="res_multistep", lora_name=REF2V_TURBO4_LORA_NAME, lora_loader="LoraLoaderModelOnly"),
+    "dmd-3": H3Recipe(steps=DMD3_STEPS, lora_name=DMD3_TURBO_LORA_NAME),
 }
 #: ``preset`` values of lipsync jobs: the video presets plus ``turbo-3``, the lipsync
 #: student (:data:`LIPSYNC_LORA_NAME` on :data:`LIPSYNC_SIGMAS`), the default.
@@ -267,7 +271,7 @@ LIPSYNC_ARTIFACT_NAME = "minimax_h3_comfy_lipsync"
 #: Every H3 artifact carries the base, text encoder and video VAE that still
 #: images need, so a worker holding any of them can render stills.
 H3_ARTIFACT_NAMES = frozenset({
-    DEFAULT_ARTIFACT_NAME, DMD3_ARTIFACT_NAME, LIPSYNC_ARTIFACT_NAME, "minimax_h3_comfy_nvfp4",
+    DEFAULT_ARTIFACT_NAME, DMD3_ARTIFACT_NAME, LIPSYNC_ARTIFACT_NAME,
 })
 
 #: Log-distance aspect error at which two uploaded keyframes are worth flagging
@@ -293,7 +297,10 @@ H3_KEYFRAME_ASPECT_WARN = 0.02
 # the only place the geometry can be reconciled without pre-warming the
 # uploaded images, so we keep the provisioned runtime file in sync instead of
 # pre-cropping keyframes in this repo.  Upstream ComfyUI (0.34.0 and current
-# master) still ships the split rule.
+# master) still ships the split rule.  Ref2VA serving (the only base since
+# 2026-11-24) pins every keyframe through ``MiniMaxH3AddGuide``, which
+# cover-crops each one the same way; the fixup only keeps the unused stock
+# FL2VA node consistent.
 H3_GEOMETRY_MARKER = "vigen: keyframes share one aspect-preserving fit"
 _H3_STOCK_FIRST_KEYFRAME_FIT = '_resize(first_frame[:1], width, height, "disabled")'
 _H3_FIXED_FIRST_KEYFRAME_FIT = '_resize(first_frame[:1], width, height, "center")'
@@ -395,10 +402,6 @@ def h3_variant() -> str:
     return value
 
 
-def is_nvfp4_vanilla() -> bool:
-    return h3_variant() == NVFP4_VANILLA_VARIANT
-
-
 def is_int8_dmd3() -> bool:
     return h3_variant() == INT8_DMD3_VARIANT
 
@@ -410,16 +413,13 @@ def h3_artifact_name() -> str:
 
 def h3_engine_name() -> str:
     """Engine label reported in job metrics for the active variant."""
-    if is_nvfp4_vanilla():
-        return "comfyui_minimax_h3_nvfp4_vanilla"
     if is_int8_dmd3():
         return "comfyui_minimax_h3_dmd3"
     return "comfyui_minimax_h3_turbo"
 
 
 def unet_name() -> str:
-    default = NVFP4_VANILLA_UNET_NAME if is_nvfp4_vanilla() else DEFAULT_UNET_NAME
-    return _env("H3_UNET_NAME", default)
+    return _env("H3_UNET_NAME", DEFAULT_UNET_NAME)
 
 
 def clip_name() -> str:
@@ -435,12 +435,7 @@ def audio_vae_name() -> str:
 
 
 def h3_steps() -> int:
-    if is_nvfp4_vanilla():
-        default = NVFP4_VANILLA_STEPS
-    elif is_int8_dmd3():
-        default = DMD3_STEPS
-    else:
-        default = DEFAULT_STEPS
+    default = DMD3_STEPS if is_int8_dmd3() else DEFAULT_STEPS
     return int(_env("H3_STEPS", str(default)))
 
 
@@ -464,7 +459,7 @@ def turbo_low_vram() -> bool:
 
 def h3_sampler() -> str:
     """Sampler reported to the job record (node type, or KSamplerSelect name)."""
-    return NVFP4_VANILLA_SAMPLER if is_nvfp4_vanilla() else "minimax_h3_turbo_sampler"
+    return "minimax_h3_turbo_sampler"
 
 
 def h3_scheduler() -> str:
@@ -473,8 +468,6 @@ def h3_scheduler() -> str:
 
 def env_recipe() -> H3Recipe:
     """The worker's own recipe (``H3_VARIANT``/``H3_STEPS``/``H3_TURBO_LORA_NAME``): videogen without a preset."""
-    if is_nvfp4_vanilla():
-        return H3Recipe(steps=h3_steps(), sampler=NVFP4_VANILLA_SAMPLER)
     lora = turbo_lora_name()
     return H3Recipe(
         steps=h3_steps(),
@@ -1052,8 +1045,7 @@ def add_sparse_attention(graph: dict[str, dict[str, Any]]) -> dict[str, dict[str
 
 def ensure_minimax_h3_runtime_assets(*, generate_audio: bool = True) -> tuple[Path, dict[str, Path]]:
     comfy_root = ensure_comfyui_runtime()
-    if not is_nvfp4_vanilla():
-        ensure_minimax_h3_turbo_node(comfy_root)
+    ensure_minimax_h3_turbo_node(comfy_root)
     ensure_minimax_h3_keyframe_geometry(comfy_root)
     return comfy_root, ensure_minimax_h3_models(comfy_root, generate_audio=generate_audio)
 
@@ -1074,7 +1066,7 @@ def build_h3_graph(
     fps: float = H3_FPS,
     addons: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
-    """Build the headless MiniMax H3 FL2VA prompt graph.
+    """Build the headless MiniMax H3 Ref2VA prompt graph.
 
     ``addons`` (:data:`VIDEO_ADDON_LORAS` names) chain after the recipe's LoRA, strength 1.0.
 
@@ -1084,19 +1076,14 @@ def build_h3_graph(
     thing between the model loader and the sampler, and the sampler is the
     Turbo sampler node rather than ``KSamplerSelect``.
 
-    For the ``nvfp4_vanilla`` variant the graph is the stock local H3 chain:
-    ``UNETLoader -> {BasicGuider, BasicScheduler} -> SamplerCustomAdvanced(<-
-    KSamplerSelect(res_multistep))`` - no LoRA node, the pruned NVFP4
-    checkpoint runs unmodified on its benchmarked 10-step recipe.
-
-    ``first_frame_input``/``last_frame_input`` are LoadImage input values
-    (relative to the ComfyUI input directory); pass ``None`` for
-    ``last_frame_input`` to omit the last-frame keyframe. ``None`` for
-    ``first_frame_input`` too is t2va: the node takes no keyframe at all and
-    the prompt alone makes the clip, on the canvas ``width``/``height`` name.
+    ``MiniMaxH3ReferenceToVideo`` takes no frames (and no reference images here):
+    ``first_frame_input``/``last_frame_input`` (LoadImage input values, relative to
+    the ComfyUI input directory) are ``MiniMaxH3AddGuide`` pins at frame 0 and -1.
+    ``None`` omits that pin; both ``None`` is t2va: the prompt alone makes the clip,
+    on the canvas ``width``/``height`` name.
     ``filename_prefix`` is the SaveVideo output prefix.
     Set ``generate_audio=False`` to drop the audio VAE decoder (no audio track);
-    the FL2VA latent always carries the audio stream, so the default keeps it.
+    the latent always carries the audio stream, so the default keeps it.
 
     ``recipe`` (a preset, default :func:`env_recipe`) picks the LoRA node (none,
     ``MiniMaxH3TurboLoRA`` or the stock ``LoraLoaderModelOnly``), the steps and the
@@ -1152,7 +1139,7 @@ def build_h3_graph(
         "class_type": "VAELoader",
         "inputs": {"vae_name": video_vae_name()},
     }
-    # MiniMaxH3ImageToVideo outputs (positive conditioning, AV latent).
+    # MiniMaxH3ReferenceToVideo outputs (positive conditioning, AV latent).
     h3_inputs: dict[str, Any] = {
         "clip": ["3", 0],
         "vae": ["4", 0],
@@ -1161,18 +1148,16 @@ def build_h3_graph(
         "height": height,
         "length": length,
     }
-    if first_frame_input is not None:
-        h3_inputs["first_frame"] = ["1", 0]
     if last_frame_input is not None:
         graph["7"] = {
             "class_type": "LoadImage",
             "inputs": {"image": last_frame_input},
         }
-        h3_inputs["last_frame"] = ["7", 0]
-    graph["8"] = {
-        "class_type": "MiniMaxH3ImageToVideo",
-        "inputs": h3_inputs,
-    }
+    # No reference images or audio: the prompt conditions the node. It takes the audio VAE (only
+    # reference audio uses it); its latent carries the audio stream either way.
+    graph["5"] = {"class_type": "VAELoader", "inputs": {"vae_name": audio_vae_name()}}
+    h3_inputs.update(audio_vae=["5", 0], ref_image_size="match")
+    graph["8"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": h3_inputs}
     graph["9"] = {
         "class_type": "BasicScheduler",
         "inputs": {
@@ -1190,6 +1175,19 @@ def build_h3_graph(
         "class_type": "BasicGuider",
         "inputs": {"model": model_source, "conditioning": ["8", 0]},
     }
+    # The keyframes are MiniMaxH3AddGuide pins at the first and last frame, the same
+    # ``minimax_keyframes`` FL2VA's node set (without showing them to the text encoder). Measured on
+    # 720p turbo-4: first / last frame PSNR 28.0 / 28.4 vs FL2VA's.
+    conditioning: list[Any] = ["8", 0]
+    for guide_id, load_id, frame_idx in (("21", "1", 0), ("22", "7", -1)):
+        if load_id in graph:
+            graph[guide_id] = {
+                "class_type": "MiniMaxH3AddGuide",
+                "inputs": {"positive": conditioning, "latent": ["8", 1], "vae": ["4", 0],
+                           "image": [load_id, 0], "frame_idx": frame_idx},
+            }
+            conditioning = [guide_id, 0]
+    graph["11"]["inputs"]["conditioning"] = conditioning
     if recipe.sampler == "turbo":
         graph["12"] = {"class_type": "MiniMaxH3TurboSampler", "inputs": {}}
     else:
@@ -1246,7 +1244,7 @@ def add_frame_guides(graph: dict[str, dict[str, Any]], guides: list[tuple[int, s
     Each guide conditions the clip at its pixel frame (an anchor, not an overwrite);
     ``frame_idx`` must sit inside ``[0, length)``.
     """
-    conditioning: list[Any] = ["8", 0]
+    conditioning: list[Any] = graph["11"]["inputs"]["conditioning"]  # after any keyframe guides
     for index, (frame_idx, image_input) in enumerate(guides):
         if not 0 <= int(frame_idx) < int(length):
             raise ValueError(f"guide frame {frame_idx} is outside the {length}-frame clip")
@@ -1308,8 +1306,7 @@ def build_lipsync_graph(
       the sampler sees the clean speech at every step and moves only the video -
       the lips follow this voice instead of one the model invents;
     - keyframes condition the clip: the first frame (and optionally the last)
-      through FL2VA, everything else through ``MiniMaxH3AddGuide`` at its frame
-      index. A few anchors seconds apart hold identity, pose and framing without
+      and everything else through ``MiniMaxH3AddGuide`` at its frame index. A few anchors seconds apart hold identity, pose and framing without
       carrying old mouth shapes often enough to fight the audio;
     - the audio is never decoded: the clip is video-only and the worker muxes the
       caller's original audio afterwards, bit-exact;
@@ -1453,8 +1450,7 @@ def _retained_runtime(
             return retained
 
         comfy_root = ensure_comfyui_runtime()
-        if not is_nvfp4_vanilla():
-            ensure_minimax_h3_turbo_node(comfy_root)
+        ensure_minimax_h3_turbo_node(comfy_root)
         ensure_minimax_h3_keyframe_geometry(comfy_root)
         if check_models:
             ensure_minimax_h3_models(comfy_root, generate_audio=generate_audio, recipe=recipe)
@@ -1476,9 +1472,8 @@ def _retained_runtime(
                 log_event("minimax_h3_builtin_node_import_failures", nodes=sorted(failed))
             # Fail here, not inside validate_prompt, if the Turbo node did not
             # load: a missing LoRA/sampler turns the render into an un-lora'd
-            # 6-step base run with garbled audio. The vanilla recipe needs no
-            # custom node - KSamplerSelect is stock ComfyUI.
-            required_nodes = () if is_nvfp4_vanilla() else ("MiniMaxH3TurboLoRA", "MiniMaxH3TurboSampler")
+            # 6-step base run with garbled audio.
+            required_nodes = ("MiniMaxH3TurboLoRA", "MiniMaxH3TurboSampler")
             missing = sorted(
                 name for name in required_nodes
                 if name not in comfy_nodes.NODE_CLASS_MAPPINGS
@@ -1664,7 +1659,7 @@ def run_minimax_h3_inference(
     addons: tuple[str, ...] = (),
     max_pixels: int | None = None,
 ) -> dict[str, Any]:
-    """Run one H3 FL2VA/i2v generation; returns stage metrics.
+    """Run one H3 Ref2VA generation (keyframes as guides); returns stage metrics.
 
     ``preview`` (:class:`h3.h3_restore.FramePreview`) renders only that frame of
     this graph to its PNG instead of the clip (``output_path`` unused); returns
@@ -1677,9 +1672,9 @@ def run_minimax_h3_inference(
     ``length`` is the requested frame count at 24 fps; the node's own
     ``temporal_shape`` snaps it up to the model's 17k+5 frame grid. ``preset`` is a
     :data:`VIDEO_PRESETS` name; ``None`` runs the worker's :func:`env_recipe`
-    (``turbo-4`` on the default variant).
-    ``generate_audio`` defaults to ``True``: FL2VA carries a synchronized audio
-    stream and the Turbo Sampler is what keeps it intelligible.
+    (ema850 at 4 steps on the default variant).
+    ``generate_audio`` defaults to ``True``: the AV latent carries a synchronized audio
+    stream.
 
     ``sparse_attention`` (default) samples with :func:`add_sparse_attention`, lipsync's
     attention: on the spin test (local/exp/h3-motion-lora, turbo-8, 4 seeds) no seed broke
@@ -1738,7 +1733,7 @@ def run_minimax_h3_inference(
     job_input_dir = comfy_root / "input" / "jobs" / job_id
     job_input_dir.mkdir(parents=True, exist_ok=True)
     # Distinct node-side names: the same upload used for both keyframes (the
-    # normal FL2VA-off-by-default case) and two different files that happen to
+    # normal continuation case) and two different files that happen to
     # share a basename must both survive the copy.
     first_frame_input: str | None = None
     if image_path is not None:

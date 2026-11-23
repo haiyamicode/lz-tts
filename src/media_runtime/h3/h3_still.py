@@ -10,7 +10,7 @@ text-to-image and multi-reference editing from the same base, text encoder and
 video VAE, with no image model.
 
 The recipe is the one the user approved in local/experiments/h3-image-studio-20261031:
-the plain FL2VA INT8 ConvRot base (no LoRA), ``er_sde``/``simple``, 50 steps, no
+the plain Ref2VA INT8 ConvRot base (no LoRA), ``er_sde``/``simple``, 50 steps, no
 CFG, on H3's native canvas of about 1 MP. Larger canvases only stretch the
 image: they add no real detail and invent hard specks.
 
@@ -67,9 +67,9 @@ DEFAULT_SAMPLER = "er_sde"
 DEFAULT_SCHEDULER = "simple"
 
 #: ``imagegen`` presets. ``standard`` is the plain base (best quality);
-#: ``turbo-8`` is the 8-step FL2V Turbo LoRA (a generic ComfyUI LoRA with
-#: ``diffusion_model.`` keys, so it loads through ``LoraLoaderModelOnly``),
-#: close to ``standard`` on edits, illustrated look on text-only images;
+#: ``turbo-8`` is the official 8-step Ref2V Turbo LoRA (a generic ComfyUI LoRA with
+#: ``diffusion_model.`` keys, so it loads through ``LoraLoaderModelOnly``; the FL2V
+#: one it replaced was close to ``standard`` on edits, illustrated look on text-only images);
 #: ``turbo-4`` is videogen's 4-step ema ckpt850 LoRA (bare keys + adaln rows,
 #: ``MiniMaxH3TurboLoRA``), fastest and roughest; ``turbo-6`` runs that LoRA at 6
 #: steps (vigen's production recipe). Measured on the 3090, warm: a 1-reference
@@ -82,7 +82,7 @@ STILL_PRESETS: dict[str, dict[str, Any]] = {
         "scheduler": "simple",
         "lora": {
             "class_type": "LoraLoaderModelOnly",
-            "name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            "name": "minimax_h3_ref2v_turbo_8step_v1.1_768p_comfyui_bf16.safetensors",
             "inputs": {"strength_model": 1.0},
         },
     },

@@ -110,7 +110,7 @@ class VideogenPinnedFrame(BaseModel):
     seconds: float = Field(ge=0, le=10)
 
 
-H3VideoPreset = Literal["standard", "turbo-8", "turbo-6", "turbo-5", "turbo-4"]
+H3VideoPreset = Literal["standard", "turbo-8", "turbo-6", "turbo-5", "turbo-4", "dmd-3"]
 H3StillPreset = Literal["standard", "turbo-8", "turbo-6", "turbo-4"]  # h3_still.STILL_PRESETS
 
 
@@ -170,9 +170,10 @@ class VideogenRequest(H3Interpolation):
     """The ``videogen`` request: an H3 clip from a first frame or from the prompt alone, with H3's
     own audio track or a pinned one.
 
-    ``preset``: ``standard`` (plain base, res_multistep 10 steps, slowest), ``turbo-8`` (8-step
-    Turbo LoRA), ``turbo-6``/``turbo-5`` (the 4-step LoRA at 6 or 5 steps) or ``turbo-4``
-    (4-step LoRA, fastest); omitted, the worker's default recipe (``turbo-4``).
+    ``preset`` (all on the Ref2VA base): ``standard`` (plain base, res_multistep 10 steps, slowest),
+    ``turbo-8`` (the Ref2V 8-step Turbo LoRA), ``turbo-6``/``turbo-5`` (the ema850 4-step LoRA at 6 or 5
+    steps), ``turbo-4`` (the Ref2V 4-step Turbo LoRA), ``dmd-3`` (vigen's 3-step DMD3 avatar student,
+    fastest); omitted, the worker's default recipe (ema850 at 4 steps).
 
     ``width``/``height`` (both or neither) are the delivered frame size; omitted, the clip keeps
     the image's aspect on H3's 32-px lattice (about 1 MP) — a clip made from the prompt alone has
@@ -437,7 +438,7 @@ class LipsyncRequest(H3Interpolation):
 
     Manual only: ``preset`` ``turbo-3`` (default: the 3-step lipsync student, trained for this mode
     with sparse attention) or one of the videogen presets (``standard``, ``turbo-8``, ``turbo-6``,
-    ``turbo-5``, ``turbo-4``) on the same pinned-audio graph; ``pinned_frames``; ``prompt``; the validator switches;
+    ``turbo-5``, ``turbo-4``, ``dmd-3``) on the same pinned-audio graph; ``pinned_frames``; ``prompt``; the validator switches;
     ``use_interpolation`` (disabled for now, see :class:`H3Interpolation`).
     """
 
@@ -453,7 +454,7 @@ class LipsyncRequest(H3Interpolation):
         default=None, description="Timed words; omitted, Whisper transcribes the audio"
     )
     custom_instructions: list[LipsyncInstruction] = Field(default_factory=list, max_length=100)
-    preset: Literal["turbo-3", "standard", "turbo-8", "turbo-6", "turbo-5", "turbo-4"] = "turbo-3"
+    preset: Literal["turbo-3", "standard", "turbo-8", "turbo-6", "turbo-5", "turbo-4", "dmd-3"] = "turbo-3"
     sparse_attention: bool = True
     detect_flicker: bool = True
     detect_desync: bool = True
