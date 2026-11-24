@@ -6996,6 +6996,10 @@ class LzTtsInferenceSession:
             if request.latent_artifact_ids is not None:
                 raise MediaInputError("latent_artifact_ids are read from a Taskflow lease; send latent_urls")
         _check_staged_paths(request)
+        if progress is not None and operation == "lipsync" and request_data.get("stage") in ("plan", "chunk"):
+            # A staged job finishes in its assemble task; the runtime's closing "finishing" after a plan
+            # or a chunk would read as the whole job finishing.
+            progress = _without_finishing(progress)
         timeout = getattr(config, f"{feature}_timeout_seconds")
         if isinstance(request, VideogenRequest) and (request.duration_seconds or 0) > 10:
             # A long clip renders a part per ~9 s.
@@ -7068,6 +7072,16 @@ _H3_FILE_TYPES = {
 def _h3_content_type(path: str, default: str) -> str:
     """A media runtime file's content type, by its suffix; ``default`` for one not listed."""
     return _H3_FILE_TYPES.get(Path(path).suffix.lower(), default)
+
+
+def _without_finishing(progress: ProgressSink) -> ProgressSink:
+    """``progress`` without its "finishing" reports."""
+
+    def report(stage: Any, current: int | None, total: int | None) -> None:
+        if stage != "finishing":
+            progress(stage, current, total)
+
+    return report
 
 
 def _check_staged_paths(request: BaseModel) -> None:

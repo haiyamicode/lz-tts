@@ -372,29 +372,30 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
                 work_dir=scratch_dir / "continuation", fps=time_axis_fps, sparse_attention=sparse_attention,
                 addons=addons, max_pixels=max_pixels,
             )
-        metrics = run_minimax_h3_inference(
-            job_id=job_id,
-            prompt=prompt,
-            image_path=image_path,
-            last_frame_path=last_frame_path,
-            output_path=output_path,
-            seed=seed,
-            width=render_width,
-            height=render_height,
-            length=length,
-            preset=preset,
-            generate_audio=generate_audio,
-            # An upscaled clip keeps the canvas render: SPAN works on it, lanczos lands on the delivered size.
-            output_width=delivery[0] if delivery and not upscale else None,
-            output_height=delivery[1] if delivery and not upscale else None,
-            guides=guides,
-            pinned_audio_path=pinned_audio,
-            fps=time_axis_fps,
-            sparse_attention=sparse_attention,
-            addons=addons,
-            max_pixels=max_pixels,
-            chain=chain,
-        )
+        with progress.final_steps():
+            metrics = run_minimax_h3_inference(
+                job_id=job_id,
+                prompt=prompt,
+                image_path=image_path,
+                last_frame_path=last_frame_path,
+                output_path=output_path,
+                seed=seed,
+                width=render_width,
+                height=render_height,
+                length=length,
+                preset=preset,
+                generate_audio=generate_audio,
+                # An upscaled clip keeps the canvas render: SPAN works on it, lanczos lands on the delivered size.
+                output_width=delivery[0] if delivery and not upscale else None,
+                output_height=delivery[1] if delivery and not upscale else None,
+                guides=guides,
+                pinned_audio_path=pinned_audio,
+                fps=time_axis_fps,
+                sparse_attention=sparse_attention,
+                addons=addons,
+                max_pixels=max_pixels,
+                chain=chain,
+            )
     finally:
         cleanup_h3_job_files(job_id)
     if latent_only:

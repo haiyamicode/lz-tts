@@ -55,6 +55,8 @@ class _Job:
         self.units = 0
         #: Inside `chunk_steps`: the chunk's own render is sampling.
         self.chunk_sampling = False
+        #: Inside `final_steps`: the job's last sampling, whose last step leaves only the decode.
+        self.final_sampling = False
         self._pending: tuple[Stage, int | None, int | None] | None = None
         self._closed = False
         self._wake = threading.Condition()
@@ -148,6 +150,23 @@ def chunk_steps() -> Iterator[None]:
         current.chunk_sampling = False
 
 
+@contextlib.contextmanager
+def final_steps() -> Iterator[None]:
+    """The sampler steps inside are the job's last: once the last of them is done, the job is
+    "finishing" (the decode and muxing are left, ~40 s of a 5 s 720p clip on the dev 3090), not
+    "rendering" at 100%."""
+    with _LOCK:
+        current = _CURRENT
+    if current is None:
+        yield
+        return
+    current.final_sampling = True
+    try:
+        yield
+    finally:
+        current.final_sampling = False
+
+
 def step(value: int, maximum: int) -> None:
     """One sampler step, as the job's progress.
 
@@ -160,7 +179,10 @@ def step(value: int, maximum: int) -> None:
     if current is None or not maximum:
         return
     if not current.counts_chunks:
-        current.report("rendering", value, maximum)
+        if current.final_sampling and value >= maximum:
+            current.report("finishing", None, None)
+        else:
+            current.report("rendering", value, maximum)
         return
     if not current.chunk_sampling or current.chunk is None:
         return
