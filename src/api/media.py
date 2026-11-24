@@ -222,7 +222,8 @@ class VideogenRequest(H3Interpolation):
     continuable: bool = Field(
         default=False,
         description="End on a clean frame another clip can open on: the last frame is previewed, restored "
-        "toward anchor_url (else image_url) and pinned; the result returns it as its lastFrame file (JPEG)",
+        "toward anchor_url (else image_url; a prompt-only first clip, toward itself) and pinned; the result "
+        "returns it as its lastFrame file (JPEG)",
     )
     anchor_url: str | None = Field(
         default=None, min_length=1,
@@ -254,8 +255,6 @@ class VideogenRequest(H3Interpolation):
             raise ValueError("a clip made from the prompt alone needs width and height")
         if self.continuable and self.last_frame_url:
             raise ValueError("continuable clips end on their own restored frame; drop last_frame_url")
-        if self.continuable and not (self.image_url or self.anchor_url):
-            raise ValueError("a continuable clip needs a first frame or an anchor to restore toward")
         if self.anchor_url and not self.continuable:
             raise ValueError("anchor_url needs continuable")
         if self.duration_seconds is not None:

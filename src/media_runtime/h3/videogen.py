@@ -35,10 +35,12 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
 - ``continuable`` (default false): the clip ends on a clean frame another job can
   open on (:mod:`h3.h3_restore`, vigen e9791cc). Its last frame is previewed (the
   recipe's preview schedule, that frame alone decoded), restored toward the
-  chain's anchor (``anchor_url`` / ``anchor_path``, else this job's own image) and
+  chain's anchor (``anchor_url`` / ``anchor_path``, else this job's own image, else, for a
+  prompt-only first clip, its own previewed last frame: cleaned, not pulled anywhere) and
   pinned as the last frame, so chained clips do not pile up each other's drift
   (speckle, colour creep). Not with ``last_frame``. The continued job passes the
-  returned last frame as its ``image_url`` and the same ``anchor_url``.
+  returned last frame as its ``image_url`` and the same ``anchor_url`` (a prompt-only
+  chain's anchor is its first clip's frame 0).
 - ``use_interpolation`` / ``interpolation_fps`` (12-23, default 16; vigen 7280e2f): H3
   renders that many frames for every second of the clip and RIFE makes the rest of
   the 24 (:mod:`h3.h3_interpolation`). A pinned audio is heard sped up ``24/fps`` on
@@ -61,7 +63,9 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
   8 rows, no rescale, no SPAN. About 3x the cost of the SPAN path (~80x RTF turbo-8 on the 3090).
 
 The result is ``{"path", "item", "metrics", "seed"}`` like :mod:`h3.lipsync`, plus
-``last_frame_path`` (a JPEG, quality 95) for a continuable clip.
+``last_frame_path`` (a JPEG, quality 95) for a continuable clip, at the clip's delivered size: the next
+clip opens on it and so takes exactly this clip's shape (the canvas is off the delivered aspect by up to
+a few rows, which ``output_short_side`` would carry into the next clip's size).
 """
 
 from __future__ import annotations
@@ -232,10 +236,7 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
             anchor_path = download_job_input(job, payload, "anchor", scratch_dir, ".png", kind="videogen")
         elif image_path is not None:
             anchor_path = image_path
-        else:
-            # Restoring the end frame needs a look to hold it to, and a prompt-only clip has none of
-            # its own yet; the first clip of a chain opens on an image, or the chain names its anchor.
-            raise ValueError("a continuable clip needs a first frame or an anchor to restore toward")
+        # else a prompt-only first clip: nothing has drifted yet, so its end is restored toward itself.
 
     # The shape everything is sized from: the first frame's, or the one a prompt-only clip stated.
     source_aspect = probe_image_dimensions(image_path) if image_path is not None else aspect
@@ -380,10 +381,13 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
         "seed": seed,
     }
     if continuable:
-        import cv2
+        from PIL import Image, ImageOps  # type: ignore
 
         jpeg = scratch_dir / "outputs" / "last_frame.jpg"
-        cv2.imwrite(str(jpeg), cv2.imread(str(last_frame_path)), [cv2.IMWRITE_JPEG_QUALITY, LAST_FRAME_JPEG_QUALITY])
+        with Image.open(last_frame_path) as restored:
+            # The canvas frame fitted to the delivered size the way the video was (cover scale, centre crop).
+            ImageOps.fit(restored.convert("RGB"), (item["width"], item["height"]),
+                         method=Image.Resampling.LANCZOS).save(jpeg, format="JPEG", quality=LAST_FRAME_JPEG_QUALITY)
         result["last_frame_path"] = str(jpeg)
     return result
 
@@ -468,7 +472,8 @@ def _restore_end(*, job_id: str, prompt: str, image_path, seed: int, width, heig
     preview_seconds = round(time.perf_counter() - started, 3)
     started = time.perf_counter()
     restored = work_dir / "last_frame.png"
-    restore_frame(job_id=job_id, frame=work_dir / "preview.png", anchor=anchor_path, output_path=restored,
+    restore_frame(job_id=job_id, frame=work_dir / "preview.png", anchor=anchor_path or work_dir / "preview.png",
+                  output_path=restored,
                   width=int(preview["width"]), height=int(preview["height"]), seed=seed)
     restore_seconds = round(time.perf_counter() - started, 3)
     log_event("videogen_continuable_end_restored", job_id=job_id, frame=grid_frames - 1,
