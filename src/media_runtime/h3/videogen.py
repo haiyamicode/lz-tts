@@ -62,6 +62,25 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
   (:func:`h3.minimax_h3_runtime.native_canvas`): 1080p of 16:9 renders 1920x1088 and the centre crop takes
   8 rows, no rescale, no SPAN. About 3x the cost of the SPAN path (~80x RTF turbo-8 on the 3090).
 
+Long clips (:mod:`h3.h3_chain`, latent handover + clip-1 refiner, decoded once):
+
+- ``duration_seconds`` above ``VIDEOGEN_MAX_SECONDS``, up to ``VIDEOGEN_MAX_CHAIN_SECONDS`` (default 60), renders
+  the clip as a chain of parts in this one job: part 0 is the clip as above (``prompt``, the image, the
+  size), each later part (``continuation_prompt``, else ``prompt``; seed + k) takes over the last 22 frames
+  of the one before in latent space and adds up to ``VIDEOGEN_MAX_SECONDS`` - 22 frames; the chain is
+  decoded once and delivered like a single clip (``width``/``height``, ``output_short_side``, ``native``,
+  ``upscale``). Not with ``last_frame``, ``pinned_frames``, ``pinned_audio``, ``continuable`` or
+  ``use_interpolation``.
+- Part by part, for a caller that drives the chain (Taskflow ``video-chain``): ``latent_only`` renders part 0
+  and returns its latent file (``.safetensors``) instead of an mp4; ``return_latent`` returns the mp4 and the
+  latent as the result's ``latent`` file. ``continue_latent_url`` / ``_path`` (the previous part's latent)
+  plus ``chain_reference_latent_url`` / ``_path`` (part 0's, the refiner's target) render a later part:
+  ``duration_seconds`` is the time it adds, the canvas is the latent's (sizing fields are ignored, no image),
+  and with ``latent_only`` the latent is the result, else an mp4 of the part at the canvas plus its
+  ``latent`` file. ``decode_chain_latent_urls`` / ``_paths`` (part 0 first) decodes such a chain once into
+  the job's mp4, delivered by ``width``/``height``, ``output_short_side`` (+ ``output_dimensions``) or
+  ``upscale`` from the latents' canvas.
+
 The result is ``{"path", "item", "metrics", "seed"}`` like :mod:`h3.lipsync`, plus
 ``last_frame_path`` (a JPEG, quality 95) for a continuable clip, at the clip's delivered size: the next
 clip opens on it and so takes exactly this clip's shape (the canvas is off the delivered aspect by up to
@@ -84,11 +103,28 @@ from .lipsync import _download_url, _probe, _run, download_job_input, extract_au
 LAST_FRAME_JPEG_QUALITY = 95
 DEFAULT_DURATION_SECONDS = 3.0
 DEFAULT_MAX_SECONDS = 10.0
+DEFAULT_MAX_CHAIN_SECONDS = 60.0
 MAX_PINNED_FRAMES = 16
 
 
 def max_seconds() -> float:
     return float(os.environ.get("VIDEOGEN_MAX_SECONDS") or DEFAULT_MAX_SECONDS)
+
+
+def max_chain_seconds() -> float:
+    """The longest clip a job renders as a chain of parts (:mod:`h3.h3_chain`)."""
+    return float(os.environ.get("VIDEOGEN_MAX_CHAIN_SECONDS") or DEFAULT_MAX_CHAIN_SECONDS)
+
+
+def part_frame_limit(width: int, height: int) -> int:
+    """The most frames one render (a single clip, a chain part with its handover) takes at a canvas:
+    ``max_seconds()`` snapped up to the grid, and a native canvas's pixel-frame budget."""
+    from .h3_chain import UNIT_FRAMES, grid_frames
+    from .minimax_h3_runtime import H3_FPS, H3_NATIVE_MAX_PIXEL_FRAMES
+
+    frames = grid_frames(round(max_seconds() * H3_FPS))
+    fits = H3_NATIVE_MAX_PIXEL_FRAMES // (int(width) * int(height))
+    return min(frames, 5 + UNIT_FRAMES * ((fits - 5) // UNIT_FRAMES))
 
 
 def _pinned_frames(job: dict[str, Any], payload: dict[str, Any], scratch_dir, image_path, length: int,
@@ -151,6 +187,10 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     )
 
     payload = job["payload"]
+    if payload.get("decode_chain_latent_urls") or payload.get("decode_chain_latent_paths"):
+        return _run_chain_decode(job)
+    if payload.get("continue_latent_url") or payload.get("continue_latent_path"):
+        return _run_continuation(job)
     job_id = str(job["id"])
     prompt = str(payload.get("prompt") or "").strip()
     if not prompt:
@@ -220,8 +260,20 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
             )
     else:
         duration = DEFAULT_DURATION_SECONDS
-    if not 0 < duration <= max_seconds():
-        raise ValueError(f"duration_seconds must be in (0, {max_seconds():g}]")
+    # Past one render's length the clip is a chain of parts (h3_chain), within this job.
+    long_chain = duration > max_seconds()
+    latent_only = payload.get("latent_only") is True
+    return_latent = payload.get("return_latent") is True
+    if long_chain or latent_only or return_latent:
+        conflicts = [name for name in ("last_frame_url", "last_frame_path", "pinned_frames", "pinned_audio_url",
+                                       "pinned_audio_path", "continuable", "use_interpolation") if payload.get(name)]
+        if conflicts:
+            raise ValueError(f"a chained clip (over {max_seconds():g} s, latent_only or return_latent) takes no "
+                             f"{conflicts}")
+    if long_chain and (latent_only or return_latent):
+        raise ValueError(f"a clip over {max_seconds():g} s is decoded whole; latent_only/return_latent are for parts")
+    if not 0 < duration <= (max_chain_seconds() if long_chain else max_seconds()):
+        raise ValueError(f"duration_seconds must be in (0, {max_chain_seconds():g}]")
     last_frame_path = None
     if payload.get("last_frame_url") or payload.get("last_frame_path"):
         last_frame_path = download_job_input(job, payload, "last_frame", scratch_dir, ".png", kind="videogen")
@@ -265,6 +317,12 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
             delivery = final_size
     elif upscale:
         final_size = target_size(*(delivery or (canvas.width, canvas.height)), upscale, bounding_box=bounding_box)
+    if long_chain:
+        return _run_long(job_id=job_id, scratch_dir=scratch_dir, payload=payload, prompt=prompt,
+                         image_path=image_path, seed=seed, width=render_width, height=render_height, canvas=canvas,
+                         max_pixels=max_pixels, preset=preset, recipe=recipe, generate_audio=generate_audio,
+                         sparse_attention=sparse_attention, addons=addons, duration=duration, delivery=delivery,
+                         final_size=final_size, upscale=upscale, bounding_box=bounding_box, native=native)
     length = max(1, round(duration * H3_FPS))
     if interpolation_fps:
         length = interpolated_render_frames(length, interpolation_fps)
@@ -293,6 +351,11 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
     time_axis_fps = interpolation_fps if interpolation_fps and pinned_audio is None else None
     output_path = scratch_dir / "outputs" / "output.mp4"
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    chain = None
+    if latent_only or return_latent:
+        from .h3_chain import ChainPart
+
+        chain = ChainPart(latent_path=scratch_dir / "outputs" / "latent.safetensors", decode=not latent_only)
     log_event("videogen_started", job_id=job_id, seed=seed, length=length, canvas=[canvas.width, canvas.height],
               delivered=list(delivery) if delivery else None, generate_audio=generate_audio,
               pinned_frames=[frame for frame, _ in guides], pinned_audio=pinned_audio is not None,
@@ -330,9 +393,14 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
             sparse_attention=sparse_attention,
             addons=addons,
             max_pixels=max_pixels,
+            chain=chain,
         )
     finally:
         cleanup_h3_job_files(job_id)
+    if latent_only:
+        return _latent_result(chain.latent_path, job_id=job_id, seed=seed, preset=preset, recipe=recipe,
+                              generate_audio=generate_audio, addons=addons, metrics=metrics,
+                              wall_seconds=time.perf_counter() - started)
     if not output_path.is_file():
         raise RuntimeError(f"H3 did not write {output_path}")
     postprocessed: dict[str, Any] = {}
@@ -380,6 +448,8 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
         "metrics": {"engine": "comfyui_h3", "wall_seconds": round(wall_seconds, 3), **metrics},
         "seed": seed,
     }
+    if return_latent:
+        result["files"] = {"latent": str(chain.latent_path)}
     if continuable:
         from PIL import Image, ImageOps  # type: ignore
 
@@ -390,6 +460,306 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
                          method=Image.Resampling.LANCZOS).save(jpeg, format="JPEG", quality=LAST_FRAME_JPEG_QUALITY)
         result["last_frame_path"] = str(jpeg)
     return result
+
+
+def _part_options(payload: dict[str, Any]) -> tuple[int, bool, Any, Any, bool, tuple[str, ...]]:
+    """(seed, generate_audio, preset, recipe, sparse_attention, addons) of a chain part's payload."""
+    from .minimax_h3_runtime import VIDEO_ADDON_LORAS, VIDEO_PRESETS, env_recipe, h3_preset
+
+    seed = int(payload["seed"]) if payload.get("seed") is not None else random.randint(0, 2**31 - 1)
+    preset = payload.get("preset") or None
+    recipe = h3_preset(str(preset), VIDEO_PRESETS) if preset else env_recipe()
+    addons = tuple(dict.fromkeys(str(name) for name in payload.get("addons") or ()))
+    if unknown := [name for name in addons if name not in VIDEO_ADDON_LORAS]:
+        raise ValueError(f"unknown addons {unknown}; available: {sorted(VIDEO_ADDON_LORAS)}")
+    return (seed, payload.get("generate_audio") is not False, preset, recipe,
+            payload.get("sparse_attention") is not False, addons)
+
+
+def _latent_item(latent_path, *, seed: int, preset, recipe, generate_audio: bool, addons) -> dict[str, Any]:
+    from .h3_chain import HANDOVER_FRAMES, read_metadata
+
+    meta = read_metadata(latent_path)
+    new_frames = meta["frames"] - (HANDOVER_FRAMES if meta["head_tokens"] else 0)
+    return {
+        "seed": seed,
+        "fps": float(meta["fps"]),
+        "width": meta["width"],
+        "height": meta["height"],
+        "canvas_width": meta["width"],
+        "canvas_height": meta["height"],
+        # The frames this part adds to the chain (its handed-over head is the part before's).
+        "frames": new_frames,
+        "duration_seconds": round(new_frames / meta["fps"], 3),
+        "rendered_frames": meta["frames"],
+        "head_frames": meta["frames"] - new_frames,
+        "preset": preset,
+        "steps": recipe.steps,
+        "addons": list(addons),
+        "generate_audio": generate_audio,
+        "latent": {"format": meta["format"], "version": meta["version"],
+                   "bytes": latent_path.stat().st_size},
+    }
+
+
+def _latent_result(latent_path, *, job_id: str, seed: int, preset, recipe, generate_audio: bool, addons,
+                   metrics: dict[str, Any], wall_seconds: float) -> dict[str, Any]:
+    item = _latent_item(latent_path, seed=seed, preset=preset, recipe=recipe, generate_audio=generate_audio,
+                        addons=addons)
+    item["sparse_attention"] = bool(metrics.get("sparse_attention", True))
+    log_event("videogen_complete", job_id=job_id, wall_seconds=round(wall_seconds, 3), latent=str(latent_path))
+    return {"path": str(latent_path), "item": item, "seed": seed,
+            "metrics": {"engine": "comfyui_h3", "wall_seconds": round(wall_seconds, 3), **metrics}}
+
+
+def _run_continuation(job: dict[str, Any]) -> dict[str, Any]:
+    """A later chain part: the previous part's latent handed over, ``duration_seconds`` of new frames."""
+    from .h3_chain import HANDOVER_FRAMES, ChainPart, continuation_frames, read_metadata
+    from .minimax_h3_runtime import H3_FPS, cleanup_h3_job_files, run_minimax_h3_inference
+
+    payload = job["payload"]
+    job_id = str(job["id"])
+    prompt = str(payload.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("videogen requires a prompt")
+    conflicts = [name for name in ("image_url", "image_path", "last_frame_url", "last_frame_path", "pinned_frames",
+                                   "pinned_audio_url", "pinned_audio_path", "anchor_url", "anchor_path",
+                                   "continuable", "use_interpolation") if payload.get(name)]
+    if conflicts:
+        raise ValueError(f"a continued part opens on the previous part's latent; drop {conflicts}")
+    seed, generate_audio, preset, recipe, sparse_attention, addons = _part_options(payload)
+    latent_only = payload.get("latent_only") is True
+    scratch_dir = job_dir(job_id)
+    progress.report("preparing")
+    previous = download_job_input(job, payload, "continue_latent", scratch_dir, ".safetensors", kind="videogen")
+    meta = read_metadata(previous)
+    reference = None
+    if payload.get("chain_reference_latent_url") or payload.get("chain_reference_latent_path"):
+        reference = download_job_input(job, payload, "chain_reference_latent", scratch_dir, ".safetensors",
+                                       kind="videogen")
+        ref_meta = read_metadata(reference)
+        if (ref_meta["width"], ref_meta["height"]) != (meta["width"], meta["height"]):
+            raise ValueError(f"chain_reference_latent is {ref_meta['width']}x{ref_meta['height']}, the previous "
+                             f"part {meta['width']}x{meta['height']}")
+    width, height = meta["width"], meta["height"]
+    new_frames = max(1, round(float(payload.get("duration_seconds") or DEFAULT_DURATION_SECONDS) * H3_FPS))
+    length = continuation_frames(new_frames)
+    limit = part_frame_limit(width, height)
+    if length > limit:
+        raise ValueError(f"a continued part at {width}x{height} adds at most "
+                         f"{(limit - HANDOVER_FRAMES) / H3_FPS:g} s; send a shorter duration_seconds")
+    latent_path = scratch_dir / "outputs" / "latent.safetensors"
+    output_path = scratch_dir / "outputs" / "output.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    log_event("videogen_started", job_id=job_id, seed=seed, length=length, canvas=[width, height],
+              chain="continuation", latent_only=latent_only, refined=reference is not None)
+    started = time.perf_counter()
+    try:
+        metrics = run_minimax_h3_inference(
+            job_id=job_id, prompt=prompt, image_path=None, last_frame_path=None, output_path=output_path,
+            seed=seed, width=width, height=height, length=length, preset=preset, generate_audio=generate_audio,
+            sparse_attention=sparse_attention, addons=addons, max_pixels=width * height,
+            chain=ChainPart(latent_path=latent_path, previous_latent=previous, reference_latent=reference,
+                            decode=not latent_only),
+        )
+    finally:
+        cleanup_h3_job_files(job_id)
+    if (metrics["width"], metrics["height"]) != (width, height):
+        raise RuntimeError(f"the part rendered {metrics['width']}x{metrics['height']}, not the chain's {width}x{height}")
+    wall_seconds = time.perf_counter() - started
+    if latent_only:
+        return _latent_result(latent_path, job_id=job_id, seed=seed, preset=preset, recipe=recipe,
+                              generate_audio=generate_audio, addons=addons, metrics=metrics, wall_seconds=wall_seconds)
+    item = _latent_item(latent_path, seed=seed, preset=preset, recipe=recipe, generate_audio=generate_audio,
+                        addons=addons)
+    # The mp4 is the whole part, its handed-over head included.
+    item.update(frames=item["rendered_frames"], duration_seconds=round(item["rendered_frames"] / H3_FPS, 3))
+    log_event("videogen_complete", job_id=job_id, wall_seconds=round(wall_seconds, 3))
+    return {"path": str(output_path), "item": item, "seed": seed, "files": {"latent": str(latent_path)},
+            "metrics": {"engine": "comfyui_h3", "wall_seconds": round(wall_seconds, 3), **metrics}}
+
+
+def _deliver_chain(output_path, *, canvas: tuple[int, int], frames: int, delivery, final_size, upscale,
+                   bounding_box, job_id: str) -> dict[str, Any]:
+    """A decoded chain (at the canvas) brought to the delivered size: SPAN + lanczos for an upscale, else a
+    cover-fit to ``delivery``. Returns the item's ``upscale`` entry, if any."""
+    from .minimax_h3_runtime import fit_video_dimensions
+
+    if upscale:
+        return _postprocess(output_path, fps=None, grid_frames=frames, upscale=upscale, size=final_size,
+                            bounding_box=bounding_box, audio=None, voice=False, job_id=job_id)
+    if delivery and tuple(delivery) != tuple(canvas):
+        fit = output_path.with_name(f"{output_path.stem}.fit.mp4")
+        fit_video_dimensions(output_path, fit, width=int(delivery[0]), height=int(delivery[1]))
+        os.replace(fit, output_path)
+    return {}
+
+
+def _chain_item(output_path, *, seed: int, canvas: tuple[int, int], preset, recipe, generate_audio: bool,
+                addons, native: bool, decoded: dict[str, Any], postprocessed: dict[str, Any]) -> dict[str, Any]:
+    from .minimax_h3_runtime import H3_FPS
+
+    video = next(s for s in _probe(output_path)["streams"] if s.get("codec_type") == "video")
+    return {
+        "seed": seed,
+        "fps": float(H3_FPS),
+        "width": int(video["width"]),
+        "height": int(video["height"]),
+        "canvas_width": canvas[0],
+        "canvas_height": canvas[1],
+        "frames": int(video.get("nb_frames") or 0) or decoded["frames"],
+        "duration_seconds": round(float(video.get("duration") or 0.0), 3),
+        "preset": preset,
+        "steps": recipe.steps if recipe is not None else None,
+        "addons": list(addons),
+        "native": native,
+        "generate_audio": generate_audio,
+        "chain": {"parts": decoded["parts"], "frames": decoded["frames"],
+                  "decode_seconds": decoded["decode_seconds"]},
+        **postprocessed,
+    }
+
+
+def _run_long(*, job_id: str, scratch_dir, payload: dict[str, Any], prompt: str, image_path, seed: int, width,
+              height, canvas, max_pixels, preset, recipe, generate_audio: bool, sparse_attention: bool, addons,
+              duration: float, delivery, final_size, upscale, bounding_box, native: bool) -> dict[str, Any]:
+    """A clip past one render: part 0 as a lone clip would render, then parts continuing it in latent
+    space (``continuation_prompt``, seed + k), decoded once and delivered like one clip."""
+    from .h3_chain import ChainPart, decode_chain, plan_parts, read_metadata
+    from .minimax_h3_runtime import H3_FPS, cleanup_h3_job_files, run_minimax_h3_inference
+
+    continuation_prompt = str(payload.get("continuation_prompt") or "").strip() or prompt
+    parts = plan_parts(round(duration * H3_FPS), part_frame_limit(canvas.width, canvas.height))
+    total = len(parts) + 1
+    latents: list[Any] = []
+    output_path = scratch_dir / "outputs" / "output.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    log_event("videogen_started", job_id=job_id, seed=seed, chain="long", parts=parts,
+              canvas=[canvas.width, canvas.height], delivered=list(delivery) if delivery else None,
+              upscale=upscale, native=native)
+    started = time.perf_counter()
+    part_seconds: list[float] = []
+    chain_size: tuple[int, int] | None = None
+    metrics: dict[str, Any] = {}
+    for index, frames in enumerate(parts):
+        progress.report("rendering", index, total)
+        latent = scratch_dir / "chain" / f"part{index}.safetensors"
+        began = time.perf_counter()
+        try:
+            with progress.chunk_steps():
+                metrics = run_minimax_h3_inference(
+                    job_id=job_id,
+                    prompt=prompt if index == 0 else continuation_prompt,
+                    image_path=image_path if index == 0 else None,
+                    last_frame_path=None,
+                    output_path=output_path,
+                    seed=seed + index,
+                    width=width if index == 0 else chain_size[0],
+                    height=height if index == 0 else chain_size[1],
+                    length=frames,
+                    preset=preset,
+                    generate_audio=generate_audio,
+                    sparse_attention=sparse_attention,
+                    addons=addons,
+                    max_pixels=max_pixels if index == 0 else chain_size[0] * chain_size[1],
+                    chain=ChainPart(latent_path=latent, previous_latent=latents[-1] if latents else None,
+                                    reference_latent=latents[0] if latents else None),
+                )
+        finally:
+            cleanup_h3_job_files(job_id)
+        if index == 0:
+            meta = read_metadata(latent)
+            chain_size = (meta["width"], meta["height"])
+        elif (metrics["width"], metrics["height"]) != chain_size:
+            raise RuntimeError(f"part {index} rendered {metrics['width']}x{metrics['height']}, not {chain_size}")
+        latents.append(latent)
+        part_seconds.append(round(time.perf_counter() - began, 3))
+    progress.report("rendering", len(parts), total)
+    with progress.chunk_steps():
+        decoded = decode_chain(job_id=job_id, latent_paths=latents, output_path=output_path,
+                               with_audio=generate_audio)
+    progress.report("finishing")
+    postprocessed = _deliver_chain(output_path, canvas=chain_size, frames=decoded["frames"], delivery=delivery,
+                                   final_size=final_size, upscale=upscale, bounding_box=bounding_box, job_id=job_id)
+    wall_seconds = time.perf_counter() - started
+    item = _chain_item(output_path, seed=seed, canvas=chain_size, preset=preset, recipe=recipe,
+                       generate_audio=generate_audio, addons=addons, native=native, decoded=decoded,
+                       postprocessed=postprocessed)
+    item["chain"].update(part_frames=parts, part_seconds=part_seconds,
+                         continuation_prompt=continuation_prompt != prompt)
+    item["sparse_attention"] = bool(metrics.get("sparse_attention", sparse_attention))
+    log_event("videogen_complete", job_id=job_id, wall_seconds=round(wall_seconds, 3), parts=len(parts))
+    return {"path": str(output_path), "item": item, "seed": seed,
+            "metrics": {"engine": "comfyui_h3", "wall_seconds": round(wall_seconds, 3), "decode": decoded,
+                        "part_seconds": part_seconds}}
+
+
+def _run_chain_decode(job: dict[str, Any]) -> dict[str, Any]:
+    """``decode_chain_latent_urls`` / ``_paths``: a caller's chain of part latents decoded into one mp4."""
+    from .h3_chain import chain_summary, decode_chain
+    from .minimax_h3_runtime import H3_FPS
+    from .span_upscale import requested_scale, requested_short_side, short_side_scale, short_side_size, target_size
+
+    payload = job["payload"]
+    job_id = str(job["id"])
+    urls = list(payload.get("decode_chain_latent_urls") or [])
+    paths = list(payload.get("decode_chain_latent_paths") or [])
+    if urls and paths:
+        raise ValueError("send decode_chain_latent_urls or decode_chain_latent_paths, not both")
+    scratch_dir = job_dir(job_id)
+    progress.report("preparing")
+    latents = []
+    for index, url in enumerate(urls):
+        latents.append(_download_url(job_id, str(url), scratch_dir / "inputs" / f"latent{index}.safetensors",
+                                     input_name=f"decode_chain_latent_urls[{index}]", kind="videogen"))
+    for index, raw in enumerate(paths):
+        path = project_path(str(raw))
+        if not path.is_file():
+            raise FileNotFoundError(f"decode_chain_latent_paths[{index}] does not exist: {path}")
+        latents.append(path)
+    summary = chain_summary(latents)
+    limit = max_chain_seconds() + max_seconds()
+    if summary["frames"] > limit * H3_FPS:
+        raise ValueError(f"the chain is {summary['frames'] / H3_FPS:g} s; a decode takes at most {limit:g} s")
+    canvas = (summary["width"], summary["height"])
+    width, height = payload.get("width"), payload.get("height")
+    if (width is None) != (height is None):
+        raise ValueError("width and height go together")
+    upscale = requested_scale(payload)
+    short_side = requested_short_side(payload)
+    output_dimensions = payload.get("output_dimensions")
+    bounding_box = ((int(output_dimensions["width"]), int(output_dimensions["height"]))
+                    if output_dimensions is not None else None)
+    if sum(x is not None for x in (width, upscale, short_side)) > 1:
+        raise ValueError("size the chain by width/height, upscale or output_short_side, one of them")
+    delivery, final_size = None, None
+    if width is not None:
+        delivery = (int(width), int(height))
+    elif short_side is not None:
+        final_size = short_side_size(canvas, short_side, bounding_box=bounding_box)
+        # native: the parts rendered at the delivered size already, lanczos takes the sliver.
+        upscale = None if payload.get("native") is True else short_side_scale(final_size, canvas)
+        if not upscale:
+            delivery = final_size
+    elif upscale:
+        final_size = target_size(*canvas, upscale, bounding_box=bounding_box)
+    generate_audio = payload.get("generate_audio") is not False
+    output_path = scratch_dir / "outputs" / "output.mp4"
+    log_event("videogen_started", job_id=job_id, chain="decode", parts=summary["parts"], frames=summary["frames"],
+              canvas=list(canvas), delivered=list(delivery or final_size or canvas), upscale=upscale)
+    started = time.perf_counter()
+    progress.report("rendering")
+    decoded = decode_chain(job_id=job_id, latent_paths=latents, output_path=output_path, with_audio=generate_audio)
+    progress.report("finishing")
+    postprocessed = _deliver_chain(output_path, canvas=canvas, frames=decoded["frames"], delivery=delivery,
+                                   final_size=final_size, upscale=upscale, bounding_box=bounding_box, job_id=job_id)
+    wall_seconds = time.perf_counter() - started
+    seed = int(payload.get("seed") or 0)
+    item = _chain_item(output_path, seed=seed, canvas=canvas, preset=None, recipe=None, generate_audio=generate_audio,
+                       addons=(), native=payload.get("native") is True, decoded=decoded, postprocessed=postprocessed)
+    log_event("videogen_complete", job_id=job_id, wall_seconds=round(wall_seconds, 3), chain="decode")
+    return {"path": str(output_path), "item": item, "seed": seed,
+            "metrics": {"engine": "comfyui_h3", "wall_seconds": round(wall_seconds, 3), "decode": decoded}}
 
 
 def _postprocess(output_path, *, fps: int | None, grid_frames: int, upscale: float | None,

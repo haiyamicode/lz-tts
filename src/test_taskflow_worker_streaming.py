@@ -125,7 +125,7 @@ def test_only_voxcpm_types_run_several_at_once():
     groups = task_groups(TASK_TYPES, 8)
     assert {g.task_types: g.concurrency for g in groups} == {
         ("tts-synthesis", "voice-design"): 8,
-        ("generate-music", "videogen", "lipsync", "imagegen"): 1,
+        ("generate-music", "videogen", "videogen-chain-decode", "lipsync", "imagegen"): 1,
         **{(t,): 1 for t in ("voice-enhance", "nudity-detect", "face-detect", "language-detect",
                              "transcribe", "force-align")},
     }

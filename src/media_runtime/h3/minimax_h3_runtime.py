@@ -1658,8 +1658,14 @@ def run_minimax_h3_inference(
     sparse_attention: bool = True,
     addons: tuple[str, ...] = (),
     max_pixels: int | None = None,
+    chain: Any = None,
 ) -> dict[str, Any]:
     """Run one H3 Ref2VA generation (keyframes as guides); returns stage metrics.
+
+    ``chain`` (:class:`h3.h3_chain.ChainPart`) renders the clip as a part of a long chain: the
+    previous part's last 22 frames handed over in latent space, the latent refined to part 0's and
+    saved; without ``chain.decode`` nothing is decoded and ``output_path`` is unused (the result's
+    ``output`` is the latent).
 
     ``preview`` (:class:`h3.h3_restore.FramePreview`) renders only that frame of
     this graph to its PNG instead of the clip (``output_path`` unused); returns
@@ -1793,6 +1799,14 @@ def run_minimax_h3_inference(
         pin_audio(graph, relative)
     if sparse_attention:  # before a preview swaps in ManualSigmas, which takes no model
         add_sparse_attention(graph)
+    chain_save_node: str | None = None
+    if chain is not None:
+        import nodes as comfy_nodes
+
+        from . import h3_chain
+
+        h3_chain.register_nodes(comfy_nodes)
+        chain_save_node = h3_chain.wire_part(graph, chain)
     if preview is not None:
         # The node renders the length snapped up to its grid; the preview indexes those frames.
         try:
@@ -1805,7 +1819,8 @@ def run_minimax_h3_inference(
             _cleanup_job_inputs(job_input_dir)
         return {**result, "width": canvas.width, "height": canvas.height}
     with h3_time_axis(time_axis_fps):
-        saved_result = _execute_graph(retained, graph, job_id=job_id)
+        saved_result = _execute_graph(retained, graph, job_id=job_id,
+                                      save_node_id=chain_save_node or _SAVE_VIDEO_NODE_ID)
     stage_timings["minimax_h3_pipeline_seconds"] = round(saved_result["pipeline_seconds"], 3)
     log_event(
         "minimax_h3_inference_complete",
@@ -1824,10 +1839,14 @@ def run_minimax_h3_inference(
     )
 
     comfy_output_dir = comfy_root / "output"
-    saved_path = comfy_output_dir / saved_result["saved_subfolder"] / saved_result["saved_filename"]
     move_started = time.perf_counter()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(saved_path), output_path)
+    if chain_save_node is not None:
+        # Nothing decoded: the part's latent is the output.
+        output_path = Path(chain.latent_path)
+    else:
+        saved_path = comfy_output_dir / saved_result["saved_subfolder"] / saved_result["saved_filename"]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(saved_path), output_path)
     generated_dir = comfy_output_dir / "jobs" / job_id
     if generated_dir.exists():
         shutil.rmtree(generated_dir, ignore_errors=True)
@@ -1842,7 +1861,7 @@ def run_minimax_h3_inference(
     # H3_CANVAS_AREA_SLACK of pixels), so this is a uniform scale plus a small
     # centre crop - never a squeeze.
     resize_metrics: dict[str, Any] | None = None
-    delivered = (int(output_width or 0), int(output_height or 0))
+    delivered = (int(output_width or 0), int(output_height or 0)) if chain_save_node is None else (0, 0)
     if delivered[0] > 0 and delivered[1] > 0 and delivered != (canvas.width, canvas.height):
         began = time.perf_counter()
         fit_path = output_path.with_name(f"{output_path.stem}.fit{delivered[0]}x{delivered[1]}.mp4")

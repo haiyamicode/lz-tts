@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -69,10 +70,12 @@ from .downloads import (
 from .media import (
     ImagegenRequest,
     LipsyncRequest,
+    LipsyncStageRequest,
     MediaCancelled,
     MediaInputError,
     MediaRuntime,
     MusicRequest,
+    VideogenChainDecodeRequest,
     VideogenRequest,
     fetch_reference,
 )
@@ -1471,6 +1474,7 @@ _OPERATION_CLAIMS: dict[str, tuple[str, ...]] = {
     "force-align": ("aligner",),
     "generate-music": ("media",),
     "videogen": ("media",),
+    "videogen-chain-decode": ("media",),
     "imagegen": ("media",),
     "lipsync": ("media",),
 }
@@ -6720,7 +6724,7 @@ class LzTtsInferenceSession:
                     result = await self._force_align(request_data)
             except TranscribeInputError as exc:
                 raise InferenceOperationError(400, str(exc)) from exc
-        elif operation in ("generate-music", "videogen", "lipsync", "imagegen"):
+        elif operation in ("generate-music", "videogen", "videogen-chain-decode", "lipsync", "imagegen"):
             try:
                 if operation == "generate-music":
                     result = await self._generate_music(request_data, progress, cancelled)
@@ -6968,14 +6972,34 @@ class LzTtsInferenceSession:
         The result travels like audio (``kind`` "audio", ``audioBase64`` on /task/sync) with
         ``content_type`` video/mp4 or image/png; its data carries the seed, size and render metrics.
         A continuable videogen clip also returns its restored last frame as the ``lastFrame`` file, a
-        ``generate`` lipsync its kept rest stills as ``still<k>`` files.
+        ``generate`` lipsync its kept rest stills as ``still<k>`` files. A videogen chain part
+        (``latent_only``) is its latent (safetensors, application/octet-stream); ``return_latent`` adds
+        it as the ``latent`` file; ``videogen-chain-decode`` decodes a chain's latents into one mp4.
         """
         config = _server_config.media
-        if not getattr(config, operation):
+        feature = "videogen" if operation == "videogen-chain-decode" else operation
+        if not getattr(config, feature):
             raise InferenceOperationError(503, f"{operation} is not enabled on this worker")
-        model = {"videogen": VideogenRequest, "lipsync": LipsyncRequest, "imagegen": ImagegenRequest}[operation]
+        model = {
+            "videogen": VideogenRequest,
+            "videogen-chain-decode": VideogenChainDecodeRequest,
+            "lipsync": LipsyncRequest,
+            "imagegen": ImagegenRequest,
+        }[operation]
+        if operation == "lipsync" and request_data.get("stage") in ("chunk", "assemble"):
+            # A staged lipsync's chunk / assemble task (the plan task is a LipsyncRequest).
+            model = LipsyncStageRequest
         request = model.model_validate(request_data)
-        timeout = getattr(config, f"{operation}_timeout_seconds")
+        if isinstance(request, VideogenRequest) and request.chain is not None:
+            raise MediaInputError("a chain part runs on Taskflow, whose worker reads its latents from the lease")
+        if isinstance(request, VideogenChainDecodeRequest) and request.latent_paths is None:
+            if request.latent_artifact_ids is not None:
+                raise MediaInputError("latent_artifact_ids are read from a Taskflow lease; send latent_urls")
+        _check_staged_paths(request)
+        timeout = getattr(config, f"{feature}_timeout_seconds")
+        if isinstance(request, VideogenRequest) and (request.duration_seconds or 0) > 10:
+            # A long clip renders a part per ~9 s.
+            timeout *= math.ceil(request.duration_seconds / 9)
         # The render stays the file the runtime wrote; the scratch goes when the result is released.
         scratch = _media_scratch_dir(operation)
         try:
@@ -6983,7 +7007,7 @@ class LzTtsInferenceSession:
                 "job_id": f"{operation}-{uuid.uuid4().hex}",
                 "payload": (
                     request.runtime_payload()
-                    if isinstance(request, LipsyncRequest)
+                    if isinstance(request, (LipsyncRequest, LipsyncStageRequest, VideogenChainDecodeRequest))
                     else request.model_dump(exclude_none=True)
                 ),
                 "output_dir": str(scratch),
@@ -6992,15 +7016,19 @@ class LzTtsInferenceSession:
                 progress("preparing", None, None)
             await _await_engine_ready("media")
             with listening_for_progress(body["job_id"], progress):
-                produced = await _ensure_media_runtime().request(operation, body, timeout, cancelled)
+                produced = await _ensure_media_runtime().request(feature, body, timeout, cancelled)
         except BaseException:
             shutil.rmtree(scratch, ignore_errors=True)
             raise
-        content_type = "image/png" if operation == "imagegen" else "video/mp4"
+        content_type = _h3_content_type(produced["path"], "image/png" if operation == "imagegen" else "video/mp4")
         # A continuable videogen clip's restored last frame: the next clip's image_url; a generate
-        # lipsync's rest stills (still<k>, PNG).
+        # lipsync's rest stills (still<k>, PNG); a videogen clip's latent; a staged lipsync's plan
+        # audio and chunk boundary frames.
         last_frame = produced.get("last_frame_path")
-        files = {name: ResultFile("image/png", path=Path(path)) for name, path in (produced.get("files") or {}).items()}
+        files = {
+            name: ResultFile(_h3_content_type(path, "application/octet-stream"), path=Path(path))
+            for name, path in (produced.get("files") or {}).items()
+        }
         if last_frame:
             files["lastFrame"] = ResultFile("image/jpeg", path=Path(last_frame))
         return InferenceResult(
@@ -7015,6 +7043,48 @@ class LzTtsInferenceSession:
             files=files or None,
             scratch=scratch,
         )
+
+
+# Media runtime result files by suffix: a chain latent (safetensors) and a staged lipsync's state (tar)
+# are opaque bytes; a staged lipsync's plan returns the job's audio, its chunks their renders.
+_H3_FILE_TYPES = {
+    ".safetensors": "application/octet-stream",
+    ".tar": "application/octet-stream",
+    ".mp4": "video/mp4",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".flac": "audio/flac",
+    ".webm": "audio/webm",
+}
+
+
+def _h3_content_type(path: str, default: str) -> str:
+    """A media runtime file's content type, by its suffix; ``default`` for one not listed."""
+    return _H3_FILE_TYPES.get(Path(path).suffix.lower(), default)
+
+
+def _check_staged_paths(request: BaseModel) -> None:
+    """Input paths are the worker's own lease downloads (a videogen ``chain``, a staged lipsync's earlier
+    stages), in the media scratch; a caller's path anywhere else is refused."""
+    root = _media_scratch_root().resolve()
+    paths = [
+        getattr(request, name, None)
+        for name in ("continue_latent_path", "chain_reference_latent_path", "state_path", "boundary_path")
+    ]
+    paths += list(getattr(request, "latent_paths", None) or [])
+    paths += list(getattr(request, "chunk_paths", None) or [])
+    if isinstance(request, LipsyncStageRequest):
+        paths.append(request.audio_path)
+    for path in paths:
+        if path is not None and not Path(path).resolve().is_relative_to(root):
+            raise MediaInputError(f"{path} is not a worker-staged input")
 
 
 def _camel_keys(value: Any) -> Any:
@@ -7047,6 +7117,7 @@ class SyncTaskInput(BaseModel):
         "force-align",
         "generate-music",
         "videogen",
+        "videogen-chain-decode",
         "lipsync",
         "imagegen",
     ]

@@ -95,6 +95,20 @@ its ``pin_image_url`` (fitted to the input image's frame) or else the input
 image; the quiet cuts and pause pins fill the stretches between pinned chunks
 (:func:`pinned_spans`, :func:`freestyle_plan`).
 
+**Staged jobs** (``stage``; :func:`run_lipsync_inference`). A whole job holds the GPU
+for every chunk of up to 300 s of audio; staged, each step is a task of its own, so
+other jobs' chunks take turns between them. ``plan`` (the request plus ``stage``) does
+everything before the first chunk and returns the state tar (payload after auto, the
+plan, the cleaned voice, the pin images) with the job's audio as the ``audio`` file
+and ``chunk_plan``. ``chunk`` (``chunk_index``, the state, and the previous chunk's
+``boundary`` file when ``needs_boundary``) renders that chunk exactly as the whole job
+does - same seeds, validators, retries - and returns its kept take plus, when it ends on
+a restored boundary, that frame as ``boundary``; chunks run in order, since chunk k
+opens on chunk k-1's boundary. ``assemble`` (the state, every chunk's render in order,
+the plan's ``audio``, optionally the chunks' ``report`` as ``chunk_reports``) joins,
+sizes and muxes them into the whole job's result. ``generate`` is not staged: render
+its stills as imagegen ``rest_frame`` tasks and pin them.
+
 **Validators.** ``detect_flicker`` (lighting jumps, punch-ins, cuts),
 ``detect_desync`` (SyncNet) and ``detect_glitches`` (a CNN for invented
 graphics, sparkles and botched hands) are on unless the payload sets them
@@ -131,11 +145,15 @@ unmodified (the model never decodes audio in this mode).
 """
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
 import random
+import re
+import shutil
 import subprocess
+import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1004,21 +1022,64 @@ def _restore_boundary(chunk: LipsyncChunk, end_anchor: Anchor, *, images: dict[s
     return metrics
 
 
-def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
-    """Run one ``lipsync`` job; returns the result.
-    """
-    from .h3_interpolation import requested_fps, speed_up
-    from .span_upscale import (SPAN_MODEL_NAME, requested_scale, requested_short_side, short_side_scale,
-                               short_side_size, target_size)
-    from .minimax_h3_runtime import (
-        DEFAULT_LIPSYNC_PRESET,
-        H3_FPS,
-        LIPSYNC_PRESETS,
-        cleanup_h3_job_files,
-        h3_preset,
-        run_lipsync_chunk,
-    )
+STATE_VERSION = 1
+STAGES = ("plan", "chunk", "assemble")
 
+
+@dataclass
+class _Job:
+    """One lipsync job's settings, images, voice and plan: everything a chunk renders from. The whole job
+    builds it once (:func:`_prepare`); a staged job's plan stage saves it (:func:`_save_state`) and every
+    chunk / assemble stage loads it back (:func:`_load_state`)."""
+
+    job_id: str
+    scratch_dir: Path
+    payload: dict[str, Any]
+    auto: dict[str, Any] | None
+    voice_path: Path
+    images: dict[str, Path]
+    plan: dict[str, Any]
+    stage_timings: dict[str, float]
+    started: float
+    audio_path: Path | None = None
+    stills_item: dict[str, Any] | None = None
+    still_files: dict[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        from .h3_interpolation import requested_fps
+        from .minimax_h3_runtime import DEFAULT_LIPSYNC_PRESET, H3_FPS, LIPSYNC_PRESETS, h3_preset
+
+        payload = self.payload
+        self.work_dir = self.scratch_dir / "lipsync"
+        self.seed = int(payload["seed"]) if payload.get("seed") is not None else DEFAULT_SEED
+        self.preset = str(payload.get("preset") or DEFAULT_LIPSYNC_PRESET)
+        self.recipe = h3_preset(self.preset, LIPSYNC_PRESETS)
+        self.sparse_attention = payload.get("sparse_attention") is not False
+        self.detect_flicker = payload.get("detect_flicker") is not False
+        self.detect_desync = payload.get("detect_desync") is not False
+        self.detect_glitches = payload.get("detect_glitches") is not False
+        self.checking = self.detect_flicker or self.detect_desync or self.detect_glitches
+        self.check_retries = _env_int("LIPSYNC_CHECK_RETRIES", DEFAULT_CHECK_RETRIES)
+        # use_interpolation: the timeline runs at interpolation_fps, every chunk renders its frames on the model's
+        # 24 fps clock from its voice sped up to match, and RIFE brings the joined video up to 24 fps.
+        self.interpolation_fps = requested_fps(payload)
+        self.fps = float(self.interpolation_fps or H3_FPS)
+        self.anchors = [Anchor(frame=int(frame), label=str(label), image=str(image))
+                        for frame, label, image in self.plan["anchors"]]
+        self.anchor_at = {anchor.frame: anchor for anchor in self.anchors}
+        self.chunks = plan_chunks(int(self.plan["total_frames"]), max_frames=int(self.plan["chunk_cap"]),
+                                  anchors=self.anchors, cut_frames=self.plan["cut_frames"])
+
+    def finish(self, name: str, began: float) -> None:
+        self.stage_timings[name] = round(time.perf_counter() - began, 3)
+
+    def opens_on_boundary(self, chunk: LipsyncChunk) -> bool:
+        """The chunk opens on the previous chunk's restored last frame (its ``boundary`` file)."""
+        return self.anchor_at[chunk.start_frame].image.startswith(RESTORED_IMAGE)
+
+
+def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
+    """Inputs fetched, auto applied, pin images and rest stills ready, the voice cleaned, the job planned."""
     job_started = time.perf_counter()
     job_id = str(job["id"])
     stage_timings: dict[str, float] = {}
@@ -1034,24 +1095,18 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     audio_path = download_job_input(job, job["payload"], "audio", scratch_dir, ".wav")
     # auto (the default): the avatar render's own setup, and its pins for this audio's length.
     payload, auto = auto_payload(job["payload"], seconds=media_duration(audio_path))
+    payload.pop("stage", None)
     log_event("lipsync_mode", job_id=job_id, auto=auto is not None, **(auto or {}))
     seed = int(payload["seed"]) if payload.get("seed") is not None else DEFAULT_SEED
-    preset = str(payload.get("preset") or DEFAULT_LIPSYNC_PRESET)
-    recipe = h3_preset(preset, LIPSYNC_PRESETS)
-    sparse_attention = payload.get("sparse_attention") is not False
-    detect_flicker = payload.get("detect_flicker") is not False
-    detect_desync = payload.get("detect_desync") is not False
-    detect_glitches = payload.get("detect_glitches") is not False
-    checking = detect_flicker or detect_desync or detect_glitches
-    check_retries = _env_int("LIPSYNC_CHECK_RETRIES", DEFAULT_CHECK_RETRIES)
-    # use_interpolation: the timeline runs at interpolation_fps, every chunk renders its frames on the model's
-    # 24 fps clock from its voice sped up to match, and RIFE brings the joined video up to 24 fps.
-    interpolation_fps = requested_fps(payload)
-    fps = float(interpolation_fps or H3_FPS)
-    # upscale: the frames go through SPAN 2x, then lanczos to the delivered size times the factor.
-    upscale = requested_scale(payload)
+    from .h3_interpolation import requested_fps
+    from .minimax_h3_runtime import H3_FPS
+
+    fps = float(requested_fps(payload) or H3_FPS)
     custom_instructions = payload.get("custom_instructions") or []
     pins = PinSettings.from_payload(payload.get("pinned_frames"))
+    if staged and pins.mode == "generate":
+        raise ValueError("a staged lipsync takes no pinned_frames generate: render the stills as imagegen "
+                         "rest_frame tasks and pin them (multi_image, or auto stills)")
     # Every pinned image - the pinned chunks' own, pinned_frames' - each URL fetched once.
     pin_urls = {url: "pin_image_url" for item in custom_instructions
                 if item.get("pin_chunk") and (url := str(item.get("pin_image_url") or ""))}
@@ -1108,112 +1163,127 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     finish("voice_cleanup_seconds", began)
     plan = _new_plan(payload, voice_path=voice_path, audio_path=audio_path, input_image=input_image, pins=pins,
                      pin_images=len(pin_downloads), fps=fps, seed=seed, job_id=job_id, finish=finish)
+    return _Job(job_id=job_id, scratch_dir=scratch_dir, payload=payload, auto=auto, voice_path=voice_path,
+                images=images, plan=plan, stage_timings=stage_timings, started=job_started, audio_path=audio_path,
+                stills_item=stills_item, still_files=still_files)
+
+
+def _render_chunk(job: _Job, chunk: LipsyncChunk) -> tuple[Path, dict[str, Any]]:
+    """One chunk rendered (its continuous end restored first, validators and reseeded retries): the kept
+    take and its report. Fills ``job.images`` with this chunk's restored end frame, if it ends on one."""
+    from .h3_interpolation import speed_up
+    from .minimax_h3_runtime import H3_FPS, run_lipsync_chunk
+
+    began = time.perf_counter()
+    plan, images, anchor_at = job.plan, job.images, job.anchor_at
+    canvas_width, canvas_height = plan["canvas"]
+    prompts = plan["prompts"]
+    # The chunks are what a long clip is made of, and the measure of how far along it is; inside
+    # one, its render's sampler steps move it too (`progress.chunk_steps`), so a one-chunk clip
+    # is not stuck at 0% for minutes.
+    progress.report("rendering", chunk.index, len(job.chunks))
+    chunk_dir = job.work_dir / f"chunk{chunk.index:03d}"
+    audio_slice = extract_audio_slice(
+        job.voice_path,
+        start_seconds=chunk.start_frame / job.fps,
+        duration_seconds=chunk.render_frames / job.fps,
+        output_path=chunk_dir / ("voice.wav" if job.interpolation_fps else "audio.wav"),
+    )
+    if job.interpolation_fps:
+        # The chunk's frames render on the model's 24 fps clock: it hears its voice that much faster.
+        audio_slice = speed_up(audio_slice, chunk_dir / "audio.wav", fps=job.interpolation_fps,
+                               duration_seconds=chunk.render_frames / H3_FPS)
+    # A continuous boundary at this chunk's end: its own last frame, previewed and restored toward
+    # the image last pinned before it, pinned there; the next chunk opens on it.
+    end_anchor = anchor_at.get(chunk.last_frame)
+    restore_metrics: dict[str, Any] | None = None
+    if end_anchor is not None and end_anchor.image.startswith(RESTORED_IMAGE) and end_anchor.image not in images:
+        look = max((anchor for anchor in job.anchors if anchor.frame < end_anchor.frame
+                    and not anchor.image.startswith(RESTORED_IMAGE)), key=lambda anchor: anchor.frame)
+        restore_metrics = _restore_boundary(
+            chunk, end_anchor, images=images, anchor_at=anchor_at, look=images[look.image], job_id=job.job_id,
+            prompt=prompts[chunk.index],
+            seed=job.seed + chunk.index, width=canvas_width, height=canvas_height, audio_slice=audio_slice,
+            work_dir=chunk_dir, recipe=job.recipe, sparse_attention=job.sparse_attention)
+        job.stage_timings[f"chunk_{chunk.index}_boundary_seconds"] = restore_metrics["seconds"]
+    # Every chunk opens on a pin: the input image, a pinned image, or a continuous
+    # boundary's restored frame (it ends on one too, unless it is the last and free).
+    first_image = images[anchor_at[chunk.start_frame].image]
+    guides = [(position, images[anchor.image]) for position, anchor in chunk.guides]
+    guide_labels = [f"{position}:{anchor.label}" for position, anchor in chunk.guides]
+    # With validators on, a chunk that fails them is rendered again on a new
+    # seed; the pins make any take fit between its neighbours. A custom
+    # instruction may turn some off for its chunks.
+    off = set(plan["checks_off"][chunk.index])
+    flicker = job.detect_flicker and "detect_flicker" not in off
+    desync = job.detect_desync and "detect_desync" not in off
+    glitches = job.detect_glitches and "detect_glitches" not in off
+    chunk_checking = flicker or desync or glitches
+    attempts: list[tuple[Path, dict[str, Any], dict[str, Any] | None]] = []
+    for attempt in range(1 + (job.check_retries if chunk_checking else 0)):
+        cancel.check()
+        output = chunk_dir / ("render.mp4" if attempt == 0 else f"render_retry{attempt}.mp4")
+        with progress.chunk_steps():
+            metrics = run_lipsync_chunk(
+                job_id=job.job_id,
+                chunk_index=chunk.index,
+                prompt=prompts[chunk.index],
+                seed=job.seed + chunk.index + attempt * RESEED_STRIDE,
+                width=canvas_width,
+                height=canvas_height,
+                length=chunk.render_frames,
+                first_frame_path=first_image,
+                last_frame_path=None,
+                guides=guides,
+                audio_path=audio_slice,
+                output_path=output,
+                recipe=job.recipe,
+                sparse_attention=job.sparse_attention,
+            )
+        # Glitches are judged against the image the chunk opens on; a chunk moving into another
+        # pinned image drifts from it on purpose, so its flicker check judges sudden steps only.
+        verdict = _check(output, audio_slice, chunk, flicker=flicker, desync=desync,
+                         glitches=glitches, image=first_image, job_id=job.job_id,
+                         judge_drift={first_image, *(path for _, path in guides)} == {first_image},
+                         ) if chunk_checking else None
+        attempts.append((output, metrics, verdict))
+        if verdict is None or not verdict["flagged"]:
+            break
+    kept = min(range(len(attempts)), key=lambda i: attempts[i][2]["badness"] if attempts[i][2] else 0.0)
+    output, metrics, verdict = attempts[kept]
+    job.finish(f"chunk_{chunk.index}_seconds", began)
+    return output, {
+        **metrics,
+        "start_frame": chunk.start_frame,
+        "kept_frames": chunk.frames,
+        "text": plan["chunk_texts"][chunk.index],
+        **({"pinned": True} if chunk.index in set(plan["pinned_chunks"]) else {}),
+        **({"instructions": plan["instructions"][chunk.index]} if plan["instructions"][chunk.index] else {}),
+        "anchors": guide_labels,
+        **({"checks": [attempt_verdict for _, _, attempt_verdict in attempts if attempt_verdict is not None],
+            "kept_attempt": kept, "flagged": bool(verdict and verdict["flagged"])} if job.checking else {}),
+        **({"checks_off": sorted(off)} if job.checking and off else {}),
+        **({"boundary_restore": restore_metrics} if restore_metrics else {}),
+    }
+
+
+def _assemble(job: _Job, chunk_paths: list[tuple[Path, int]], chunk_metrics: list[dict[str, Any]] | None,
+              *, audio_path: Path) -> dict[str, Any]:
+    """The rendered chunks joined, sized and muxed with the job's audio: the job's result. ``chunk_metrics``
+    None (a staged job whose caller sent no chunk reports) leaves the per-chunk summary out."""
+    from .minimax_h3_runtime import H3_FPS
+    from .span_upscale import (SPAN_MODEL_NAME, requested_scale, requested_short_side, short_side_scale,
+                               short_side_size, target_size)
+
+    payload, plan = job.payload, job.plan
     audio_duration = float(plan["audio_duration"])
     total_frames = int(plan["total_frames"])
+    source_width, source_height = plan["source_size"]
     canvas_width, canvas_height = plan["canvas"]
-    anchors = [Anchor(frame=int(frame), label=str(label), image=str(image)) for frame, label, image in plan["anchors"]]
-    anchor_at = {anchor.frame: anchor for anchor in anchors}
-    chunks = plan_chunks(total_frames, max_frames=int(plan["chunk_cap"]), anchors=anchors, cut_frames=plan["cut_frames"])
-    pinned_chunks = set(plan["pinned_chunks"])
-    chunk_texts, prompts, instructions = plan["chunk_texts"], plan["prompts"], plan["instructions"]
-    chunk_paths: list[tuple[Path, int]] = []
-    chunk_metrics: list[dict[str, Any]] = []
-    try:
-        for chunk in chunks:
-            began = time.perf_counter()
-            # The chunks are what a long clip is made of, and the measure of how far along it is; inside
-            # one, its render's sampler steps move it too (`progress.chunk_steps`), so a one-chunk clip
-            # is not stuck at 0% for minutes.
-            progress.report("rendering", chunk.index, len(chunks))
-            chunk_dir = work_dir / f"chunk{chunk.index:03d}"
-            audio_slice = extract_audio_slice(
-                voice_path,
-                start_seconds=chunk.start_frame / fps,
-                duration_seconds=chunk.render_frames / fps,
-                output_path=chunk_dir / ("voice.wav" if interpolation_fps else "audio.wav"),
-            )
-            if interpolation_fps:
-                # The chunk's frames render on the model's 24 fps clock: it hears its voice that much faster.
-                audio_slice = speed_up(audio_slice, chunk_dir / "audio.wav", fps=interpolation_fps,
-                                       duration_seconds=chunk.render_frames / H3_FPS)
-            # A continuous boundary at this chunk's end: its own last frame, previewed and restored toward
-            # the image last pinned before it, pinned there; the next chunk opens on it.
-            end_anchor = anchor_at.get(chunk.last_frame)
-            restore_metrics: dict[str, Any] | None = None
-            if end_anchor is not None and end_anchor.image.startswith(RESTORED_IMAGE) and end_anchor.image not in images:
-                look = max((anchor for anchor in anchors if anchor.frame < end_anchor.frame
-                            and not anchor.image.startswith(RESTORED_IMAGE)), key=lambda anchor: anchor.frame)
-                restore_metrics = _restore_boundary(
-                    chunk, end_anchor, images=images, anchor_at=anchor_at, look=images[look.image], job_id=job_id,
-                    prompt=prompts[chunk.index],
-                    seed=seed + chunk.index, width=canvas_width, height=canvas_height, audio_slice=audio_slice,
-                    work_dir=chunk_dir, recipe=recipe, sparse_attention=sparse_attention)
-                stage_timings[f"chunk_{chunk.index}_boundary_seconds"] = restore_metrics["seconds"]
-            # Every chunk opens on a pin: the input image, a pinned image, or a continuous
-            # boundary's restored frame (it ends on one too, unless it is the last and free).
-            first_image = images[anchor_at[chunk.start_frame].image]
-            guides = [(position, images[anchor.image]) for position, anchor in chunk.guides]
-            guide_labels = [f"{position}:{anchor.label}" for position, anchor in chunk.guides]
-            # With validators on, a chunk that fails them is rendered again on a new
-            # seed; the pins make any take fit between its neighbours. A custom
-            # instruction may turn some off for its chunks.
-            off = set(plan["checks_off"][chunk.index])
-            flicker = detect_flicker and "detect_flicker" not in off
-            desync = detect_desync and "detect_desync" not in off
-            glitches = detect_glitches and "detect_glitches" not in off
-            chunk_checking = flicker or desync or glitches
-            attempts: list[tuple[Path, dict[str, Any], dict[str, Any] | None]] = []
-            for attempt in range(1 + (check_retries if chunk_checking else 0)):
-                cancel.check()
-                output = chunk_dir / ("render.mp4" if attempt == 0 else f"render_retry{attempt}.mp4")
-                with progress.chunk_steps():
-                    metrics = run_lipsync_chunk(
-                        job_id=job_id,
-                        chunk_index=chunk.index,
-                        prompt=prompts[chunk.index],
-                        seed=seed + chunk.index + attempt * RESEED_STRIDE,
-                        width=canvas_width,
-                        height=canvas_height,
-                        length=chunk.render_frames,
-                        first_frame_path=first_image,
-                        last_frame_path=None,
-                        guides=guides,
-                        audio_path=audio_slice,
-                        output_path=output,
-                        recipe=recipe,
-                        sparse_attention=sparse_attention,
-                    )
-                # Glitches are judged against the image the chunk opens on; a chunk moving into another
-                # pinned image drifts from it on purpose, so its flicker check judges sudden steps only.
-                verdict = _check(output, audio_slice, chunk, flicker=flicker, desync=desync,
-                                 glitches=glitches, image=first_image, job_id=job_id,
-                                 judge_drift={first_image, *(path for _, path in guides)} == {first_image},
-                                 ) if chunk_checking else None
-                attempts.append((output, metrics, verdict))
-                if verdict is None or not verdict["flagged"]:
-                    break
-            kept = min(range(len(attempts)), key=lambda i: attempts[i][2]["badness"] if attempts[i][2] else 0.0)
-            output, metrics, verdict = attempts[kept]
-            stage_timings[f"chunk_{chunk.index}_seconds"] = round(time.perf_counter() - began, 3)
-            chunk_paths.append((output, chunk.frames))
-            chunk_metrics.append({
-                **metrics,
-                "start_frame": chunk.start_frame,
-                "kept_frames": chunk.frames,
-                "text": chunk_texts[chunk.index],
-                **({"pinned": True} if chunk.index in pinned_chunks else {}),
-                **({"instructions": instructions[chunk.index]} if instructions[chunk.index] else {}),
-                "anchors": guide_labels,
-                **({"checks": [attempt_verdict for _, _, attempt_verdict in attempts if attempt_verdict is not None],
-                    "kept_attempt": kept, "flagged": bool(verdict and verdict["flagged"])} if checking else {}),
-                **({"checks_off": sorted(off)} if checking and off else {}),
-                **({"boundary_restore": restore_metrics} if restore_metrics else {}),
-            })
-    finally:
-        cleanup_h3_job_files(job_id)
-
+    # upscale: the frames go through SPAN 2x, then lanczos to the delivered size times the factor.
+    upscale = requested_scale(payload)
     # Every chunk is rendered; joining them, interpolating and muxing is the rest.
-    progress.report("finishing", len(chunks), len(chunks))
+    progress.report("finishing", len(job.chunks), len(job.chunks))
     output_dimensions = payload.get("output_dimensions")
     bounding_box = (
         (int(output_dimensions["width"]), int(output_dimensions["height"]))
@@ -1235,61 +1305,62 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
                                                         bounding_box=bounding_box)
         bounding_box = None
     began = time.perf_counter()
-    output_name = "output.mp4"
-    output_path = scratch_dir / "outputs" / output_name
+    output_path = job.scratch_dir / "outputs" / "output.mp4"
     streamed = assemble_output(
         chunk_paths,
         audio_path=audio_path,
         total_frames=total_frames,
-        fps=fps,
+        fps=job.fps,
         duration_seconds=audio_duration,
         output_path=output_path,
         width=None if bounding_box else delivered_width,
         height=None if bounding_box else delivered_height,
         bounding_box=bounding_box,
-        output_fps=int(H3_FPS) if interpolation_fps else None,
+        output_fps=int(H3_FPS) if job.interpolation_fps else None,
         upscale=bool(upscale),
-        job_id=job_id,
+        job_id=job.job_id,
     )
-    finish("assemble_seconds", began)
+    job.finish("assemble_seconds", began)
     if bounding_box is not None:
         delivered_width, delivered_height = image_size(output_path)
 
-    total_seconds = time.perf_counter() - job_started
-    render_seconds = sum(float(m["pipeline_seconds"]) for m in chunk_metrics)
+    total_seconds = time.perf_counter() - job.started
+    reported = chunk_metrics is not None
+    render_seconds = sum(float(m["pipeline_seconds"]) for m in chunk_metrics) if reported else None
     transcript = plan["transcript"]
+    recipe = job.recipe
     item = {
-        "seed": seed,
+        "seed": job.seed,
         "fps": float(H3_FPS),
         "width": delivered_width,
         "height": delivered_height,
         "frames": streamed["output_frames"] if streamed else total_frames,
         "duration_seconds": round(audio_duration, 3),
         "source": "freestyle",
-        "auto": auto is not None,
-        **({"auto_choices": auto} if auto is not None else {}),
+        "auto": job.auto is not None,
+        **({"auto_choices": job.auto} if job.auto is not None else {}),
         "pin_mode": plan["pin_mode"],
         # generate: each rest still (its seed, variation, identity, mouth and takes); the kept ones are
         # the result's still<k> files.
-        **stills_item,
-        "anchors": len(anchors),
-        "pinned_chunks": len(pinned_chunks),
+        **(job.stills_item or {}),
+        "anchors": len(job.anchors),
+        "pinned_chunks": len(plan["pinned_chunks"]),
         "canvas_width": canvas_width,
         "canvas_height": canvas_height,
-        "chunks": len(chunks),
-        "preset": preset,
+        "chunks": len(job.chunks),
+        "preset": job.preset,
         "steps": recipe.steps,
         "sampler": recipe.sampler_label,
         "sigmas": recipe.sigmas,
         "lora": recipe.lora_name,
-        "sparse_attention": sparse_attention and all(metric["sparse_attention"] for metric in chunk_metrics),
+        "sparse_attention": job.sparse_attention and (not reported or all(m["sparse_attention"] for m in chunk_metrics)),
         "checks": {
-            "detect_flicker": detect_flicker,
-            "detect_desync": detect_desync,
-            "detect_glitches": detect_glitches,
-            "rerendered_chunks": sum(len(metric["checks"]) > 1 for metric in chunk_metrics),
-            "flagged_chunks": sum(metric["flagged"] for metric in chunk_metrics),
-        } if checking else None,
+            "detect_flicker": job.detect_flicker,
+            "detect_desync": job.detect_desync,
+            "detect_glitches": job.detect_glitches,
+            "rerendered_chunks": sum(len(m.get("checks") or ()) > 1 for m in chunk_metrics) if reported else None,
+            "flagged_chunks": sum(bool(m.get("flagged")) for m in chunk_metrics) if reported else None,
+        } if job.checking else None,
         "prompt_source": "payload" if str(payload.get("prompt") or "").strip() else "template",
         "transcript_source": transcript["source"],
         "language": transcript["language"],
@@ -1298,18 +1369,18 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
     if bounding_box is not None:
         item["output_dimensions"] = {"width": bounding_box[0], "height": bounding_box[1]}
     span_seconds = float(((streamed or {}).get("span") or {}).get("seconds", 0.0))
-    if streamed and interpolation_fps:
+    if streamed and job.interpolation_fps:
         # Rendered at interpolation_fps; RIFE made the rest of the 24 fps frames.
         rife_seconds = round(streamed["seconds"] - span_seconds, 3)
-        item["interpolation"] = {"fps": interpolation_fps, "rendered_frames": total_frames,
+        item["interpolation"] = {"fps": job.interpolation_fps, "rendered_frames": total_frames,
                                  "rife_frames": streamed["rife_frames"], "seconds": rife_seconds}
-        stage_timings["interpolation_seconds"] = rife_seconds
+        job.stage_timings["interpolation_seconds"] = rife_seconds
     if streamed and upscale:
         # SPAN 2x on the joined render, then lanczos to width x height.
         item["upscale"] = {"scale": upscale, "method": "span2x_lanczos", "model": SPAN_MODEL_NAME,
                            "span_seconds": span_seconds}
-        stage_timings["upscale_span_seconds"] = span_seconds
-    log_event("lipsync_complete", job_id=job_id, wall_seconds=round(total_seconds, 3), **{
+        job.stage_timings["upscale_span_seconds"] = span_seconds
+    log_event("lipsync_complete", job_id=job.job_id, wall_seconds=round(total_seconds, 3), **{
         key: item[key] for key in ("frames", "chunks", "anchors", "width", "height")
     })
     return {
@@ -1318,13 +1389,206 @@ def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
         "metrics": {
             "engine": "comfyui_lipsync",
             "wall_seconds": round(total_seconds, 3),
-            "render_seconds": round(render_seconds, 3),
+            "render_seconds": round(render_seconds, 3) if reported else None,
             "wall_rtf": round(total_seconds / audio_duration, 3) if audio_duration else None,
-            "render_rtf": round(render_seconds / audio_duration, 3) if audio_duration else None,
-            "stage_timings": stage_timings,
-            "chunks": chunk_metrics,
+            "render_rtf": round(render_seconds / audio_duration, 3) if reported and audio_duration else None,
+            "stage_timings": job.stage_timings,
+            **({"chunks": chunk_metrics} if reported else {}),
         },
-        "seed": seed,
+        "seed": job.seed,
         # generate: the kept rest stills, by result file name.
-        **({"files": still_files} if still_files else {}),
+        **({"files": job.still_files} if job.still_files else {}),
     }
+
+
+# ---------------------------------------------------------------------------
+# Staged jobs: plan -> chunk 0..n-1 -> assemble, one Taskflow task each
+# ---------------------------------------------------------------------------
+
+
+def _save_state(job: _Job, path: Path) -> Path:
+    """The plan stage's state: ``state.json`` (payload after auto, plan, image files, timings), the cleaned
+    voice and the pin images, one tar every later stage starts from."""
+    keys = sorted(job.images)
+    state = {
+        "version": STATE_VERSION,
+        "payload": job.payload,
+        "auto": job.auto,
+        "plan": job.plan,
+        "images": {key: f"images/{index}{job.images[key].suffix}" for index, key in enumerate(keys)},
+        "stage_timings": job.stage_timings,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(path, "w") as tar:
+        data = json.dumps(state).encode()
+        info = tarfile.TarInfo("state.json")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        tar.add(job.voice_path, arcname="voice.wav")
+        for key in keys:
+            tar.add(job.images[key], arcname=state["images"][key])
+    return path
+
+
+def _load_state(job: dict[str, Any], *, began: float) -> _Job:
+    """A staged job's state, from the plan stage's tar (``state_url`` / ``state_path``)."""
+    job_id = str(job["id"])
+    scratch_dir = job_dir(job_id)
+    tar_path = download_job_input(job, job["payload"], "state", scratch_dir, ".tar")
+    state_dir = scratch_dir / "lipsync" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(tar_path) as tar:
+            tar.extractall(state_dir, filter="data")
+        state = json.loads((state_dir / "state.json").read_text())
+    except (tarfile.TarError, OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"state is not a lipsync plan's state: {exc}") from exc
+    if state.get("version") != STATE_VERSION:
+        raise ValueError(f"state version {state.get('version')} is not {STATE_VERSION}; plan the job again")
+    return _Job(job_id=job_id, scratch_dir=scratch_dir, payload=state["payload"], auto=state["auto"],
+                voice_path=state_dir / "voice.wav",
+                images={key: state_dir / name for key, name in state["images"].items()},
+                plan=state["plan"], stage_timings=dict(state["stage_timings"]), started=began)
+
+
+def _snake_keys(value: Any) -> Any:
+    """A chunk report as the API returned it (camelCase keys) back in the runtime's snake_case."""
+    if isinstance(value, dict):
+        return {re.sub(r"(?<!^)(?=[A-Z])", "_", str(key)).lower(): _snake_keys(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_snake_keys(item) for item in value]
+    return value
+
+
+def _stage_plan(job: dict[str, Any]) -> dict[str, Any]:
+    """``stage: "plan"``: everything before the first chunk. The result is the state tar (later stages'
+    ``state``) plus the job's audio as the ``audio`` file (assemble muxes it), and the chunk list."""
+    ctx = _prepare(job, staged=True)
+    outputs = ctx.scratch_dir / "outputs"
+    state_path = _save_state(ctx, outputs / "state.tar")
+    audio_copy = outputs / f"audio{ctx.audio_path.suffix or '.wav'}"
+    shutil.copyfile(ctx.audio_path, audio_copy)
+    plan = ctx.plan
+    item = {
+        "stage": "plan",
+        "seed": ctx.seed,
+        "chunks": len(ctx.chunks),
+        # Chunk k > 0 that opens on a boundary needs chunk k-1's boundary file: the chunks run in order.
+        "chunk_plan": [{"index": chunk.index, "start_frame": chunk.start_frame, "frames": chunk.frames,
+                        "seconds": round(chunk.frames / ctx.fps, 3), "needs_boundary": ctx.opens_on_boundary(chunk)}
+                       for chunk in ctx.chunks],
+        "frames": int(plan["total_frames"]),
+        "duration_seconds": round(float(plan["audio_duration"]), 3),
+        "canvas_width": plan["canvas"][0],
+        "canvas_height": plan["canvas"][1],
+        "pin_mode": plan["pin_mode"],
+        "auto": ctx.auto is not None,
+        **({"auto_choices": ctx.auto} if ctx.auto is not None else {}),
+        "transcript_source": plan["transcript"]["source"],
+        "language": plan["transcript"]["language"],
+        "transcript": plan["transcript"]["text"],
+    }
+    seconds = round(time.perf_counter() - ctx.started, 3)
+    log_event("lipsync_stage_planned", job_id=ctx.job_id, chunks=len(ctx.chunks), wall_seconds=seconds)
+    return {"path": str(state_path), "item": item, "seed": ctx.seed, "files": {"audio": str(audio_copy)},
+            "metrics": {"engine": "comfyui_lipsync", "wall_seconds": seconds, "stage_timings": ctx.stage_timings}}
+
+
+def _stage_chunk(job: dict[str, Any], began: float) -> dict[str, Any]:
+    """``stage: "chunk"``: chunk ``chunk_index`` of the planned job, rendered exactly as the whole job
+    renders it (same seeds, validators, retries). Opening on a boundary, it needs the previous chunk's
+    ``boundary`` file (``boundary_url`` / ``boundary_path``). Its result is the kept take (more frames
+    than it keeps: assemble trims) and, when it ends on a restored boundary, that frame as ``boundary``."""
+    from .minimax_h3_runtime import cleanup_h3_job_files
+
+    payload = job["payload"]
+    ctx = _load_state(job, began=began)
+    ctx.stage_timings = {}
+    index = int(payload.get("chunk_index", -1))
+    if not 0 <= index < len(ctx.chunks):
+        raise ValueError(f"chunk_index {index} is not one of the plan's {len(ctx.chunks)} chunks")
+    chunk = ctx.chunks[index]
+    start_key = ctx.anchor_at[chunk.start_frame].image
+    if ctx.opens_on_boundary(chunk):
+        if not (payload.get("boundary_url") or payload.get("boundary_path")):
+            raise ValueError(f"chunk {index} opens on chunk {index - 1}'s boundary: send its boundary file")
+        # The restored frame as the previous chunk made it (canvas size), as the whole job pins it.
+        ctx.images[start_key] = download_job_input(job, payload, "boundary", ctx.scratch_dir, ".png")
+    try:
+        render, report = _render_chunk(ctx, chunk)
+    finally:
+        cleanup_h3_job_files(ctx.job_id)
+    end_anchor = ctx.anchor_at.get(chunk.last_frame)
+    files = ({"boundary": str(ctx.images[end_anchor.image])}
+             if end_anchor is not None and end_anchor.image.startswith(RESTORED_IMAGE) else {})
+    seconds = round(time.perf_counter() - began, 3)
+    report["seconds"] = ctx.stage_timings[f"chunk_{index}_seconds"]
+    item = {"stage": "chunk", "seed": ctx.seed, "chunk_index": index, "chunks": len(ctx.chunks),
+            "start_frame": chunk.start_frame, "frames": chunk.frames, "render_frames": chunk.render_frames,
+            "boundary": bool(files), "report": report}
+    log_event("lipsync_stage_chunk", job_id=ctx.job_id, chunk=index, wall_seconds=seconds)
+    return {"path": str(render), "item": item, "seed": ctx.seed, **({"files": files} if files else {}),
+            "metrics": {"engine": "comfyui_lipsync", "wall_seconds": seconds, "stage_timings": ctx.stage_timings}}
+
+
+def _stage_assemble(job: dict[str, Any], began: float) -> dict[str, Any]:
+    """``stage: "assemble"``: the chunks' renders (``chunk_urls`` / ``chunk_paths``, in order) joined, sized
+    and muxed with the job's audio (``audio_url`` / ``audio_path``: the plan's ``audio`` file); the
+    whole job's result. ``chunk_reports`` (each chunk result's ``report``) fill the per-chunk summary."""
+    payload = job["payload"]
+    ctx = _load_state(job, began=began)
+    audio_path = download_job_input(job, payload, "audio", ctx.scratch_dir, ".wav")
+    urls, paths = payload.get("chunk_urls"), payload.get("chunk_paths")
+    sources = list(urls or paths or [])
+    if len(sources) != len(ctx.chunks):
+        raise ValueError(f"the plan has {len(ctx.chunks)} chunks; got {len(sources)} chunk renders")
+    renders = []
+    for chunk, source in zip(ctx.chunks, sources):
+        name = f"chunk{chunk.index:03d}"
+        if urls:
+            renders.append(_download_url(ctx.job_id, str(source), ctx.scratch_dir / "inputs" / f"{name}.mp4",
+                                         input_name=f"chunk_urls[{chunk.index}]"))
+        else:
+            from .compat import project_path
+
+            path = project_path(str(source))
+            if not path.exists():
+                raise FileNotFoundError(f"chunk_paths[{chunk.index}] does not exist: {path}")
+            renders.append(path)
+    reports = payload.get("chunk_reports")
+    if reports is not None and len(reports) != len(ctx.chunks):
+        raise ValueError(f"the plan has {len(ctx.chunks)} chunks; got {len(reports)} chunk reports")
+    return _assemble(ctx, [(path, chunk.frames) for path, chunk in zip(renders, ctx.chunks)],
+                     _snake_keys(reports) if reports is not None else None, audio_path=audio_path)
+
+
+def run_lipsync_inference(job: dict[str, Any]) -> dict[str, Any]:
+    """Run one ``lipsync`` job; returns the result.
+
+    ``stage`` absent: the whole job in one go. A long job runs staged instead, one Taskflow task per
+    stage so other jobs' chunks take turns on the GPU between them: ``plan``, then ``chunk`` 0..n-1 in
+    order, then ``assemble`` (:func:`_stage_plan`, :func:`_stage_chunk`, :func:`_stage_assemble`). The
+    staged result is the whole job's, chunk for chunk."""
+    from .minimax_h3_runtime import cleanup_h3_job_files
+
+    began = time.perf_counter()
+    stage = job["payload"].get("stage")
+    if stage is not None and stage not in STAGES:
+        raise ValueError(f"stage must be one of {', '.join(STAGES)}")
+    if stage == "plan":
+        return _stage_plan(job)
+    if stage == "chunk":
+        return _stage_chunk(job, began)
+    if stage == "assemble":
+        return _stage_assemble(job, began)
+    ctx = _prepare(job)
+    chunk_paths: list[tuple[Path, int]] = []
+    chunk_metrics: list[dict[str, Any]] = []
+    try:
+        for chunk in ctx.chunks:
+            render, report = _render_chunk(ctx, chunk)
+            chunk_paths.append((render, chunk.frames))
+            chunk_metrics.append(report)
+    finally:
+        cleanup_h3_job_files(ctx.job_id)
+    return _assemble(ctx, chunk_paths, chunk_metrics, audio_path=ctx.audio_path)

@@ -181,6 +181,15 @@ class VideogenRequest(H3Interpolation):
     ``output_dimensions`` (with ``upscale`` only) bounds the result, aspect kept, as on lipsync:
     ``width`` 1920, ``height`` 1080, ``upscale`` and ``output_dimensions`` 1920x1080 is a SPAN-detailed
     1080p clip, not a 2880x1620 one.
+
+    Long clips (``h3/videogen.py`` docstring, "Long clips"): ``duration_seconds`` above 10 (up to 60) renders
+    parts of at most ~9 s, each continuing the previous one's latent (its last 22 frames handed over) and
+    refined toward the first part's colour, decodes them once and returns one mp4; later parts follow
+    ``continuation_prompt`` (default ``prompt``). The same chain one part per request: ``latent_only`` returns
+    the part's latent (safetensors) instead of an mp4, ``continue_latent_url`` (+ ``chain_reference_latent_url``,
+    the first part's latent) continues one with ``duration_seconds`` of new frames, on its canvas, and
+    ``videogen-chain-decode`` (:class:`VideogenChainDecodeRequest`) decodes the parts into the mp4. On Taskflow
+    the worker fills the ``*_path`` fields from ``chain`` (lease artifacts), never a caller.
     """
 
     model_config = {"extra": "forbid"}
@@ -192,8 +201,9 @@ class VideogenRequest(H3Interpolation):
     )
     last_frame_url: str | None = Field(default=None, description="Optional last frame")
     duration_seconds: float | None = Field(
-        default=None, gt=0, le=10,
-        description="Clip length at 24 fps; omitted: the pinned audio's length, else 3 s",
+        default=None, gt=0, le=60,
+        description="Clip length at 24 fps; omitted: the pinned audio's length, else 3 s. Above 10 s (no pins, no "
+        "last frame, not continuable): rendered in parts and decoded once; a continued part: its new seconds",
     )
     width: int | None = Field(default=None, ge=64, le=4096)
     height: int | None = Field(default=None, ge=64, le=4096)
@@ -238,6 +248,26 @@ class VideogenRequest(H3Interpolation):
         "(native 1080p), instead of ~1 MP + SPAN; about 3x the render time, and at 1080p at most 8 s (the 3090's "
         "VRAM; a longer duration is a 400)",
     )
+    continuation_prompt: str | None = Field(
+        default=None, min_length=1, max_length=4000,
+        description="A long clip's later parts follow this prompt (default prompt)",
+    )
+    latent_only: bool = Field(
+        default=False, description="Return the part's latent (safetensors) instead of an mp4: a chain part"
+    )
+    return_latent: bool = Field(default=False, description="Also return the clip's latent as the latent file")
+    continue_latent_url: str | None = Field(
+        default=None, min_length=1,
+        description="Continue this part's latent: no image, the canvas is the latent's, duration_seconds new",
+    )
+    chain_reference_latent_url: str | None = Field(
+        default=None, min_length=1, description="The chain's first part's latent: later parts are refined toward it"
+    )
+    continue_latent_path: str | None = Field(default=None, min_length=1, description="Worker-staged (chain)")
+    chain_reference_latent_path: str | None = Field(default=None, min_length=1, description="Worker-staged (chain)")
+    chain: VideogenChain | None = Field(
+        default=None, description="Taskflow chain part: the worker reads its latents from the lease's artifacts"
+    )
 
     @model_validator(mode="after")
     def _size_pair(self) -> "VideogenRequest":
@@ -247,6 +277,28 @@ class VideogenRequest(H3Interpolation):
             raise ValueError("native renders at output_short_side; send it")
         if self.output_dimensions is not None and not (self.upscale or self.output_short_side):
             raise ValueError("output_dimensions goes with upscale or output_short_side; else width/height are the delivered size")
+        continued = bool(
+            self.continue_latent_url or self.continue_latent_path or (self.chain is not None and self.chain.index > 0)
+        )
+        if self.chain_reference_latent_url or self.chain_reference_latent_path:
+            if not continued:
+                raise ValueError("chain_reference_latent_url goes with continue_latent_url")
+        if continued:
+            opened = [name for name in ("image_url", "last_frame_url", "pinned_audio_url", "anchor_url")
+                      if getattr(self, name)] + (["pinned_frames"] if self.pinned_frames else []) + (
+                ["continuable"] if self.continuable else [])
+            if opened:
+                raise ValueError(f"a continued part opens on the previous part's latent; drop {opened}")
+            if self.duration_seconds is not None and self.duration_seconds > 10:
+                raise ValueError("a continued part adds at most ~9 s (7 s native 1080p); send a shorter duration_seconds")
+            # The canvas is the previous latent's; sizing fields are the decode's.
+            return self
+        if self.duration_seconds is not None and self.duration_seconds > 10:
+            parts = [name for name in ("last_frame_url", "pinned_audio_url", "chain") if getattr(self, name)] + [
+                name for name in ("pinned_frames", "continuable", "latent_only", "return_latent", "use_interpolation")
+                if getattr(self, name)]
+            if parts:
+                raise ValueError(f"a clip over 10 s renders in parts; drop {parts} or send at most 10 s")
         if self.image_url is not None:
             if self.output_short_side is not None and self.width is not None:
                 raise ValueError("output_short_side sizes the clip from the image's aspect; send it or width/height")
@@ -261,6 +313,28 @@ class VideogenRequest(H3Interpolation):
             late = [pin.seconds for pin in self.pinned_frames if pin.seconds >= self.duration_seconds]
             if late:
                 raise ValueError(f"pinned_frames at {late} s are past duration_seconds")
+        return self
+
+
+class VideogenChain(BaseModel):
+    """A Taskflow chain part (``videogen`` ``request.chain``): the part uploads only its latent, to
+    ``latent_artifact_id`` (the payload's ``artifactId``). A later part (``index`` > 0) continues
+    ``previous_latent_artifact_id`` and is refined toward ``anchor_latent_artifact_id`` (part 0's latent);
+    it sends no image and no width/height."""
+
+    model_config = {"extra": "forbid"}
+
+    index: int = Field(ge=0, le=64)
+    latent_artifact_id: str = Field(min_length=1)
+    previous_latent_artifact_id: str | None = Field(default=None, min_length=1)
+    anchor_latent_artifact_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _later_parts(self) -> "VideogenChain":
+        if self.index > 0 and self.previous_latent_artifact_id is None:
+            raise ValueError("a chain part after the first needs previous_latent_artifact_id")
+        if self.index == 0 and (self.previous_latent_artifact_id or self.anchor_latent_artifact_id):
+            raise ValueError("chain part 0 opens the chain; it has no previous or anchor latent")
         return self
 
 
@@ -359,6 +433,49 @@ class OutputDimensions(BaseModel):
 
     width: int = Field(ge=64, le=4096)
     height: int = Field(ge=64, le=4096)
+
+
+class VideogenChainDecodeRequest(BaseModel):
+    """The ``videogen-chain-decode`` request: the latents of a videogen chain (``latent_only`` parts, in
+    order) decoded once into one mp4, sized like a videogen clip: ``width``/``height`` (the delivered
+    size), ``output_short_side`` (+ ``native`` when the parts rendered natively, ``output_dimensions``) or
+    ``upscale``; none of them = the parts' canvas. Taskflow sends ``latent_artifact_ids`` (the worker reads
+    them from the lease and fills ``latent_paths``); /task/sync sends ``latent_urls``."""
+
+    model_config = {"extra": "forbid"}
+
+    latent_artifact_ids: list[str] | None = Field(default=None, min_length=1, max_length=64)
+    latent_urls: list[str] | None = Field(default=None, min_length=1, max_length=64)
+    latent_paths: list[str] | None = Field(default=None, min_length=1, max_length=64, description="Worker-staged")
+    width: int | None = Field(default=None, ge=64, le=4096)
+    height: int | None = Field(default=None, ge=64, le=4096)
+    upscale: bool | float = False
+    output_short_side: int | None = Field(default=None, ge=64, le=2160)
+    native: bool = False
+    output_dimensions: OutputDimensions | None = None
+    generate_audio: bool = True
+    seed: int | None = Field(default=None, ge=0, le=2**31 - 1, description="Reported back only")
+
+    @model_validator(mode="after")
+    def _one_source(self) -> "VideogenChainDecodeRequest":
+        if sum(x is not None for x in (self.latent_urls, self.latent_paths)) != 1:
+            raise ValueError("send latent_urls (or, on Taskflow, latent_artifact_ids)")
+        if (self.width is None) != (self.height is None):
+            raise ValueError("width and height go together")
+        if self.native and self.output_short_side is None:
+            raise ValueError("native goes with output_short_side")
+        if not isinstance(self.upscale, bool) and not 1.0 < self.upscale <= 2.0:
+            raise ValueError("upscale must be true or a factor above 1 and at most 2")
+        return self
+
+    def runtime_payload(self) -> dict[str, Any]:
+        """The media runtime's ``videogen`` payload: a chain decode."""
+        payload = self.model_dump(exclude_none=True, exclude={"latent_artifact_ids", "latent_urls", "latent_paths"})
+        if self.latent_urls is not None:
+            payload["decode_chain_latent_urls"] = self.latent_urls
+        else:
+            payload["decode_chain_latent_paths"] = self.latent_paths
+        return payload
 
 
 class ImagegenRequest(BaseModel):
@@ -467,9 +584,17 @@ class LipsyncRequest(H3Interpolation):
     stills: list[str] = Field(
         default_factory=list, max_length=16, description="auto: the avatar's rest stills, pinned at the pauses"
     )
+    stage: Literal["plan"] | None = Field(
+        default=None, description="plan: the first task of a staged job (LipsyncStageRequest has the rest)"
+    )
 
     @model_validator(mode="after")
     def _auto_or_manual(self) -> "LipsyncRequest":
+        if self.stage == "plan" and self.pinned_frames.mode == "generate":
+            raise ValueError(
+                "a staged lipsync takes no pinned_frames generate: render the stills as imagegen rest_frame "
+                "tasks and pin them (multi_image, or auto stills)"
+            )
         if not self.auto:
             if self.stills:
                 raise ValueError("stills go with auto; with auto false, pin them with pinned_frames")
@@ -482,6 +607,74 @@ class LipsyncRequest(H3Interpolation):
     def runtime_payload(self) -> dict[str, Any]:
         """The payload the media runtime gets: an auto job leaves out the fields auto chooses."""
         return self.model_dump(exclude_none=True, exclude=set(LIPSYNC_AUTO_CHOSEN) if self.auto else None)
+
+
+class LipsyncStageRequest(BaseModel):
+    """A staged ``lipsync`` job's later tasks (``h3/lipsync.py`` :func:`run_lipsync_inference`). The job's
+    first task is its :class:`LipsyncRequest` with ``stage: "plan"``: its result is the state tar (the
+    main artifact) plus the job's audio (the ``audio`` file) and ``chunkPlan``. Then:
+
+    - ``stage: "chunk"``, ``chunk_index`` k, the state; a chunk whose ``chunkPlan`` entry
+      ``needsBoundary`` also chunk k-1's ``boundary`` file. Chunks run in order. Result: the chunk's
+      render (mp4, the main artifact), ``report``, and its ``boundary`` file when it ends on one (every
+      chunk whose successor needs it).
+    - ``stage: "assemble"``: the state, every chunk's render in order, the plan's ``audio`` and,
+      optionally, the chunks' ``report`` data as ``chunk_reports``. Result: the job's mp4 and data, as
+      the whole job returns them.
+
+    Taskflow sends ``*_artifact_id(s)`` (the worker reads them from the lease into ``*_path(s)``);
+    /task/sync sends ``*_url(s)``."""
+
+    model_config = {"extra": "forbid"}
+
+    stage: Literal["chunk", "assemble"]
+    chunk_index: int | None = Field(default=None, ge=0, le=999)
+    state_artifact_id: str | None = None
+    state_url: str | None = None
+    state_path: str | None = Field(default=None, description="Worker-staged")
+    boundary_artifact_id: str | None = None
+    boundary_url: str | None = None
+    boundary_path: str | None = Field(default=None, description="Worker-staged")
+    chunk_artifact_ids: list[str] | None = Field(default=None, min_length=1, max_length=1000)
+    chunk_urls: list[str] | None = Field(default=None, min_length=1, max_length=1000)
+    chunk_paths: list[str] | None = Field(default=None, min_length=1, max_length=1000, description="Worker-staged")
+    audio_artifact_id: str | None = None
+    audio_url: str | None = None
+    audio_path: str | None = Field(default=None, description="Worker-staged")
+    chunk_reports: list[dict[str, Any]] | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def _stage_inputs(self) -> "LipsyncStageRequest":
+        def given(name: str) -> int:
+            return sum(getattr(self, f"{name}_{kind}", None) is not None for kind in ("url", "path"))
+
+        def sent(name: str, plural: bool = False) -> bool:
+            kinds = ("artifact_ids", "urls", "paths") if plural else ("artifact_id", "url", "path")
+            return any(getattr(self, f"{name}_{kind}", None) is not None for kind in kinds)
+
+        if given("state") != 1:
+            raise ValueError("send the plan's state: state_url (or, on Taskflow, state_artifact_id)")
+        if given("boundary") > 1:
+            raise ValueError("send one of boundary_url and boundary_path")
+        if self.stage == "chunk":
+            if self.chunk_index is None:
+                raise ValueError("a chunk stage needs chunk_index")
+            if sent("chunk", plural=True) or sent("audio") or self.chunk_reports is not None:
+                raise ValueError("chunk renders, audio and chunk_reports go with stage assemble")
+        else:
+            if self.chunk_index is not None or sent("boundary"):
+                raise ValueError("chunk_index and boundary go with stage chunk")
+            if sum(x is not None for x in (self.chunk_urls, self.chunk_paths)) != 1:
+                raise ValueError("send the chunk renders: chunk_urls (or, on Taskflow, chunk_artifact_ids)")
+            if given("audio") != 1:
+                raise ValueError("send the plan's audio: audio_url (or, on Taskflow, audio_artifact_id)")
+        return self
+
+    def runtime_payload(self) -> dict[str, Any]:
+        return self.model_dump(
+            exclude_none=True,
+            exclude={"state_artifact_id", "boundary_artifact_id", "chunk_artifact_ids", "audio_artifact_id"},
+        )
 
 
 async def fetch_reference(url: str, dest: Path) -> Path:

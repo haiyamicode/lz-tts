@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import math
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -27,6 +29,7 @@ from .api.server import (
     InferenceResult,
     LzTtsInferenceSession,
     _env_bool,
+    _media_scratch_dir,
     create_app,
     deferred_engines,
     get_health_status,
@@ -49,11 +52,18 @@ TASK_TYPES = (
     "force-align",
     "generate-music",
     "videogen",
+    "videogen-chain-decode",
     "lipsync",
     "imagegen",
 )
 # Media runtime task types: advertised only when the worker's server config ``media`` enables them.
-_MEDIA_TASK_TYPES = {"generate-music": "music", "videogen": "videogen", "lipsync": "lipsync", "imagegen": "imagegen"}
+_MEDIA_TASK_TYPES = {
+    "generate-music": "music",
+    "videogen": "videogen",
+    "videogen-chain-decode": "videogen",
+    "lipsync": "lipsync",
+    "imagegen": "imagegen",
+}
 # Task types whose work runs long enough that the person waiting needs to see it moving. The rest
 # answer in seconds, where a report would land after the result it was about.
 _REPORTED_TASK_TYPES = frozenset({*_MEDIA_TASK_TYPES, "transcribe"})
@@ -70,6 +80,7 @@ _TYPE_OPERATIONS = {
     "force-align": "force-align",
     "generate-music": "generate-music",
     "videogen": "videogen",
+    "videogen-chain-decode": "videogen-chain-decode",
     "lipsync": "lipsync",
     "imagegen": "imagegen",
 }
@@ -587,6 +598,36 @@ class TaskflowWorker:
             time.monotonic() - started_at,
         )
 
+    async def download(self, lease: dict[str, Any], artifact_id: str, destination: Path) -> int:
+        """Read an artifact an earlier run of the lease's workflow uploaded (a videogen chain
+        part's latent) into ``destination``, through the lease. Returns its size."""
+        url = f"{self.artifact_base_url}/leases/{lease['id']}/{artifact_id}"
+        headers = {"Authorization": f"Bearer {lease['leaseToken']}"}
+        async with self._client.stream("GET", url, headers=headers) as response:
+            if response.status_code == 404:
+                raise InferenceOperationError(400, f"artifact {artifact_id} does not exist")
+            if response.is_error:
+                await response.aread()
+                if response.status_code >= 500:  # retried like any failed job
+                    raise RuntimeError(
+                        f"Artifact download failed ({response.status_code}): {response.text[:500]}"
+                    )
+                raise ProtocolError(  # the lease is gone
+                    f"Artifact download failed ({response.status_code}): {response.text[:500]}",
+                    response.status_code,
+                    _error_code(response),
+                    scope="lease",
+                )
+            size = 0
+            with destination.open("wb") as handle:
+                async for chunk in response.aiter_bytes(1 << 20):
+                    handle.write(chunk)
+                    size += len(chunk)
+        _LOGGER.info(
+            "Artifact download completed lease=%s artifact=%s bytes=%d", lease["id"], artifact_id, size
+        )
+        return size
+
 
 @dataclass(frozen=True)
 class _LeaseWork:
@@ -595,6 +636,83 @@ class _LeaseWork:
     request: dict[str, Any]
     task_type: str
     started_at: float
+    # Inputs the worker read from the lease for the job (a chain's latents), deleted after it.
+    staged_dir: Path | None = None
+
+
+async def _stage_lease_inputs(taskflow: TaskflowWorker, work: _LeaseWork) -> _LeaseWork:
+    """A videogen chain part or chain decode names its latents by artifact id, a staged lipsync's chunk /
+    assemble task its earlier stages' files; the media runtime reads files, so they are downloaded
+    through the lease and the request names their paths."""
+    from .api.media import VideogenChain  # pylint: disable=import-outside-toplevel
+
+    request = work.request
+    if work.task_type == "videogen" and request.get("chain") is not None:
+        chain = VideogenChain.model_validate(request["chain"])
+        if chain.latent_artifact_id != work.lease["payload"].get("artifactId"):
+            raise InferenceOperationError(400, "chain.latent_artifact_id is not the payload's artifactId")
+        wanted = {
+            "continue_latent_path": chain.previous_latent_artifact_id,
+            "chain_reference_latent_path": chain.anchor_latent_artifact_id,
+        }
+        request = {key: value for key, value in request.items() if key != "chain"}
+        request["latent_only"] = True
+    elif work.task_type == "videogen-chain-decode" and request.get("latent_artifact_ids"):
+        ids = _artifact_id_list(request["latent_artifact_ids"], "latent_artifact_ids")
+        wanted = {f"latent{index}": artifact_id for index, artifact_id in enumerate(ids)}
+        request = {key: value for key, value in request.items() if key != "latent_artifact_ids"}
+    elif work.task_type == "lipsync" and request.get("stage") in ("chunk", "assemble"):
+        # A staged lipsync's chunk / assemble task: the plan's state, the previous chunk's boundary
+        # frame, the chunks' renders and the job's audio, all earlier stages' artifacts.
+        wanted = {
+            "state_path": request.get("state_artifact_id"),
+            "boundary_path": request.get("boundary_artifact_id"),
+            "audio_path": request.get("audio_artifact_id"),
+        }
+        if request.get("chunk_artifact_ids") is not None:
+            ids = _artifact_id_list(request["chunk_artifact_ids"], "chunk_artifact_ids")
+            wanted.update({f"chunk{index}": artifact_id for index, artifact_id in enumerate(ids)})
+        request = {key: value for key, value in request.items()
+                   if key not in ("state_artifact_id", "boundary_artifact_id", "audio_artifact_id", "chunk_artifact_ids")}
+    else:
+        return work
+    wanted = {name: artifact_id for name, artifact_id in wanted.items() if artifact_id}
+    if not wanted:
+        return dataclasses.replace(work, request=request)
+    staged_dir = _media_scratch_dir(f"{work.task_type}-inputs")
+    try:
+        paths = {}
+        for name, artifact_id in wanted.items():
+            suffix = _STAGED_SUFFIXES.get(name, ".mp4" if work.task_type == "lipsync" else ".safetensors")
+            paths[name] = staged_dir / f"{name.removesuffix('_path')}{suffix}"
+            await taskflow.download(work.lease, artifact_id, paths[name])
+    except BaseException:
+        shutil.rmtree(staged_dir, ignore_errors=True)
+        raise
+    if work.task_type == "videogen-chain-decode":
+        request["latent_paths"] = [str(path) for path in paths.values()]
+    elif work.task_type == "lipsync":
+        chunks = [str(path) for name, path in paths.items() if name.startswith("chunk")]
+        request.update({name: str(path) for name, path in paths.items() if name.endswith("_path")})
+        if chunks:
+            request["chunk_paths"] = chunks
+    else:
+        request.update({name: str(path) for name, path in paths.items()})
+    return dataclasses.replace(work, request=request, staged_dir=staged_dir)
+
+
+# A staged input's file suffix (the media runtime probes the content; the suffix only names it).
+_STAGED_SUFFIXES = {
+    "state_path": ".tar",
+    "boundary_path": ".png",
+    "audio_path": ".audio",
+}
+
+
+def _artifact_id_list(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise InferenceOperationError(400, f"{field} must be a list of artifact ids")
+    return value
 
 
 @dataclass
@@ -1288,6 +1406,13 @@ async def _process_leases(
 
     if not works:
         return
+    staged = await asyncio.gather(
+        *(_stage_lease_inputs(taskflow, work) for work in works), return_exceptions=True
+    )
+    # A lease whose inputs could not be read fails like its job would, without running.
+    staging_errors = {i: item for i, item in enumerate(staged) if isinstance(item, BaseException)}
+    works = [item if isinstance(item, _LeaseWork) else work for item, work in zip(staged, works, strict=True)]
+    run = [i for i in range(len(works)) if i not in staging_errors]
     uploads = [_segment_uploads(taskflow, work) for work in works]
     reports = [_progress_reports(taskflow, work) for work in works]
     cancel_events = [asyncio.Event() for _ in works]
@@ -1296,16 +1421,23 @@ async def _process_leases(
         if work.lease["id"] not in taskflow.active_lease_ids:
             event.set()  # released before it got here
     try:
-        outcomes = await inference.execute_many(
-            [(work.operation, work.request) for work in works],
-            mp3_sinks=[upload.write if upload is not None else None for upload in uploads],
-            progress_sinks=[report.report if report is not None else None for report in reports],
-            cancel_events=cancel_events,
+        ran = (
+            await inference.execute_many(
+                [(works[i].operation, works[i].request) for i in run],
+                mp3_sinks=[uploads[i].write if uploads[i] is not None else None for i in run],
+                progress_sinks=[reports[i].report if reports[i] is not None else None for i in run],
+                cancel_events=[cancel_events[i] for i in run],
+            )
+            if run
+            else []
         )
-        if len(outcomes) != len(works):
+        if len(ran) != len(run):
             raise RuntimeError(
                 "Inference batch returned a different number of outcomes"
             )
+        outcomes: list[Any] = [staging_errors.get(i) for i in range(len(works))]
+        for i, outcome in zip(run, ran, strict=True):
+            outcomes[i] = outcome
     except ChildWorkerDied:
         # A backend subprocess died. Don't waste retries on these leases; let
         # the worker's serve loop drop the Taskflow session and surface
@@ -1316,7 +1448,7 @@ async def _process_leases(
         raise
     except Exception as error:
         _LOGGER.exception("LZAI task batch planning or execution failed")
-        outcomes = [error] * len(works)
+        outcomes = [staging_errors.get(i, error) for i in range(len(works))]
     try:
         prepared = await asyncio.gather(
             *(
@@ -1338,6 +1470,8 @@ async def _process_leases(
     finally:
         for work in works:
             taskflow.active_lease_ids.discard(work.lease["id"])
+            if work.staged_dir is not None:
+                shutil.rmtree(work.staged_dir, ignore_errors=True)
             taskflow.dropped_lease_ids.pop(work.lease["id"], None)
             taskflow.lease_cancel_events.pop(work.lease["id"], None)
     for result in prepared:
