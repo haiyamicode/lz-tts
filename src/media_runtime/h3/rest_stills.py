@@ -74,14 +74,16 @@ STYLIZED_PROMPTS = (
 #: Pixar-style/clay/low-poly/bitmoji/VTuber 3D, oil/watercolor/pencil, pixel art) >= 0.52, but a robot 0.04 (it
 #: has no face to check). More prompts ("avatar", "doll", "robot") lift real avatars to 0.56-0.83.
 MAX_STYLIZED = 0.3
-#: Addons (:data:`h3.minimax_h3_runtime.VIDEO_ADDON_LORAS`) a still of a realistic reference renders with: the
-#: fal Realism People LoRA (natural skin, not the glossy look; local/exp/h3-realism-lora). A stylized reference
-#: gets none: realism would pull a cartoon toward a photo.
+#: Addons (:data:`h3.minimax_h3_runtime.VIDEO_ADDON_LORAS`) an auto lipsync clip of a realistic person renders
+#: with: the fal Realism People LoRA (natural skin, not the glossy look; local/exp/h3-realism-lora). A stylized
+#: reference gets none: realism would pull a cartoon toward a photo. Rest stills never take addons: 2026-11-26 A/B
+#: (9 stills, 2 avatars, same seed/index) kept the face better without it (ArcFace 0.836 vs 0.806, off won 7/9,
+#: worst still 0.789 vs 0.679); owner's call.
 REALISTIC_ADDONS = ("realism",)
 
 
-def still_addons(stylized: float) -> tuple[str, ...]:
-    """The addons rest stills of a reference with :func:`stylized_score` ``stylized`` render with."""
+def clip_addons(stylized: float) -> tuple[str, ...]:
+    """The addons an auto lipsync clip of a person with :func:`stylized_score` ``stylized`` renders with."""
     return () if stylized >= MAX_STYLIZED else REALISTIC_ADDONS
 
 
@@ -182,9 +184,9 @@ class Still:
 
 
 def render_still(*, job_id: str, image: Path, index: int, seed: int, retries: int, out_dir: Path,
-                 reference: "Face | None", preset: str | None = None, addons: tuple[str, ...] = ()) -> Still:
+                 reference: "Face | None", preset: str | None = None) -> Still:
     """Rest still ``index`` of the person in ``image`` (an upright RGB PNG) on H3's native canvas with the
-    image's shape (+ ``addons``, :func:`still_addons`): take ``attempt`` on :func:`attempt_seed`, judged against
+    image's shape (no addons, :data:`REALISTIC_ADDONS`): take ``attempt`` on :func:`attempt_seed`, judged against
     ``reference`` (the image's face, :func:`measure_face`), retaken until one has no problem or ``retries``
     retakes are spent."""
     from PIL import Image  # type: ignore
@@ -204,7 +206,7 @@ def render_still(*, job_id: str, image: Path, index: int, seed: int, retries: in
         metrics = run_minimax_h3_still(job_id=job_id, prompt=h3_still.picture_tags(rest_prompt(index)),
                                        reference_paths=[image], output_path=path, width=render_size[0],
                                        height=render_size[1], seed=take_seed,
-                                       preset=preset or h3_still.DEFAULT_PRESET, addons=addons)
+                                       preset=preset or h3_still.DEFAULT_PRESET)
         take = judge(Take(seed=take_seed, path=path), measure_face(path) if reference else None, reference)
         takes.append(take)
         log_event("rest_still_take", job_id=job_id, index=index, attempt=attempt, **take.report())

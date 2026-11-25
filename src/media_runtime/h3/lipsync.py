@@ -27,8 +27,9 @@ validator switches included), ``output_dimensions`` and ``upscale`` work as
 always; the knobs auto chooses (:data:`AUTO_CHOSEN`) are an error with it -
 ``auto: false`` (manual) takes them, and every mode below, instead of ``stills``.
 Addons: a plain auto job (no ``addons`` key, no ``custom_instructions``) of a photo
-avatar (:func:`h3.rest_stills.still_addons`, stylized < ``MAX_STYLIZED``) renders with
-``realism``; a stylized one, or any custom job, without. Caller ``addons`` (``[]`` too)
+avatar (:func:`h3.rest_stills.clip_addons`, stylized < ``MAX_STYLIZED``) renders with
+``realism``; a stylized one, or any custom job, without. ``generate`` rest stills never
+take addons (``stills_addons: []``). Caller ``addons`` (``[]`` too)
 decide; ``auto_choices`` reports ``addons`` (+ ``stylized`` when checked).
 
 **Freestyle.** The job's image (``image_url`` / ``image_path``) is the first
@@ -1133,15 +1134,15 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
         url: prepare_pin_image(path, work_dir / "anchors" / f"pin{index}.png", size=(source_width, source_height))
         for index, (url, path) in enumerate(pin_downloads.items())
     }}
-    # auto: a photo avatar renders with the realism addon (rest_stills.still_addons: the same CLIP check and
-    # threshold as its rest stills), unless the caller sent anything custom: addons (even []) or
+    # auto: a photo avatar renders with the realism addon (rest_stills.clip_addons: CLIP stylized score below
+    # MAX_STYLIZED), unless the caller sent anything custom: addons (even []) or
     # custom_instructions (prompts or pins). Manual jobs only get the addons they send.
     if auto is not None:
         if payload.get("addons") is None and not custom_instructions:
             from . import rest_stills
 
             stylized = rest_stills.stylized_score(input_image)
-            payload["addons"] = list(rest_stills.still_addons(stylized))
+            payload["addons"] = list(rest_stills.clip_addons(stylized))
             auto["stylized"] = round(stylized, 3)
         auto["addons"] = list(payload.get("addons") or [])
         log_event("lipsync_auto_addons", job_id=job_id, addons=auto["addons"], stylized=auto.get("stylized"))
@@ -1158,7 +1159,6 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
 
         began = time.perf_counter()
         reference, stylized = rest_stills.reference_face(input_image)
-        still_addons = rest_stills.still_addons(stylized)
         delivered = rest_stills.delivered_size(source_width, source_height)
         kept_keys = []
         for key in pins.images:
@@ -1166,7 +1166,7 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
             progress.report("preparing", index, len(pins.images))
             still = rest_stills.render_still(job_id=job_id, image=input_image, index=index, seed=seed,
                                              retries=pins.max_retries, out_dir=work_dir / "stills",
-                                             reference=reference, addons=still_addons)
+                                             reference=reference)
             generated.append(still.report())
             path = rest_stills.save_fitted(still.kept.path, scratch_dir / "outputs" / f"still_{index}.png", delivered)
             images[key] = prepare_pin_image(path, work_dir / "anchors" / f"generated_{index}.png",
@@ -1176,7 +1176,7 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
         pins = replace(pins, images=tuple(kept_keys))
         finish("generate_stills_seconds", began)
         stills_item = {"generated_stills": generated, "stills_face_checked": reference is not None,
-                       "stylized": round(stylized, 3), "stills_addons": list(still_addons)}
+                       "stylized": round(stylized, 3), "stills_addons": []}
         log_event("lipsync_stills", job_id=job_id, kept=len(kept_keys), **stills_item)
     # The voice alone - no music, no noise - is what the rest of the job hears.
     began = time.perf_counter()

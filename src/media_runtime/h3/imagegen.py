@@ -27,9 +27,8 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
   the mouth is retaken, at most ``max_retries`` (0..5, default 1) times, and
   out of retakes the best take is delivered (``likeness`` in the item says
   which and whether it passed); delivered at the image's size
-  (long side <= 2048) unless ``width``/``height`` are given. A realistic person
-  renders with the ``realism`` addon, a stylized one without
-  (:func:`h3.rest_stills.still_addons`; ``addons`` in the item);
+  (long side <= 2048) unless ``width``/``height`` are given. Stills render with
+  no addons (``addons: []`` in the item; :data:`h3.rest_stills.REALISTIC_ADDONS`);
 
 The result is ``{"path", "item", "metrics", "seed"}`` like :mod:`h3.videogen`.
 """
@@ -147,10 +146,9 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
     still = None
     if rest_frame is not None:
         reference_face, stylized = rest_stills.reference_face(references[0])
-        addons = rest_stills.still_addons(stylized)
         still = rest_stills.render_still(job_id=job_id, image=references[0], index=rest_frame, seed=seed,
                                          retries=retries, out_dir=scratch_dir / "outputs", reference=reference_face,
-                                         preset=preset, addons=addons)
+                                         preset=preset)
         render_path, render_metrics = still.kept.path, still.metrics
     else:
         render_path = scratch_dir / "outputs" / "h3_still.png"

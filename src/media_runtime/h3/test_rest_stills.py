@@ -54,3 +54,16 @@ def test_a_still_that_missed_the_gate_reports_its_best_take_as_not_passed():
     assert Still(index=0, takes=unchecked, kept=keep(unchecked), render_size=(8, 8), metrics={},
                  checked=False).likeness() == {"checked": False, "takes": 1, "chosen": 0, "score": None,
                                                "passed": None, "problem": None}
+
+
+def test_a_photo_gets_realism_on_its_auto_lipsync_clip_but_never_on_its_rest_stills():
+    import inspect
+
+    from h3 import rest_stills
+
+    photo = Path(__file__).resolve().parents[2] / "api" / "testdata" / "face.jpg"
+    stylized = rest_stills.stylized_score(photo)  # the real CLIP model (data/realism-clip), CPU
+    assert stylized < rest_stills.MAX_STYLIZED
+    assert rest_stills.clip_addons(stylized) == ("realism",)
+    # A still has no way to take an addon: render_still renders the base H3 still only.
+    assert "addons" not in inspect.signature(rest_stills.render_still).parameters
