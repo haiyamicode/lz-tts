@@ -21,13 +21,16 @@ its ``addons`` (:func:`h3.videogen.run_videogen` sends it here): the video whose
 - ``prompt`` (optional): the swap's instruction, default the toolkit's ``DEFAULT_PROMPT``.
 
 Nothing else applies (preset, sizing, pins, other addons); the API rejects them. The clip comes out at the
-render's size with the source's audio. Cost on the dev 3090: 944 s for 5 s at 1344x736 (one window),
-8.5 GiB peak allocated.
+render's size with the source's audio. The source window is Ref2V reference video, so the DiT runs ~2.2x the
+tokens of a plain clip (80k vs 36k at 5 s): sampling uses Kitchen INT8 + SLA 85% like videogen/lipsync
+(``H3_SWAP_SLA=0`` = the toolkit's dense attention). Cost on the dev 3090: 598 s for 5 s at 1344x736 (one
+window; dense 982 s; sparse steps 34 s vs 84 s), 11.7 GiB peak allocated.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
 import time
@@ -76,6 +79,13 @@ def build_graph(*, source_input: str, reference_input: str, seed: int, duration_
     graph["plan"]["inputs"]["seed"] = int(seed)
     if prompt:
         graph["reference_conditioning"]["inputs"]["prompt"] = prompt
+    if os.environ.get("H3_SWAP_SLA", "1") != "0":
+        from .minimax_h3_runtime import SLA_ATTENTION_INPUTS
+
+        # Kitchen INT8 (the graph's own backend) + SLA 85%, as videogen/lipsync sample.
+        graph["sla"] = {"class_type": "H3SLAAttention", "inputs": {"model": ["adapter", 0], **SLA_ATTENTION_INPUTS}}
+        graph["sampling_memory"]["inputs"]["model"] = ["sla", 0]
+        graph["schedule"]["inputs"]["model"] = ["sla", 0]
     graph["save"]["inputs"]["filename_prefix"] = filename_prefix
     del graph["mask_preview"]
     return graph
