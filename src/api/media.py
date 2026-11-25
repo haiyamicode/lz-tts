@@ -579,10 +579,11 @@ class LipsyncRequest(H3Interpolation):
     custom_instructions: list[LipsyncInstruction] = Field(default_factory=list, max_length=100)
     preset: Literal["turbo-3", "standard", "turbo-8", "turbo-6", "turbo-5", "turbo-4", "dmd-3"] = "turbo-3"
     sparse_attention: bool = True
-    addons: list[Literal["realism"]] = Field(
-        default_factory=list, max_length=1,
-        description="LoRAs stacked on the preset at strength 1.0 (auto too): realism (fal Realism People: "
-        "natural skin instead of the glossy look; its trigger word is added to every chunk's prompt)",
+    addons: list[Literal["realism"]] | None = Field(
+        default=None, max_length=1,
+        description="LoRAs stacked on the preset at strength 1.0: realism (fal Realism People: natural skin "
+        "instead of the glossy look; its trigger word is added to every chunk's prompt). Omitted: a plain auto "
+        "job (no custom_instructions) of a photo avatar gets realism, anything else none; [] = none",
     )
     detect_flicker: bool = True
     detect_desync: bool = True

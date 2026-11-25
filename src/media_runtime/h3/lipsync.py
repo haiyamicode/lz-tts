@@ -26,6 +26,10 @@ pins (an end pin froze it) and pins frame 0 alone (``none``). ``seed``,
 validator switches included), ``output_dimensions`` and ``upscale`` work as
 always; the knobs auto chooses (:data:`AUTO_CHOSEN`) are an error with it -
 ``auto: false`` (manual) takes them, and every mode below, instead of ``stills``.
+Addons: a plain auto job (no ``addons`` key, no ``custom_instructions``) of a photo
+avatar (:func:`h3.rest_stills.still_addons`, stylized < ``MAX_STYLIZED``) renders with
+``realism``; a stylized one, or any custom job, without. Caller ``addons`` (``[]`` too)
+decide; ``auto_choices`` reports ``addons`` (+ ``stylized`` when checked).
 
 **Freestyle.** The job's image (``image_url`` / ``image_path``) is the first
 frame. The chunks are cut at the quietest frames of the voice
@@ -1129,6 +1133,18 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
         url: prepare_pin_image(path, work_dir / "anchors" / f"pin{index}.png", size=(source_width, source_height))
         for index, (url, path) in enumerate(pin_downloads.items())
     }}
+    # auto: a photo avatar renders with the realism addon (rest_stills.still_addons: the same CLIP check and
+    # threshold as its rest stills), unless the caller sent anything custom: addons (even []) or
+    # custom_instructions (prompts or pins). Manual jobs only get the addons they send.
+    if auto is not None:
+        if payload.get("addons") is None and not custom_instructions:
+            from . import rest_stills
+
+            stylized = rest_stills.stylized_score(input_image)
+            payload["addons"] = list(rest_stills.still_addons(stylized))
+            auto["stylized"] = round(stylized, 3)
+        auto["addons"] = list(payload.get("addons") or [])
+        log_event("lipsync_auto_addons", job_id=job_id, addons=auto["addons"], stylized=auto.get("stylized"))
     # generate: rest stills of the person, rendered from the job's image and pinned like multi_image's
     # images; a still whose every take lost the face is left out, and with none left the job's image is pinned.
     # A non-realistic character (cartoon, anime, 3D animation, painting) or a faceless image is not checked.
