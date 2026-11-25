@@ -68,6 +68,7 @@ from .downloads import (
     fetch_to_file,
 )
 from .media import (
+    CHARACTER_SWAP_MAX_SECONDS,
     ImagegenRequest,
     LipsyncRequest,
     LipsyncStageRequest,
@@ -7001,7 +7002,11 @@ class LzTtsInferenceSession:
             # or a chunk would read as the whole job finishing.
             progress = _without_finishing(progress)
         timeout = getattr(config, f"{feature}_timeout_seconds")
-        if isinstance(request, VideogenRequest) and (request.duration_seconds or 0) > 10:
+        if isinstance(request, VideogenRequest) and request.character_swap is not None:
+            # A character swap renders a 124-frame window (~16 min on the 3090) per ~5 s of the source.
+            frames = round((request.duration_seconds or CHARACTER_SWAP_MAX_SECONDS) * 24)
+            timeout *= 1 + math.ceil(max(0, frames - 124) / 123)
+        elif isinstance(request, VideogenRequest) and (request.duration_seconds or 0) > 10:
             # A long clip renders a part per ~9 s.
             timeout *= math.ceil(request.duration_seconds / 9)
         # The render stays the file the runtime wrote; the scratch goes when the result is released.
