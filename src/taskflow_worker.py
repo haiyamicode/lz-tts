@@ -126,9 +126,18 @@ def served_task_types(config: Any) -> tuple[str, ...]:
     return tuple(task_type for task_type in TASK_TYPES if task_type not in off)
 _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
 # Join, heartbeat, pull, settle and leave are small requests (pulls long-poll
-# for at most a second); a minute is plenty, and a hung heartbeat must not hold
-# up failure detection for the uploads' 15 minutes.
-_CONTROL_TIMEOUT = httpx.Timeout(connect=30.0, read=60.0, write=60.0, pool=30.0)
+# for at most a second), answered by the server in milliseconds. On the long
+# home -> API path a single connection sometimes stalls while fresh ones go
+# straight through, so a control request gives up well inside the server's
+# session timeout (3 heartbeat intervals, 45 s) and is retried on a new
+# connection, instead of letting one stuck request expire the session.
+_CONTROL_TIMEOUT = httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0)
+# Retry delay after a failed heartbeat or pull; the request that failed took
+# its connection down with it, so the retry goes out on a fresh one.
+_CONTROL_RETRY_DELAY = 1.0
+_PULL_RETRY_MAX_DELAY = 5.0
+# The server expires a session after this many heartbeat intervals without one.
+_SESSION_HEARTBEATS = 3
 _CALLBACK_MAX_ATTEMPTS = 3
 _RECONNECT_BASE_DELAY = 2.0
 # Length of the segments a streamed take is uploaded in.
@@ -336,18 +345,48 @@ class TaskflowWorker:
             self.active_lease_ids.discard(lease_id)
 
     async def heartbeat_loop(self, connection_lost: asyncio.Event) -> None:
+        """Beat every interval, retrying a failed beat at once on a new connection.
+
+        A failed request says nothing about the session: only the server saying
+        so (or no beat getting through for as long as the server keeps a
+        session) sends the serve loop to rejoin. Beating goes on after that
+        too: heartbeats also extend the leases of the batches still in flight
+        while the serve loop drains them.
+        """
+        last_ok = time.monotonic()
+        delay = self.heartbeat_interval
         while True:
-            await asyncio.sleep(self.heartbeat_interval)
+            await asyncio.sleep(delay)
+            started = time.monotonic()
             try:
                 await self.heartbeat()
-            except Exception:
-                # Signal the serve loop to reconnect, but never stop beating:
-                # heartbeats are also what extends the leases of an in-flight
-                # batch, and the serve loop cannot start a new loop while it is
-                # still awaiting that batch. A transient failure here must not
-                # leave a running batch without lease renewal until it ends.
-                _LOGGER.exception("Taskflow worker heartbeat failed")
+            except ProtocolError as error:
+                if not error.loses_session:
+                    delay = self._heartbeat_failed(error, last_ok, connection_lost)
+                    continue
+                _LOGGER.error("Taskflow ended the worker session: %s", error)
                 connection_lost.set()
+                delay = self.heartbeat_interval
+            except Exception as error:
+                delay = self._heartbeat_failed(error, last_ok, connection_lost)
+            else:
+                last_ok = time.monotonic()
+                delay = max(0.0, self.heartbeat_interval - (last_ok - started))
+
+    def _heartbeat_failed(
+        self, error: BaseException, last_ok: float, connection_lost: asyncio.Event
+    ) -> float:
+        silent = time.monotonic() - last_ok
+        if silent >= self.heartbeat_interval * _SESSION_HEARTBEATS:
+            _LOGGER.error(
+                "Taskflow worker heartbeat failing for %.0fs; reconnecting: %r", silent, error
+            )
+            connection_lost.set()
+            return self.heartbeat_interval
+        _LOGGER.warning(
+            "Taskflow worker heartbeat failed after %.0fs without one; retrying: %r", silent, error
+        )
+        return _CONTROL_RETRY_DELAY
 
     async def pull(
         self,
@@ -1200,6 +1239,19 @@ async def _pull_leases(
     )
 
 
+def _transient_failure(error: BaseException) -> bool:
+    """A failed request worth retrying in the same session: the network, or the
+    API restarting (502/503/504), as opposed to an answer about the session."""
+    if isinstance(error, httpx.TransportError):
+        return True
+    return (
+        isinstance(error, ProtocolError)
+        and not error.loses_session
+        and error.status_code is not None
+        and error.status_code >= 500
+    )
+
+
 class _DisconnectWatchdog:
     """Hard-exit the worker once it has not been joined to Taskflow for too long.
 
@@ -1256,6 +1308,7 @@ async def _serve_taskflow(
             reconnect = True
             # Leases in flight -> (1, 1 if negative-priority else 0).
             running: dict[asyncio.Task[None], tuple[int, int]] = {}
+            pull_failures = 0
             try:
                 if taskflow.session_token:
                     await taskflow.heartbeat()
@@ -1286,7 +1339,25 @@ async def _serve_taskflow(
                     busy = sum(count for count, _ in running.values())
                     background = sum(count for _, count in running.values())
                     _update_pull_task_types(taskflow)
-                    leases = await _pull_leases(taskflow, busy, background)
+                    try:
+                        leases = await _pull_leases(taskflow, busy, background)
+                    except Exception as error:
+                        if not _transient_failure(error):
+                            raise
+                        # The session is still good (the heartbeat says when it
+                        # is not): pull again on a fresh connection instead of
+                        # draining the batches in flight and rejoining.
+                        pull_failures += 1
+                        _LOGGER.warning(
+                            "Taskflow pull failed; retrying in the same session (attempt %d): %r",
+                            pull_failures,
+                            error,
+                        )
+                        await asyncio.sleep(
+                            min(_PULL_RETRY_MAX_DELAY, _CONTROL_RETRY_DELAY * 2 ** min(pull_failures - 1, 3))
+                        )
+                        continue
+                    pull_failures = 0
                     if taskflow.pull_sticky:
                         # Nothing ready for the loaded engines: let the next pull take any type.
                         taskflow.sticky_missed = not leases and busy < taskflow.concurrency
