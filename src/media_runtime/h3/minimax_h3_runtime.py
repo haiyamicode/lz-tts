@@ -1308,6 +1308,7 @@ def build_lipsync_graph(
     filename_prefix: str,
     recipe: H3Recipe = LIPSYNC_PRESETS[DEFAULT_LIPSYNC_PRESET],
     sparse_attention: bool = True,
+    addons: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     """Pinned-audio lipsync: the Turbo graph re-rendering every frame to a fixed voice.
 
@@ -1329,6 +1330,7 @@ def build_lipsync_graph(
     on :data:`LIPSYNC_SIGMAS`, sparse attention), the one this mode ships.
     ``guides`` are ``(frame_idx, LoadImage input)`` pairs inside ``[0, length)``.
     ``sparse_attention`` samples with :func:`add_sparse_attention`.
+    ``addons`` (:data:`VIDEO_ADDON_LORAS` names) stack on the recipe as in :func:`build_h3_graph`.
     """
     graph = build_h3_graph(
         prompt=prompt,
@@ -1341,6 +1343,7 @@ def build_lipsync_graph(
         filename_prefix=filename_prefix,
         recipe=recipe,
         generate_audio=True,
+        addons=addons,
     )
     add_frame_guides(graph, guides, length=length)
     pin_audio(graph, audio_input)
@@ -1986,6 +1989,7 @@ def run_lipsync_chunk(
     recipe: H3Recipe = LIPSYNC_PRESETS[DEFAULT_LIPSYNC_PRESET],
     sparse_attention: bool = True,
     preview: Any = None,
+    addons: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Render one pinned-audio lipsync chunk with ``recipe`` (default: the lipsync student).
 
@@ -2002,7 +2006,7 @@ def run_lipsync_chunk(
     # The retained runtime may have been loaded by a videogen job; check this
     # recipe's weights per chunk.
     ensure_minimax_h3_turbo_node(comfy_root)
-    ensure_minimax_h3_models(comfy_root, generate_audio=True, recipe=recipe)
+    ensure_minimax_h3_models(comfy_root, generate_audio=True, recipe=recipe, addons=addons)
     if sparse_attention:
         reason = sparse_attention_unavailable(comfy_root)
         if reason is not None:
@@ -2033,6 +2037,7 @@ def run_lipsync_chunk(
         filename_prefix=f"{relative_dir}/{prefix}",
         recipe=recipe,
         sparse_attention=sparse_attention,
+        addons=addons,
     )
     if preview is not None:
         try:

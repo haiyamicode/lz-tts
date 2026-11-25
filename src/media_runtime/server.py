@@ -256,6 +256,7 @@ def _check_h3_assets(features: list[str]) -> None:
         lora_names |= set(VIDEO_ADDON_LORAS.values())
     if "lipsync" in features:
         lora_names |= {recipe.lora_name for recipe in LIPSYNC_PRESETS.values() if recipe.lora_name}
+        lora_names |= set(VIDEO_ADDON_LORAS.values())
     missing = [str(path) for path in (comfy_root / "models" / "loras" / name for name in sorted(lora_names)) if not path.exists()]
     if missing:
         raise FileNotFoundError("H3 preset weights are missing: " + ", ".join(missing))

@@ -985,7 +985,7 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
 
 def _restore_boundary(chunk: LipsyncChunk, end_anchor: Anchor, *, images: dict[str, Path], anchor_at: dict[int, Anchor],
                       look: Path, job_id: str, prompt: str, seed: int, width: int, height: int, audio_slice: Path,
-                      work_dir: Path, recipe: Any, sparse_attention: bool) -> dict[str, Any]:
+                      work_dir: Path, recipe: Any, sparse_attention: bool, addons: tuple[str, ...] = ()) -> dict[str, Any]:
     """Fill ``images[end_anchor.image]``: this chunk's last kept frame, previewed on its own pins (the
     recipe's preview schedule, that frame alone decoded), then restored toward ``look``, the image last
     pinned before it."""
@@ -1010,6 +1010,7 @@ def _restore_boundary(chunk: LipsyncChunk, end_anchor: Anchor, *, images: dict[s
         recipe=recipe,
         sparse_attention=sparse_attention,
         preview=FramePreview(frame=chunk.frames - 1, output_path=preview_path, sigmas=recipe.preview_sigmas),
+        addons=addons,
     )
     preview_seconds = time.perf_counter() - began
     restored = work_dir.parent / "anchors" / f"{end_anchor.image.replace(':', '_')}.png"
@@ -1047,7 +1048,7 @@ class _Job:
 
     def __post_init__(self) -> None:
         from .h3_interpolation import requested_fps
-        from .minimax_h3_runtime import DEFAULT_LIPSYNC_PRESET, H3_FPS, LIPSYNC_PRESETS, h3_preset
+        from .minimax_h3_runtime import DEFAULT_LIPSYNC_PRESET, H3_FPS, LIPSYNC_PRESETS, VIDEO_ADDON_LORAS, h3_preset
 
         payload = self.payload
         self.work_dir = self.scratch_dir / "lipsync"
@@ -1055,6 +1056,9 @@ class _Job:
         self.preset = str(payload.get("preset") or DEFAULT_LIPSYNC_PRESET)
         self.recipe = h3_preset(self.preset, LIPSYNC_PRESETS)
         self.sparse_attention = payload.get("sparse_attention") is not False
+        self.addons = tuple(dict.fromkeys(str(name) for name in payload.get("addons") or ()))
+        if unknown := [name for name in self.addons if name not in VIDEO_ADDON_LORAS]:
+            raise ValueError(f"unknown addons {unknown}; available: {sorted(VIDEO_ADDON_LORAS)}")
         self.detect_flicker = payload.get("detect_flicker") is not False
         self.detect_desync = payload.get("detect_desync") is not False
         self.detect_glitches = payload.get("detect_glitches") is not False
@@ -1138,6 +1142,7 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
 
         began = time.perf_counter()
         reference, stylized = rest_stills.reference_face(input_image)
+        still_addons = rest_stills.still_addons(stylized)
         delivered = rest_stills.delivered_size(source_width, source_height)
         kept_keys = []
         for key in pins.images:
@@ -1145,7 +1150,7 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
             progress.report("preparing", index, len(pins.images))
             still = rest_stills.render_still(job_id=job_id, image=input_image, index=index, seed=seed,
                                              retries=pins.max_retries, out_dir=work_dir / "stills",
-                                             reference=reference)
+                                             reference=reference, addons=still_addons)
             generated.append(still.report())
             path = rest_stills.save_fitted(still.kept.path, scratch_dir / "outputs" / f"still_{index}.png", delivered)
             images[key] = prepare_pin_image(path, work_dir / "anchors" / f"generated_{index}.png",
@@ -1155,7 +1160,7 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
         pins = replace(pins, images=tuple(kept_keys))
         finish("generate_stills_seconds", began)
         stills_item = {"generated_stills": generated, "stills_face_checked": reference is not None,
-                       "stylized": round(stylized, 3)}
+                       "stylized": round(stylized, 3), "stills_addons": list(still_addons)}
         log_event("lipsync_stills", job_id=job_id, kept=len(kept_keys), **stills_item)
     # The voice alone - no music, no noise - is what the rest of the job hears.
     began = time.perf_counter()
@@ -1204,7 +1209,7 @@ def _render_chunk(job: _Job, chunk: LipsyncChunk) -> tuple[Path, dict[str, Any]]
             chunk, end_anchor, images=images, anchor_at=anchor_at, look=images[look.image], job_id=job.job_id,
             prompt=prompts[chunk.index],
             seed=job.seed + chunk.index, width=canvas_width, height=canvas_height, audio_slice=audio_slice,
-            work_dir=chunk_dir, recipe=job.recipe, sparse_attention=job.sparse_attention)
+            work_dir=chunk_dir, recipe=job.recipe, sparse_attention=job.sparse_attention, addons=job.addons)
         job.stage_timings[f"chunk_{chunk.index}_boundary_seconds"] = restore_metrics["seconds"]
     # Every chunk opens on a pin: the input image, a pinned image, or a continuous
     # boundary's restored frame (it ends on one too, unless it is the last and free).
@@ -1239,6 +1244,7 @@ def _render_chunk(job: _Job, chunk: LipsyncChunk) -> tuple[Path, dict[str, Any]]
                 output_path=output,
                 recipe=job.recipe,
                 sparse_attention=job.sparse_attention,
+                addons=job.addons,
             )
         # Glitches are judged against the image the chunk opens on; a chunk moving into another
         # pinned image drifts from it on purpose, so its flicker check judges sudden steps only.
@@ -1353,6 +1359,7 @@ def _assemble(job: _Job, chunk_paths: list[tuple[Path, int]], chunk_metrics: lis
         "sampler": recipe.sampler_label,
         "sigmas": recipe.sigmas,
         "lora": recipe.lora_name,
+        "addons": list(job.addons),
         "sparse_attention": job.sparse_attention and (not reported or all(m["sparse_attention"] for m in chunk_metrics)),
         "checks": {
             "detect_flicker": job.detect_flicker,
