@@ -81,11 +81,6 @@ Long clips (:mod:`h3.h3_chain`, latent handover + clip-1 refiner, decoded once):
   the job's mp4, delivered by ``width``/``height``, ``output_short_side`` (+ ``output_dimensions``) or
   ``upscale`` from the latents' canvas.
 
-Character swap (:mod:`h3.character_swap`): an ``addons`` entry ``{"name": "character_swap",
-"source_video_url" | "source_video_path"}`` replaces the person in that video with the ``image_url`` / ``_path``
-character (akatz V1.5 on the official h3-relay graph, SAM 3.1 person mask); beside it ``duration_seconds`` (how
-much of the source, default all, <= 30 s), ``seed`` and ``prompt`` (default the toolkit's) apply.
-
 The result is ``{"path", "item", "metrics", "seed"}`` like :mod:`h3.lipsync`, plus
 ``last_frame_path`` (a JPEG, quality 95) for a continuable clip, at the clip's delivered size: the next
 clip opens on it and so takes exactly this clip's shape (the canvas is off the delivered aspect by up to
@@ -196,11 +191,6 @@ def run_videogen(job: dict[str, Any]) -> dict[str, Any]:
         return _run_chain_decode(job)
     if payload.get("continue_latent_url") or payload.get("continue_latent_path"):
         return _run_continuation(job)
-    if swap := next((addon for addon in payload.get("addons") or ()
-                     if isinstance(addon, dict) and addon.get("name") == "character_swap"), None):
-        from .character_swap import run_character_swap
-
-        return run_character_swap(job, swap)
     job_id = str(job["id"])
     prompt = str(payload.get("prompt") or "").strip()
     if not prompt:

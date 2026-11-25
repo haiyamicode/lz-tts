@@ -1355,36 +1355,6 @@ class _ProgressSink:
         return
 
 
-class _HeadlessPromptQueue:
-    def get_current_queue(self) -> tuple[list, list]:
-        return [], []
-
-    def set_flag(self, *args: Any) -> None:
-        return
-
-
-class _HeadlessPromptServer:
-    """`server.PromptServer.instance` without the web app.
-
-    ComfyUI's StartLoop/EndLoop report iterations through it, and the h3-relay nodes (the character swap
-    graph) read it at import to register routes and preview events; with no instance their import fails.
-    """
-
-    client_id = None
-    prompt_queue = _HeadlessPromptQueue()
-
-    def __init__(self) -> None:
-        from aiohttp import web
-
-        self.routes = web.RouteTableDef()
-
-    def send_sync(self, *args: Any, **kwargs: Any) -> None:
-        return
-
-    def send_progress_text(self, text: Any, *args: Any, **kwargs: Any) -> None:
-        return
-
-
 def _report_sampling_progress(value, total, preview_image=None, prompt_id=None, node_id=None) -> None:
     """One sampler step, as the job's progress: a clip is rendered in one window, step by step.
 
@@ -1493,10 +1463,7 @@ def _retained_runtime(
         async def _init() -> None:
             import execution as comfy_execution
             import nodes as comfy_nodes
-            import server as comfy_server
 
-            if getattr(comfy_server.PromptServer, "instance", None) is None:
-                comfy_server.PromptServer.instance = _HeadlessPromptServer()
             failed = await comfy_nodes.init_extra_nodes(
                 init_custom_nodes=True,
                 init_api_nodes=False,

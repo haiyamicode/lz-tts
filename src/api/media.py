@@ -166,29 +166,6 @@ class H3Interpolation(BaseModel):
         return self
 
 
-#: The most of the source video a ``character_swap`` addon renders (``h3/character_swap.py``).
-CHARACTER_SWAP_MAX_SECONDS = 30.0
-#: The request fields that apply beside a ``character_swap`` addon; the clip is the source's frames, size and
-#: audio, so the rest (sizing, pins, presets, chains...) do not.
-CHARACTER_SWAP_REQUEST_FIELDS = frozenset({"prompt", "image_url", "duration_seconds", "seed", "addons"})
-
-
-class CharacterSwapAddon(BaseModel):
-    """Videogen addon ``character_swap``: the person in ``source_video_url`` replaced by the request's
-    ``image_url`` character (akatz H3 Character Swap V1.5 on the official h3-relay graph, SAM 3.1 person mask,
-    ``h3/character_swap.py``). The clip keeps the source's scene, camera, size and audio; ~16 min per 5 s on
-    the 3090 (124-frame windows). It runs its own graph, so it does not stack with the LoRA addons.
-    """
-
-    model_config = {"extra": "forbid"}
-
-    name: Literal["character_swap"]
-    source_video_url: str = Field(
-        min_length=1,
-        description="The video whose person is replaced; its first duration_seconds (default all, <= 30 s) rendered",
-    )
-
-
 class VideogenRequest(H3Interpolation):
     """The ``videogen`` request: an H3 clip from a first frame or from the prompt alone, with H3's
     own audio track or a pinned one.
@@ -213,24 +190,14 @@ class VideogenRequest(H3Interpolation):
     the first part's latent) continues one with ``duration_seconds`` of new frames, on its canvas, and
     ``videogen-chain-decode`` (:class:`VideogenChainDecodeRequest`) decodes the parts into the mp4. On Taskflow
     the worker fills the ``*_path`` fields from ``chain`` (lease artifacts), never a caller.
-
-    Character swap: the ``character_swap`` addon (:class:`CharacterSwapAddon`, its ``source_video_url``)
-    replaces the person in that video with ``image_url``'s character. Beside it only ``image_url`` (required),
-    ``duration_seconds`` (of the source, default all, at most 30 s), ``seed`` and ``prompt`` (optional: the
-    swap's instruction, default the toolkit's) apply.
     """
 
     model_config = {"extra": "forbid"}
 
-    prompt: str | None = Field(
-        default=None, min_length=1, max_length=4000,
-        description="What happens in the clip (required; with the character_swap addon optional: the swap's "
-        "instruction, default the toolkit's)",
-    )
+    prompt: str = Field(min_length=1, max_length=4000, description="What happens in the clip")
     image_url: str | None = Field(
         default=None, min_length=1,
-        description="First frame; omitted, the clip is made from the prompt alone and states width/height. "
-        "With the character_swap addon: the character put into its source video",
+        description="First frame; omitted, the clip is made from the prompt alone and states width/height",
     )
     last_frame_url: str | None = Field(default=None, description="Optional last frame")
     duration_seconds: float | None = Field(
@@ -257,11 +224,10 @@ class VideogenRequest(H3Interpolation):
         description="Lipsync's attention (Comfy Kitchen INT8 + SLA, 85% of key blocks skipped, step 2 dense): "
         "~2x faster diffusion; false renders dense",
     )
-    addons: list[Literal["motion", "dance"] | CharacterSwapAddon] = Field(
+    addons: list[Literal["motion", "dance"]] = Field(
         default_factory=list, max_length=2,
         description="Community LoRAs stacked on the preset at strength 1.0: motion (Better Human Motion H3, "
-        "civitai 2734359), dance (civitai 3056222); or alone, {name: character_swap, source_video_url}: the "
-        "source video's person replaced by image_url's character",
+        "civitai 2734359), dance (civitai 3056222)",
     )
     continuable: bool = Field(
         default=False,
@@ -303,26 +269,8 @@ class VideogenRequest(H3Interpolation):
         default=None, description="Taskflow chain part: the worker reads its latents from the lease's artifacts"
     )
 
-    @property
-    def character_swap(self) -> CharacterSwapAddon | None:
-        return next((addon for addon in self.addons if isinstance(addon, CharacterSwapAddon)), None)
-
     @model_validator(mode="after")
     def _size_pair(self) -> "VideogenRequest":
-        if self.character_swap is not None:
-            if len(self.addons) > 1:
-                raise ValueError("the character_swap addon runs its own graph; it does not stack with other addons")
-            if extra := sorted(self.model_fields_set - CHARACTER_SWAP_REQUEST_FIELDS):
-                raise ValueError(f"the character_swap addon keeps the source video's frames, size and audio; "
-                                 f"{', '.join(extra)} do not apply to it")
-            if self.image_url is None:
-                raise ValueError("the character_swap addon needs image_url: the character to put in")
-            if self.duration_seconds is not None and self.duration_seconds > CHARACTER_SWAP_MAX_SECONDS:
-                raise ValueError(f"the character_swap addon renders at most {CHARACTER_SWAP_MAX_SECONDS:g} s of "
-                                 "the source")
-            return self
-        if self.prompt is None:
-            raise ValueError("prompt is required")
         if (self.width is None) != (self.height is None):
             raise ValueError("width and height go together")
         if self.native and self.output_short_side is None:
