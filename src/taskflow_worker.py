@@ -510,6 +510,50 @@ class TaskflowWorker:
     def artifact_base_url(self) -> str:
         return self.base_url.removesuffix("/taskflow/v1") + "/tts-artifacts/v1"
 
+    async def deliver_media(self, lease: dict[str, Any], result: dict[str, Any]) -> None:
+        """Hand a media job's result to the API before the lease settles, so the job is
+        delivered (credits charged, the next workflow step queued) by the same run that rendered
+        it. ``result`` is exactly the completion the lease then settles with; the API takes it
+        idempotently, so a retry after a lost response is harmless.
+
+        204 is delivered and 404 (an API without the route, a deploy window) is taken as
+        delivered. Any other client error means the lease is no longer this worker's. A server or
+        network error is retried with backoff and then raised, which fails the lease as
+        retryable."""
+        url = (
+            self.base_url.removesuffix("/taskflow/v1")
+            + f"/media-jobs/v1/leases/{lease['id']}/deliver"
+        )
+        headers = {"Authorization": f"Bearer {lease['leaseToken']}"}
+        last_error = ""
+        for attempt in range(1, _CALLBACK_MAX_ATTEMPTS + 1):
+            try:
+                response = await self._client.post(
+                    url, json={"result": result}, headers=headers, timeout=_CONTROL_TIMEOUT
+                )
+            except httpx.HTTPError as error:
+                last_error = f"{type(error).__name__}: {error}"
+            else:
+                if response.status_code == 404:
+                    _LOGGER.warning(
+                        "Media delivery route missing (404) lease=%s; settling", lease["id"]
+                    )
+                    return
+                if not response.is_error:
+                    _LOGGER.info("Media job delivered lease=%s", lease["id"])
+                    return
+                if response.status_code < 500:
+                    raise ProtocolError(
+                        f"Media delivery failed ({response.status_code}): {response.text[:500]}",
+                        response.status_code,
+                        _error_code(response),
+                        scope="lease",
+                    )
+                last_error = f"{response.status_code}: {response.text[:500]}"
+            if attempt < _CALLBACK_MAX_ATTEMPTS:
+                await asyncio.sleep(2.0 * attempt)
+        raise RuntimeError(f"Media delivery failed lease={lease['id']}: {last_error}")
+
     async def report_progress(self, lease: dict[str, Any], progress: dict[str, Any]) -> None:
         """Tell the API where the job of ``lease`` has got to, for it to pass to the person
         waiting. It goes on the run itself, over the Taskflow protocol this worker already speaks:
@@ -1162,6 +1206,12 @@ async def _prepare_result(
             outcome.release()
 
 
+def _media_job(lease: dict[str, Any]) -> bool:
+    """A lease the API runs as a media job: its result is delivered to the API before it settles."""
+    metadata = lease.get("metadata")
+    return isinstance(metadata, dict) and bool(metadata.get("mediaJobId"))
+
+
 async def _upload_result(
     taskflow: TaskflowWorker,
     work: _LeaseWork,
@@ -1182,7 +1232,10 @@ async def _upload_result(
             raise outcome
         result = outcome
         if result.kind == "json":
-            return _LeaseResult(work, completion={"kind": "json", "data": result.data})
+            completion = {"kind": "json", "data": result.data}
+            if _media_job(lease):
+                await taskflow.deliver_media(lease, completion)
+            return _LeaseResult(work, completion=completion)
 
         artifact_id = lease["payload"].get("artifactId")
         if not artifact_id:
@@ -1232,6 +1285,8 @@ async def _upload_result(
         }
         if duration is not None:
             completion["duration"] = duration
+        if _media_job(lease):
+            await taskflow.deliver_media(lease, completion)
         token = _callback_token(lease)
         ack = (
             {
