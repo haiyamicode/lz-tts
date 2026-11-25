@@ -224,10 +224,10 @@ class VideogenRequest(H3Interpolation):
         description="Lipsync's attention (Comfy Kitchen INT8 + SLA, 85% of key blocks skipped, step 2 dense): "
         "~2x faster diffusion; false renders dense",
     )
-    addons: list[Literal["motion", "dance"]] = Field(
-        default_factory=list, max_length=2,
+    addons: list[Literal["motion", "dance", "realism"]] = Field(
+        default_factory=list, max_length=3,
         description="Community LoRAs stacked on the preset at strength 1.0: motion (Better Human Motion H3, "
-        "civitai 2734359), dance (civitai 3056222)",
+        "civitai 2734359), dance (civitai 3056222), realism (fal Realism People: natural skin, not glossy)",
     )
     continuable: bool = Field(
         default=False,
@@ -509,6 +509,11 @@ class ImagegenRequest(BaseModel):
     preset: H3StillPreset = "standard"
     rest_frame: int | None = Field(default=None, ge=0, le=1000)
     max_retries: int | None = Field(default=None, ge=0, le=5)
+    addons: list[Literal["realism"]] = Field(
+        default_factory=list, max_length=1,
+        description="LoRAs stacked on the preset at strength 1.0: realism (fal Realism People: natural skin "
+        "and candid look instead of the glossy one; its trigger word is added to the prompt). Not with rest_frame",
+    )
 
     @model_validator(mode="after")
     def _size_pair(self) -> "ImagegenRequest":
@@ -520,6 +525,8 @@ class ImagegenRequest(BaseModel):
             raise ValueError("rest_frame writes its own prompt; send no prompt")
         if self.max_retries is not None and self.rest_frame is None:
             raise ValueError("max_retries goes with rest_frame")
+        if self.addons and self.rest_frame is not None:
+            raise ValueError("addons don't go with rest_frame")
         if self.rest_frame is not None and len(self.image_urls) != 1:
             raise ValueError("rest_frame takes exactly one image_urls entry (the person)")
         return self

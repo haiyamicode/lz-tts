@@ -16,6 +16,10 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
 - ``seed`` (random when omitted);
 - ``preset``: ``standard`` (default; plain base, 50 steps), ``turbo-8`` (8-step
   Turbo LoRA) or ``turbo-4`` (videogen's 4-step Turbo LoRA);
+- ``addons``: :data:`h3.minimax_h3_runtime.VIDEO_ADDON_LORAS` names stacked on the
+  preset at strength 1.0, their trigger words put in front of the prompt
+  (``realism``: the fal Realism People LoRA, natural skin instead of the glossy
+  look). Not with ``rest_frame``;
 - ``rest_frame`` (``k`` >= 0): rest still ``k`` of the person in the one
   reference image, for lipsync frame pins (:mod:`h3.rest_stills`). No
   ``prompt``: the still's prompt is written here. Rendered on ``seed + k``
@@ -67,7 +71,7 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
 
     from . import h3_still, rest_stills
     from .lipsync import prepare_input_image
-    from .minimax_h3_runtime import run_minimax_h3_still
+    from .minimax_h3_runtime import VIDEO_ADDON_LORAS, run_minimax_h3_still
 
     payload = job["payload"]
     job_id = str(job["id"])
@@ -101,6 +105,11 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
     preset = str(payload.get("preset") or h3_still.DEFAULT_PRESET)
     spec = h3_still.still_preset(preset)
     seed = int(payload["seed"]) if payload.get("seed") is not None else random.randint(0, 2**31 - 1)
+    addons = tuple(dict.fromkeys(str(name) for name in payload.get("addons") or ()))
+    if unknown := [name for name in addons if name not in VIDEO_ADDON_LORAS]:
+        raise ValueError(f"unknown addons {unknown}; available: {sorted(VIDEO_ADDON_LORAS)}")
+    if addons and rest_frame is not None:
+        raise ValueError("addons don't go with rest_frame")
 
     scratch_dir = job_dir(job_id)
     started = time.perf_counter()
@@ -130,7 +139,7 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
             width, height, pixels=max(width * height, h3_still.DEFAULT_CANVAS_PIXELS)
         )
     output_path = scratch_dir / "outputs" / "output.png"
-    log_event("imagegen_started", job_id=job_id, preset=preset, seed=seed, references=len(references),
+    log_event("imagegen_started", job_id=job_id, preset=preset, addons=list(addons), seed=seed, references=len(references),
               render=[render_width, render_height], delivered=[width, height])
     inference_started = time.perf_counter()
     still = None
@@ -151,6 +160,7 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
             height=render_height,
             seed=seed,
             preset=preset,
+            addons=addons,
         )
     rest_stills.save_fitted(render_path, output_path, (width, height))
     inference_seconds = time.perf_counter() - inference_started
@@ -166,6 +176,7 @@ def run_imagegen(job: dict[str, Any]) -> dict[str, Any]:
             "render_height": render_height,
             "references": len(references),
             "preset": preset,
+            "addons": list(addons),
             "steps": spec["steps"],
             **({"rest_frame": rest_frame, "max_retries": retries, "reference_face": reference_face is not None,
                 "stylized": round(stylized, 3),

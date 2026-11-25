@@ -190,15 +190,27 @@ LIPSYNC_STEPS = 3
 #: er_sde/res_multistep, simple").
 REF2V_TURBO4_LORA_NAME = "minimax_h3_ref2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
 TURBO8_LORA_NAME = "minimax_h3_ref2v_turbo_8step_v1.1_768p_comfyui_bf16.safetensors"
-#: Videogen ``addons``: community LoRAs a request can stack on any preset, each at strength 1.0 through
-#: the stock ``LoraLoaderModelOnly`` after the recipe's own LoRA (local/exp/h3-motion-lora).
+#: Videogen/imagegen ``addons``: community LoRAs a request can stack on any preset, each at strength 1.0
+#: through the stock ``LoraLoaderModelOnly`` after the recipe's own LoRA (local/exp/h3-motion-lora).
 #: ``motion``: Better Human Motion H3 (civitai 2734359 v1.0-MH3, rank 32, sha256 285f9ed3...); on the
 #: spin test it was the one clean turbo-8 arm at 1.0. ``dance``: civitai 3056222 (2400 steps, no trigger
 #: word, sha256 b671d0f9...); no reliable spin fix on turbo-8 or turbo-6. Neither was tested with SLA.
+#: ``realism``: fal MiniMax-H3-Realism-People-LoRA (t2v/i2v/r2v, trained on FL2VA, rank 32 attn, 1500
+#: steps, sha256 acc52952...; local/exp/h3-realism-lora): natural skin and candid framing instead of the
+#: glossy look, no time cost; on the avatar-scene still at 1.0 it also kept glasses 0.7 and no LoRA lost.
 VIDEO_ADDON_LORAS: dict[str, str] = {
     "motion": "minimax_h3_addon_motion_civitai2734359_v1.0.safetensors",
     "dance": "minimax_h3_addon_dance_civitai3056222.safetensors",
+    "realism": "minimax_h3_addon_realism_people_fal_v1.safetensors",
 }
+#: Trigger words an addon was trained on, put in front of the prompt (:func:`addon_prompt`).
+ADDON_TRIGGERS: dict[str, str] = {"realism": "r34l1sm"}
+
+
+def addon_prompt(prompt: str, addons) -> str:
+    """``prompt`` with the trigger words of ``addons`` in front (each once)."""
+    triggers = [ADDON_TRIGGERS[name] for name in addons if name in ADDON_TRIGGERS and ADDON_TRIGGERS[name] not in prompt]
+    return " ".join([*triggers, prompt])
 
 
 @dataclass(frozen=True)
@@ -1143,7 +1155,7 @@ def build_h3_graph(
     h3_inputs: dict[str, Any] = {
         "clip": ["3", 0],
         "vae": ["4", 0],
-        "prompt": prompt,
+        "prompt": addon_prompt(prompt, addons),
         "width": width,
         "height": height,
         "length": length,
@@ -2067,6 +2079,7 @@ def build_h3_still_graph(
     preset: str,
     reference_inputs: list[str],
     filename_prefix: str,
+    addons: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     """One H3 still: ``{UNET, CLIP, VAE} -> [LoRA] -> VigenH3StillRender(<- LoadImage x N) -> SaveImage``.
 
@@ -2074,7 +2087,8 @@ def build_h3_still_graph(
     retained executor's cache hands the still the base model, encoder and VAE
     that videogen/lipsync already loaded. ``preset`` (``h3_still.STILL_PRESETS``)
     sets steps, sampler, scheduler and the optional Turbo LoRA; both LoRA
-    loaders patch a clone, never the cached base.
+    loaders patch a clone, never the cached base. ``addons`` (:data:`VIDEO_ADDON_LORAS` names) chain
+    after it at strength 1.0, their trigger words in front of the prompt, as in :func:`build_h3_graph`.
     ``reference_inputs`` are LoadImage values (relative to the ComfyUI input
     directory) in ``<Picture 1>``..``<Picture N>`` order.
     """
@@ -2097,11 +2111,18 @@ def build_h3_still_graph(
             "inputs": {"model": ["2", 0], "lora_name": lora["name"], **lora["inputs"]},
         }
         model = ["18", 0]
+    for index, addon in enumerate(addons):
+        node_id = str(70 + index)
+        graph[node_id] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": model, "lora_name": VIDEO_ADDON_LORAS[addon], "strength_model": 1.0},
+        }
+        model = [node_id, 0]
     still_inputs: dict[str, Any] = {
         "model": model,
         "clip": ["3", 0],
         "vae": ["4", 0],
-        "prompt": prompt,
+        "prompt": addon_prompt(prompt, addons),
         "width": int(width),
         "height": int(height),
         "steps": int(spec["steps"]),
@@ -2131,8 +2152,9 @@ def run_minimax_h3_still(
     height: int,
     seed: int,
     preset: str,
+    addons: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Render one still on the retained H3 runtime with ``preset``; returns stage metrics.
+    """Render one still on the retained H3 runtime with ``preset`` (+ ``addons``); returns stage metrics.
 
     ``width``/``height`` must already be an H3 canvas (32-pixel grid, at most
     about 1 MP; see :mod:`h3.h3_still`).
@@ -2150,6 +2172,7 @@ def run_minimax_h3_still(
         "clip": comfy_root / "models" / "text_encoders" / clip_name(),
         "video_vae": comfy_root / "models" / "vae" / video_vae_name(),
         **({"lora": comfy_root / "models" / "loras" / spec["lora"]["name"]} if spec["lora"] else {}),
+        **{f"addon_{name}": comfy_root / "models" / "loras" / VIDEO_ADDON_LORAS[name] for name in addons},
     }.items():
         if not path.exists():
             raise FileNotFoundError(f"MiniMax H3 {name} for still images is missing: {path}")
@@ -2172,6 +2195,7 @@ def run_minimax_h3_still(
         preset=preset,
         reference_inputs=reference_inputs,
         filename_prefix=f"{_OUTPUT_SUBDIR_PREFIX}/{job_id}/still",
+        addons=addons,
     )
     try:
         saved = _execute_graph(retained, graph, job_id=job_id, save_node_id=_SAVE_IMAGE_NODE_ID)
@@ -2198,6 +2222,7 @@ def run_minimax_h3_still(
         "sampler": spec["sampler"],
         "scheduler": spec["scheduler"],
         "lora": spec["lora"]["name"] if spec["lora"] else None,
+        "addons": list(addons),
         "pipeline_seconds": round(saved["pipeline_seconds"], 3),
         "cuda_peak_allocated_gib": round(saved["cuda_peak_allocated_gib"], 3),
         "cuda_peak_reserved_gib": round(saved["cuda_peak_reserved_gib"], 3),

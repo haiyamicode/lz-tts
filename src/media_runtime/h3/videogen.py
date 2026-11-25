@@ -22,7 +22,8 @@ A job is ``{"id": ..., "payload": {...}}``; the payload takes:
   worker without the kernel renders dense and the item says so;
 - ``addons`` (default none): community LoRAs stacked on the preset at strength 1.0
   (:data:`h3.minimax_h3_runtime.VIDEO_ADDON_LORAS`): ``motion`` (Better Human Motion H3),
-  ``dance`` (civitai 3056222);
+  ``dance`` (civitai 3056222), ``realism`` (fal Realism People; its trigger word goes in
+  front of the prompt);
 - ``pinned_frames``: ``[{"image_url" | "image_path", "seconds"}]`` guide images
   pinned at those times (``MiniMaxH3AddGuide`` anchors, not overwrites), cover-fit
   to the first frame's size like lipsync's pins;

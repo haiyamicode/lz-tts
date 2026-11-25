@@ -250,6 +250,7 @@ def _check_h3_assets(features: list[str]) -> None:
     lora_names = set()
     if "imagegen" in features:
         lora_names |= {spec["lora"]["name"] for spec in STILL_PRESETS.values() if spec["lora"]}
+        lora_names |= set(VIDEO_ADDON_LORAS.values())
     if "videogen" in features:
         lora_names |= {recipe.lora_name for recipe in VIDEO_PRESETS.values() if recipe.lora_name}
         lora_names |= set(VIDEO_ADDON_LORAS.values())
