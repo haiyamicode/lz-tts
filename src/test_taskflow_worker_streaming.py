@@ -124,7 +124,7 @@ def test_pull_fills_free_slots_only():
 def test_only_voxcpm_types_run_several_at_once():
     groups = task_groups(TASK_TYPES, 8)
     assert {g.task_types: g.concurrency for g in groups} == {
-        ("tts-synthesis", "tts-voxcpm", "voice-design"): 8,
+        ("tts-synthesis", "tts-fallback", "voice-design"): 8,
         ("generate-music", "videogen", "videogen-chain-decode", "lipsync", "imagegen"): 1,
         **{(t,): 1 for t in ("voice-enhance", "nudity-detect", "face-detect", "language-detect",
                              "transcribe", "force-align")},

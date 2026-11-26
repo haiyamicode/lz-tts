@@ -631,4 +631,5 @@ def test_synthesis_claims_only_the_route_it_takes() -> None:
     assert server._synthesis_claim({**voice, "language": "vi"}) == ("voxcpm", "aligner")
     assert server._synthesis_claim({**voice, "language": "bs-BA"}) == ("speech", "aligner")
     assert server._synthesis_claim({**voice, "language": "bs-BA", "model": "voxcpm"}) == ("voxcpm", "aligner")
+    assert server._synthesis_claim({**voice, "language": "vi", "model": "sparrow"}) == ("speech", "aligner")
     assert server._synthesis_claim({"text": "Xin chào.", "language": "vi"}) == ("speech", "aligner")
