@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 from collections import Counter, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
@@ -73,6 +74,16 @@ class ResidencySnapshot:
     # The engine the oldest waiting job needs, when a job is waiting for memory to free up.
     waiting_for: str | None
     pinned: frozenset[str] = frozenset()
+    # Engines a new job could not be admitted for now, beside the running jobs' claims
+    # (exclusive engines left out: they never fit beside anything, admission empties the card).
+    blocked: frozenset[str] = frozenset()
+    # Engines not loaded that would load beside the loaded ones without unloading any.
+    loadable: frozenset[str] = frozenset()
+    # Engines that only ever run alone: their footprint is the whole unpinned budget (media).
+    exclusive: frozenset[str] = frozenset()
+    # Seconds since a loaded unpinned engine was last used (0 while one is in use or claimed,
+    # inf when none is loaded).
+    idle_seconds: float = math.inf
 
 
 class EngineResidency:
@@ -133,10 +144,28 @@ class EngineResidency:
         self._unloading: set[str] = set()
 
     def snapshot(self) -> ResidencySnapshot:
+        resident = frozenset(name for name in self._resident if name not in self._unloading)
+        unpinned = [name for name in self.footprints if name not in self.pinned]
+        exclusive = frozenset(
+            name for name in unpinned if self.footprints[name] >= self.budget - self._pinned_total - 1e-9
+        )
+        used = sum(self.footprints[name] for name in self._resident)
+        swapped = resident - self.pinned
+        if any(self._in_use[name] > 0 or name in self._claimed for name in swapped):
+            idle = 0.0
+        else:
+            idle = time.monotonic() - max(self._resident[name] for name in swapped) if swapped else math.inf
         return ResidencySnapshot(
-            resident=frozenset(name for name in self._resident if name not in self._unloading),
+            resident=resident,
             waiting_for=self._queue[0][1] if self._queue else None,
             pinned=self.pinned,
+            blocked=frozenset(name for name in unpinned if name not in exclusive and not self._fits({name})),
+            loadable=frozenset(
+                name for name in unpinned
+                if name not in self._resident and used + self.footprints[name] <= self.budget + 1e-9
+            ),
+            exclusive=exclusive,
+            idle_seconds=idle,
         )
 
     def is_resident(self, engine: str) -> bool:

@@ -35,8 +35,9 @@ def test_budget_smaller_than_an_engine_is_rejected():
 class _Engines:
     """Real load/unload bookkeeping that also checks the budget is never exceeded."""
 
-    def __init__(self, budget: float):
+    def __init__(self, budget: float, foot: dict[str, float] = FOOT):
         self.budget = budget
+        self.foot = foot
         self.loaded: set[str] = set()
         self.events: list[str] = []
         self.peak = 0.0
@@ -45,7 +46,7 @@ class _Engines:
         await asyncio.sleep(0.01)
         self.loaded.add(engine)
         self.events.append(f"load {engine}")
-        self.peak = max(self.peak, sum(FOOT[name] for name in self.loaded))
+        self.peak = max(self.peak, sum(self.foot[name] for name in self.loaded))
 
     async def unload(self, engine: str) -> None:
         await asyncio.sleep(0.01)
@@ -286,3 +287,60 @@ def test_pinning_speech_pins_the_aligner():
 
 async def _noop(engine: str) -> None:
     await asyncio.sleep(0.01)
+
+
+def test_on_demand_pull_never_leases_work_that_would_wait_behind_a_running_job():
+    pinned = frozenset({"aligner"})
+    # A media job runs (prod 3090): TTS and transcribe could not be admitted beside it, so the
+    # V100 takes them; media (exclusive) and the engine-free types are still pulled.
+    blocked = frozenset({"voxcpm", "speech", "transcribe"})
+    for sticky in (True, False):
+        assert on_demand_task_types(
+            TYPES, frozenset({"media", "aligner"}), None, sticky, pinned, blocked=blocked, exclusive=frozenset({"media"})
+        ) == ("voice-enhance", "force-align", "videogen", "imagegen")
+    # A job waiting to load an engine still takes more work for that engine.
+    assert on_demand_task_types(TYPES, frozenset({"voxcpm"}), "voxcpm", False, blocked=frozenset({"voxcpm"})) == (
+        "tts-synthesis",
+        "voice-design",
+        "voice-enhance",
+    )
+
+
+def test_sticky_tts_still_pulls_media_and_engines_that_load_beside_it():
+    # Sticky on voxcpm: transcribe loads beside it (no swap), media only ever runs alone.
+    pulled = on_demand_task_types(
+        TYPES, frozenset({"voxcpm", "aligner"}), None, True, frozenset({"aligner"}),
+        loadable=frozenset({"transcribe", "speech"}), exclusive=frozenset({"media"}),
+    )
+    assert pulled == TYPES
+    # Without them, the old narrowing.
+    assert on_demand_task_types(TYPES, frozenset({"voxcpm"}), None, True) == ("tts-synthesis", "voice-design", "voice-enhance")
+
+
+def test_snapshot_blocks_engines_that_cannot_join_the_running_claims():
+    foot = {"voxcpm": 10.0, "speech": 2.5, "transcribe": 2.5, "aligner": 1.5, "media": None}
+
+    async def scenario():
+        engines = _Engines(22.0, {**foot, "media": 20.5})
+        residency = EngineResidency(
+            budget_gb=22.0, footprints_gb=foot, load=engines.load, unload=engines.unload, pinned=["aligner"],
+        )
+        async with residency.hold("aligner"):
+            pass
+        idle = residency.snapshot()
+        assert idle.exclusive == frozenset({"media"}) and not idle.blocked
+        assert idle.idle_seconds == float("inf")  # nothing swappable loaded
+        async with residency.hold("media"):
+            running = residency.snapshot()
+        after = residency.snapshot()
+        async with residency.hold("voxcpm"):
+            tts = residency.snapshot()
+        return running, after, tts
+
+    running, after, tts = asyncio.run(scenario())
+    assert running.blocked == frozenset({"voxcpm", "speech", "transcribe"}) and running.idle_seconds == 0.0
+    assert not running.loadable
+    # Media idle again: nothing blocked, recently used.
+    assert not after.blocked and 0.0 <= after.idle_seconds < 5.0
+    # voxcpm runs: speech and transcribe fit beside it (and load without a swap); media is exclusive, never blocked.
+    assert not tts.blocked and tts.loadable == frozenset({"speech", "transcribe"}) and tts.idle_seconds == 0.0

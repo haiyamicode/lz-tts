@@ -164,23 +164,41 @@ def on_demand_task_types(
     waiting_for: str | None,
     sticky: bool,
     pinned: frozenset[str] = frozenset(),
+    *,
+    blocked: frozenset[str] = frozenset(),
+    loadable: frozenset[str] = frozenset(),
+    exclusive: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
     """What an on-demand worker pulls.
 
     While a job waits for memory to load ``waiting_for``, only that engine's types (and the
     types needing no swappable engine): anything else would run on an engine about to be
-    unloaded. While ``sticky``, the loaded engines' types, so a mixed queue does not swap
-    models on every job; the caller drops stickiness after an empty pull or a while after
-    the last swap, so the other types still get pulled. ``pinned`` engines never unload:
-    their types are always pulled, and they alone make nothing sticky.
+    unloaded. While ``sticky``, the loaded engines' types, those of engines that load beside
+    them without unloading anything (``loadable``) and of ``exclusive`` engines (media: they
+    only ever run alone, so stickiness would starve them; admission empties the card for
+    them), so a mixed queue does not swap models on every job; the caller drops stickiness
+    after an empty pull, unless the loaded engines were just used, or a while after the last
+    swap. ``pinned`` engines never unload: their types are always pulled, and they alone make
+    nothing sticky. Never the types of a ``blocked`` engine (its job could not be admitted
+    beside the running ones): the lease would sit behind them, where another worker could
+    run it now.
     """
     if waiting_for is not None:
-        allowed = {waiting_for} | pinned
+        allowed: set[str] | None = {waiting_for} | pinned
     elif sticky and resident - pinned:
-        allowed = set(resident) | pinned
+        allowed = set(resident) | pinned | loadable | exclusive
     else:
-        return task_types
-    return tuple(t for t in task_types if t not in _TYPE_SWAP_ENGINE or _TYPE_SWAP_ENGINE[t] in allowed)
+        allowed = None
+
+    def pulled(task_type: str) -> bool:
+        engine = _TYPE_SWAP_ENGINE.get(task_type)
+        if engine is None:
+            return True
+        if allowed is not None and engine not in allowed:
+            return False
+        return engine == waiting_for or engine not in blocked
+
+    return tuple(t for t in task_types if pulled(t))
 
 
 def served_task_types(config: Any) -> tuple[str, ...]:
@@ -302,6 +320,8 @@ class TaskflowWorker:
     resident_since: float = 0.0
     pool_metadata: dict[str, object] = field(default_factory=dict)
     sticky_seconds: float = 300.0
+    # Loaded engines used this recently stay sticky even after an empty pull.
+    swap_grace_seconds: float = 30.0
     session_id: str | None = None
     session_token: str | None = None
     heartbeat_interval: float = 15.0
@@ -1606,9 +1626,21 @@ def _update_pull_task_types(taskflow: TaskflowWorker) -> None:
         if snapshot.resident != taskflow.resident:
             taskflow.resident = snapshot.resident
             taskflow.resident_since = now
-        sticky = not taskflow.sticky_missed and now - taskflow.resident_since < taskflow.sticky_seconds
+        # Just used (a staged lipsync's next chunk is on its way): keep the loaded engines.
+        sticky = snapshot.idle_seconds < taskflow.swap_grace_seconds or (
+            not taskflow.sticky_missed and now - taskflow.resident_since < taskflow.sticky_seconds
+        )
         taskflow.sticky_missed = False  # one full pull per empty sticky pull
-        narrowed = on_demand_task_types(ready, snapshot.resident, snapshot.waiting_for, sticky, snapshot.pinned)
+        narrowed = on_demand_task_types(
+            ready,
+            snapshot.resident,
+            snapshot.waiting_for,
+            sticky,
+            snapshot.pinned,
+            blocked=snapshot.blocked,
+            loadable=snapshot.loadable,
+            exclusive=snapshot.exclusive,
+        )
         if narrowed != ready:
             taskflow.pull_sticky = snapshot.waiting_for is None
             note += (
@@ -1879,6 +1911,7 @@ async def run_worker() -> None:
         low_priority_batch_size=max(1, int(os.environ.get("TASKFLOW_LOW_PRIORITY_BATCH_SIZE", "3"))),
         persistent=_env_bool("TASKFLOW_WORKER_PERSISTENT", False),
         sticky_seconds=float(os.environ.get("LZAI_SWAP_STICKY_SECONDS", "300")),
+        swap_grace_seconds=float(os.environ.get("LZAI_SWAP_GRACE_SECONDS", "30")),
     )
     taskflow.pool_metadata = pool_metadata()
     inference = LzTtsInferenceSession()
