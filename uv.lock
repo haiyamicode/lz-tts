@@ -650,8 +650,8 @@ wheels = [
 
 [[package]]
 name = "ctc-forced-aligner"
-version = "0.3.0"
-source = { path = "data/runtime-wheels/ctc_forced_aligner-0.3.0-cp310-cp310-linux_x86_64.whl" }
+version = "0.3.0+lz1"
+source = { path = "data/runtime-wheels/ctc_forced_aligner-0.3.0+lz1-cp310-cp310-linux_x86_64.whl" }
 dependencies = [
     { name = "nltk" },
     { name = "torch" },
@@ -661,23 +661,18 @@ dependencies = [
     { name = "uroman" },
 ]
 wheels = [
-    { filename = "ctc_forced_aligner-0.3.0-cp310-cp310-linux_x86_64.whl", hash = "sha256:f094dc8510712cfdb4f9f50f58340f0ad6384c47d555b89563fcb7619e1e9874" },
+    { filename = "ctc_forced_aligner-0.3.0+lz1-cp310-cp310-linux_x86_64.whl", hash = "sha256:96a50c9ff2f63a2337c2a2c03adee42598d631dd2e6101cc4f3bab5d49f97187" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "nltk" },
-    { name = "pre-commit", marker = "extra == 'dev'" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = "==7.*" },
-    { name = "ruff", marker = "extra == 'dev'" },
     { name = "torch" },
-    { name = "torchaudio", marker = "extra == 'dev'" },
     { name = "torchcodec" },
     { name = "transformers", specifier = ">=4.34" },
     { name = "unidecode" },
     { name = "uroman" },
 ]
-provides-extras = ["dev"]
 
 [[package]]
 name = "cycler"
@@ -2331,7 +2326,7 @@ requires-dist = [
     { name = "cached-path", specifier = ">=1.8.10" },
     { name = "cn2an", specifier = "==0.5.22" },
     { name = "conformer", specifier = ">=0.3.2" },
-    { name = "ctc-forced-aligner", path = "data/runtime-wheels/ctc_forced_aligner-0.3.0-cp310-cp310-linux_x86_64.whl" },
+    { name = "ctc-forced-aligner", path = "data/runtime-wheels/ctc_forced_aligner-0.3.0+lz1-cp310-cp310-linux_x86_64.whl" },
     { name = "datasets", specifier = ">=5.0.0" },
     { name = "demucs", specifier = ">=4.0.1" },
     { name = "descript-audio-codec", specifier = "==1.0.0" },

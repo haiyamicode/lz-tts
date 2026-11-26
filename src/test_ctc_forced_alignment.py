@@ -156,32 +156,37 @@ def test_token_pieces_split_letters_over_source_characters():
     assert pieces("안녕", "ko") == [[("안", 2), ("녕", 6)]]
 
 
-def test_padding_keeps_the_cpp_aligner_in_bounds_and_its_path_unchanged() -> None:
-    # ctc_forced_aligner's C++ under-sizes its back pointers when the audio barely fits the
-    # text; the overflow corrupted the heap (garbage paths, SIGABRT) on short TTS takes.
+def test_cpp_aligner_finds_the_best_path_when_the_audio_barely_fits_the_text() -> None:
+    # Upstream ctc_forced_aligner 0.3.0 under-sized its back pointers for these takes (heap
+    # corruption: garbage paths, SIGABRT); the fork in src/ctc_forced_aligner sizes them per row.
     import numpy as np
-    import torch
     from ctc_forced_aligner.alignment_utils import forced_align
 
+    def best_score(logp, targets):  # plain CTC Viterbi over blank-interleaved states
+        ext = np.zeros(2 * len(targets) + 1, dtype=int)
+        ext[1::2] = targets
+        skip = np.zeros(len(ext), bool)
+        skip[2:] = (ext[2:] != 0) & (ext[2:] != ext[:-2])
+        score = np.full(len(ext), -np.inf)
+        score[:2] = logp[0, ext[:2]]
+        for t in range(1, len(logp)):
+            step = np.concatenate([[-np.inf], score[:-1]])
+            jump = np.where(skip, np.concatenate([[-np.inf, -np.inf], score[:-2]]), -np.inf)
+            score = np.maximum(np.maximum(score, step), jump) + logp[t, ext]
+        return max(score[-1], score[-2])
+
     rng = np.random.default_rng(0)
-    padded = 0
     for _ in range(200):
-        targets = [int(x) for x in rng.integers(1, 28, int(rng.integers(3, 60)))]
+        targets = [int(rng.integers(1, 28))]
+        while len(targets) < int(rng.integers(1, 120)):
+            targets.append(int(rng.integers(1, 28)))
         repeats = sum(a == b for a, b in zip(targets, targets[1:]))
-        frames = len(targets) + repeats + int(rng.integers(0, 40))
-        emissions = torch.cat(
-            [torch.log_softmax(torch.randn(frames, 27) * 3, -1), torch.zeros(frames, 1)], 1
-        )
-        padding = ctc_forced_alignment._safe_ctc_padding(targets, frames)
-        assert not ctc_forced_alignment._ctc_backpointer_overflows(targets, frames + padding)
-        if not padding:
-            continue
-        padded += 1
-        pad = torch.full((padding, 28), float("-inf"))
-        pad[:, 0] = 0.0
-        path, _ = forced_align(torch.cat([emissions, pad]).numpy()[None], np.array([targets]), blank=0)
-        # Every label, in order, on the real frames (CTC merges a run of one label).
-        merged = [x for i, x in enumerate(path[0, :frames]) if x and (i == 0 or path[0, i - 1] != x)]
-        assert [int(x) for x in merged] == targets
-        assert not path[0, frames:].any()
-    assert padded > 20
+        frames = len(targets) + repeats + int(rng.integers(0, len(targets) + 2))
+        logits = rng.normal(size=(frames, 28)) * 3
+        logp = (logits - np.log(np.exp(logits).sum(1, keepdims=True))).astype(np.float32)
+        path, _ = forced_align(logp[None], np.array([targets]), blank=0)
+        path = path[0]
+        # A valid CTC path: every label, in order (a run of one label merges).
+        merged = [int(x) for i, x in enumerate(path) if x and (i == 0 or path[i - 1] != x)]
+        assert merged == targets
+        assert np.isclose(logp[np.arange(frames), path].astype(np.float64).sum(), best_score(logp, targets), atol=1e-2)

@@ -104,7 +104,7 @@ dependencies = [
     "khmerphonemizer>=0.0.3",
     "epitran>=1.35.2",
     "km-num2text>=1.0.1",
-    "ctc-forced-aligner==0.3.0",
+    "ctc-forced-aligner==0.3.0+lz1",
     "langcodes>=3.5.1",
     "xxhash>=3.0.0",
     "triton>=3.0.0",
@@ -149,7 +149,7 @@ flash-attn = { path = "data/runtime-wheels/flash_attn-2.8.3.post1-cp310-cp310-li
 # Pure-python pinned git forks, vendored as py3-none-any wheels (no ABI, so
 # portable by construction):
 epitran = { path = "data/runtime-wheels/epitran-1.35.2-py3-none-any.whl" }
-ctc-forced-aligner = { path = "data/runtime-wheels/ctc_forced_aligner-0.3.0-cp310-cp310-linux_x86_64.whl" }
+ctc-forced-aligner = { path = "data/runtime-wheels/ctc_forced_aligner-0.3.0+lz1-cp310-cp310-linux_x86_64.whl" }
 # Compiled extensions install from PyPI normally — the image carries
 # g++/libicu-dev so sdist-only C extensions (pyicu, webrtcvad, pesq,
 # monotonic-align) build at uv sync against THIS image's libicu: no

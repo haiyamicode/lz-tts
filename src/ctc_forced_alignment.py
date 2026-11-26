@@ -325,48 +325,6 @@ def _target_indices(tokens: Sequence[str], tokenizer: Any) -> list[int]:
     return [dictionary[c] for c in " ".join(tokens).split(" ") if c in dictionary]
 
 
-def _ctc_backpointer_overflows(targets: Sequence[int], frames: int) -> bool:
-    """Whether ctc_forced_aligner 0.3.0's C++ `forced_align_impl` writes past its back pointers.
-
-    It sizes them `(S + 1) * (T - L)`, which is too small when the audio barely fits the text
-    (T close to L + repeats): the writes then corrupt the heap, and the aligner returns a
-    garbage path (`get_spans` asserts `x != <star>`) or the process aborts. This replays its
-    band bookkeeping to find the highest index it writes.
-    """
-    length = len(targets)
-    states = 2 * length + 1
-    repeats = sum(a == b for a, b in zip(targets, targets[1:]))
-    allocated = (states + 1) * (frames - length)
-    start = 0 if frames - (length + repeats) > 0 else 1
-    end = 1 if states == 1 else 2
-    seek = 0
-    for t in range(1, frames):
-        if frames - t <= length + repeats:
-            if start % 2 == 1 and targets[start // 2] != targets[start // 2 + 1]:
-                start += 1
-            start += 1
-        if t <= length + repeats:
-            if end % 2 == 0 and end < 2 * length and targets[end // 2 - 1] != targets[end // 2]:
-                end += 1
-            end += 1
-        loop_start = start
-        if start == 0:
-            loop_start += 1
-            seek += 1
-        if end > loop_start and seek + end - 1 - loop_start >= allocated:
-            return True
-        seek += end - loop_start
-    return False
-
-
-def _safe_ctc_padding(targets: Sequence[int], frames: int) -> int:
-    """Blank-only frames to append so the C++ aligner stays inside its buffers (0 = none)."""
-    padding = 0
-    while _ctc_backpointer_overflows(targets, frames + padding):
-        padding = max(16, padding * 2)
-    return padding
-
-
 class CtcForcedAligner:
     """Load one multilingual CTC model and align utterances at word level."""
 
@@ -450,33 +408,17 @@ class CtcForcedAligner:
         if frames < len(targets) + repeats:
             # CTC needs a frame per label plus a blank between repeats: the audio is too
             # short to say this text (a cut take). The C++ aligner would throw anyway.
+            # (Our fork of ctc_forced_aligner, src/ctc_forced_aligner, sizes its back pointers
+            # for any take that fits; upstream 0.3.0 overran them when a take barely fit.)
             raise ValueError(
                 f"Audio too short to align its text: {frames} frames for "
                 f"{len(targets)} labels + {repeats} repeats"
             )
-        padding = _safe_ctc_padding(targets, frames)
-        if padding:
-            blank_id = self._tokenizer.get_vocab().get("<blank>", self._tokenizer.pad_token_id)
-            pad = torch.full(
-                (padding, emissions.shape[1]),
-                float("-inf"),
-                dtype=emissions.dtype,
-                device=emissions.device,
-            )
-            pad[:, blank_id] = 0.0
-            emissions = torch.cat([emissions, pad])
         segments, scores, blank = get_alignments(
             emissions,
             prepared.tokens,
             self._tokenizer,
         )
-        if padding:
-            # The padding frames only allow blank, so the path on the real frames is the one
-            # the unpadded alignment picks; drop what fell on the padding.
-            segments = [segment for segment in segments if segment.start < frames]
-            last = segments[-1]
-            segments[-1] = type(last)(last.label, last.start, min(last.end, frames - 1))
-            scores = scores[..., :frames]
         spans = get_spans(prepared.tokens, segments, blank)
         raw_words = postprocess_results(
             prepared.starred_text,

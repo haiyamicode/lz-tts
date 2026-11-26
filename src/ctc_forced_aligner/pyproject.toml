@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=70", "pybind11>=2.10.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ctc-forced-aligner"
+# Fork of MahmoudAshraf97/ctc-forced-aligner 0.3.0: forced_align_impl.cpp sizes its back pointers
+# for what it writes (upstream overran them when the audio barely fits the text).
+version = "0.3.0+lz1"
+description = "Text to speech alignment using CTC forced alignment"
+authors = [{ name = "Mahmoud Ashraf", email = "hassouna97.ma@gmail.com" }]
+license = { text = "CC-BY-NC 4.0" }
+requires-python = ">=3.10"
+dependencies = ["uroman", "nltk", "torch", "torchcodec", "transformers>=4.34", "Unidecode"]
+
+[project.urls]
+repository = "https://github.com/MahmoudAshraf97/ctc-forced-aligner"
+
+[project.scripts]
+ctc-forced-aligner = "ctc_forced_aligner.align:cli"
+
+[tool.setuptools]
+packages = ["ctc_forced_aligner"]
+
+[tool.setuptools.package-data]
+ctc_forced_aligner = ["punctuations.lst", "forced_align_impl.cpp"]
