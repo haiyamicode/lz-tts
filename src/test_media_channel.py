@@ -150,7 +150,8 @@ def test_progress_reaches_the_job_it_belongs_to(tmp_path, monkeypatch):
             await asyncio.to_thread(runtime.stop)
 
     asyncio.run(run())
-    assert ("videogen-1", "rendering", 1, 4) in reports
+    # Chunks travel in units (progress.CHUNK_UNITS per chunk) so the steps inside one move the bar too.
+    assert ("videogen-1", "rendering", 100, 400) in reports
 
 
 def test_a_runtime_that_exits_fails_what_it_was_asked(tmp_path):
