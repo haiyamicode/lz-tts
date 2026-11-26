@@ -83,6 +83,21 @@ def test_lzai_models_turns_engines_and_their_types_off(server_json, monkeypatch)
     assert "force-align" in served and "tts-synthesis" in served
 
 
+def test_voxcpm_only_worker_serves_only_the_voxcpm_tts_type(monkeypatch):
+    from src.api import server
+
+    monkeypatch.setenv("LZAI_SERVER_CONFIG", "configs/server/base.yml")
+    monkeypatch.setenv("LZAI_SERVER_CONFIG_YAML", "{engines: {pipertts: false, voxcpm: true, seed_vc: false}}")
+    monkeypatch.delenv("LZAI_MODELS", raising=False)
+    served = served_task_types(server._load_config())
+    assert "tts-voxcpm" in served and "voice-design" in served
+    assert "tts-synthesis" not in served  # the whole stack: Sparrow and Seed-VC routes too
+
+    monkeypatch.setenv("LZAI_SERVER_CONFIG_YAML", "{engines: {pipertts: true, voxcpm: false, seed_vc: true}}")
+    served = served_task_types(server._load_config())
+    assert "tts-synthesis" in served and "tts-voxcpm" not in served
+
+
 def test_media_only_worker_serves_no_tts(monkeypatch):
     from src.api import server
 
@@ -100,7 +115,7 @@ def test_media_only_worker_serves_no_tts(monkeypatch):
     config = server._load_config()
     assert config.media.gpu is None and config.media.features() == ["videogen", "lipsync", "imagegen"]
     served = served_task_types(config)
-    assert not {"tts-synthesis", "voice-design", "transcribe", "generate-music"} & set(served)
+    assert not {"tts-synthesis", "tts-voxcpm", "voice-design", "transcribe", "generate-music"} & set(served)
     assert {"videogen", "lipsync", "imagegen", "force-align"} <= set(served)
 
 

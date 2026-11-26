@@ -1468,7 +1468,7 @@ class _EngineHolds:
 # may route to VoxCPM or Sparrow (+ Seed-VC) and times or verbalizes with the aligner.
 _OPERATION_CLAIMS: dict[str, tuple[str, ...]] = {
     "synthesize": ("voxcpm", "speech", "aligner"),
-    "voice-anchor": ("voxcpm", "speech", "aligner"),
+    "voice-anchor": ("voxcpm", "aligner"),
     "voice-design": ("voxcpm", "aligner"),
     "transcribe": ("transcribe", "aligner"),
     "force-align": ("aligner",),
@@ -1478,6 +1478,26 @@ _OPERATION_CLAIMS: dict[str, tuple[str, ...]] = {
     "imagegen": ("media",),
     "lipsync": ("media",),
 }
+
+
+_VOXCPM_SYNTHESIS_CLAIM = ("voxcpm", "aligner")
+_SPARROW_SYNTHESIS_CLAIM = ("speech", "aligner")
+
+
+def _synthesis_claim(request_data: dict[str, Any]) -> tuple[str, ...]:
+    """The groups one synthesize request may use: its route's, not the whole stack's, so a VoxCPM
+    job on an on-demand worker never waits for room for Sparrow. SSML pronunciations on VoxCPM
+    without the IPA-text LoRA take the adapter path, which times chunks with Sparrow."""
+    try:
+        request = SynthesizeRequest.model_validate(request_data)
+        model = _resolve_api_model(request.model)
+    except (ValidationError, HTTPException):
+        return _OPERATION_CLAIMS["synthesize"]  # rejected in the job itself
+    if not _request_routes_to_voxcpm(request, model):
+        return _SPARROW_SYNTHESIS_CLAIM
+    if request.ssml is not None and not _server_config.voxcpm.ipa_text_lora:
+        return _OPERATION_CLAIMS["synthesize"]
+    return _VOXCPM_SYNTHESIS_CLAIM
 
 
 _engine_holds: contextvars.ContextVar[_EngineHolds | None] = contextvars.ContextVar("engine_holds", default=None)
@@ -6493,7 +6513,7 @@ class LzTtsInferenceSession:
         )
 
         for plan in plans:
-            claim = _OPERATION_CLAIMS["synthesize"] if plan.pipeline == "voxcpm" else ("speech", "aligner")
+            claim = _VOXCPM_SYNTHESIS_CLAIM if plan.pipeline == "voxcpm" else _SPARROW_SYNTHESIS_CLAIM
             async with _engine_hold_scope(claim):
                 line_encoders: list[StreamingMp3Encoder | None] | None = None
                 try:
@@ -6638,7 +6658,8 @@ class LzTtsInferenceSession:
         }
         _LOGGER.info("Inference operation started: %s", json.dumps(context, default=str))
         try:
-            async with _engine_hold_scope(_OPERATION_CLAIMS.get(operation, ())):
+            claim = _synthesis_claim(request_data) if operation == "synthesize" else _OPERATION_CLAIMS.get(operation, ())
+            async with _engine_hold_scope(claim):
                 result = await self._dispatch(operation, request_data, progress, cancelled)
         except ValidationError as exc:
             _LOGGER.warning("Inference input rejected context=%s errors=%s", context, exc.errors())

@@ -624,3 +624,11 @@ def test_voxcpm_prompt_fields_validate_and_stay_per_item() -> None:
     plain = BatchSynthesizeInputItem(**base)
     assert _batch_item_compatibility_key(instructed) == _batch_item_compatibility_key(plain)
     assert _batch_item_compatibility_key(continued) == _batch_item_compatibility_key(plain)
+
+
+def test_synthesis_claims_only_the_route_it_takes() -> None:
+    voice = {"text": "Xin chào.", "voice_id": "product.voice", "reference_url": "https://example.com/reference.wav"}
+    assert server._synthesis_claim({**voice, "language": "vi"}) == ("voxcpm", "aligner")
+    assert server._synthesis_claim({**voice, "language": "bs-BA"}) == ("speech", "aligner")
+    assert server._synthesis_claim({**voice, "language": "bs-BA", "model": "voxcpm"}) == ("voxcpm", "aligner")
+    assert server._synthesis_claim({"text": "Xin chào.", "language": "vi"}) == ("speech", "aligner")

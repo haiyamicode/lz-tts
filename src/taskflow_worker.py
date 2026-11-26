@@ -43,6 +43,7 @@ from .process_guard import hard_exit
 _LOGGER = logging.getLogger(__name__)
 TASK_TYPES = (
     "tts-synthesis",
+    "tts-voxcpm",
     "voice-design",
     "voice-enhance",
     "nudity-detect",
@@ -69,7 +70,7 @@ _MEDIA_TASK_TYPES = {
 _REPORTED_TASK_TYPES = frozenset({*_MEDIA_TASK_TYPES, "transcribe"})
 
 # Task types whose payload carries no operation field: the task type implies
-# exactly one operation. Everything else (tts-synthesis) reads payload["operation"].
+# exactly one operation. Everything else (tts-synthesis, tts-voxcpm) reads payload["operation"].
 _TYPE_OPERATIONS = {
     "voice-design": "voice-design",
     "voice-enhance": "voice-enhance",
@@ -90,6 +91,7 @@ _TYPE_OPERATIONS = {
 # for its model sets to download (LZAI_REQUIRED_MODELS); the other types need core data only.
 _TYPE_ENGINES = {
     "tts-synthesis": ("pipertts", "voxcpm", "seed_vc"),
+    "tts-voxcpm": ("voxcpm",),
     "voice-design": ("voxcpm",),
     "transcribe": ("transcribe",),
     **{task_type: ("media",) for task_type in _MEDIA_TASK_TYPES},
@@ -97,11 +99,11 @@ _TYPE_ENGINES = {
 
 
 # Leases a worker runs at once, per group of task types (Taskflow join ``capabilities.taskGroups``).
-# Only VoxCPM work batches (nano-vLLM batches across the leases in flight), so its two types share
+# Only VoxCPM work batches (nano-vLLM batches across the leases in flight), so its three types share
 # the box concurrency (TASKFLOW_WORKER_CONCURRENCY). The media types share one GPU lock in the
 # media runtime, so one at a time between them. Every other type is a single call that gains
 # nothing from company: one at a time each.
-_BATCHED_TASK_TYPES = ("tts-synthesis", "voice-design")
+_BATCHED_TASK_TYPES = ("tts-synthesis", "tts-voxcpm", "voice-design")
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,7 @@ def ready_task_types(task_types: tuple[str, ...], deferred: frozenset[str]) -> t
 # (ffmpeg) and the detect-* types need none (CPU).
 _TYPE_SWAP_ENGINE = {
     "tts-synthesis": "voxcpm",
+    "tts-voxcpm": "voxcpm",
     "voice-design": "voxcpm",
     "force-align": "aligner",
     "transcribe": "transcribe",
@@ -185,9 +188,10 @@ def served_task_types(config: Any) -> tuple[str, ...]:
     if not config.transcribe.enabled:
         off.add("transcribe")
     if not config.engines.voxcpm:
-        off.add("voice-design")
-        if not config.engines.pipertts:
-            off.add("tts-synthesis")
+        off.update({"voice-design", "tts-voxcpm"})
+    if not config.engines.pipertts:
+        # tts-synthesis is the whole stack: the API sends there what it cannot tell VoxCPM can take.
+        off.add("tts-synthesis")
     return tuple(task_type for task_type in TASK_TYPES if task_type not in off)
 _REQUEST_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
 # Join, heartbeat, pull, settle and leave are small requests (pulls long-poll
@@ -1156,6 +1160,10 @@ def _prepare_lease(taskflow: TaskflowWorker, lease: dict[str, Any]) -> _LeaseWor
     payload = lease["payload"]
     operation = _TYPE_OPERATIONS.get(task_type) or payload["operation"]
     request = payload["request"]
+    if task_type == "tts-voxcpm" and operation == "synthesize":
+        # The API routed it here because VoxCPM takes it; the type alone guarantees no Sparrow or
+        # Seed-VC fallback on a worker that may not have them.
+        request = {**request, "model": "voxcpm"}
     taskflow.active_lease_ids.add(lease_id)
     _LOGGER.info(
         "LZAI task started type=%s lease=%s run=%s operation=%s artifact=%s "
