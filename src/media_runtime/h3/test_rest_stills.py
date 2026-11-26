@@ -6,13 +6,13 @@ from pathlib import Path
 
 import numpy as np
 
-from h3.rest_stills import MIN_IDENTITY, MOUTH_CLOSED, Face, Still, Take, judge, keep
+from h3.rest_stills import FRAMING_SCALE, MAX_FRAMING_SHIFT, MIN_IDENTITY, MOUTH_CLOSED, Face, Still, Take, judge, keep
 
-PERSON = Face(mouth=0.002, identity=np.array([1.0, 0.0]))
+PERSON = Face(mouth=0.002, identity=np.array([1.0, 0.0]), height=0.4, center=(0.5, 0.4))
 
 
-def _face(mouth: float, identity: float) -> Face:
-    return Face(mouth=mouth, identity=np.array([identity, np.sqrt(1 - identity**2)]))
+def _face(mouth: float, identity: float, height: float = 0.4, center: tuple[float, float] = (0.5, 0.4)) -> Face:
+    return Face(mouth=mouth, identity=np.array([identity, np.sqrt(1 - identity**2)]), height=height, center=center)
 
 
 def _take(seed: int, face: Face | None, reference: Face | None = PERSON) -> Take:
@@ -27,6 +27,24 @@ def test_takes_are_judged_on_face_identity_then_mouth():
     assert _take(5, None).problem == "no_face"
     # No face in the image: nothing to hold the still to.
     assert _take(6, None, reference=None).problem is None
+
+
+def test_a_zoomed_or_reframed_still_fails_framing_behind_identity():
+    assert _take(1, _face(0.001, 0.8, height=0.4 * 1.2, center=(0.5 + MAX_FRAMING_SHIFT * 0.9, 0.4))).problem is None
+    # mara_close 2026-11-26: a close-up whose still zoomed out to show the hands (scale 0.47, shift 0.21).
+    assert _take(2, _face(0.001, 0.87, height=0.4 * 0.47, center=(0.6, 0.58))).problem == "framing"
+    assert _take(3, _face(0.001, 0.8, height=0.4 * FRAMING_SCALE * 1.05)).problem == "framing"
+    assert _take(4, _face(0.001, 0.8, center=(0.5, 0.4 + MAX_FRAMING_SHIFT * 1.1))).problem == "framing"
+    # Reframed and open: the framing is the worse problem; lost the face: identity still comes first.
+    assert _take(5, _face(0.04, 0.8, height=0.2)).problem == "framing"
+    assert _take(6, _face(0.001, MIN_IDENTITY - 0.01, height=0.2)).problem == "identity"
+
+
+def test_keep_ranks_an_open_mouth_over_a_reframed_take_and_the_closest_framing_among_reframed():
+    reframed, open_mouth = _take(1, _face(0.001, 0.9, height=0.2)), _take(2, _face(0.03, 0.6))
+    assert keep([reframed, open_mouth]) is open_mouth
+    closer = _take(3, _face(0.001, 0.6, height=0.3))
+    assert keep([reframed, closer, _take(4, _face(0.001, 0.2))]) is closer
 
 
 def test_keep_prefers_a_clean_take_then_the_most_closed_mouth_that_kept_the_person():

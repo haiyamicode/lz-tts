@@ -59,13 +59,19 @@ frame. The chunks are cut at the quietest frames of the voice
 - ``generate`` (vigen 9ff3052): the job first renders ``count`` (2-12, default 6) rest
   stills of the person from its own image (:func:`h3.rest_stills.render_still`, the
   imagegen ``rest_frame`` stills: still k on ``seed + k``, retaken at most ``max_retries``
-  times on a lost face or open mouth, the best take kept either way) and pins them like
+  times on a lost face, a zoomed or reframed shot or an open mouth, the best take kept
+  either way) and pins them like
   ``multi_image`` (``order``); they are delivered with the video as the result's
   ``still<k>`` files.
 
 Every pinned image is fitted to the job's image's frame (cover scale, centre
-crop). Motion and gestures between the pins come from the prompt and the pinned
-audio.
+crop). ``single_image`` / ``multi_image`` / ``generate`` images whose face sits
+elsewhere in the frame than the job's image's (:func:`drop_reframed_pins`: size
+off by more than ``rest_stills.FRAMING_SCALE`` or centre moved more than
+``MAX_FRAMING_SHIFT``) are left out of the pins, and with none left the job's image
+is pinned: a zoomed-out still pinned in a pause made the clip zoom out and back.
+Not checked for a cartoon or a faceless image. Motion and gestures between the pins
+come from the prompt and the pinned audio.
 
 **Reference** (``reference_image_url`` / ``reference_image_path``; auto: on, the job's image
 when not sent). The person's canonical picture goes to every chunk's render (and boundary
@@ -1190,13 +1196,16 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
     generated: list[dict[str, Any]] = []
     still_files: dict[str, str] = {}
     stills_item: dict[str, Any] = {}
+    # The face the pause pins' images are held to (None: a cartoon or faceless image, nothing checked).
+    reference = None
+    if pins.mode in ("single_image", "multi_image", "generate"):
+        from . import rest_stills
+
+        reference, stylized = rest_stills.reference_face(input_image)
     if pins.mode == "generate":
         from dataclasses import replace
 
-        from . import rest_stills
-
         began = time.perf_counter()
-        reference, stylized = rest_stills.reference_face(input_image)
         delivered = rest_stills.delivered_size(source_width, source_height)
         kept_keys = []
         for key in pins.images:
@@ -1216,6 +1225,8 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
         stills_item = {"generated_stills": generated, "stills_face_checked": reference is not None,
                        "stylized": round(stylized, 3), "stills_addons": []}
         log_event("lipsync_stills", job_id=job_id, kept=len(kept_keys), **stills_item)
+    if reference is not None:
+        pins = drop_reframed_pins(pins, images, reference, job_id=job_id)
     # The voice alone - no music, no noise - is what the rest of the job hears.
     began = time.perf_counter()
     voice_path = clean_voice(audio_path, work_dir / "voice.wav", job_id=job_id)
@@ -1226,6 +1237,32 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
     return _Job(job_id=job_id, scratch_dir=scratch_dir, payload=payload, auto=auto, voice_path=voice_path,
                 images=images, plan=plan, stage_timings=stage_timings, started=job_started, audio_path=audio_path,
                 stills_item=stills_item, still_files=still_files)
+
+
+def drop_reframed_pins(pins: PinSettings, images: dict[str, Path], reference: Any, *, job_id: str) -> PinSettings:
+    """``pins`` without the pause-pin images whose face sits elsewhere in the frame than in the job's image
+    (``reference``, :func:`h3.rest_stills.framing_matches`): pinned in a pause, a zoomed or reframed image makes
+    the clip zoom there and back. An image with no face found is kept (nothing to measure); with none left, the
+    job's own image is pinned (``single_image``)."""
+    from dataclasses import replace
+
+    from . import rest_stills
+
+    kept, dropped = [], []
+    for key in pins.images:
+        face = None if key == INPUT_IMAGE else rest_stills.measure_face(images[key])
+        if face is None or rest_stills.framing_matches(face, reference):
+            kept.append(key)
+        else:
+            scale, shift = rest_stills.framing(face, reference)
+            dropped.append({"image": key if key.startswith(GENERATED_IMAGE) else pins.images.index(key),
+                            "scale": round(scale, 3), "shift": round(shift, 3)})
+    if not dropped:
+        return pins
+    log_event("lipsync_pins_reframed", job_id=job_id, dropped=dropped, kept=len(kept))
+    if not kept:
+        return replace(pins, mode="single_image", images=(INPUT_IMAGE,))
+    return replace(pins, images=tuple(kept))
 
 
 def _render_chunk(job: _Job, chunk: LipsyncChunk) -> tuple[Path, dict[str, Any]]:

@@ -12,6 +12,9 @@ on one seed gets vigen's set. Unlike vigen, every take is checked against the im
 FaceLandmarker, then ArcFace on the aligned face) and retaken on ``seed + k + 100 * attempt``, at most
 ``max_retries`` times, when it:
 - lost the person: ArcFace cosine below :data:`MIN_IDENTITY`, or no face at all;
+- moved the camera: the face's size off the image's by more than :data:`FRAMING_SCALE`, or its centre moved by
+  more than :data:`MAX_FRAMING_SHIFT` of the frame (a punched-in or reframed still pinned in a pause makes the
+  lipsync zoom there and back);
 - opened the mouth: inner-lip gap over face height above :data:`MOUTH_CLOSED` (vigen's own run had 2 of 6
   stills open on one avatar, and an open-mouth rest pin holds the mouth open at a pause).
 Out of retakes, the best take is delivered all the same (:func:`keep`): a failed likeness check is an expected
@@ -39,9 +42,10 @@ REST_PROMPT = (
     "Image 1 is a frame from a video of a person talking to the camera. Show the same video a few seconds later, "
     "in a short pause between two sentences: the same person, face, hairstyle, makeup, clothing and accessories, in "
     "the same place, seen from exactly the same camera position with the same framing, lens, lighting and background "
-    "as Image 1. The person rests in a calm, natural pose with the shoulders relaxed. A hand that holds something in "
-    "Image 1 keeps holding it in the same place; every free hand rests naturally in front of the body - in the lap, "
-    "on the table or clasped with the other hand - still, not raised and not gesturing. The mouth is closed with "
+    "as Image 1: the identical crop, the head the same size and in the same place in the frame, no zooming in or "
+    "out. The person rests in a calm, natural pose with the shoulders relaxed. A hand that holds something in Image "
+    "1 keeps holding it in the same place; a free hand that Image 1 shows rests still in front of the body, not "
+    "raised and not gesturing; a hand Image 1 does not show stays out of the frame. The mouth is closed with "
     "relaxed lips, the expression calm and neutral, the eyes open and looking into the lens. {variation}"
 )
 #: One small variation per still, in this order and cycled past the sixth.
@@ -62,6 +66,10 @@ MOUTH_CLOSED = 0.012
 #: small face; prompted strangers -0.05 and 0.44; different real people <= 0.30. Look-alike drift (0.58)
 #: overlaps the low-res stills, so only the clearly lost face is retaken.
 MIN_IDENTITY = 0.45
+#: Face height ratio (still's over the image's) outside [1 / FRAMING_SCALE, FRAMING_SCALE]: the still zoomed.
+FRAMING_SCALE = 1.25
+#: Face centre moved by more than this share of the frame (x of the width, y of the height): reframed.
+MAX_FRAMING_SHIFT = 0.08
 #: CLIP ViT-L/14 zero-shot prompts: the image is a real photo, or a non-realistic picture.
 REAL_PROMPTS = ("a photo", "a photograph of a real person", "a webcam video frame", "a smartphone selfie")
 STYLIZED_PROMPTS = (
@@ -122,12 +130,42 @@ class Take:
     #: None: no face found in the still.
     mouth: float | None = None
     identity: float | None = None
-    #: What rejects it: "no_face", "identity" (below MIN_IDENTITY), "mouth" (open), or None.
+    #: Face height over the image's, and how far its centre moved (share of the frame).
+    scale: float | None = None
+    shift: float | None = None
+    #: What rejects it, worst first: "no_face", "identity" (below MIN_IDENTITY), "framing" (zoomed or
+    #: reframed, :func:`framing_matches`), "mouth" (open), or None.
     problem: str | None = None
 
     def report(self) -> dict:
         return {"seed": self.seed, "mouth": None if self.mouth is None else round(self.mouth, 4),
-                "identity": None if self.identity is None else round(self.identity, 3), "problem": self.problem}
+                "identity": None if self.identity is None else round(self.identity, 3),
+                "scale": None if self.scale is None else round(self.scale, 3),
+                "shift": None if self.shift is None else round(self.shift, 3), "problem": self.problem}
+
+    @property
+    def framing_error(self) -> float:
+        """How far the framing is off, in units of its limits (<= 1: within them)."""
+        import math
+
+        if self.scale is None or self.shift is None:
+            return math.inf
+        return max(abs(math.log(self.scale)) / math.log(FRAMING_SCALE), self.shift / MAX_FRAMING_SHIFT)
+
+
+def framing(face: "Face", reference: "Face") -> tuple[float, float]:
+    """``face``'s height over ``reference``'s, and how far its centre moved (share of the frame)."""
+    import math
+
+    return (face.height / reference.height,
+            math.hypot(face.center[0] - reference.center[0], face.center[1] - reference.center[1]))
+
+
+def framing_matches(face: "Face", reference: "Face") -> bool:
+    """Whether ``face`` sits in the frame as ``reference`` does: size within :data:`FRAMING_SCALE`, centre
+    within :data:`MAX_FRAMING_SHIFT`."""
+    scale, shift = framing(face, reference)
+    return 1 / FRAMING_SCALE <= scale <= FRAMING_SCALE and shift <= MAX_FRAMING_SHIFT
 
 
 def judge(take: Take, face: "Face | None", reference: "Face | None") -> Take:
@@ -139,20 +177,26 @@ def judge(take: Take, face: "Face | None", reference: "Face | None") -> Take:
         take.problem = "no_face"
         return take
     take.mouth, take.identity = face.mouth, float(face.identity @ reference.identity)
-    take.problem = ("identity" if take.identity < MIN_IDENTITY else "mouth" if take.mouth > MOUTH_CLOSED else None)
+    take.scale, take.shift = framing(face, reference)
+    take.problem = ("identity" if take.identity < MIN_IDENTITY
+                    else "framing" if not framing_matches(face, reference)
+                    else "mouth" if take.mouth > MOUTH_CLOSED else None)
     return take
 
 
 def keep(takes: list[Take]) -> Take:
     """The take to deliver, ranked by the gate's own measures: the first without a problem, else the least open
-    mouth among those that kept the person, else the most similar face (a take with no face last; ties go to
-    the earlier take)."""
+    mouth among those that kept the person and the framing, else the closest framing among those that kept the
+    person, else the most similar face (a take with no face last; ties go to the earlier take)."""
     clean = [take for take in takes if take.problem is None]
     if clean:
         return clean[0]
-    kept_person = [take for take in takes if take.problem == "mouth"]
-    if kept_person:
-        return min(kept_person, key=lambda take: take.mouth)
+    open_mouth = [take for take in takes if take.problem == "mouth"]
+    if open_mouth:
+        return min(open_mouth, key=lambda take: take.mouth)
+    reframed = [take for take in takes if take.problem == "framing"]
+    if reframed:
+        return min(reframed, key=lambda take: take.framing_error)
     return max(takes, key=lambda take: -2.0 if take.identity is None else take.identity)
 
 
@@ -235,6 +279,10 @@ class Face:
     mouth: float
     #: Unit ArcFace embedding of the aligned face.
     identity: "np.ndarray"
+    #: Face height (landmarks 10-152) over the image height, and the landmarks' box centre as (x / width,
+    #: y / height): where the face sits in the frame.
+    height: float = 0.0
+    center: tuple[float, float] = (0.5, 0.5)
 
 
 def _model(name: str):
@@ -317,5 +365,7 @@ def measure_face(path: Path) -> Face | None:
     blob = ((crop.astype(np.float32) - 127.5) / 127.5).transpose(2, 0, 1)[None]
     session = _model("identity")
     embedding = session.run(None, {session.get_inputs()[0].name: blob})[0][0]
+    low, high = points.min(axis=0), points.max(axis=0)
     return Face(mouth=float(np.linalg.norm(points[13] - points[14])) / face,
-                identity=embedding / np.linalg.norm(embedding))
+                identity=embedding / np.linalg.norm(embedding), height=face / height,
+                center=(float(low[0] + high[0]) / 2 / width, float(low[1] + high[1]) / 2 / height))
