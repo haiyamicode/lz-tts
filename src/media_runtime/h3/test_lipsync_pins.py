@@ -205,7 +205,23 @@ def test_auto_runs_on_our_setup_and_keeps_the_callers_content():
                                 "upscale": True}, seconds=10.0)
     # Nothing manual reaches the job: preset, attention, validators, prompt and frame rate are the defaults.
     assert resolved == {"image_url": "i", "audio_url": "a", "seed": 3, "custom_instructions": instructions,
-                        "upscale": True, "pinned_frames": {"mode": "single_image"}}
+                        "upscale": True, "pinned_frames": {"mode": "single_image"}, "reference_image_url": "i"}
+
+
+@pytest.mark.parametrize("payload, reference, choice", [
+    ({"image_url": "http://x/still1.png", "reference_image_url": "http://x/me.png"}, ("url", "http://x/me.png"), "reference_image"),
+    ({"image_url": "http://x/me.png"}, ("url", "http://x/me.png"), "image"),
+    ({"image_path": "local/me.png"}, ("path", "local/me.png"), "image"),
+])
+def test_auto_always_has_a_reference_image(payload, reference, choice):
+    resolved, choices = auto_payload({"audio_url": "a", "stills": STILLS, **payload}, seconds=10.0)
+    key, value = reference
+    assert resolved[f"reference_image_{key}"] == value and choices["reference"] == choice
+
+
+def test_manual_has_a_reference_only_when_sent():
+    resolved, _ = auto_payload({"image_url": "i", "audio_url": "a", "auto": False}, seconds=10.0)
+    assert not any(key.startswith("reference_image") for key in resolved)
 
 
 @pytest.mark.parametrize("payload, error", [

@@ -1,6 +1,8 @@
 """generate-music: YuE2 song, then YingMusic-SVC when there is a clone reference.
 
 Without a reference the song is the YuE2 render, untouched.
+Instrumental: YuE2 renders the song from section tags alone, and BS-RoFormer's
+accompaniment (the mix less any vocal that slipped in) is the result.
 With a reference: YuE2 renders the song, BS-RoFormer splits the lead vocal
 from the rest, YingMusic-SVC re-voices the vocal toward the reference, and the
 converted vocal is mixed back over the accompaniment.
@@ -34,7 +36,7 @@ PEAK_CEILING = 0.98
 class RenderResult:
     path: Path
     seed: int
-    mode: str  # "prompt" (YuE2 only) or "clone" (YuE2 + YingMusic-SVC)
+    mode: str  # "prompt" (YuE2 only), "clone" (YuE2 + YingMusic-SVC) or "instrumental" (YuE2 + BS-RoFormer)
 
 
 def mix_over_accompaniment(vocal_path: Path, accompaniment: np.ndarray, out_path: Path) -> Path:
@@ -61,8 +63,19 @@ def mix_over_accompaniment(vocal_path: Path, accompaniment: np.ndarray, out_path
     return out_path
 
 
+def write_accompaniment(accompaniment: np.ndarray, out_path: Path) -> Path:
+    """Write a (2, samples) 44.1 kHz accompaniment as 16-bit WAV, peak-limited like a mix."""
+    backing = np.asarray(accompaniment, dtype=np.float32).T  # (samples, 2)
+    peak = float(np.abs(backing).max()) if backing.size else 0.0
+    if peak > PEAK_CEILING:
+        backing *= PEAK_CEILING / peak
+    sf.write(str(out_path), backing, SAMPLE_RATE, subtype="PCM_16")
+    return out_path
+
+
 class MusicPipeline:
-    """One model group on the GPU at a time: YuE2 ("song"), or BS-RoFormer + YingMusic-SVC ("voice").
+    """One model group on the GPU at a time: YuE2 ("song"), BS-RoFormer + YingMusic-SVC ("voice"),
+    or BS-RoFormer alone ("split", for an instrumental).
 
     YuE2 peaks near 11 GB and the voice models take ~8 GB; one group at a time keeps the
     runtime inside a single smaller GPU. A clone job loads YuE2, renders, unloads it, then loads
@@ -91,7 +104,7 @@ class MusicPipeline:
             return
         if self._resident == "song":
             self.song.unload()
-        elif self._resident == "voice":
+        elif self._resident in ("voice", "split"):
             self.separator.unload()
             self.converter.unload()
         self._resident = None
@@ -104,11 +117,18 @@ class MusicPipeline:
             self.song.load()
         else:
             self.separator.load()
-            self.converter.load()
+            if group == "voice":
+                self.converter.load()
         self._resident = group
         print(f"[timing] load {group}: {time.monotonic() - started:.1f}s", flush=True)
 
-    def render(self, request: SongRequest, output_dir: Path, reference_path: Path | None = None) -> RenderResult:
+    def render(
+        self,
+        request: SongRequest,
+        output_dir: Path,
+        reference_path: Path | None = None,
+        instrumental: bool = False,
+    ) -> RenderResult:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         with self._lock, tempfile.TemporaryDirectory(prefix="music-", dir=output_dir) as work_dir:
@@ -122,6 +142,13 @@ class MusicPipeline:
             print(f"[timing] yue2 generate: {time.monotonic() - started:.1f}s", flush=True)
             progress.report("finishing")
             cancel.check()
+            if instrumental:
+                self._activate("split")
+                started = time.monotonic()
+                _, accompaniment = self.separator.split(song_path)
+                print(f"[timing] separate: {time.monotonic() - started:.1f}s", flush=True)
+                final = write_accompaniment(accompaniment, output_dir / f"song-{seed}.wav")
+                return RenderResult(path=final, seed=seed, mode="instrumental")
             if reference_path is None:
                 final = output_dir / f"song-{seed}.wav"
                 shutil.move(str(song_path), final)

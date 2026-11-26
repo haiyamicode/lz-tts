@@ -12,8 +12,10 @@ hands and body all move with the speech and nothing is composited:
 - the result carries ``path`` / ``item`` / ``metrics`` / ``seed``.
 
 **Auto** (``auto``, the default; :func:`auto_payload`): the avatar render. The caller
-sends the person's canonical image, the audio and the avatar's rest ``stills`` (its
-imagegen ``rest_frame`` stills, any number; none = the image itself), and the job
+sends the image the clip opens on (``image_url``: one of the avatar's stills picked at
+random, or its canonical picture), the avatar's canonical picture as
+``reference_image_url``, the audio and the avatar's rest ``stills`` (its imagegen
+``rest_frame`` stills, any number; none = the image itself), and the job
 runs on our setup, the same for every length and every audio: the default preset
 (``turbo-3``) with sparse attention, every validator on, the built-in prompt, and
 H3's native 24 fps (no interpolation: an interpolated lipsync renders its frames
@@ -21,7 +23,9 @@ from a sped-up voice, so every motion the voice does not drive - blinks, head
 turns, hands - plays back ``24/interpolation_fps`` times slow). Pins: a clip of
 ``AUTO_SHORT_SECONDS`` (3 s) or more pins the stills as ``multi_image`` ``random``
 (one still: ``single_image``); a shorter clip is too short to travel between two
-pins (an end pin froze it) and pins frame 0 alone (``none``). ``seed``,
+pins (an end pin froze it) and pins frame 0 alone (``none``). Every chunk also sees the
+reference image (``reference_image_url``, else the job's image) as Ref2VA's ``<Picture 1>``,
+named in the prompt (see **Reference**). ``seed``,
 ``transcript``, ``custom_instructions`` (``pin_chunk`` spans and per-instruction
 validator switches included), ``output_dimensions`` and ``upscale`` work as
 always; the knobs auto chooses (:data:`AUTO_CHOSEN`) are an error with it -
@@ -62,6 +66,17 @@ frame. The chunks are cut at the quietest frames of the voice
 Every pinned image is fitted to the job's image's frame (cover scale, centre
 crop). Motion and gestures between the pins come from the prompt and the pinned
 audio.
+
+**Reference** (``reference_image_url`` / ``reference_image_path``; auto: on, the job's image
+when not sent). The person's canonical picture goes to every chunk's render (and boundary
+preview) as ``MiniMaxH3ReferenceToVideo`` ``ref_images.ref_image_0`` (``ref_image_size``
+match), and the built-in prompt names the person from it
+(:data:`h3.speech_chunks.REFERENCE_SUBJECT`, "The real person from <Picture 1>"); a caller
+``prompt`` should cite ``<Picture 1>`` itself. It is not pinned to any frame and not fitted.
+A/B 2026-11-24 (``local/exp/h3-lipsync-ref``, 14 s, frame 0 a random still, the stills
+pinned): ArcFace vs the picture 0.762 -> 0.789 (69/85 frames up, paired CI [+0.019,
++0.037]), SyncNet level, no breakage, +8% render time; with the picture as frame 0 too,
+0.787 -> 0.804.
 
 **Voice.** The render never hears the raw audio: room tone and noise make H3
 invent things (overlay graphics, punch-ins) and blur the pauses the pins go in.
@@ -236,6 +251,8 @@ AUTO_CHOSEN = ("pinned_frames", "preset", "use_interpolation", "interpolation_fp
                "detect_flicker", "detect_desync", "detect_glitches", "prompt")
 #: ``auto``: a clip shorter than this pins frame 0 alone (too short to travel between two pins).
 AUTO_SHORT_SECONDS = 3.0
+#: Image key of the person's reference image (``reference_image_*``; auto: the job's image when not sent).
+REFERENCE_IMAGE = "reference"
 #: Image key of a continuous boundary's restored frame: ``restored:<frame>``, filled in when rendered.
 RESTORED_IMAGE = "restored:"
 
@@ -398,7 +415,8 @@ def frame_pins(settings: PinSettings, *, fps: float, total_frames: int, pinned: 
 def auto_payload(payload: dict[str, Any], *, seconds: float) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """The manual payload an ``auto`` job (the default) runs as, for audio ``seconds`` long, and what auto
     chose (``None`` for a manual job, which is returned as it is). Raises ``ValueError`` for an auto job
-    that sets a field auto chooses (:data:`AUTO_CHOSEN`), or a manual one that sends ``stills``."""
+    that sets a field auto chooses (:data:`AUTO_CHOSEN`), or a manual one that sends ``stills``. An auto job
+    always has a reference image: ``reference_image_url`` / ``_path``, else the job's image."""
     if payload.get("auto", True) is False:
         if payload.get("stills"):
             raise ValueError("stills go with auto; with auto false, pin them with pinned_frames")
@@ -417,7 +435,11 @@ def auto_payload(payload: dict[str, Any], *, seconds: float) -> tuple[dict[str, 
     else:
         pinned = {"mode": "single_image", **({"image_url": stills[0]} if stills else {})}
     resolved["pinned_frames"] = pinned
-    return resolved, {"stills": len(stills), "pin_mode": pinned["mode"], "short": seconds < AUTO_SHORT_SECONDS}
+    reference = "reference_image" if payload.get("reference_image_url") or payload.get("reference_image_path") else "image"
+    if reference == "image":
+        resolved.update({f"reference_{key}": payload[key] for key in ("image_url", "image_path") if payload.get(key)})
+    return resolved, {"stills": len(stills), "pin_mode": pinned["mode"], "short": seconds < AUTO_SHORT_SECONDS,
+                      "reference": reference}
 
 
 def freestyle_plan(samples, *, total_frames: int, fps: float, chunk_cap: int,
@@ -892,7 +914,7 @@ def _check(render: Path, audio: Path, chunk: LipsyncChunk, *, flicker: bool, des
 
 
 def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, input_image: Path, pins: PinSettings,
-              pin_images: int, fps: float, seed: int, job_id: str, finish: Any) -> dict[str, Any]:
+              pin_images: int, fps: float, seed: int, job_id: str, finish: Any, reference: bool = False) -> dict[str, Any]:
     """The job's plan: chunks, pins, prompts and per-chunk validators. Its frames run at ``fps``: the
     model's 24, or an interpolated job's ``interpolation_fps``, whose every chunk still renders on the
     model's own clock (:mod:`h3.h3_interpolation`)."""
@@ -943,7 +965,7 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
         prompts = [render_prompt_template(caller_prompt, text=text, language=language_name) for text in chunk_texts]
         prompts = ["\n".join([prompt, pinned_lines[i]]) if i in pinned_lines else prompt for i, prompt in enumerate(prompts)]
     else:
-        prompts = [render_prompt(text, transcript.language, pinned_instruction=pinned_lines.get(i))
+        prompts = [render_prompt(text, transcript.language, pinned_instruction=pinned_lines.get(i), reference=reference)
                    for i, text in enumerate(chunk_texts)]
     # The caller's timed extra instructions, each on its own line at the end of its chunks' prompts.
     timed_lines = chunk_instructions(custom_instructions, chunks, fps=fps, total_frames=total_frames,
@@ -967,6 +989,7 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
         chunk_seconds=[round(chunk.frames / fps, 3) for chunk in chunks],
         pinned_chunks=pinned_chunks,
         pin_images=pin_images,
+        reference=reference,
         transcript_source=transcript_source,
         language=transcript.language,
     )
@@ -978,6 +1001,7 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
         "chunk_cap": chunk_cap,
         "cut_frames": list(cut_frames),
         "pin_mode": pins.mode,
+        "reference": reference,
         "anchors": [[anchor.frame, anchor.label, anchor.image] for anchor in anchors],
         "pinned_chunks": pinned_chunks,
         "chunk_texts": chunk_texts,
@@ -991,7 +1015,8 @@ def _new_plan(payload: dict[str, Any], *, voice_path: Path, audio_path: Path, in
 
 def _restore_boundary(chunk: LipsyncChunk, end_anchor: Anchor, *, images: dict[str, Path], anchor_at: dict[int, Anchor],
                       look: Path, job_id: str, prompt: str, seed: int, width: int, height: int, audio_slice: Path,
-                      work_dir: Path, recipe: Any, sparse_attention: bool, addons: tuple[str, ...] = ()) -> dict[str, Any]:
+                      work_dir: Path, recipe: Any, sparse_attention: bool,
+                      reference: Path | None = None, addons: tuple[str, ...] = ()) -> dict[str, Any]:
     """Fill ``images[end_anchor.image]``: this chunk's last kept frame, previewed on its own pins (the
     recipe's preview schedule, that frame alone decoded), then restored toward ``look``, the image last
     pinned before it."""
@@ -1016,6 +1041,7 @@ def _restore_boundary(chunk: LipsyncChunk, end_anchor: Anchor, *, images: dict[s
         recipe=recipe,
         sparse_attention=sparse_attention,
         preview=FramePreview(frame=chunk.frames - 1, output_path=preview_path, sigmas=recipe.preview_sigmas),
+        reference_path=reference,
         addons=addons,
     )
     preview_seconds = time.perf_counter() - began
@@ -1079,6 +1105,8 @@ class _Job:
         self.anchor_at = {anchor.frame: anchor for anchor in self.anchors}
         self.chunks = plan_chunks(int(self.plan["total_frames"]), max_frames=int(self.plan["chunk_cap"]),
                                   anchors=self.anchors, cut_frames=self.plan["cut_frames"])
+        # The person's reference image, seen by every chunk (a state planned before it existed has none).
+        self.reference = self.images[REFERENCE_IMAGE] if self.plan.get("reference") else None
 
     def finish(self, name: str, began: float) -> None:
         self.stage_timings[name] = round(time.perf_counter() - began, 3)
@@ -1126,6 +1154,11 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
                            input_name=name)
         for index, (url, name) in enumerate(pin_urls.items())
     }
+    # The reference image (auto: the job's own when the caller sent none, fetched once).
+    same_as_image = any(payload.get(f"reference_image_{key}") and payload.get(f"reference_image_{key}") == payload.get(f"image_{key}")
+                        for key in ("url", "path"))
+    reference_path = (None if same_as_image or not (payload.get("reference_image_url") or payload.get("reference_image_path"))
+                      else download_job_input(job, payload, "reference_image", scratch_dir, ".png"))
     finish("input_download_seconds", began)
 
     # The job's image, the only image the render sees.
@@ -1135,6 +1168,10 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
         url: prepare_pin_image(path, work_dir / "anchors" / f"pin{index}.png", size=(source_width, source_height))
         for index, (url, path) in enumerate(pin_downloads.items())
     }}
+    if same_as_image:
+        images[REFERENCE_IMAGE] = input_image
+    elif reference_path is not None:
+        images[REFERENCE_IMAGE] = prepare_input_image(reference_path, work_dir / "anchors" / "reference.png")
     # auto: a photo avatar renders with the realism addon (rest_stills.clip_addons: CLIP stylized score below
     # MAX_STYLIZED), unless the caller sent anything custom: addons (even []) or
     # custom_instructions (prompts or pins). Manual jobs only get the addons they send.
@@ -1142,7 +1179,7 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
         if payload.get("addons") is None and not custom_instructions:
             from . import rest_stills
 
-            stylized = rest_stills.stylized_score(input_image)
+            stylized = rest_stills.stylized_score(images.get(REFERENCE_IMAGE, input_image))
             payload["addons"] = list(rest_stills.clip_addons(stylized))
             auto["stylized"] = round(stylized, 3)
         auto["addons"] = list(payload.get("addons") or [])
@@ -1184,7 +1221,8 @@ def _prepare(job: dict[str, Any], *, staged: bool = False) -> _Job:
     voice_path = clean_voice(audio_path, work_dir / "voice.wav", job_id=job_id)
     finish("voice_cleanup_seconds", began)
     plan = _new_plan(payload, voice_path=voice_path, audio_path=audio_path, input_image=input_image, pins=pins,
-                     pin_images=len(pin_downloads), fps=fps, seed=seed, job_id=job_id, finish=finish)
+                     pin_images=len(pin_downloads), fps=fps, seed=seed, job_id=job_id, finish=finish,
+                     reference=REFERENCE_IMAGE in images)
     return _Job(job_id=job_id, scratch_dir=scratch_dir, payload=payload, auto=auto, voice_path=voice_path,
                 images=images, plan=plan, stage_timings=stage_timings, started=job_started, audio_path=audio_path,
                 stills_item=stills_item, still_files=still_files)
@@ -1226,7 +1264,8 @@ def _render_chunk(job: _Job, chunk: LipsyncChunk) -> tuple[Path, dict[str, Any]]
             chunk, end_anchor, images=images, anchor_at=anchor_at, look=images[look.image], job_id=job.job_id,
             prompt=prompts[chunk.index],
             seed=job.seed + chunk.index, width=canvas_width, height=canvas_height, audio_slice=audio_slice,
-            work_dir=chunk_dir, recipe=job.recipe, sparse_attention=job.sparse_attention, addons=job.addons)
+            work_dir=chunk_dir, recipe=job.recipe, sparse_attention=job.sparse_attention, reference=job.reference,
+            addons=job.addons)
         job.stage_timings[f"chunk_{chunk.index}_boundary_seconds"] = restore_metrics["seconds"]
     # Every chunk opens on a pin: the input image, a pinned image, or a continuous
     # boundary's restored frame (it ends on one too, unless it is the last and free).
@@ -1261,6 +1300,7 @@ def _render_chunk(job: _Job, chunk: LipsyncChunk) -> tuple[Path, dict[str, Any]]
                 output_path=output,
                 recipe=job.recipe,
                 sparse_attention=job.sparse_attention,
+                reference_path=job.reference,
                 addons=job.addons,
             )
         # Glitches are judged against the image the chunk opens on; a chunk moving into another
@@ -1363,6 +1403,7 @@ def _assemble(job: _Job, chunk_paths: list[tuple[Path, int]], chunk_metrics: lis
         "auto": job.auto is not None,
         **({"auto_choices": job.auto} if job.auto is not None else {}),
         "pin_mode": plan["pin_mode"],
+        "reference": job.reference is not None,
         # generate: each rest still (its seed, variation, identity, mouth and takes); the kept ones are
         # the result's still<k> files.
         **(job.stills_item or {}),
@@ -1506,6 +1547,7 @@ def _stage_plan(job: dict[str, Any]) -> dict[str, Any]:
         "canvas_width": plan["canvas"][0],
         "canvas_height": plan["canvas"][1],
         "pin_mode": plan["pin_mode"],
+        "reference": ctx.reference is not None,
         "auto": ctx.auto is not None,
         **({"auto_choices": ctx.auto} if ctx.auto is not None else {}),
         "transcript_source": plan["transcript"]["source"],

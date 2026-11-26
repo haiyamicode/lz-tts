@@ -71,14 +71,19 @@ class MusicRequest(BaseModel):
     """The ``generate-music`` request.
 
     YuE2 writes the song from ``style`` and ``lyrics``; the length follows the lyrics sections (there is
-    no duration, BPM, key or instrumental parameter: put tempo and mood in ``style``, or give ``abc``).
+    no duration, BPM or key parameter: put tempo and mood in ``style``, or give ``abc``).
     Without ``reference_url`` the song is YuE2's render; with it, the lead vocal is re-voiced by YingMusic-SVC.
+    ``instrumental``: no vocals. ``lyrics`` become optional (section tags alone set the structure; omitted,
+    a standard intro-verse-chorus form), and BS-RoFormer removes any vocal YuE2 slips in.
     """
 
     model_config = {"extra": "forbid"}
 
     style: str = Field(min_length=1, max_length=2000, description="Comma-separated genre, vocal, instruments, mood")
-    lyrics: str = Field(min_length=1, max_length=8000, description="Plain text in [verse]/[chorus]... sections")
+    lyrics: str | None = Field(
+        default=None, min_length=1, max_length=8000, description="Plain text in [verse]/[chorus]... sections"
+    )
+    instrumental: bool = Field(default=False, description="No vocals; lyrics optional (section tags only)")
     cot: Literal["full", "melody", "off"] = Field(
         default="full", description="Planning pass: melody and chords, melody only, or none (covers: melody)"
     )
@@ -98,6 +103,10 @@ class MusicRequest(BaseModel):
     def _abc_needs_plan(self) -> "MusicRequest":
         if self.abc is not None and self.cot == "off":
             raise ValueError("abc needs cot 'melody' or 'full'")
+        if not self.instrumental and self.lyrics is None:
+            raise ValueError("lyrics are required unless instrumental")
+        if self.instrumental and self.reference_url:
+            raise ValueError("an instrumental has no vocal to re-voice; drop reference_url")
         return self
 
 
@@ -553,22 +562,30 @@ class LipsyncRequest(H3Interpolation):
     fits inside ``output_dimensions`` with its aspect kept.
 
     ``auto`` (default true): the avatar render (``h3/lipsync.py`` docstring, **Auto**). Send the
-    person's canonical image, the audio and the avatar's rest ``stills`` (none: the image is
-    pinned); the preset, attention, validators, prompt, frame rate and pins are ours: 24 fps native,
-    the stills pinned at random at the pauses, and frame 0 alone for a clip under 3 s. ``seed``,
+    image the clip opens on (a random one of the avatar's stills, or its picture), the avatar's
+    canonical picture as ``reference_image_url``, the audio and the avatar's rest ``stills`` (none:
+    the image is pinned); the preset, attention, validators, prompt, frame rate and pins are ours:
+    24 fps native, the stills pinned at random at the pauses, and frame 0 alone for a clip under
+    3 s; every chunk sees the reference as Ref2VA ``<Picture 1>`` (not sent: ``image_url``). ``seed``,
     ``transcript``, ``custom_instructions``, ``output_dimensions`` and ``upscale`` still apply. The
     fields auto chooses (:data:`LIPSYNC_AUTO_CHOSEN`) need ``auto: false`` (manual).
 
     Manual only: ``preset`` ``turbo-3`` (default: the 3-step lipsync student, trained for this mode
     with sparse attention) or one of the videogen presets (``standard``, ``turbo-8``, ``turbo-6``,
     ``turbo-5``, ``turbo-4``, ``dmd-3``) on the same pinned-audio graph; ``pinned_frames``; ``prompt``; the validator switches;
-    ``use_interpolation`` (disabled for now, see :class:`H3Interpolation`).
+    ``use_interpolation`` (disabled for now, see :class:`H3Interpolation`). A manual job sees
+    ``reference_image_url`` only when sent; a manual ``prompt`` should cite it as ``<Picture 1>``.
     """
 
     model_config = {"extra": "forbid"}
 
     image_url: str = Field(min_length=1)
     audio_url: str = Field(min_length=1)
+    reference_image_url: str | None = Field(
+        default=None,
+        min_length=1,
+        description="The person's canonical picture, a Ref2VA reference on every chunk (auto: default image_url)",
+    )
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
     prompt: str | None = Field(
         default=None, max_length=8000, description="Prompt template with {{text}} (and optional {{language}})"

@@ -1308,6 +1308,7 @@ def build_lipsync_graph(
     filename_prefix: str,
     recipe: H3Recipe = LIPSYNC_PRESETS[DEFAULT_LIPSYNC_PRESET],
     sparse_attention: bool = True,
+    reference_input: str | None = None,
     addons: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     """Pinned-audio lipsync: the Turbo graph re-rendering every frame to a fixed voice.
@@ -1330,6 +1331,10 @@ def build_lipsync_graph(
     on :data:`LIPSYNC_SIGMAS`, sparse attention), the one this mode ships.
     ``guides`` are ``(frame_idx, LoadImage input)`` pairs inside ``[0, length)``.
     ``sparse_attention`` samples with :func:`add_sparse_attention`.
+    ``reference_input`` (a LoadImage input): the person's reference image as Ref2VA's
+    ``ref_images.ref_image_0`` (``ref_image_size`` match), which the prompt cites as ``<Picture 1>``
+    (``speech_chunks.REFERENCE_SUBJECT``); it holds identity on top of the pins (A/B 2026-11-24,
+    ``local/exp/h3-lipsync-ref``: ArcFace +0.028, 69/85 frames up, +8% render time).
     ``addons`` (:data:`VIDEO_ADDON_LORAS` names) stack on the recipe as in :func:`build_h3_graph`.
     """
     graph = build_h3_graph(
@@ -1346,6 +1351,9 @@ def build_lipsync_graph(
         addons=addons,
     )
     add_frame_guides(graph, guides, length=length)
+    if reference_input is not None:
+        graph["ref0"] = {"class_type": "LoadImage", "inputs": {"image": reference_input}}
+        graph["8"]["inputs"]["ref_images.ref_image_0"] = ["ref0", 0]
     pin_audio(graph, audio_input)
     if sparse_attention:
         add_sparse_attention(graph)
@@ -1989,10 +1997,12 @@ def run_lipsync_chunk(
     recipe: H3Recipe = LIPSYNC_PRESETS[DEFAULT_LIPSYNC_PRESET],
     sparse_attention: bool = True,
     preview: Any = None,
+    reference_path: Path | None = None,
     addons: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Render one pinned-audio lipsync chunk with ``recipe`` (default: the lipsync student).
 
+    ``reference_path``: the person's reference image (:func:`build_lipsync_graph` ``reference_input``).
     ``preview`` (:class:`h3.h3_restore.FramePreview`) renders only that frame
     instead, to its PNG (``output_path`` unused).
 
@@ -2037,6 +2047,7 @@ def run_lipsync_chunk(
         filename_prefix=f"{relative_dir}/{prefix}",
         recipe=recipe,
         sparse_attention=sparse_attention,
+        reference_input=stage(reference_path, "reference") if reference_path is not None else None,
         addons=addons,
     )
     if preview is not None:

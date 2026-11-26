@@ -13,8 +13,8 @@ lipsync and imagegen share the H3 group, so nothing unloads between them; only
 a music job releases it. Requests run one at a time.
 
 state (sent, not asked for) -> {"status": "starting" | "ok" | "error", "reason": str, "features": [...]}
-generate  -> {"path", "seed", "mode": "prompt" | "clone"}
-    body: {"style", "lyrics", "cot"?, "cfg_scale"?, "seed"?, "abc"?, "ode_steps"?,
+generate  -> {"path", "seed", "mode": "prompt" | "clone" | "instrumental"}
+    body: {"style", "lyrics"?, "instrumental"?, "cot"?, "cfg_scale"?, "seed"?, "abc"?, "ode_steps"?,
            "abc_sampling"?, "semantic_sampling"?, "reference_path"?, "output_dir"}
 videogen  -> {"path", "seed", "item", "metrics", "last_frame_path"?}
     body: {"job_id", "payload": h3.videogen payload, "output_dir"}
@@ -54,9 +54,15 @@ _gpu_lock = threading.Lock()
 _h3_resident = False
 
 
+#: The lyrics of an instrumental that brings none: sections with no words, so YuE2 still plans a song.
+INSTRUMENTAL_LYRICS = "[intro]\n\n[verse]\n\n[chorus]\n\n[verse]\n\n[chorus]\n\n[bridge]\n\n[chorus]\n\n[outro]"
+
+
 class GenerateBody(BaseModel):
     style: str
-    lyrics: str
+    lyrics: str | None = None
+    #: No vocals: the style says so, the lyrics are sections alone and the vocal is separated out.
+    instrumental: bool = False
     cot: str = "full"
     cfg_scale: float | None = None
     seed: int | None = None
@@ -123,9 +129,13 @@ def generate(body: GenerateBody) -> dict[str, Any]:
         reference = Path(body.reference_path)
         if not reference.is_file():
             raise RequestError("reference_path is not a file")
+    if body.instrumental and reference is not None:
+        raise RequestError("an instrumental has no vocal to re-voice; drop reference_path")
+    if not body.instrumental and not body.lyrics:
+        raise RequestError("lyrics are required unless instrumental")
     request = SongRequest(
-        style=body.style,
-        lyrics=body.lyrics,
+        style=f"{body.style}, instrumental, no vocals" if body.instrumental else body.style,
+        lyrics=body.lyrics or INSTRUMENTAL_LYRICS,
         cot=body.cot,
         cfg_scale=body.cfg_scale,
         seed=body.seed,
@@ -137,7 +147,9 @@ def generate(body: GenerateBody) -> dict[str, Any]:
     with _gpu_lock, progress.job(body.job_id), _cancellable(body.job_id):
         _release_h3()
         try:
-            result = _pipeline.render(request, Path(body.output_dir), reference_path=reference)
+            result = _pipeline.render(
+                request, Path(body.output_dir), reference_path=reference, instrumental=body.instrumental
+            )
         except ValueError as exc:
             raise RequestError(str(exc)) from exc
     return {"path": str(result.path), "seed": result.seed, "mode": result.mode}

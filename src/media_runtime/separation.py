@@ -9,6 +9,7 @@ config are data/yingmusic-svc/bs_roformer.ckpt and config_bd_roformer.yaml.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 import threading
 from pathlib import Path
@@ -20,6 +21,28 @@ import torch
 from paths import VENDOR_SEPARATION_DIR, YINGMUSIC_DIR
 
 SAMPLE_RATE = 44100
+
+# The vendored code imports its own top-level ``utils`` and ``models``, names ComfyUI (loaded in this process for H3)
+# also owns. Each side gets its own modules in sys.modules while it runs.
+_VENDOR_PACKAGES = ("utils", "models")
+_vendor_modules: dict = {}
+
+
+def _owned(name: str) -> bool:
+    return any(name == root or name.startswith(root + ".") for root in _VENDOR_PACKAGES)
+
+
+@contextlib.contextmanager
+def _vendor_imports():
+    others = {name: sys.modules.pop(name) for name in list(sys.modules) if _owned(name)}
+    sys.modules.update(_vendor_modules)
+    sys.path.insert(0, str(VENDOR_SEPARATION_DIR))
+    try:
+        yield
+    finally:
+        sys.path.remove(str(VENDOR_SEPARATION_DIR))
+        _vendor_modules.update({name: sys.modules.pop(name) for name in list(sys.modules) if _owned(name)})
+        sys.modules.update(others)
 
 
 class VocalSeparator:
@@ -33,8 +56,10 @@ class VocalSeparator:
     def load(self) -> None:
         if self._model is not None:
             return
-        if str(VENDOR_SEPARATION_DIR) not in sys.path:
-            sys.path.insert(0, str(VENDOR_SEPARATION_DIR))
+        with _vendor_imports():
+            self._load()
+
+    def _load(self) -> None:
         from utils.model_utils import load_start_checkpoint
         from utils.settings import get_model_from_config
 
@@ -57,6 +82,10 @@ class VocalSeparator:
     def split(self, audio_path: str | Path) -> tuple[np.ndarray, np.ndarray]:
         """Return (vocal, accompaniment), both float32 (2, samples) at 44.1 kHz."""
         self.load()
+        with _vendor_imports():
+            return self._split(audio_path)
+
+    def _split(self, audio_path: str | Path) -> tuple[np.ndarray, np.ndarray]:
         from utils.audio_utils import denormalize_audio, normalize_audio
         from utils.model_utils import demix
 

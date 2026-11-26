@@ -64,8 +64,11 @@ GESTURE_LINE = (
     "never cover the face."
 )
 SETTLE_LINE = "In pauses the body and hands settle back into the first frame's pose while the face keeps moving."
+#: The prompt's subject: the person in the first frame; with a reference image, the person from it.
+PROMPT_SUBJECT = "A real person"
+REFERENCE_SUBJECT = "The real person from <Picture 1>"
 PROMPT_TEMPLATE = (
-    "A real person talking straight to the camera{language}, in a live video, not a still image, saying: "
+    PROMPT_SUBJECT + " talking straight to the camera{language}, in a live video, not a still image, saying: "
     "\"{words}\"\n"
     "Their mouth moves the whole time they speak: lips, jaw and tongue shape every syllable in time with the voice, "
     "and the lips never rest closed or freeze while words are being spoken. The face reacts naturally to the meaning "
@@ -110,12 +113,16 @@ class Transcript:
         return cls(text=" ".join(w.text for w in words), language=None, words=words)
 
 
-def render_prompt(words: str, language: str | None, *, pinned_instruction: str | None = None) -> str:
+def render_prompt(words: str, language: str | None, *, pinned_instruction: str | None = None,
+                  reference: bool = False) -> str:
     """The chunk prompt: the words first, then the mouth, body, hands and the return to the first frame.
     A pinned chunk's ``pinned_instruction`` replaces the hand choreography (:data:`GESTURE_LINE`,
-    :data:`SETTLE_LINE`)."""
+    :data:`SETTLE_LINE`). ``reference``: the render also sees the person's reference image (``<Picture 1>``),
+    and the prompt names the person from it (:data:`REFERENCE_SUBJECT`)."""
     name = LANGUAGE_NAMES.get(language or "")
     prompt = PROMPT_TEMPLATE.format(language=f" in {name}" if name else "", words=" ".join(words.split()))
+    if reference:
+        prompt = REFERENCE_SUBJECT + prompt[len(PROMPT_SUBJECT):]
     if pinned_instruction:
         prompt = prompt.replace(GESTURE_LINE, pinned_instruction).replace(f"\n{SETTLE_LINE}", "")
     return prompt
