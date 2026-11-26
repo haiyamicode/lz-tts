@@ -19,6 +19,7 @@ from fastapi import HTTPException
 
 from ..heap_trim import IDLE_SECONDS, release_freed_heap
 from ..process_guard import exit_with_parent, start_child
+from .downloads import DownloadError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +50,9 @@ def error_response(exc: Exception) -> dict[str, Any]:
             "status_code": exc.status_code,
             "detail": exc.detail,
         }
+    if isinstance(exc, DownloadError):
+        # The caller's URL, not this worker: retrying cannot help (as the in-process fetches answer).
+        return {"ok": False, "status_code": 400, "detail": str(exc)}
     return {
         "ok": False,
         "status_code": 500,
