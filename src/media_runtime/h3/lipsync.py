@@ -164,11 +164,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 from urllib.error import URLError
 
 import cancel
 import progress
+import public_urls
 
 from .lipsync_prompt import render_prompt_template
 from .compat import log_event
@@ -826,7 +827,7 @@ def _download_url(job_id: str, url: str, path: Path, *, input_name: str, kind: s
     log_event("job_input_download_started", job_id=job_id, kind=kind, input=input_name, url_host=parsed.netloc)
     written = 0
     try:
-        with urlopen(Request(url, headers={"User-Agent": "lzai-media/1.0"}), timeout=120) as response:
+        with public_urls.urlopen(Request(url, headers={"User-Agent": "lzai-media/1.0"}), timeout=120) as response:
             with path.open("wb") as file:
                 while chunk := response.read(1024 * 1024):
                     written += len(chunk)
