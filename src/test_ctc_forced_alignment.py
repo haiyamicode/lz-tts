@@ -154,3 +154,34 @@ def test_token_pieces_split_letters_over_source_characters():
     assert pieces("naïve cat", "en") == [[("n", 1), ("a", 1), ("ï", 1), ("v", 1), ("e", 1)], [("c", 1), ("a", 1), ("t", 1)]]
     assert pieces("今天三月", "zh") == [[("今", 3), ("天", 4)], [("三", 3), ("月", 3)]]
     assert pieces("안녕", "ko") == [[("안", 2), ("녕", 6)]]
+
+
+def test_padding_keeps_the_cpp_aligner_in_bounds_and_its_path_unchanged() -> None:
+    # ctc_forced_aligner's C++ under-sizes its back pointers when the audio barely fits the
+    # text; the overflow corrupted the heap (garbage paths, SIGABRT) on short TTS takes.
+    import numpy as np
+    import torch
+    from ctc_forced_aligner.alignment_utils import forced_align
+
+    rng = np.random.default_rng(0)
+    padded = 0
+    for _ in range(200):
+        targets = [int(x) for x in rng.integers(1, 28, int(rng.integers(3, 60)))]
+        repeats = sum(a == b for a, b in zip(targets, targets[1:]))
+        frames = len(targets) + repeats + int(rng.integers(0, 40))
+        emissions = torch.cat(
+            [torch.log_softmax(torch.randn(frames, 27) * 3, -1), torch.zeros(frames, 1)], 1
+        )
+        padding = ctc_forced_alignment._safe_ctc_padding(targets, frames)
+        assert not ctc_forced_alignment._ctc_backpointer_overflows(targets, frames + padding)
+        if not padding:
+            continue
+        padded += 1
+        pad = torch.full((padding, 28), float("-inf"))
+        pad[:, 0] = 0.0
+        path, _ = forced_align(torch.cat([emissions, pad]).numpy()[None], np.array([targets]), blank=0)
+        # Every label, in order, on the real frames (CTC merges a run of one label).
+        merged = [x for i, x in enumerate(path[0, :frames]) if x and (i == 0 or path[0, i - 1] != x)]
+        assert [int(x) for x in merged] == targets
+        assert not path[0, frames:].any()
+    assert padded > 20
