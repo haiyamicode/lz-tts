@@ -237,6 +237,10 @@ class WorkerProcessClient:
 
         request_id = uuid.uuid4().hex
         self.lock.acquire()
+        if self.process is None or self.requests is None or self.responses is None:
+            # The child died under the call this one queued behind, which dropped its queues.
+            self.lock.release()
+            raise HTTPException(status_code=503, detail=f"{self.name} worker is not running")
         started = time.perf_counter()
         _LOGGER.info(
             "%s worker request start action=%s request_id=%s pid=%s",
