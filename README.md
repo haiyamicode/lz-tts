@@ -12,4 +12,5 @@ Fetches origin/main, pulls S3 `data/runtime-wheels` and refuses before touching 
 commit installs is missing, pulls (fast-forward only, clean tree), syncs the model data each pm2 app serves,
 `uv sync --frozen` (main + media venvs), then restarts `lzai-gpu0` and `lzai-gpu1` one at a time, each
 waiting for `/health` 200 and "Taskflow worker ready"; it stops at the first one that does not come back.
+A failed run resumes on a plain rerun (`local/.deploy-pending` keeps the commit the workers run).
 Docker images get the same wheels from S3 in `docker/entrypoint.sh` before `uv sync`.
