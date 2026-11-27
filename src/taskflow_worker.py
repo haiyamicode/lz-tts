@@ -36,6 +36,7 @@ from .api.server import (
     residency_snapshot,
     set_status,
 )
+from .api.residency import ResidencySnapshot
 from .api.take_stream import Mp3Segment, Mp3Segmenter, mp3_duration_seconds
 from .api.worker_common import ChildWorkerDied
 from .process_guard import hard_exit
@@ -319,6 +320,9 @@ class TaskflowWorker:
     resident: frozenset[str] = frozenset()
     resident_since: float = 0.0
     pool_metadata: dict[str, object] = field(default_factory=dict)
+    # What the worker says about itself on every heartbeat (Taskflow keeps the latest for fleet
+    # dashboards; an older server ignores it): see ``_update_pull_task_types``.
+    reported_state: dict[str, Any] = field(default_factory=dict)
     sticky_seconds: float = 300.0
     # Loaded engines used this recently stay sticky even after an empty pull.
     swap_grace_seconds: float = 30.0
@@ -432,7 +436,10 @@ class TaskflowWorker:
             f"/workers/{self.worker_id}/heartbeat",
             token=self.session_token,
             headers=self._session_headers(),
-            json={"activeLeaseIds": sorted(self.active_lease_ids)},
+            json={
+                "activeLeaseIds": sorted(self.active_lease_ids),
+                **({"state": self.reported_state} if self.reported_state else {}),
+            },
         )
         body = response.json()
         cancelled = body.get("cancelledLeaseIds", [])
@@ -1652,6 +1659,31 @@ def _update_pull_task_types(taskflow: TaskflowWorker) -> None:
     if ready != taskflow.pull_task_types:
         _LOGGER.info("Pulling task types %s%s", list(ready), note)
         taskflow.pull_task_types = ready
+    taskflow.reported_state = worker_state(ready, waiting, snapshot)
+
+
+def worker_state(
+    pulling: tuple[str, ...], waiting_for_models: list[str], snapshot: ResidencySnapshot | None
+) -> dict[str, Any]:
+    """What the worker tells Taskflow about itself: the types it pulls when a group has room
+    (Taskflow's ``lastPull`` says what it last asked for), types still waiting for model sets
+    and, in on-demand mode, its engines."""
+    state: dict[str, Any] = {
+        "loadMode": "all" if snapshot is None else "on-demand",
+        "pulling": list(pulling),
+    }
+    if waiting_for_models:
+        state["waitingForModels"] = waiting_for_models
+    if snapshot is not None:
+        state["engines"] = {
+            "loaded": sorted(snapshot.resident),
+            "loading": snapshot.waiting_for,
+            "pinned": sorted(snapshot.pinned),
+            "blocked": sorted(snapshot.blocked),
+            "exclusive": sorted(snapshot.exclusive),
+            "idleSeconds": None if math.isinf(snapshot.idle_seconds) else round(snapshot.idle_seconds),
+        }
+    return state
 
 
 async def _pull_leases(
