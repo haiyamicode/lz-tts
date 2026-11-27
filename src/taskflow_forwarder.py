@@ -108,8 +108,11 @@ class ForwardingInferenceSession:
         self,
         operations: list[tuple[str, dict[str, Any]]],
         mp3_sinks: list[Any] | None = None,  # pylint: disable=unused-argument
+        progress_sinks: list[Any] | None = None,  # pylint: disable=unused-argument
+        cancel_events: list[asyncio.Event] | None = None,  # pylint: disable=unused-argument
     ) -> list[Any]:
-        """Forward each operation. A forwarded result arrives complete, so the sinks get nothing."""
+        """Forward each operation. A forwarded result arrives complete, so the sinks get nothing
+        and a released lease is not cancelled upstream."""
         if not self._started:
             raise RuntimeError("Forwarding inference session has not been started")
         outcomes = await asyncio.gather(
