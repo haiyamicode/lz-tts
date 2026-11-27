@@ -189,13 +189,6 @@ def _build_word2ph_counts(
     if phoneme_length <= _EMPTY_PHONEME_ID_COUNT:
         return [0 for _ in attention_mask]
 
-    spans = _normalize_word_spans(word_spans)
-    if not spans:
-        raise ValueError(
-            "word_spans are required when building phoneme-aligned BERT input "
-            f"(phoneme_length={phoneme_length})"
-        )
-
     active_tokens = [idx for idx, value in enumerate(attention_mask) if value]
     if not active_tokens:
         raise ValueError("tokenizer produced no active tokens for phoneme-aligned BERT input")
@@ -208,6 +201,17 @@ def _build_word2ph_counts(
         (idx for idx in reversed(active_tokens) if special_tokens_mask[idx]),
         active_tokens[-1],
     )
+
+    spans = _normalize_word_spans(word_spans)
+    if not spans:
+        # Phonemes but no word: eSpeak reads emoji and symbols by name ("🎉", "©", "$") without a
+        # word mapping, so a span of only those has phonemes and no spans (the phonemizer's
+        # `_validate_word_spans` lets that through only for text with no letter or digit). Those
+        # phonemes are unmapped, which inside a sentence go to the neighbouring word or, before
+        # the first word, to the leading special token: here every one is before the first word.
+        counts = [0 for _ in attention_mask]
+        counts[first_special] = phoneme_length
+        return counts
 
     counts = [0 for _ in attention_mask]
     previous_id_end = 0
