@@ -499,6 +499,14 @@ class MediaConfig(BaseModel):
     # CUDA_VISIBLE_DEVICES for the runtime (PCI-order index or UUID). One GPU, Ampere or newer
     # (YuE2 and H3 need bf16; H3 wants a 24 GB card); the runtime holds one model group at a time.
     gpu: str | None = None
+    # Host RAM the runtime may use, GB, page cache and every helper it starts included, and no swap: it
+    # runs in a systemd user scope with MemoryMax (needs `systemd-run --user` with the memory controller
+    # delegated; the runtime does not start without it). ComfyUI reads the scope's limit, so it pins H3
+    # weights only up to the limit minus its headroom (`H3_PIN_RAM_HEADROOM_GB`, default 20% of the
+    # limit, >= 8) and reads the rest from disk. Unset = no limit: on a disk ComfyUI calls slow (SATA)
+    # it pins until host RAM available falls to that headroom and keeps the pins while idle, which
+    # starves anything else on the box (a TTS worker beside it).
+    memory_limit_gb: float | None = Field(default=None, gt=0)
     ready_timeout_seconds: float = Field(default=1800.0, gt=0)
     music_timeout_seconds: float = Field(default=3600.0, gt=0)
     videogen_timeout_seconds: float = Field(default=1800.0, gt=0)
@@ -1661,6 +1669,7 @@ def _ensure_media_runtime() -> MediaRuntime:
             gpu=config.gpu,
             ready_timeout_seconds=config.ready_timeout_seconds,
             features=config.features(),
+            memory_limit_gb=config.memory_limit_gb,
         )
     return _media_runtime
 

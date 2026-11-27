@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import signal
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -737,6 +738,7 @@ class MediaRuntime:
         gpu: str | None,
         ready_timeout_seconds: float,
         features: list[str],
+        memory_limit_gb: float | None = None,
     ):
         # Relative paths are the repo's (server config), not the runtime dir the child starts in.
         repo_dir = Path(__file__).resolve().parents[2]
@@ -745,6 +747,8 @@ class MediaRuntime:
         self.gpu = gpu
         self.ready_timeout_seconds = ready_timeout_seconds
         self.features = list(features)
+        self.memory_limit_gb = memory_limit_gb
+        self._starts = itertools.count(1)
         self._process: subprocess.Popen | None = None
         self._start_lock = asyncio.Lock()
         #: The loop the requests and the progress sinks belong to; replies are read on a thread.
@@ -765,21 +769,22 @@ class MediaRuntime:
         if self.gpu is not None:
             env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
             env["CUDA_VISIBLE_DEVICES"] = self.gpu
-        _LOGGER.info("Starting media runtime (gpu=%s, features=%s)", self.gpu, self.features)
+        command = [self.python, "server.py", "--device", "cuda:0", "--features", ",".join(self.features)]
+        if self.memory_limit_gb is not None:
+            command = self._memory_scope(next(self._starts)) + command
+        _LOGGER.info(
+            "Starting media runtime (gpu=%s, features=%s, memory_limit_gb=%s)",
+            self.gpu,
+            self.features,
+            self.memory_limit_gb,
+        )
         request_read, request_write = os.pipe()
         reply_read, reply_write = os.pipe()
         env[REQUEST_FD_VARIABLE] = str(request_read)
         env[REPLY_FD_VARIABLE] = str(reply_write)
         try:
             self._process = subprocess.Popen(
-                [
-                    self.python,
-                    "server.py",
-                    "--device",
-                    "cuda:0",
-                    "--features",
-                    ",".join(self.features),
-                ],
+                command,
                 cwd=self.runtime_dir,
                 env=env,
                 start_new_session=True,
@@ -796,6 +801,32 @@ class MediaRuntime:
             os.close(reply_write)
         self._request_fd = request_write
         self._read_replies(reply_read)
+
+    def _memory_scope(self, start: int) -> list[str]:
+        """The `systemd-run` prefix that starts the runtime in a user scope holding it to `memory_limit_gb`.
+
+        `--scope` execs the command in place (same pid, same inherited pipes, the parent-death signal
+        kept), in a cgroup of its own under the user manager: MemoryMax bounds its RAM and page cache
+        and everything it starts (ffmpeg), MemorySwapMax=0 keeps it out of the swap the rest of the box
+        shares. Over the limit the kernel reclaims the scope's page cache, then kills inside the scope
+        only. A worker under a system service cannot make a child cgroup of its own; the user manager
+        (`systemd-run --user`, XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS in the env) can.
+        """
+        if shutil.which("systemd-run") is None:
+            raise MediaRuntimeError("media memory_limit_gb is set but systemd-run is not on PATH")
+        limit_mb = int(self.memory_limit_gb * 1024)
+        return [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            f"--unit=lzai-media-{os.getpid()}-{start}",
+            "--description=lzai media runtime",
+            f"--property=MemoryMax={limit_mb}M",
+            "--property=MemorySwapMax=0",
+            "--",
+        ]
 
     def _read_replies(self, reply_fd: int) -> None:
         """Hands each line the child sends to the loop: a reply, its state, or a job's progress.
