@@ -503,9 +503,13 @@ class VoxCPMRuntime:
             raise ValueError("on_audio length must match texts length")
 
         duration_started = time.perf_counter()
-        generation_limits, _budgets = await self._predict_generation_limits(
+        generation_limits, budgets = await self._predict_generation_limits(
             texts, languages
         )
+        min_share = float(self.settings["duration_budget"].get("min_generate_share", 0.5))
+        min_lengths = [
+            int(budget["estimated_tokens"] * min_share) if budget else 0 for budget in budgets
+        ]
         duration_wall_seconds = time.perf_counter() - duration_started
 
         unique_references: dict[tuple[str, str], tuple[bytes, str]] = {}
@@ -556,11 +560,13 @@ class VoxCPMRuntime:
                         continuation_latents=item_continuation_latents,
                         continuation_text=continuation[2] if continuation else "",
                         lora_name=lora_name,
+                        min_generate_length=min_generate_length,
                         on_audio=item_on_audio,
                     )
-                    for text, max_generate_length, seed, item_reference_latents, item_continuation_latents, continuation, lora_name, description, item_on_audio in zip(
+                    for text, max_generate_length, min_generate_length, seed, item_reference_latents, item_continuation_latents, continuation, lora_name, description, item_on_audio in zip(
                         texts,
                         generation_limits,
+                        min_lengths,
                         seeds,
                         reference_latents,
                         continuation_latents,
