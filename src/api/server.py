@@ -316,6 +316,9 @@ class VoxCPMDurationBudgetConfig(BaseModel):
     max_margin: float = Field(default=1.35, ge=0)
     min_extra_tokens: int = Field(default=0, ge=0)
     max_extra_tokens: int = Field(default=38, ge=0)
+    # The shortest take, as a share of its predicted length: VoxCPM2 can stop early (a
+    # premature EOS) and drop the end of a line, so it may not stop before this.
+    min_generate_share: float = Field(default=0.5, ge=0, le=1)
     soft_text_token_limit: int = Field(default=64, ge=1)
     hard_text_token_limit: int = Field(default=80, ge=1)
     include_word_spans: bool = True
