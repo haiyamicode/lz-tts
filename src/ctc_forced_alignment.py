@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +13,8 @@ import torch
 from langcodes import Language
 
 from .piper.word_segmentation import WordSpan, icu_word_spans
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -405,14 +408,24 @@ class CtcForcedAligner:
         frames = int(emissions.shape[0])
         targets = _target_indices(prepared.tokens, self._tokenizer)
         repeats = sum(a == b for a, b in zip(targets, targets[1:]))
-        if frames < len(targets) + repeats:
-            # CTC needs a frame per label plus a blank between repeats: the audio is too
-            # short to say this text (a cut take). The C++ aligner would throw anyway.
-            # (Our fork of ctc_forced_aligner, src/ctc_forced_aligner, sizes its back pointers
-            # for any take that fits; upstream 0.3.0 overran them when a take barely fit.)
-            raise ValueError(
-                f"Audio too short to align its text: {frames} frames for "
-                f"{len(targets)} labels + {repeats} repeats"
+        needed = len(targets) + repeats
+        if not frames:
+            raise ValueError("Audio too short to align its text: no frames")
+        if frames < needed:
+            # CTC needs a frame (20 ms) per label plus a blank between repeats. Real takes say
+            # more than that: a held "aaaa..." (400 a's in 15.6 s), fast speech after speed,
+            # or a cut take of junk text. Split each frame into k equal frames so a path fits;
+            # the times stay on the audio's clock. (Our fork of ctc_forced_aligner sizes its
+            # back pointers for any take that fits; upstream 0.3.0 overran them.)
+            split = -(-needed // frames)
+            emissions = torch.repeat_interleave(emissions, split, dim=0)
+            stride_ms = stride_ms / split
+            _LOGGER.info(
+                "CTC aligner: %d frames for %d labels + %d repeats, split each frame in %d",
+                frames,
+                len(targets),
+                repeats,
+                split,
             )
         segments, scores, blank = get_alignments(
             emissions,
