@@ -15,6 +15,7 @@ from .japanese import normalize_japanese
 from .khmer import normalize_khmer
 from .korean import normalize_korean
 from .romance import normalize_french, normalize_spanish
+from .speakable import speakable_caps_runs, speakable_word_slashes
 from .spoken import verbalize_spoken_text
 from .thai import normalize_thai
 from .vietnamese import normalize_vietnamese
@@ -63,6 +64,7 @@ def normalize_text(text: str, language: str) -> str:
     lang = (language or "").strip().lower().replace("_", "-")
     base = lang.split("-", 1)[0]
 
+    text = speakable_word_slashes(text)
     if lang in {"zh-mix-en", "zh_mix_en"}:
         return text
     if lang.startswith("cmn-latn") and not _contains_cjk(text):

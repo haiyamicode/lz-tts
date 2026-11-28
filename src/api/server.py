@@ -55,6 +55,7 @@ from ..ssml_postprocessing import (
 )
 from ..text_splitter import count_cl100k_tokens
 from ..voxcpm_ipa_adapter import approximate_ipa_spelling, resolve_ipa_control_schedules
+from ..text_norm.speakable import speakable_caps_runs, speakable_word_slashes
 from .audio_utils import _audio_to_mp3_bytes, _audio_to_pcm16, _audio_to_wav_bytes, _resample_audio
 from .audio_adjustments import AudioEffect, adjust_audio
 from .take_stream import OrderedChunkAudio, StreamingMp3Encoder
@@ -4482,10 +4483,11 @@ def _prepare_voxcpm_input(
     fallback_language: str | None = None,
 ) -> tuple[str, str]:
     # Numbers were spelled out before chunking (_verbalize_voxcpm_numbers).
-    text = _voxcpm_speakable_paren_groups(text)
-    if language is not None:
-        return text, language
-    return text, _voxcpm_main_language(text, fallback_language)
+    text = speakable_word_slashes(_voxcpm_speakable_paren_groups(text))
+    if language is None:
+        language = _voxcpm_main_language(text, fallback_language)
+    # VoxCPM2 reads all-caps words as acronyms ("WAR AND PEACE" as "War and PAC").
+    return speakable_caps_runs(text, language), language
 
 
 def _voxcpm_main_language(text: str, fallback_language: str | None = None) -> str:
