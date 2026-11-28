@@ -2767,37 +2767,97 @@ async def _align_words(
     language_hint: str | None,
     forced_language: str | None,
 ) -> list[dict[str, Any]]:
-    language, language_spans = _ssml_language_plan(
-        text,
-        language_hint,
-        forced_language,
-    )
+    """When each word of ``text`` is said in ``audio``, by the CTC aligner.
+
+    Timings are never worth failing a take over: when the aligner can't time the
+    text (junk text, a take that can't say it, an aligner error), the words are
+    spread over the audio by their length (``_estimated_word_timestamps``). Only a
+    dead aligner process (or one that never loads) propagates, so the job is retried.
+    """
     await _await_engine_ready("aligner")
-    response = await asyncio.to_thread(
-        _aligner_client().call,
-        "align_words",
-        {
-            "text": text,
-            "audio": audio,
-            "sample_rate": sample_rate,
-            "language": language,
-            "language_spans": language_spans,
-        },
-    )
-    result = response.get("data") or {}
-    if not result.get("valid"):
-        if result.get("reason") == "empty_transcript":
-            # Nothing in the text tokenizes as a word (punctuation-only or
-            # symbol-only), so there is no word to align. The audio was still
-            # synthesized: there are no word timings (SSML pauses go on the
-            # audio boundaries) instead of failing the whole task.
-            return []
-        raise ValueError(
-            f"Could not force-align audio: {result.get('reason') or 'unknown error'}"
+    try:
+        language, language_spans = _ssml_language_plan(
+            text,
+            language_hint,
+            forced_language,
         )
-    if not result.get("word_timestamps"):
-        raise ValueError("Could not force-align audio: no word timestamps")
-    return list(result["word_timestamps"])
+        response = await asyncio.to_thread(
+            _aligner_client().call,
+            "align_words",
+            {
+                "text": text,
+                "audio": audio,
+                "sample_rate": sample_rate,
+                "language": language,
+                "language_spans": language_spans,
+            },
+        )
+        result = response.get("data") or {}
+        if not result.get("valid"):
+            if result.get("reason") == "empty_transcript":
+                # Nothing in the text tokenizes as a word (punctuation-only or
+                # symbol-only), so there is no word to align. The audio was still
+                # synthesized: there are no word timings (SSML pauses go on the
+                # audio boundaries) instead of failing the whole task.
+                return []
+            raise ValueError(f"aligner: {result.get('reason') or 'unknown error'}")
+        if not result.get("word_timestamps"):
+            raise ValueError("aligner returned no word timestamps")
+        return list(result["word_timestamps"])
+    except ChildWorkerDied:
+        raise
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        words = _estimated_word_timestamps(text, audio, sample_rate)
+        _LOGGER.warning(
+            "Word alignment failed (%s); estimated %d words over %.2f s of audio",
+            exc,
+            len(words),
+            len(audio) / sample_rate if sample_rate else 0.0,
+        )
+        return words
+
+
+_ESTIMATE_FRAME_SECONDS = 0.02
+_ESTIMATE_QUIET_DB = 40.0
+
+
+def _estimated_word_timestamps(
+    text: str,
+    audio: np.ndarray,
+    sample_rate: int,
+) -> list[dict[str, Any]]:
+    """Words of ``text`` spread over the voiced part of ``audio`` by their length.
+
+    The fallback when the aligner can't time a take: each word (a run between
+    spaces, or one CJK character) gets a share of the time from the first to the
+    last frame within 40 dB of the loudest, in proportion to its characters.
+    """
+    spans = [match.span() for match in _TIMESTAMP_TOKEN_RE.finditer(text)]
+    if not spans:
+        return []
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    duration = len(samples) / sample_rate if sample_rate else 0.0
+    start, end = 0.0, duration
+    frame = max(1, int(sample_rate * _ESTIMATE_FRAME_SECONDS))
+    frames = len(samples) // frame
+    if frames:
+        rms = np.sqrt(np.mean(samples[: frames * frame].reshape(frames, frame) ** 2, axis=1))
+        loud = np.flatnonzero(rms > rms.max() * 10 ** (-_ESTIMATE_QUIET_DB / 20)) if rms.max() > 0 else []
+        if len(loud):
+            start = float(loud[0]) * frame / sample_rate
+            end = float(loud[-1] + 1) * frame / sample_rate
+    weights = np.array([span_end - span_start for span_start, span_end in spans], dtype=np.float64)
+    edges = start + (end - start) * np.concatenate([[0.0], np.cumsum(weights) / weights.sum()])
+    return [
+        {
+            "text": text[span_start:span_end],
+            "start_seconds": float(edges[index]),
+            "end_seconds": float(edges[index + 1]),
+            "source_start": span_start,
+            "source_end": span_end,
+        }
+        for index, (span_start, span_end) in enumerate(spans)
+    ]
 
 
 def _language_at_source_position(
@@ -5640,15 +5700,25 @@ async def _add_word_timestamps(
     text = parse_ssml(request.ssml).text if request.ssml is not None else request.text or ""
     explicit_language = _explicit_language(request.language, request.language_override)
     audio, sample_rate = await asyncio.to_thread(_decode_wav_bytes, result.audio)
-    timestamps = await _timed_words(
-        text,
-        audio,
-        sample_rate,
-        request.language,
-        explicit_language,
-        explicit_language,
-        request.voice_id,
-    )
+    try:
+        timestamps = await _timed_words(
+            text,
+            audio,
+            sample_rate,
+            request.language,
+            explicit_language,
+            explicit_language,
+            request.voice_id,
+        )
+    except ChildWorkerDied:
+        raise
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # The take is done: timings that can't be made (number reading, alignment)
+        # are estimated instead of failing it.
+        _LOGGER.warning("Word timestamps failed (%s); estimating them", exc)
+        timestamps = [
+            _word_timestamp(text, word) for word in _estimated_word_timestamps(text, audio, sample_rate)
+        ]
     return InferenceResult(
         kind="audio",
         content_type=result.content_type,
