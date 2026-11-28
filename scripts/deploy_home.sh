@@ -11,7 +11,7 @@
 #    pm2 app's LZAI_SERVER_CONFIG / LZAI_MODELS; per-file ETag check, --skip-data skips it).
 # 4. uv sync --frozen for the main venv and, when present, the media runtime venv.
 # 5. Rolling restart (APPS, default lzai-gpu0 then lzai-gpu1): pm2 restart, then wait for the app's
-#    /health 200 on its PORT and "Taskflow worker ready" in its new log lines. One that does not come
+#    /health 200 on its PORT (default 8000) and "Taskflow worker ready" in its new log lines. One that does not come
 #    back stops the script, so the others keep serving the old code (pm2 shows which one).
 # 6. Prints the old and new HEAD, the commits and the package changes.
 # Nothing new on origin/main: stops after step 1 unless --restart. A run that failed after the pull
@@ -134,7 +134,7 @@ fi
 # --------------------------------------------------------------------------- 5. rolling restart
 for app in "${APPS[@]}"; do
     port=$(app_field "$app" PORT)
-    [ -n "$port" ] || fail "$app has no PORT in its pm2 env"
+    port=${port:-8000}  # the worker's own default (src/api/server.py) when its pm2 env sets none
     step "restart $app (port $port)"
     out_log=$(app_field "$app" out_log)
     err_log=$(app_field "$app" err_log)
