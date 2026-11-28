@@ -143,27 +143,37 @@ class LanguageInputError(ValueError):
 
 
 def decode_audio_16k_mono(audio: bytes, max_seconds: float = MAX_SECONDS) -> np.ndarray:
-    """Decode any ffmpeg-readable audio to float32 16 kHz mono samples."""
+    """Decode any ffmpeg-readable audio to float32 16 kHz mono samples.
+
+    The bytes go to ffmpeg as a file, not a pipe: an MP4/M4A whose moov atom
+    comes after its media data (ffmpeg's own default without +faststart) needs a
+    seek to reach it, and on a pipe ffmpeg exits 0 with no output.
+    """
     if not audio:
         raise LanguageInputError("Language identification input is empty")
-    try:
-        completed = subprocess.run(
-            [
-                "ffmpeg", "-nostdin", "-loglevel", "error",
-                "-i", "pipe:0",
-                "-t", str(max_seconds),
-                "-ac", "1", "-ar", str(SAMPLE_RATE),
-                "-f", "f32le", "pipe:1",
-            ],
-            input=audio,
-            capture_output=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        stderr = exc.stderr.decode("utf-8", errors="replace").strip()
-        raise LanguageInputError(f"Undecodable audio: {stderr[-500:]}") from exc
+    with tempfile.NamedTemporaryFile(prefix="lzai-decode-") as source:
+        source.write(audio)
+        source.flush()
+        try:
+            completed = subprocess.run(
+                [
+                    "ffmpeg", "-nostdin", "-loglevel", "error",
+                    "-i", source.name,
+                    "-t", str(max_seconds),
+                    "-ac", "1", "-ar", str(SAMPLE_RATE),
+                    "-f", "f32le", "pipe:1",
+                ],
+                capture_output=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode("utf-8", errors="replace").strip()
+            raise LanguageInputError(f"Undecodable audio: {stderr[-500:]}") from exc
     samples = np.frombuffer(completed.stdout, dtype=np.float32)
     if samples.size == 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+        if stderr:
+            raise LanguageInputError(f"Undecodable audio: {stderr[-500:]}")
         raise LanguageInputError("Decoded audio contains no samples")
     return samples
 
